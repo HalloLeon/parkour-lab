@@ -63,7 +63,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = UNITREE_A1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     feet_contact: ContactSensorCfg = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/.*foot",
+        prim_path="{ENV_REGEX_NS}/Robot/.*_foot",
         history_length=3,
         track_air_time=True
     )
