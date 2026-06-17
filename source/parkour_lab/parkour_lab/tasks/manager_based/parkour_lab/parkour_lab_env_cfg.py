@@ -88,7 +88,14 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_effort = mdp.JointEffortActionCfg(asset_name="robot", joint_names=["slider_to_cart"], scale=100.0)
+    # The policy outputs joint-position target offsets.
+    #
+    # For Unitree A1 this controls the 12 leg joints.
+    # The action is interpreted roughly as:
+    #
+    # target_joint_pos = default_joint_pos + scale * policy_action
+
+    joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], scale=0.25, use_default_offset=True)
 
 
 @configclass
