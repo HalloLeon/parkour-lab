@@ -106,15 +106,25 @@ class ObservationsCfg:
     class PolicyCfg(ObsGroup):
         """Observations for policy group."""
 
-        # observation terms (order preserved)
-        joint_pos_rel = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel_rel = ObsTerm(func=mdp.joint_vel_rel)
+        # Root/body state.
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+        projected_gravity = ObsTerm(func=mdp.projected_gravity)
 
-        def __post_init__(self) -> None:
+        # Joint state.
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+
+        # Previous action.
+        actions = ObsTerm(func=mdp.last_action)
+
+        def __post_init__(self):
+            # Keep the first version deterministic and easy to debug.
             self.enable_corruption = False
+
+            # Concatenate all terms into one flat policy observation vector.
             self.concatenate_terms = True
 
-    # observation groups
     policy: PolicyCfg = PolicyCfg()
 
 
