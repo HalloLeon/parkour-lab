@@ -49,8 +49,8 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         )
     )
 
-    object: RigidObjectCfg = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Object",
+    obstacle: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Obstacle",
         spawn=sim_utils.CuboidCfg(
             size=(0.5, 0.5, 0.5),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
