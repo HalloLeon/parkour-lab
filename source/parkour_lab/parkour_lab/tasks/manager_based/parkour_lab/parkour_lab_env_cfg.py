@@ -56,7 +56,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
             collision_props=sim_utils.CollisionPropertiesCfg()
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(1.0, 0.0, 0.06))
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(1.0, 0.0, 0.25))
     )
 
     robot: ArticulationCfg = UNITREE_A1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
@@ -209,7 +209,7 @@ class TerminationsCfg:
     # Time out.
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
-    # Trunk touces the ground.
+    # Trunk touches the ground.
     trunk_contact = DoneTerm(
         func=mdp.illegal_contact,
         params={
