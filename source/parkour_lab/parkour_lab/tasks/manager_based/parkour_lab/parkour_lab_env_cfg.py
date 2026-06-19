@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import isaaclab.sim as sim_utils
+import isaaclab_tasks.manager_based.locomotion.velocity.mdp as velocity_mdp
 from isaaclab.assets import ArticulationCfg
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.assets import RigidBodyCfg
@@ -171,27 +172,33 @@ class EventCfg:
 class RewardsCfg:
     """Reward terms for the MDP."""
 
-    # (1) Constant running reward
     alive = RewTerm(func=mdp.is_alive, weight=1.0)
-    # (2) Failure penalty
-    terminating = RewTerm(func=mdp.is_terminated, weight=-2.0)
-    # (3) Primary task: keep pole upright
-    pole_pos = RewTerm(
-        func=mdp.joint_pos_target_l2,
-        weight=-1.0,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"]), "target": 0.0},
-    )
-    # (4) Shaping tasks: lower cart velocity
-    cart_vel = RewTerm(
-        func=mdp.joint_vel_l1,
-        weight=-0.01,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["slider_to_cart"])},
-    )
-    # (5) Shaping tasks: lower pole angular velocity
-    pole_vel = RewTerm(
-        func=mdp.joint_vel_l1,
-        weight=-0.005,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=["cart_to_pole"])},
+
+    terminated = RewTerm(func=mdp.is_terminated, weight=-2.0)
+
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
+
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
+
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.1)
+
+    joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.001)
+
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+
+    feet_slide = RewTerm(
+        func=velocity_mdp.feet_slide,
+        weight=-0.1,
+        params={
+            "sensor_cfg": SceneEntityCfg(
+                "feet_contact",
+                body_names=".*_foot"
+            ),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=".*_foot"
+            )
+        }
     )
 
 
