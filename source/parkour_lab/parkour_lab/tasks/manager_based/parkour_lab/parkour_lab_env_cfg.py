@@ -38,7 +38,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     """Configuration for a parkour lab scene."""
 
     ground: TerrainImporterCfg = TerrainImporterCfg(
-        prim_path="/World/ground",
+        prim_path="/World/Ground",
         terrain_type="plane",
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
@@ -46,7 +46,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
             static_friction=1.0,
             dynamic_friction=1.0,
             restitution=0.0,
-        ),
+        )
     )
 
     object: RigidBodyCfg = RigidBodyCfg(
@@ -74,7 +74,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
 
     dome_light: AssetBaseCfg = AssetBaseCfg(
         prim_path="/World/DomeLight",
-        spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0),
+        spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0)
     )
 
 
