@@ -52,11 +52,11 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     obstacle: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Obstacle",
         spawn=sim_utils.CuboidCfg(
-            size=(0.5, 0.5, 0.5),
+            size=(0.5, 0.5, 0.12),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
             collision_props=sim_utils.CollisionPropertiesCfg()
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(1.0, 0.0, 0.25))
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(1.0, 0.0, 0.06))
     )
 
     robot: ArticulationCfg = UNITREE_A1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
