@@ -7,7 +7,7 @@ import isaaclab.sim as sim_utils
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as velocity_mdp
 from isaaclab.assets import ArticulationCfg
 from isaaclab.assets import AssetBaseCfg
-from isaaclab.assets import RigidBodyCfg
+from isaaclab.assets import RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -49,14 +49,14 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         )
     )
 
-    object: RigidBodyCfg = RigidBodyCfg(
+    object: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Object",
         spawn=sim_utils.CuboidCfg(
             size=(0.5, 0.5, 0.5),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
             collision_props=sim_utils.CollisionPropertiesCfg()
         ),
-        init_state=RigidBodyCfg.InitStateCfg(pos=(1.0, 0.0, 0.06))
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(1.0, 0.0, 0.06))
     )
 
     robot: ArticulationCfg = UNITREE_A1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
@@ -216,7 +216,7 @@ class TerminationsCfg:
             "threshold": 1.0,
             "sensor_cfg": SceneEntityCfg(
                 "base_contact",
-                base_names="trunk"
+                body_names="trunk"
             )
         }
     )
