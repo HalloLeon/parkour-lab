@@ -229,24 +229,39 @@ class TerminationsCfg:
 
 @configclass
 class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
-    # Scene settings
+    # Scene settings.
     scene: ParkourLabSceneCfg = ParkourLabSceneCfg(num_envs=4096, env_spacing=4.0)
-    # Basic settings
+
+    # Basic settings.
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     events: EventCfg = EventCfg()
-    # MDP settings
+
+    # MDP settings.
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
 
-    # Post initialization
+    # Post initialization.
     def __post_init__(self) -> None:
         """Post initialization."""
-        # general settings
-        self.decimation = 2
-        self.episode_length_s = 5
-        # viewer settings
-        self.viewer.eye = (8.0, 0.0, 5.0)
-        # simulation settings
-        self.sim.dt = 1 / 120
+
+        # Simulation and control timing.
+        #
+        # sim.dt = 0.005 means physics runs at 200 Hz.
+        # decimation = 4 means the policy acts every 4 physics steps.
+        # So the policy/control rate is 50 Hz.
+        self.decimation = 4
+        self.episode_length_s = 10.0
+
+        self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
+
+        # Match the simulation material to the terrain material.
+        self.sim.physics_material = self.scene.ground.physics_material
+
+        # Contact sensors should update every physics step.
+        if self.scene.feet_contact is not None:
+            self.scene.feet_contact.update_period = self.sim.dt
+
+        if self.scene.base_contact is not None:
+            self.scene.base_contact.update_period = self.sim.dt
