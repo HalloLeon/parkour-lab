@@ -4,7 +4,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import isaaclab.sim as sim_utils
-import isaaclab_tasks.manager_based.locomotion.velocity.mdp as velocity_mdp
 from isaaclab.assets import ArticulationCfg
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.assets import RigidObjectCfg
@@ -187,7 +186,7 @@ class RewardsCfg:
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
 
     feet_slide = RewTerm(
-        func=velocity_mdp.feet_slide,
+        func=mdp.feet_slide,
         weight=-0.1,
         params={
             "sensor_cfg": SceneEntityCfg(
