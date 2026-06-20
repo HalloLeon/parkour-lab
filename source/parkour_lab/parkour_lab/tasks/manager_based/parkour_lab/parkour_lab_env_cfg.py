@@ -66,7 +66,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
             collision_props=sim_utils.CollisionPropertiesCfg()
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(6.0, 0.0, 0.01))
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(2.0, 0.0, 0.01))
     )
 
     robot: ArticulationCfg = UNITREE_A1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
@@ -209,6 +209,7 @@ class RewardsCfg:
         func=mdp.illegal_contact_l2,
         weight=-1.0,
         params={
+            "threshold": 1.0,
             "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk")
         }
     )
@@ -243,14 +244,12 @@ class RewardsCfg:
 class TerminationsCfg:
     """Termination terms for the MDP."""
 
-    # Time out.
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
-    # Trunk touches the ground.
-    trunk_contact = DoneTerm(
+    success = DoneTerm(
         func=mdp.reached_goal,
         params={
-            "threshold": 0.01,
+            "threshold": 0.25,
             "goal_cfg": SceneEntityCfg("goal"),
             "asset_cfg": SceneEntityCfg("robot")
         }
