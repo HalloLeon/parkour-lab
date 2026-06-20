@@ -3,7 +3,7 @@ from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
-import utils
+from . import utils
 
 
 def illegal_contact_l2(env: ManagerBasedRLEnv, sensor_cfg=SceneEntityCfg("base_contact", body_names="trunk")) -> torch.Tensor:
@@ -17,11 +17,8 @@ def reached_goal_l2(env: ManagerBasedRLEnv, threshold: float, goal_cfg=SceneEnti
     return (dist_to_goal < threshold).float()
 
 
-def velocity_towards_goal_l2(env: ManagerBasedRLEnv, goal_x: float, goal_y: float, goal_z: float, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
-    robot_root_pos = utils._robot_root_pos_env(env, asset_cfg)
-    goal_pos = torch.tensor([goal_x, goal_y, goal_z], device=robot_root_pos.device, dtype=robot_root_pos.dtype).unsqueeze(0)
-
-    to_goal = goal_pos - robot_root_pos
+def velocity_towards_goal_l2(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+    to_goal = utils._goal_distance(env, goal_cfg, asset_cfg).unsqueeze(0)
     to_goal_norm = torch.linalg.norm(to_goal, dim=-1, keepdim=True).clamp_min(1.0e-6)
     goal_dir = to_goal / to_goal_norm
 
