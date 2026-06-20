@@ -18,11 +18,24 @@ def reached_goal_l2(env: ManagerBasedRLEnv, threshold: float, goal_cfg=SceneEnti
 
 
 def velocity_towards_goal_l2(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
-    to_goal = utils._goal_distance(env, goal_cfg, asset_cfg).unsqueeze(0)
+    """
+    Reward velocity along the XYZ direction from robot to goal.
+
+    Returns:
+        [num_envs]
+    """
+
+    to_goal = utils._goal_vector_xyz(env, goal_cfg, asset_cfg)
+
+    # [num_envs, 1]
     to_goal_norm = torch.linalg.norm(to_goal, dim=-1, keepdim=True).clamp_min(1.0e-6)
+
+    # [num_envs, 3]
     goal_dir = to_goal / to_goal_norm
 
     asset: Articulation = env.scene[asset_cfg.name]
+
+    # [num_envs, 3]
     vel_asset = asset.data.root_lin_vel_w
 
     return torch.sum(vel_asset * goal_dir, dim=-1).clamp(min=-1.0, max=1.0)
