@@ -17,6 +17,32 @@ def _robot_root_pos_env(env: ManagerBasedRLEnv, asset_cfg=SceneEntityCfg("robot"
     return asset.data.root_pos_w - env.scene.env_origins
 
 
+def _goal_pos_env(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal")) -> torch.Tensor:
+    """
+    Goal position in each environment's local frame.
+
+    Returns:
+        [num_envs, 3]
+    """
+
+    goal: AssetBase = env.scene[goal_cfg.name]
+    return goal.data.root_pos_w - env.scene.env_origins
+
+
+def _goal_vector_xyz(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+    """
+    XYZ vector from robot root to goal.
+
+    Returns:
+        [num_envs, 3]
+    """
+
+    robot_root_pos = _robot_root_pos_env(env, asset_cfg)
+    goal_pos = _goal_pos_env(env, goal_cfg)
+
+    return goal_pos - robot_root_pos
+
+
 def _goal_distance(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
     """
     XYZ distance from robot root to goal.
@@ -25,8 +51,5 @@ def _goal_distance(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), asse
         [num_envs]
     """
 
-    robot_root_pos = _robot_root_pos_env(env, asset_cfg)
-    goal: AssetBase = env.scene[goal_cfg.name]
-    goal_pos = goal.data.root_pos_w - env.scene.env_origins
-
-    return torch.linalg.norm(robot_root_pos - goal_pos, dim=-1)
+    to_goal = _goal_vector_xyz(env, goal_cfg, asset_cfg)
+    return torch.linalg.norm(to_goal, dim=-1)
