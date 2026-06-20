@@ -2,14 +2,34 @@ import torch
 from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.sensors import ContactSensor
 
 from . import utils
 
 
-def illegal_contact_l2(env: ManagerBasedRLEnv, sensor_cfg=SceneEntityCfg("base_contact", body_names="trunk")) -> torch.Tensor:
-    contact_sensor = env.scene[sensor_cfg.name]
-    illegal_contact = contact_sensor.data.contact > 0
-    return illegal_contact.float()
+def illegal_contact_l2(env: ManagerBasedRLEnv, threshold: float, sensor_cfg=SceneEntityCfg("base_contact", body_names="trunk")) -> torch.Tensor:
+    """
+    Penalty signal for illegal trunk/base contact.
+
+    Returns:
+        Tensor of shape [num_envs].
+    """
+
+    contact_sensor: ContactSensor = env.scene[sensor_cfg.name]
+
+    # [num_envs, history_length, num_bodies, 3]
+    net_forces = contact_sensor.data.net_forces_w_history
+
+    if sensor_cfg.body_ids is not None:
+        net_forces = net_forces[:, :, sensor_cfg.body_ids, :]
+
+    # [num_envs, history_length, selected_bodies]
+    force_norm = torch.linalg.norm(net_forces, dim=-1)
+
+    # [num_envs]
+    has_illegal_contact = torch.any(force_norm > threshold, dim=(1, 2))
+
+    return has_illegal_contact.float()
 
 
 def reached_goal_l2(env: ManagerBasedRLEnv, threshold: float, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
