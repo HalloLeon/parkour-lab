@@ -58,6 +58,17 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=(1.0, 0.0, 0.06))
     )
 
+    goal: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Goal",
+        spawn=sim_utils.CylinderCfg(
+            radius=0.25,
+            height=0.02,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            collision_props=sim_utils.CollisionPropertiesCfg()
+        ),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(6.0, 0.0, 0.01))
+    )
+
     robot: ArticulationCfg = UNITREE_A1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     feet_contact: ContactSensorCfg = ContactSensorCfg(
@@ -108,6 +119,8 @@ class ObservationsCfg:
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
         projected_gravity = ObsTerm(func=mdp.projected_gravity)
+
+        goal_distance = ObsTerm(func=mdp.goal_distance, params={"goal_cfg": SceneEntityCfg("goal"), "asset_cfg": SceneEntityCfg("robot")})
 
         # Joint state.
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
@@ -173,7 +186,32 @@ class RewardsCfg:
 
     alive = RewTerm(func=mdp.is_alive, weight=1.0)
 
-    terminated = RewTerm(func=mdp.is_terminated, weight=-2.0)
+    forward_velocity = RewTerm(
+        func=mdp.velocity_towards_goal_l2,
+        weight=1.0,
+        params={
+            "goal_cfg": SceneEntityCfg("goal"),
+            "asset_cfg": SceneEntityCfg("robot")
+        }
+    )
+
+    reached_goal = RewTerm(
+        func=mdp.reached_goal_l2,
+        weight=2.0,
+        params={
+            "threshold": 0.01,
+            "goal_cfg": SceneEntityCfg("goal"),
+            "asset_cfg": SceneEntityCfg("robot")
+        }
+    )
+
+    illegal_contact = RewTerm(
+        func=mdp.illegal_contact_l2,
+        weight=-1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk")
+        }
+    )
 
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
 
@@ -210,13 +248,11 @@ class TerminationsCfg:
 
     # Trunk touches the ground.
     trunk_contact = DoneTerm(
-        func=mdp.illegal_contact,
+        func=mdp.reached_goal,
         params={
-            "threshold": 1.0,
-            "sensor_cfg": SceneEntityCfg(
-                "base_contact",
-                body_names="trunk"
-            )
+            "threshold": 0.01,
+            "goal_cfg": SceneEntityCfg("goal"),
+            "asset_cfg": SceneEntityCfg("robot")
         }
     )
 
