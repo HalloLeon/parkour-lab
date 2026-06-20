@@ -15,4 +15,4 @@ def _goal_distance(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), asse
     goal: AssetBase = env.scene[goal_cfg.name]
     goal_pos = goal.data.root_pos_w - env.scene.env_origins
 
-    return torch.linalg.norm(robot_root_pos - goal_pos, dim=-1, keepdim=True)
+    return torch.linalg.norm(robot_root_pos - goal_pos, dim=-1)
