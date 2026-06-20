@@ -6,7 +6,7 @@ import torch
 
 def _robot_root_pos_env(env: ManagerBasedRLEnv, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
     asset: Articulation = env.scene[asset_cfg.name]
-    return asset.data.root_base_w - env.scene.env_origins
+    return asset.data.root_pos_w - env.scene.env_origins
 
 
 def _goal_distance(env: ManagerBasedRLEnv, goal_x: float, goal_y: float, goal_z: float, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
