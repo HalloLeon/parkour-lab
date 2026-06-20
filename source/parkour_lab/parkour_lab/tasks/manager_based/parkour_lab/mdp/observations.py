@@ -5,5 +5,5 @@ import torch
 import utils
 
 
-def goal_distance_w(env: ManagerBasedRLEnv, goal_x: float, goal_y: float, goal_z: float, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
-    return utils._goal_distance(env, goal_x, goal_y, goal_z, asset_cfg)
+def goal_distance_w(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+    return utils._goal_distance(env, goal_cfg, asset_cfg)

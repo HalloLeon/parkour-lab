@@ -1,4 +1,5 @@
 from isaaclab.assets import Articulation
+from isaaclab.assets import AssetBase
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 import torch
@@ -9,8 +10,9 @@ def _robot_root_pos_env(env: ManagerBasedRLEnv, asset_cfg=SceneEntityCfg("robot"
     return asset.data.root_pos_w - env.scene.env_origins
 
 
-def _goal_distance(env: ManagerBasedRLEnv, goal_x: float, goal_y: float, goal_z: float, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+def _goal_distance(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
     robot_root_pos = _robot_root_pos_env(env, asset_cfg)
-    goal_pos = torch.tensor([goal_x, goal_y, goal_z], device=robot_root_pos.device, dtype=robot_root_pos.dtype).unsqueeze(0)
+    goal: AssetBase = env.scene[goal_cfg.name]
+    goal_pos = goal.data.root_pos_w - env.scene.env_origins
 
     return torch.linalg.norm(robot_root_pos - goal_pos, dim=-1, keepdim=True)
