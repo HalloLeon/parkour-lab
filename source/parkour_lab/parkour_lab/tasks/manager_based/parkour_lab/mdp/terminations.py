@@ -1,8 +1,8 @@
-from isaaclab.assets import SceneEntityCfg
 from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.managers import SceneEntityCfg
 import torch
 
-import utils
+from . import utils
 
 
 def reached_goal(env: ManagerBasedRLEnv, threshold: float, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
