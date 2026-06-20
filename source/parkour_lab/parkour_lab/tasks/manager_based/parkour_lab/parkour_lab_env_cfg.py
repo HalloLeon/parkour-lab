@@ -61,12 +61,12 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     goal: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Goal",
         spawn=sim_utils.CylinderCfg(
-            radius=0.25,
+            radius=0.10,
             height=0.02,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
-            collision_props=sim_utils.CollisionPropertiesCfg()
+            collision_props=None
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(2.0, 0.0, 0.01))
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(2.0, 0.0, 0.35))
     )
 
     robot: ArticulationCfg = UNITREE_A1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
@@ -199,7 +199,7 @@ class RewardsCfg:
         func=mdp.reached_goal_l2,
         weight=2.0,
         params={
-            "threshold": 0.01,
+            "threshold": 0.30,
             "goal_cfg": SceneEntityCfg("goal"),
             "asset_cfg": SceneEntityCfg("robot")
         }
@@ -246,10 +246,18 @@ class TerminationsCfg:
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
+    trunk_contact = DoneTerm(
+        func=mdp.illegal_contact,
+        params={
+            "threshold": 1.0,
+            "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk"),
+        }
+    )
+
     success = DoneTerm(
         func=mdp.reached_goal,
         params={
-            "threshold": 0.25,
+            "threshold": 0.30,
             "goal_cfg": SceneEntityCfg("goal"),
             "asset_cfg": SceneEntityCfg("robot")
         }
