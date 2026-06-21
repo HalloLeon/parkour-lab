@@ -199,10 +199,11 @@ class EventCfg:
 class RewardsCfg:
     """Reward terms for the MDP."""
 
-    alive = RewTerm(func=mdp.is_alive, weight=1.0)
+    alive = RewTerm(func=mdp.is_alive, weight=0.05)
 
-    forward_velocity = RewTerm(
-        func=mdp.velocity_towards_goal_l2,
+    # Horizontal goal-reaching.
+    forward_velocity_xy = RewTerm(
+        func=mdp.velocity_towards_goal_xy_l2,
         weight=1.0,
         params={
             "goal_cfg": SceneEntityCfg("goal"),
@@ -210,16 +211,39 @@ class RewardsCfg:
         }
     )
 
-    reached_goal = RewTerm(
-        func=mdp.reached_goal_l2,
-        weight=2.0,
+    goal_closeness_xy = RewTerm(
+        func=mdp.goal_closeness_xy_l2,
+        weight=1.0,
         params={
-            "threshold": 0.30,
+            "max_distance": 2.0,
             "goal_cfg": SceneEntityCfg("goal"),
             "asset_cfg": SceneEntityCfg("robot")
         }
     )
 
+    reached_goal_xy = RewTerm(
+        func=mdp.reached_goal_xy_l2,
+        weight=20.0,
+        params={
+            "threshold": 0.30,
+            "min_base_height": 0.22,
+            "goal_cfg": SceneEntityCfg("goal"),
+            "asset_cfg": SceneEntityCfg("robot")
+        }
+    )
+
+    # Vertical body-shape control.
+    base_height_error = RewTerm(
+        func=mdp.base_height_error_l2,
+        weight=-1.0,
+        params={
+            "target_height": 0.35,
+            "max_error": 0.5,
+            "asset_cfg": SceneEntityCfg("robot")
+        }
+    )
+
+    # Illegal contact.
     illegal_contact = RewTerm(
         func=mdp.illegal_contact_l2,
         weight=-1.0,
@@ -229,14 +253,11 @@ class RewardsCfg:
         }
     )
 
+    # Stability and regularization.
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
-
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
-
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.1)
-
     joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.001)
-
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
 
     feet_slide = RewTerm(
