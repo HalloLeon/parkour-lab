@@ -61,12 +61,15 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     goal: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Goal",
         spawn=sim_utils.CylinderCfg(
-            radius=0.10,
+            radius=0.25,
             height=0.02,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
-            collision_props=None
+            collision_props=None,
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=(0.1, 0.8, 0.1)
+            )
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(2.0, 0.0, 0.35))
+        init_state=RigidObjectCfg.InitialStateCfg(pos=(2.0, 0.0, 0.01))
     )
 
     robot: ArticulationCfg = UNITREE_A1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
