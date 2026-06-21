@@ -123,7 +123,22 @@ class ObservationsCfg:
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
         projected_gravity = ObsTerm(func=mdp.projected_gravity)
 
-        goal_distance = ObsTerm(func=mdp.goal_distance_xyz_w, params={"goal_cfg": SceneEntityCfg("goal"), "asset_cfg": SceneEntityCfg("robot")})
+        # Goal/task state.
+        goal_distance_xy = ObsTerm(
+            func=mdp.goal_distance_xy,
+            params={
+                "goal_cfg": SceneEntityCfg("goal"),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        # Vertical state.
+        base_height = ObsTerm(
+            func=mdp.base_height_w,
+            params={
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
 
         # Joint state.
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
@@ -133,10 +148,7 @@ class ObservationsCfg:
         actions = ObsTerm(func=mdp.last_action)
 
         def __post_init__(self):
-            # Keep the first version deterministic and easy to debug.
             self.enable_corruption = False
-
-            # Concatenate all terms into one flat policy observation vector.
             self.concatenate_terms = True
 
     policy: PolicyCfg = PolicyCfg()
