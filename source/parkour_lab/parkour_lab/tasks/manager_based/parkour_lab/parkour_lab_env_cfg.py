@@ -282,20 +282,21 @@ class TerminationsCfg:
 
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
+    success = DoneTerm(
+        func=mdp.reached_goal_xy,
+        params={
+            "threshold": 0.30,
+            "min_base_height": 0.22,
+            "goal_cfg": SceneEntityCfg("goal"),
+            "asset_cfg": SceneEntityCfg("robot")
+        }
+    )
+
     trunk_contact = DoneTerm(
         func=mdp.illegal_contact,
         params={
             "threshold": 1.0,
-            "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk"),
-        }
-    )
-
-    success = DoneTerm(
-        func=mdp.reached_goal,
-        params={
-            "threshold": 0.30,
-            "goal_cfg": SceneEntityCfg("goal"),
-            "asset_cfg": SceneEntityCfg("robot")
+            "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk")
         }
     )
 
