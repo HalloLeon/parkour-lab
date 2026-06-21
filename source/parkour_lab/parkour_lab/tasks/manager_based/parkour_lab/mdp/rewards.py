@@ -7,7 +7,11 @@ from isaaclab.sensors import ContactSensor
 from . import utils
 
 
-def illegal_contact_l2(env: ManagerBasedRLEnv, threshold: float, sensor_cfg=SceneEntityCfg("base_contact", body_names="trunk")) -> torch.Tensor:
+def illegal_contact_l2(
+    env: ManagerBasedRLEnv,
+    threshold: float,
+    sensor_cfg=SceneEntityCfg("base_contact", body_names="trunk"),
+) -> torch.Tensor:
     """
     Penalty signal for illegal trunk/base contact.
 
@@ -32,51 +36,96 @@ def illegal_contact_l2(env: ManagerBasedRLEnv, threshold: float, sensor_cfg=Scen
     return has_illegal_contact.float()
 
 
-def reached_goal_l2(env: ManagerBasedRLEnv, threshold: float, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
-    dist_to_goal = utils._goal_distance_xyz(env, goal_cfg, asset_cfg)
-    return (dist_to_goal < threshold).float()
+def velocity_towards_goal_xy_l2(
+    env: ManagerBasedRLEnv,
+    goal_cfg=SceneEntityCfg("goal"),
+    asset_cfg=SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    Reward velocity along the XY direction from robot to goal.
+
+    Returns:
+        [num_envs]
+    """
+
+    to_goal_xy = utils._goal_vector_xy(env, goal_cfg, asset_cfg)
+
+    # [num_envs, 1]
+    to_goal_norm = torch.linalg.norm(to_goal_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
+
+    # [num_envs, 2]
+    goal_dir_xy = to_goal_xy / to_goal_norm
+
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    # [num_envs, 2]
+    vel_xy = asset.data.root_lin_vel_w[:, :2]
+
+    return torch.sum(vel_xy * goal_dir_xy, dim=-1).clamp(min=-1.0, max=1.0)
 
 
-def goal_closeness_l2(
+def goal_closeness_xy_l2(
     env: ManagerBasedRLEnv,
     max_distance: float,
     goal_cfg=SceneEntityCfg("goal"),
     asset_cfg=SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
-    Dense reward for being close to the XYZ goal.
+    Dense reward for being horizontally close to the goal.
 
     Returns:
         [num_envs], roughly in [0, 1].
     """
 
-    dist_to_goal = utils._goal_distance_xyz(env, goal_cfg, asset_cfg)
+    dist_to_goal = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
 
-    # 1.0 near the goal, 0.0 when farther than max_distance.
     closeness = 1.0 - torch.clamp(dist_to_goal / max_distance, min=0.0, max=1.0)
 
     return closeness
 
 
-def velocity_towards_goal_l2(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+def reached_goal_xy_l2(
+    env: ManagerBasedRLEnv,
+    threshold: float,
+    min_base_height: float = 0.22,
+    goal_cfg=SceneEntityCfg("goal"),
+    asset_cfg=SceneEntityCfg("robot"),
+) -> torch.Tensor:
     """
-    Reward velocity along the XYZ direction from robot to goal.
+    Sparse success reward based on XY goal distance,
+    while requiring the robot base to remain above a minimum height.
 
     Returns:
         [num_envs]
     """
 
-    to_goal = utils._goal_vector_xyz(env, goal_cfg, asset_cfg)
+    dist_to_goal = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
+    base_height = utils._robot_base_height(env, asset_cfg)
 
-    # [num_envs, 1]
-    to_goal_norm = torch.linalg.norm(to_goal, dim=-1, keepdim=True).clamp_min(1.0e-6)
+    reached = dist_to_goal < threshold
+    base_high_enough = base_height > min_base_height
 
-    # [num_envs, 3]
-    goal_dir = to_goal / to_goal_norm
+    return torch.logical_and(reached, base_high_enough).float()
 
-    asset: Articulation = env.scene[asset_cfg.name]
 
-    # [num_envs, 3]
-    vel_asset = asset.data.root_lin_vel_w
+def base_height_error_l2(
+    env: ManagerBasedRLEnv,
+    target_height: float,
+    max_error: float = 0.5,
+    asset_cfg=SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    Penalty term for deviating from a desired base/root height.
 
-    return torch.sum(vel_asset * goal_dir, dim=-1).clamp(min=-1.0, max=1.0)
+    Use with a negative reward weight.
+
+    Returns:
+        [num_envs]
+    """
+
+    base_height = utils._robot_base_height(env, asset_cfg)
+
+    error = base_height - target_height
+    error_l2 = error.square()
+
+    return torch.clamp(error_l2, max=max_error * max_error)
