@@ -120,7 +120,7 @@ class ObservationsCfg:
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
         projected_gravity = ObsTerm(func=mdp.projected_gravity)
 
-        goal_distance = ObsTerm(func=mdp.goal_distance_w, params={"goal_cfg": SceneEntityCfg("goal"), "asset_cfg": SceneEntityCfg("robot")})
+        goal_distance = ObsTerm(func=mdp.goal_distance_xyz_w, params={"goal_cfg": SceneEntityCfg("goal"), "asset_cfg": SceneEntityCfg("robot")})
 
         # Joint state.
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
