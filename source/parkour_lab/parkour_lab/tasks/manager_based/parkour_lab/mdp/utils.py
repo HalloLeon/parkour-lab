@@ -43,7 +43,7 @@ def _goal_vector_xyz(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), as
     return goal_pos - robot_root_pos
 
 
-def _goal_distance(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+def _goal_distance_xyz(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
     """
     XYZ distance from robot root to goal.
 

@@ -33,8 +33,29 @@ def illegal_contact_l2(env: ManagerBasedRLEnv, threshold: float, sensor_cfg=Scen
 
 
 def reached_goal_l2(env: ManagerBasedRLEnv, threshold: float, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
-    dist_to_goal = utils._goal_distance(env, goal_cfg, asset_cfg)
+    dist_to_goal = utils._goal_distance_xyz(env, goal_cfg, asset_cfg)
     return (dist_to_goal < threshold).float()
+
+
+def goal_closeness_l2(
+    env: ManagerBasedRLEnv,
+    max_distance: float,
+    goal_cfg=SceneEntityCfg("goal"),
+    asset_cfg=SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    Dense reward for being close to the XYZ goal.
+
+    Returns:
+        [num_envs], roughly in [0, 1].
+    """
+
+    dist_to_goal = utils._goal_distance_xyz(env, goal_cfg, asset_cfg)
+
+    # 1.0 near the goal, 0.0 when farther than max_distance.
+    closeness = 1.0 - torch.clamp(dist_to_goal / max_distance, min=0.0, max=1.0)
+
+    return closeness
 
 
 def velocity_towards_goal_l2(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
