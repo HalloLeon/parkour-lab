@@ -176,14 +176,66 @@ def reached_goal_xy_l2(
     return torch.logical_and(reached, base_high_enough).float()
 
 
-def base_height_error_l2(
+def obstacle_progress_l2(
     env: ManagerBasedRLEnv,
-    target_height: float,
-    max_error: float = 0.5,
-    asset_cfg=SceneEntityCfg("robot"),
+    obstacle_x: float,
+    obstacle_length: float,
+    max_progress: float = 0.25,
+    asset_cfg=SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
-    Penalty term for deviating from a desired base/root height.
+    Reward actual increase in obstacle-region progress.
+
+    Standing still gives 0.
+    Moving backward gives negative reward.
+    Moving forward gives positive reward.
+
+    Returns:
+        [num_envs]
+    """
+
+    x = utils._robot_x_env(env, asset_cfg)
+
+    obstacle_front_x = obstacle_x - obstacle_length / 2.0
+    obstacle_back_x = obstacle_x + obstacle_length / 2.0
+
+    current_progress = (x - obstacle_front_x) / (obstacle_back_x - obstacle_front_x)
+    current_progress = torch.clamp(current_progress, min=0.0, max=1.0)
+
+    buffer_name = "_parkour_prev_obstacle_progress"
+
+    if (
+        not hasattr(env, buffer_name)
+        or getattr(env, buffer_name).shape != current_progress.shape
+    ):
+        setattr(env, buffer_name, current_progress.detach().clone())
+
+    previous_progress = getattr(env, buffer_name)
+
+    progress_delta = current_progress - previous_progress
+
+    # Avoid artificial progress spikes right after reset.
+    if hasattr(env, "episode_length_buf"):
+        just_reset = env.episode_length_buf <= 1
+        progress_delta = torch.where(
+            just_reset,
+            torch.zeros_like(progress_delta),
+            progress_delta,
+        )
+
+    setattr(env, buffer_name, current_progress.detach().clone())
+
+    return torch.clamp(progress_delta, min=-max_progress, max=max_progress)
+
+
+def base_height_band_l2(
+    env: ManagerBasedRLEnv,
+    min_height: float = 0.25,
+    max_height: float = 0.50,
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Penalize base/root height outside a healthy walking band.
 
     Use with a negative reward weight.
 
