@@ -10,7 +10,7 @@ def reached_goal_xy(
     threshold: float,
     min_base_height: float = 0.22,
     goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot"),
+    asset_cfg=SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
     Success termination based on XY distance to goal,

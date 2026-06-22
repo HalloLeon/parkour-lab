@@ -125,11 +125,19 @@ class ObservationsCfg:
 
         # Goal/task state.
         goal_distance_xy = ObsTerm(
-            func=mdp.goal_distance_xy,
+            func=mdp.goal_distance_xy_w,
             params={
                 "goal_cfg": SceneEntityCfg("goal"),
                 "asset_cfg": SceneEntityCfg("robot"),
             },
+        )
+
+        goal_direction_xy = ObsTerm(
+            func=mdp.goal_direction_xy_w,
+            params={
+                "goal_cfg": SceneEntityCfg("goal"),
+                "asset_cfg": SceneEntityCfg("robot")
+            }
         )
 
         # Vertical state.
