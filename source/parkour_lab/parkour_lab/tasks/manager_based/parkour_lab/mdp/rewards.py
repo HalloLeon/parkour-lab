@@ -82,29 +82,30 @@ def velocity_along_goal_xy_exp(
 def lateral_velocity_to_goal_xy_l2_sq(
     env: ManagerBasedRLEnv,
     goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot"),
+    asset_cfg=SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
-    Reward velocity along the XY direction from robot to goal.
+    Penalize velocity perpendicular to the XY goal direction.
+
+    Use with a negative reward weight.
 
     Returns:
         [num_envs]
     """
 
-    to_goal_xy = utils._goal_vector_xy(env, goal_cfg, asset_cfg)
-
-    # [num_envs, 1]
-    to_goal_norm = torch.linalg.norm(to_goal_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
-
-    # [num_envs, 2]
-    goal_dir_xy = to_goal_xy / to_goal_norm
+    goal_vec_xy = utils._goal_vector_xy(env, goal_cfg, asset_cfg)
+    goal_dis_xy = torch.linalg.norm(goal_vec_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
+    goal_dir_xy = goal_vec_xy / goal_dis_xy
 
     asset: Articulation = env.scene[asset_cfg.name]
+    root_vel_xy = asset.data.root_lin_vel_w[:, :2]
 
-    # [num_envs, 2]
-    vel_xy = asset.data.root_lin_vel_w[:, :2]
+    vel_along_goal = torch.sum(root_vel_xy * goal_dir_xy, dim=-1, keepdim=True)
 
-    return torch.sum(vel_xy * goal_dir_xy, dim=-1).clamp(min=-1.0, max=1.0)
+    vel_parallel_to_goal = vel_along_goal * goal_dir_xy
+    vel_lateral_to_goal = root_vel_xy - vel_parallel_to_goal
+
+    return torch.sum(vel_lateral_to_goal.square(), dim=-1)
 
 
 def goal_closeness_xy_l2(
