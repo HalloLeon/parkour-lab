@@ -293,7 +293,7 @@ class TerminationsCfg:
     success = DoneTerm(
         func=mdp.reached_goal_xy,
         params={
-            "threshold": 0.30,
+            "threshold": 0.35,
             "min_base_height": 0.22,
             "goal_cfg": SceneEntityCfg("goal"),
             "asset_cfg": SceneEntityCfg("robot")
