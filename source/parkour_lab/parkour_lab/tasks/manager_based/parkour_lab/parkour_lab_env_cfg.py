@@ -32,6 +32,12 @@ from . import mdp
 ##
 
 
+OBSTACLE_POS = (1.0, 0.0, 0.06)
+OBSTACLE_SIZE = (0.5, 1.2, 0.03)
+
+GOAL_POS = (2.0, 0.0, 0.01)
+
+
 @configclass
 class ParkourLabSceneCfg(InteractiveSceneCfg):
     """Configuration for a parkour lab scene."""
@@ -51,11 +57,11 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     obstacle: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Obstacle",
         spawn=sim_utils.CuboidCfg(
-            size=(0.5, 1.2, 0.12),
+            size=OBSTACLE_SIZE,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
             collision_props=sim_utils.CollisionPropertiesCfg()
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(1.0, 0.0, 0.06))
+        init_state=RigidObjectCfg.InitialStateCfg(pos=OBSTACLE_POS)
     )
 
     goal: RigidObjectCfg = RigidObjectCfg(
@@ -69,7 +75,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
                 diffuse_color=(0.1, 0.8, 0.1)
             )
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(2.0, 0.0, 0.01))
+        init_state=RigidObjectCfg.InitialStateCfg(pos=GOAL_POS)
     )
 
     robot: ArticulationCfg = UNITREE_A1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
