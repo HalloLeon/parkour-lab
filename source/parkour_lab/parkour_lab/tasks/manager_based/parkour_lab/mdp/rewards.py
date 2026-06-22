@@ -155,9 +155,9 @@ def goal_progress_xy_l2(
 def reached_goal_xy_l2(
     env: ManagerBasedRLEnv,
     threshold: float,
-    min_base_height: float = 0.22,
+    min_base_height: float = 0.25,
     goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot"),
+    asset_cfg=SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
     Sparse success reward based on XY goal distance,
