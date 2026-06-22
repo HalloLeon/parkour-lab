@@ -10,7 +10,7 @@ from . import utils
 def illegal_contact_l2(
     env: ManagerBasedRLEnv,
     threshold: float,
-    sensor_cfg=SceneEntityCfg("base_contact", body_names="trunk"),
+    sensor_cfg=SceneEntityCfg("base_contact", body_names="trunk")
 ) -> torch.Tensor:
     """
     Penalty signal for illegal trunk/base contact.
@@ -36,7 +36,50 @@ def illegal_contact_l2(
     return has_illegal_contact.float()
 
 
-def velocity_towards_goal_xy_l2(
+def velocity_along_goal_xy_exp(
+    env: ManagerBasedRLEnv,
+    target_speed: float = 0.5,
+    speed_tracking_scale: float = 0.25,
+    slow_down_distance: float = 0.5,
+    goal_cfg=SceneEntityCfg("goal"),
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Reward moving toward the XY goal at a desired speed.
+
+    The desired speed decreases near the goal to reduce lunging,
+    jumping, and overshooting.
+
+    Returns:
+        [num_envs]
+    """
+
+    goal_vec_xy = utils._goal_vector_xy(env, goal_cfg, asset_cfg)
+    goal_dis_xy = torch.linalg.norm(goal_vec_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
+    goal_dir_xy = goal_vec_xy / goal_dis_xy
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    root_vel_xy = asset.data.root_lin_vel_w[:, :2]
+
+    velocity_along_goal = torch.sum(root_vel_xy * goal_dir_xy, dim=-1)
+
+    # Far from the goal: desired speed ~= target_speed.
+    # Near the goal: desired speed gradually decreases.
+    slowdown_scale = torch.clamp(
+        goal_dis_xy.squeeze(-1) / slow_down_distance,
+        min=0.0,
+        max=1.0)
+    desired_vel_along_goal = target_speed * slowdown_scale
+
+    vel_err_along_goal = velocity_along_goal - desired_vel_along_goal
+
+    return torch.exp(
+        -vel_err_along_goal.square()
+        / (speed_tracking_scale * speed_tracking_scale)
+    )
+
+
+def lateral_velocity_to_goal_xy_l2_sq(
     env: ManagerBasedRLEnv,
     goal_cfg=SceneEntityCfg("goal"),
     asset_cfg=SceneEntityCfg("robot"),
