@@ -5,7 +5,10 @@ from isaaclab.managers import SceneEntityCfg
 import torch
 
 
-def _robot_root_pos_env(env: ManagerBasedRLEnv, asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+def _robot_root_pos_env(
+        env: ManagerBasedRLEnv,
+        asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
     """
     Robot root position in each environment's local frame.
 
@@ -17,7 +20,67 @@ def _robot_root_pos_env(env: ManagerBasedRLEnv, asset_cfg=SceneEntityCfg("robot"
     return asset.data.root_pos_w - env.scene.env_origins
 
 
-def _goal_pos_env(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal")) -> torch.Tensor:
+def _robot_xy_env(
+    env: ManagerBasedRLEnv,
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Robot root XY position in each environment's local frame.
+
+    Returns:
+        [num_envs, 2]
+    """
+
+    return _robot_root_pos_env(env, asset_cfg)[:, :2]
+
+
+def _robot_x_env(
+    env: ManagerBasedRLEnv,
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Robot root x-position in each environment's local frame.
+
+    Returns:
+        [num_envs]
+    """
+
+    return _robot_root_pos_env(env, asset_cfg)[:, 0]
+
+
+def _robot_y_env(
+    env: ManagerBasedRLEnv,
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Robot root y-position in each environment's local frame.
+
+    Returns:
+        [num_envs]
+    """
+
+    return _robot_root_pos_env(env, asset_cfg)[:, 1]
+
+
+def _obstacle_pos_env(
+        env: ManagerBasedRLEnv,
+        asset_cfg=SceneEntityCfg("obstacle")
+) -> torch.Tensor:
+    """
+    Obstacle position in each environment's local frame.
+
+    Returns:
+        [num_envs, 3]
+    """
+
+    obstacle: AssetBase = env.scene[asset_cfg.name]
+    return obstacle.data.root_pos_w - env.scene.env_origins
+
+
+def _goal_pos_env(
+        env: ManagerBasedRLEnv,
+        goal_cfg=SceneEntityCfg("goal")
+) -> torch.Tensor:
     """
     Goal position in each environment's local frame.
 
@@ -29,7 +92,11 @@ def _goal_pos_env(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal")) -> to
     return goal.data.root_pos_w - env.scene.env_origins
 
 
-def _goal_vector_xyz(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+def _goal_vector_xyz(
+    env: ManagerBasedRLEnv,
+    goal_cfg=SceneEntityCfg("goal"),
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
     """
     XYZ vector from robot root to goal.
 
@@ -43,7 +110,11 @@ def _goal_vector_xyz(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), as
     return goal_pos - robot_root_pos
 
 
-def _goal_distance_xyz(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), asset_cfg=SceneEntityCfg("robot")) -> torch.Tensor:
+def _goal_distance_xyz(
+    env: ManagerBasedRLEnv,
+    goal_cfg=SceneEntityCfg("goal"),
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
     """
     XYZ distance from robot root to goal.
 
@@ -58,7 +129,7 @@ def _goal_distance_xyz(env: ManagerBasedRLEnv, goal_cfg=SceneEntityCfg("goal"), 
 def _goal_vector_xy(
     env: ManagerBasedRLEnv,
     goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot"),
+    asset_cfg=SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
     XY vector from robot root to goal.
@@ -74,7 +145,7 @@ def _goal_vector_xy(
 def _goal_distance_xy(
     env: ManagerBasedRLEnv,
     goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot"),
+    asset_cfg=SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
     XY distance from robot root to goal.
@@ -88,8 +159,8 @@ def _goal_distance_xy(
 
 
 def _robot_base_height(
-    env: ManagerBasedRLEnv,
-    asset_cfg=SceneEntityCfg("robot"),
+        env: ManagerBasedRLEnv,
+        asset_cfg=SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
     Robot root/base height in each local environment frame.
