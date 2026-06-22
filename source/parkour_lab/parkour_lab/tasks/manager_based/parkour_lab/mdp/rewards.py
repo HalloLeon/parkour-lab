@@ -108,24 +108,48 @@ def lateral_velocity_to_goal_xy_l2_sq(
     return torch.sum(vel_lateral_to_goal.square(), dim=-1)
 
 
-def goal_closeness_xy_l2(
+def goal_progress_xy_l2(
     env: ManagerBasedRLEnv,
-    max_distance: float,
+    max_progress: float = 0.25,
     goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot"),
+    asset_cfg=SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
-    Dense reward for being horizontally close to the goal.
+    Dense reward for reducing XY distance to the goal.
+
+    progress = previous_distance - current_distance
 
     Returns:
-        [num_envs], roughly in [0, 1].
+        [num_envs]
     """
 
-    dist_to_goal = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
+    current_dist = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
 
-    closeness = 1.0 - torch.clamp(dist_to_goal / max_distance, min=0.0, max=1.0)
+    buffer_name = "_parkour_prev_goal_distance"
 
-    return closeness
+    if (
+        not hasattr(env, buffer_name)
+        or getattr(env, buffer_name).shape != current_dist.shape
+    ):
+        setattr(env, buffer_name, current_dist.detach().clone())
+
+    previous_dist = getattr(env, buffer_name)
+
+    progress = previous_dist - current_dist
+
+    # Avoid artificial progress spikes right after reset.
+    if hasattr(env, "episode_length_buf"):
+        just_reset = env.episode_length_buf <= 1
+        progress = torch.where(
+            just_reset,
+            torch.zeros_like(progress),
+            progress
+        )
+
+    # Store current distance for the next step.
+    setattr(env, buffer_name, current_dist.detach().clone())
+
+    return torch.clamp(progress, min=-max_progress, max=max_progress)
 
 
 def reached_goal_xy_l2(
