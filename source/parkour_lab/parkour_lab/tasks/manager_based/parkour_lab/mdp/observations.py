@@ -16,7 +16,7 @@ def base_height_w(
         [num_envs, 1]
     """
 
-    return utils._robot_base_height(env, asset_cfg).unsqueeze(-1)
+    return utils._root_height(env, asset_cfg).unsqueeze(-1)
 
 
 def goal_distance_xy_w(
@@ -32,6 +32,24 @@ def goal_distance_xy_w(
     """
 
     return utils._goal_distance_xy(env, goal_cfg, asset_cfg).unsqueeze(-1)
+
+
+def desired_speed_obs(
+    env: ManagerBasedRLEnv,
+    target_speed: float = 0.6
+) -> torch.Tensor:
+    """
+    Constant desired forward speed observation.
+
+    Returns:
+        [num_envs, 1]
+    """
+
+    return torch.full(
+        (env.num_envs, 1),
+        target_speed,
+        device=env.device
+    )
 
 
 def goal_distance_xyz_w(
