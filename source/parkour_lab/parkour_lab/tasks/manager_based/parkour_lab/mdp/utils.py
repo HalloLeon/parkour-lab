@@ -4,8 +4,26 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 import torch
 
+from . import constants
 
-def _robot_root_pos_env(
+
+def _root_lin_vel_xy(
+    env: ManagerBasedRLEnv,
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Robot root linear velocity in the world XY plane.
+
+    Returns:
+        [num_envs, 2]
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    return asset.data.root_lin_vel_w[:, :2]
+
+
+def _root_pos_env(
         env: ManagerBasedRLEnv,
         asset_cfg=SceneEntityCfg("robot")
 ) -> torch.Tensor:
