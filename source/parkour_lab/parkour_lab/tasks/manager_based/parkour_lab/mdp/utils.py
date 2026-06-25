@@ -66,7 +66,31 @@ def _validate_matching_shape(
             f"Got {lhs_name} shape {tuple(lhs.shape)} and "
             f"{rhs_name} shape {tuple(rhs.shape)}."
         )
-    
+
+
+def _gate_positive_values(
+    values: torch.Tensor,
+    gate: torch.Tensor
+) -> torch.Tensor:
+    """
+    Keep negative values always, but allow positive values only when gate is true.
+
+    This is useful for rewards where:
+      - positive progress should require valid behavior,
+      - negative progress should still be penalized.
+
+    Returns:
+        Tensor with the same shape as values.
+    """
+
+    keep_value = torch.logical_or(values <= 0.0, gate)
+
+    return torch.where(
+        keep_value,
+        values,
+        torch.zeros_like(values)
+    )
+
 
 def _private_buffer_name(
     prefix: str,
