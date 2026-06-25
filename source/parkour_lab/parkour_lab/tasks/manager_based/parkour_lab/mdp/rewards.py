@@ -141,6 +141,43 @@ def base_clearance_below_l2(
     return clearance_error.square()
 
 
+def no_feet_contact_l2(
+    env: ManagerBasedRLEnv,
+    threshold: float = 1.0,
+    sensor_cfg=SceneEntityCfg("feet_contact", body_names=".*_foot")
+) -> torch.Tensor:
+    """
+    Penalty for having no feet in contact with the ground.
+
+    This discourages hopping/skipping in flat walking.
+
+    Returns:
+        [num_envs]
+    """
+
+    contact_sensor: ContactSensor = env.scene[sensor_cfg.name]
+
+    # [num_envs, history_length, num_bodies, 3]
+    net_forces = contact_sensor.data.net_forces_w_history
+
+    if sensor_cfg.body_ids is not None:
+        net_forces = net_forces[:, :, sensor_cfg.body_ids, :]
+
+    # [num_envs, history_length, num_bodies]
+    force_norm = torch.linalg.norm(net_forces, dim=-1)
+
+    # Has each foot contacted recently?
+    # [num_envs, num_bodies]
+    feet_in_contact = torch.any(force_norm > threshold, dim=1)
+
+    # [num_envs]
+    num_feet_in_contact = torch.sum(feet_in_contact.float(), dim=-1)
+
+    no_contact = num_feet_in_contact < 1.0
+
+    return no_contact.float()
+
+
 def rapid_feet_motion_l2(
     env: ManagerBasedRLEnv,
     motion_cfg: constants.FeetMotionPenaltyCfg = constants.DEFAULT_FOOT_MOTION_PENALTY,
