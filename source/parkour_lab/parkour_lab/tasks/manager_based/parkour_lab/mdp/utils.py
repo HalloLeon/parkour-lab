@@ -496,18 +496,18 @@ def _root_pos_env(
     return asset.data.root_pos_w - env.scene.env_origins
 
 
-def _robot_xy_env(
+def _root_height(
     env: ManagerBasedRLEnv,
     asset_cfg=SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
-    Robot root XY position in each environment's local frame.
+    Robot root/base height in each environment's local frame.
 
     Returns:
-        [num_envs, 2]
+        [num_envs]
     """
 
-    return _robot_root_pos_env(env, asset_cfg)[:, :2]
+    return _root_pos_env(env, asset_cfg)[:, 2]
 
 
 def _root_forward_xy_w(
