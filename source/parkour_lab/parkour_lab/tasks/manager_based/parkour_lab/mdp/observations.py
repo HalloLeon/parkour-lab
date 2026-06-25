@@ -7,45 +7,6 @@ import torch
 from . import utils
 
 
-def base_height_w(
-    env: ManagerBasedRLEnv,
-    asset_cfg=SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    Robot base/root height.
-
-    Returns:
-        [num_envs, 1]
-    """
-
-    return utils._root_height(env, asset_cfg).unsqueeze(-1)
-
-
-def foot_contact_state(
-    env: ManagerBasedRLEnv,
-    threshold: float = 1.0,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot")
-) -> torch.Tensor:
-    """
-    Foot contact state, centered.
-
-    Official-style convention:
-        no contact -> -0.5
-        contact    ->  0.5
-
-    Returns:
-        [num_envs, num_feet]
-    """
-
-    contact = utils._contact_mask(
-        env,
-        sensor_cfg=sensor_cfg,
-        threshold=threshold,
-    )
-
-    return contact.float() - 0.5
-
-
 def goal_distance_xy_w(
     env: ManagerBasedRLEnv,
     goal_cfg=SceneEntityCfg("goal"),
@@ -59,53 +20,6 @@ def goal_distance_xy_w(
     """
 
     return utils._goal_distance_xy(env, goal_cfg, asset_cfg).unsqueeze(-1)
-
-
-def desired_speed_obs(
-    env: ManagerBasedRLEnv,
-    target_speed: float = 0.6
-) -> torch.Tensor:
-    """
-    Constant desired forward speed observation.
-
-    Returns:
-        [num_envs, 1]
-    """
-
-    return torch.full(
-        (env.num_envs, 1),
-        target_speed,
-        device=env.device
-    )
-
-
-def base_clearance_obs(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    Base/root clearance above the support surface underneath the robot.
-
-    Returns:
-        [num_envs, 1]
-    """
-
-    return utils._base_clearance(env, asset_cfg).unsqueeze(-1)
-
-
-def goal_distance_xyz_w(
-    env: ManagerBasedRLEnv,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    XYZ distance from robot root to goal.
-
-    Returns:
-        [num_envs, 1]
-    """
-
-    return utils._goal_distance_xyz(env, goal_cfg, asset_cfg).unsqueeze(-1)
 
 
 def goal_direction_body_xy(
@@ -159,6 +73,66 @@ def goal_direction_body_xy(
         dim=-1,
         keepdim=True
     ).clamp_min(1.0e-6)
+
+
+def base_clearance_obs(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Base/root clearance above the support surface underneath the robot.
+
+    Returns:
+        [num_envs, 1]
+    """
+
+    return utils._base_clearance(env, asset_cfg).unsqueeze(-1)
+
+
+def foot_contact_state(
+    env: ManagerBasedRLEnv,
+    threshold: float = 1.0,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot")
+) -> torch.Tensor:
+    """
+    Foot contact state, centered.
+
+    Official-style convention:
+        no contact -> -0.5
+        contact    ->  0.5
+
+    Returns:
+        [num_envs, num_feet]
+    """
+
+    contact = utils._contact_mask(
+        env,
+        sensor_cfg=sensor_cfg,
+        threshold=threshold,
+    )
+
+    return contact.float() - 0.5
+
+
+def desired_speed_obs(
+    env: ManagerBasedRLEnv,
+    target_speed: float = 0.6
+) -> torch.Tensor:
+    """
+    Constant desired forward speed observation.
+
+    Returns:
+        [num_envs, 1]
+    """
+
+    return torch.full(
+        (env.num_envs, 1),
+        target_speed,
+        device=env.device
+    )
+
+
+# LEGACY
 
 
 def goal_direction_xy_w(
