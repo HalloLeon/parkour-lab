@@ -4,6 +4,8 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply
+from isaaclab.utils.math import quat_rotate_inverse
+
 import torch
 
 from . import constants
@@ -109,6 +111,37 @@ def _private_buffer_name(
     ]
 
     return "_" + "_".join((prefix, *safe_parts))
+
+
+def _xy_vector_w_to_xy_vector_b(
+    env: ManagerBasedRLEnv,
+    vector_xy_w: torch.Tensor,
+    asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """
+    Convert a world-frame XY vector into body-frame XY.
+
+    Args:
+        env: The RL environment.
+        vector_xy_w: World-frame XY vector, shape [num_envs, 2].
+        asset_cfg: Robot asset config.
+
+    Returns:
+        [num_envs, 2]
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    vector_w = torch.zeros(
+        (vector_xy_w.shape[0], 3),
+        device=vector_xy_w.device,
+        dtype=vector_xy_w.dtype
+    )
+    vector_w[:, :2] = vector_xy_w
+
+    vector_b = quat_rotate_inverse(asset.data.root_quat_w, vector_w)
+
+    return vector_b[:, :2]
 
 
 def _get_or_init_env_buffer(
