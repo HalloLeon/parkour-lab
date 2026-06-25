@@ -21,6 +21,31 @@ def base_height_w(
     return utils._root_height(env, asset_cfg).unsqueeze(-1)
 
 
+def foot_contact_state(
+    env: ManagerBasedRLEnv,
+    threshold: float = 1.0,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot")
+) -> torch.Tensor:
+    """
+    Foot contact state, centered.
+
+    Official-style convention:
+        no contact -> -0.5
+        contact    ->  0.5
+
+    Returns:
+        [num_envs, num_feet]
+    """
+
+    contact = utils._contact_mask(
+        env,
+        sensor_cfg=sensor_cfg,
+        threshold=threshold,
+    )
+
+    return contact.float() - 0.5
+
+
 def goal_distance_xy_w(
     env: ManagerBasedRLEnv,
     goal_cfg=SceneEntityCfg("goal"),
