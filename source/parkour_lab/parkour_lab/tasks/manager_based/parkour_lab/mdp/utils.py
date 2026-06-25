@@ -641,6 +641,22 @@ def _goal_distance_xyz(
     return torch.linalg.norm(to_goal, dim=-1)
 
 
+def _goal_distance_xy(
+    env: ManagerBasedRLEnv,
+    goal_cfg=SceneEntityCfg("goal"),
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    XY distance from robot root to goal.
+
+    Returns:
+        [num_envs]
+    """
+
+    to_goal_xy = _goal_vector_xy(env, goal_cfg, asset_cfg)
+    return torch.linalg.norm(to_goal_xy, dim=-1)
+
+
 def _velocity_along_goal_xy(
     env: ManagerBasedRLEnv,
     goal_cfg=SceneEntityCfg("goal"),
