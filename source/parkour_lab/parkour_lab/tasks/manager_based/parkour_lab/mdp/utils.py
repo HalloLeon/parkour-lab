@@ -580,26 +580,10 @@ def _goal_vector_xyz(
         [num_envs, 3]
     """
 
-    robot_root_pos = _robot_root_pos_env(env, asset_cfg)
+    robot_root_pos = _root_pos_env(env, asset_cfg)
     goal_pos = _goal_pos_env(env, goal_cfg)
 
     return goal_pos - robot_root_pos
-
-
-def _goal_distance_xyz(
-    env: ManagerBasedRLEnv,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    XYZ distance from robot root to goal.
-
-    Returns:
-        [num_envs]
-    """
-
-    to_goal = _goal_vector_xyz(env, goal_cfg, asset_cfg)
-    return torch.linalg.norm(to_goal, dim=-1)
 
 
 def _goal_vector_xy(
@@ -616,6 +600,22 @@ def _goal_vector_xy(
 
     to_goal_xyz = _goal_vector_xyz(env, goal_cfg, asset_cfg)
     return to_goal_xyz[:, :2]
+
+
+def _goal_distance_xyz(
+    env: ManagerBasedRLEnv,
+    goal_cfg=SceneEntityCfg("goal"),
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    XYZ distance from robot root to goal.
+
+    Returns:
+        [num_envs]
+    """
+
+    to_goal = _goal_vector_xyz(env, goal_cfg, asset_cfg)
+    return torch.linalg.norm(to_goal, dim=-1)
 
 
 def _goal_distance_xy(
