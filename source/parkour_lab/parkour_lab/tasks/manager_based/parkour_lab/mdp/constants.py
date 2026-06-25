@@ -6,6 +6,60 @@ from isaaclab.utils import configclass
 
 GROUND_HEIGHT = 0.0
 
+# ==================== OBSERVATION CONFIGURATIONS ====================
+
+
+@dataclass(frozen=True)
+class GoalSlotsObservationCfg:
+    """
+    Configuration for fixed-size goal-slot observations.
+
+    Each goal slot contains:
+        direction_body_xy: 2
+        normalized_distance: 1
+
+    So each slot contributes 3 values.
+    """
+
+    num_slots: int = 2
+    max_distance: float = 5.0
+
+    def __post_init__(self) -> None:
+        if self.num_slots <= 0:
+            raise ValueError("num_slots must be positive.")
+
+        if self.max_distance <= 0.0:
+            raise ValueError("max_distance must be positive.")
+
+
+DEFAULT_GOAL_SLOTS_OBSERVATION = GoalSlotsObservationCfg()
+
+
+@dataclass(frozen=True)
+class HeightScanObservationCfg:
+    """
+    Configuration for terrain/obstacle height-scan observations.
+
+    This is intended for teacher/critic use, not for the first deployable actor.
+    """
+
+    num_rays: int = 132
+    vertical_offset: float = 0.3
+    clip: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.num_rays <= 0:
+            raise ValueError("num_rays must be positive.")
+
+        if self.clip <= 0.0:
+            raise ValueError("clip must be positive.")
+
+
+DEFAULT_HEIGHT_SCAN_OBSERVATION = HeightScanObservationCfg()
+
+
+# ==================== REWARD CONFIGURATIONS ====================
+
 
 @dataclass(frozen=True)
 class BoxSurfaceCfg:
