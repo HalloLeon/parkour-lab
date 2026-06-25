@@ -246,6 +246,22 @@ def base_clearance_below_l2(
     return clearance_error.square()
 
 
+def joint_deviation_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """
+    Penalize selected joints deviating from their default pose.
+
+    Returns:
+        [num_envs]
+    """
+
+    joint_error = utils._selected_joint_pos_error(env, asset_cfg)
+
+    return torch.sum(joint_error.square(), dim=-1)
+
+
 def no_feet_contact_l2(
     env: ManagerBasedRLEnv,
     threshold: float = 1.0,
