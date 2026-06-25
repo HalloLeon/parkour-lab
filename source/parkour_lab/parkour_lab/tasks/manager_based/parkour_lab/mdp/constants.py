@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from dataclasses import field
 
 from isaaclab.utils import configclass
 
@@ -88,3 +89,55 @@ class GoalVelocityTrackingCfg:
 
 
 DEFAULT_GOAL_VELOCITY_TRACKING = GoalVelocityTrackingCfg()
+
+
+@dataclass(frozen=True)
+class RootStabilityCfg:
+    """
+    Configuration for root-stability checks.
+
+    Stability here means:
+      - not rotating too violently in roll/pitch,
+      - not tilted too far,
+      - not too close to the support surface underneath the base.
+
+    The support surface may be:
+      - flat ground,
+      - an obstacle top,
+      - later another terrain/platform surface.
+    """
+
+    max_roll_pitch_ang_speed: float = 4.0
+    max_projected_gravity_xy_norm: float = 0.75
+    min_clearance: float = 0.25
+
+    def __post_init__(self) -> None:
+        if self.max_roll_pitch_ang_speed <= 0.0:
+            raise ValueError("max_roll_pitch_ang_speed must be positive.")
+
+        if self.max_projected_gravity_xy_norm <= 0.0:
+            raise ValueError("max_projected_gravity_xy_norm must be positive.")
+
+        if self.min_clearance < 0.0:
+            raise ValueError("min_clearance must be non-negative.")
+
+
+@dataclass(frozen=True)
+class StableGoalProgressCfg:
+    """
+    Configuration for stable XY goal-progress reward.
+    """
+
+    max_progress: float = 0.25
+    reset_grace_steps: int = 1
+    stability: RootStabilityCfg = field(default_factory=RootStabilityCfg)
+
+    def __post_init__(self) -> None:
+        if self.max_progress <= 0.0:
+            raise ValueError("max_progress must be positive.")
+
+        if self.reset_grace_steps < 0:
+            raise ValueError("reset_grace_steps must be non-negative.")
+
+
+DEFAULT_STABLE_GOAL_PROGRESS = StableGoalProgressCfg()
