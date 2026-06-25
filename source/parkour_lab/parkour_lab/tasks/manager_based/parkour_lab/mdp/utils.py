@@ -27,6 +27,24 @@ def _require_body_ids(
         )
 
 
+def _selected_contact_forces_w_history(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """
+    Contact forces for selected contact-sensor bodies.
+
+    Returns:
+        [num_envs, history_length, num_bodies, 3]
+    """
+
+    _require_body_ids(sensor_cfg, role="contact force selection")
+
+    contact_sensor: ContactSensor = env.scene[sensor_cfg.name]
+
+    return contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+
+
 def _root_lin_vel_xy(
     env: ManagerBasedRLEnv,
     asset_cfg=SceneEntityCfg("robot")
