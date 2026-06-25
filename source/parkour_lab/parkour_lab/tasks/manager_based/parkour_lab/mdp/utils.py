@@ -66,6 +66,25 @@ def _validate_matching_shape(
             f"Got {lhs_name} shape {tuple(lhs.shape)} and "
             f"{rhs_name} shape {tuple(rhs.shape)}."
         )
+    
+
+def _private_buffer_name(
+    prefix: str,
+    *parts: str
+) -> str:
+    """
+    Create a private environment-buffer name.
+
+    Returns:
+        str
+    """
+
+    safe_parts = [
+        str(part).replace("/", "_").replace(" ", "_")
+        for part in parts
+    ]
+
+    return "_" + "_".join((prefix, *safe_parts))
 
 
 def _get_or_init_env_buffer(
