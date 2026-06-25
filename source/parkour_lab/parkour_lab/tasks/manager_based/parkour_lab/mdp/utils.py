@@ -25,8 +25,6 @@ def _get_scene_entity_or_none(
     except KeyError:
         return None
 
-from . import constants
-
 
 def _require_body_ids(
     entity_cfg: SceneEntityCfg,
@@ -45,6 +43,28 @@ def _require_body_ids(
             f"SceneEntityCfg for '{entity_cfg.name}' must resolve body_ids "
             f"when used for {role}. Pass body_names, for example "
             "body_names='.*_foot'."
+        )
+
+
+def _validate_matching_shape(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    *,
+    lhs_name: str,
+    rhs_name: str
+) -> None:
+    """
+    Validate that two tensors have identical shape.
+
+    Raises:
+        RuntimeError: If shapes differ.
+    """
+
+    if lhs.shape != rhs.shape:
+        raise RuntimeError(
+            f"{lhs_name} shape does not match {rhs_name} shape. "
+            f"Got {lhs_name} shape {tuple(lhs.shape)} and "
+            f"{rhs_name} shape {tuple(rhs.shape)}."
         )
 
 
