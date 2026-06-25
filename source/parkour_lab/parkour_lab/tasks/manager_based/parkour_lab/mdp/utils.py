@@ -68,6 +68,24 @@ def _validate_matching_shape(
         )
 
 
+def _selected_body_lin_vel_w(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """
+    Linear velocity of selected articulation bodies in world frame.
+
+    Returns:
+        [num_envs, num_bodies, 3]
+    """
+
+    _require_body_ids(asset_cfg, role="body velocity selection")
+
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    return asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :]
+
+
 def _selected_contact_forces_w_history(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg
