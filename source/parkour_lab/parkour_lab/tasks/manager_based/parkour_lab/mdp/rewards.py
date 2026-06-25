@@ -237,7 +237,7 @@ def velocity_along_goal_xy_clearance_exp(
 def base_clearance_below_l2(
     env: ManagerBasedRLEnv,
     min_clearance: float,
-    asset_cfg=SceneEntityCfg("robot")
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
     Penalty signal for the robot base/root being too close to the surface
@@ -271,7 +271,7 @@ def base_clearance_below_l2(
 
 def joint_deviation_l2(
     env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
     Penalize selected joints deviating from their default pose.
@@ -322,7 +322,7 @@ def feet_stumble_l2(
 def no_feet_contact_l2(
     env: ManagerBasedRLEnv,
     threshold: float = 1.0,
-    sensor_cfg=SceneEntityCfg("feet_contact", body_names=".*_foot")
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot")
 ) -> torch.Tensor:
     """
     Penalty for having no feet in contact with the ground.
@@ -354,40 +354,6 @@ def no_feet_contact_l2(
     no_contact = num_feet_in_contact < 1.0
 
     return no_contact.float()
-
-
-def feet_stumble_l2(
-    env: ManagerBasedRLEnv,
-    stumble_cfg: constants.FeetStumbleCfg = constants.DEFAULT_FEET_STUMBLE,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot")
-) -> torch.Tensor:
-    """
-    Penalize feet hitting near-vertical surfaces.
-
-    A stumble is detected when lateral contact force is large compared with
-    vertical contact force.
-
-    Returns:
-        [num_envs]
-    """
-
-    contact_forces = utils._selected_contact_forces_w_history(
-        env,
-        sensor_cfg=sensor_cfg
-    )
-
-    lateral_force = torch.linalg.norm(contact_forces[..., :2], dim=-1)
-    vertical_force = torch.abs(contact_forces[..., 2])
-
-    valid_vertical_contact = vertical_force > stumble_cfg.min_vertical_force
-
-    stumble = torch.logical_and(
-        valid_vertical_contact,
-        lateral_force
-        > stumble_cfg.lateral_to_vertical_force_ratio * vertical_force
-    )
-
-    return torch.any(stumble, dim=(1, 2)).float()
 
 
 def rapid_feet_motion_l2(
