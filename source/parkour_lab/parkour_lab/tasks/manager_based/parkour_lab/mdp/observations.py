@@ -52,6 +52,20 @@ def desired_speed_obs(
     )
 
 
+def base_clearance_obs(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Base/root clearance above the support surface underneath the robot.
+
+    Returns:
+        [num_envs, 1]
+    """
+
+    return utils._base_clearance(env, asset_cfg).unsqueeze(-1)
+
+
 def goal_distance_xyz_w(
     env: ManagerBasedRLEnv,
     goal_cfg=SceneEntityCfg("goal"),
