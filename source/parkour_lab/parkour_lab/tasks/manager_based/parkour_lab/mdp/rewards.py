@@ -38,44 +38,46 @@ def illegal_contact_l2(
 
 def velocity_along_goal_xy_exp(
     env: ManagerBasedRLEnv,
-    target_speed: float = 0.5,
-    speed_tracking_scale: float = 0.25,
-    slow_down_distance: float = 0.5,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
+    tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
-    Reward moving toward the XY goal at a desired speed.
+    Reward tracking a desired XY velocity along the direction to the goal.
 
-    The desired speed decreases near the goal to reduce lunging,
-    jumping, and overshooting.
+    Far from the goal:
+        desired velocity is close to tracking_cfg.target_speed.
+
+    Near the goal:
+        desired velocity decreases toward zero to reduce overshooting.
+
+    This reward does not check whether the robot is upright or has enough
+    clearance. Use velocity_along_goal_xy_clearance_exp for the gated version.
 
     Returns:
         [num_envs]
     """
 
-    goal_vec_xy = utils._goal_vector_xy(env, goal_cfg, asset_cfg)
-    goal_dis_xy = torch.linalg.norm(goal_vec_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
-    goal_dir_xy = goal_vec_xy / goal_dis_xy
+    velocity_along_goal = utils._velocity_along_goal_xy(
+        env,
+        goal_cfg=goal_cfg,
+        asset_cfg=asset_cfg
+    )
 
-    asset: Articulation = env.scene[asset_cfg.name]
-    root_vel_xy = asset.data.root_lin_vel_w[:, :2]
+    goal_dist_xy = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
 
-    velocity_along_goal = torch.sum(root_vel_xy * goal_dir_xy, dim=-1)
-
-    # Far from the goal: desired speed ~= target_speed.
-    # Near the goal: desired speed gradually decreases.
     slowdown_scale = torch.clamp(
-        goal_dis_xy.squeeze(-1) / slow_down_distance,
+        goal_dist_xy / tracking_cfg.slow_down_distance,
         min=0.0,
-        max=1.0)
-    desired_vel_along_goal = target_speed * slowdown_scale
+        max=1.0
+    )
 
-    vel_err_along_goal = velocity_along_goal - desired_vel_along_goal
+    desired_velocity = tracking_cfg.target_speed * slowdown_scale
+
+    velocity_error = velocity_along_goal - desired_velocity
 
     return torch.exp(
-        -vel_err_along_goal.square()
-        / (speed_tracking_scale * speed_tracking_scale)
+        -velocity_error.square() / tracking_cfg.speed_tracking_scale**2
     )
 
 
