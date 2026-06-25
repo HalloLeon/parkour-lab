@@ -91,7 +91,7 @@ class GoalVelocityTrackingCfg:
 DEFAULT_GOAL_VELOCITY_TRACKING = GoalVelocityTrackingCfg()
 
 
-@dataclass(frozen=True)
+@configclass
 class RootStabilityCfg:
     """
     Configuration for root-stability checks.
@@ -122,7 +122,7 @@ class RootStabilityCfg:
             raise ValueError("min_clearance must be non-negative.")
 
 
-@dataclass(frozen=True)
+@configclass
 class StableGoalProgressCfg:
     """
     Configuration for stable XY goal-progress reward.
