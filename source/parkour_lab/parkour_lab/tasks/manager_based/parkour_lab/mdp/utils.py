@@ -2,7 +2,28 @@ from isaaclab.assets import Articulation
 from isaaclab.assets import AssetBase
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.sensors import ContactSensor
+from isaaclab.utils.math import quat_apply
 import torch
+
+from . import constants
+
+
+def _get_scene_entity_or_none(
+    env: ManagerBasedRLEnv,
+    name: str
+) -> AssetBase | None:
+    """
+    Return a scene entity if it exists, otherwise None.
+
+    This keeps optional scene objects, such as an obstacle, from making
+    reward functions crash in simpler environments.
+    """
+
+    try:
+        return env.scene[name]
+    except KeyError:
+        return None
 
 from . import constants
 
