@@ -68,6 +68,43 @@ def _validate_matching_shape(
         )
 
 
+def _get_or_init_env_buffer(
+    env: ManagerBasedRLEnv,
+    name: str,
+    value: torch.Tensor
+) -> torch.Tensor:
+    """
+    Get an environment-level tensor buffer, creating or resizing it if needed.
+
+    Returns:
+        Tensor with the same shape, device, and dtype as value.
+    """
+
+    needs_init = (
+        not hasattr(env, name)
+        or getattr(env, name).shape != value.shape
+        or getattr(env, name).device != value.device
+        or getattr(env, name).dtype != value.dtype
+    )
+
+    if needs_init:
+        setattr(env, name, value.detach().clone())
+
+    return getattr(env, name)
+
+
+def _set_env_buffer(
+    env: ManagerBasedRLEnv,
+    name: str,
+    value: torch.Tensor
+) -> None:
+    """
+    Store a detached clone as an environment-level tensor buffer.
+    """
+
+    setattr(env, name, value.detach().clone())
+
+
 def _selected_body_lin_vel_w(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg
