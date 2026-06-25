@@ -192,6 +192,28 @@ def goal_progress_xy_stable(
     )
 
 
+def goal_heading_alignment_exp(
+    env: ManagerBasedRLEnv,
+    heading_cfg: constants.GoalHeadingTrackingCfg = constants.DEFAULT_GOAL_HEADING_TRACKING,
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Reward the robot for facing the XY goal direction.
+
+    Returns:
+        [num_envs]
+    """
+
+    heading_error = utils._heading_error_to_goal_xy(
+        env,
+        goal_cfg=goal_cfg,
+        asset_cfg=asset_cfg
+    )
+
+    return torch.exp(-heading_error / heading_cfg.tracking_scale)
+
+
 def reached_goal_xy_l2(
     env: ManagerBasedRLEnv,
     threshold: float = 0.25,
