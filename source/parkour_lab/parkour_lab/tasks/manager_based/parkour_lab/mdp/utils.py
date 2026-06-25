@@ -214,7 +214,7 @@ def _box_surface_height_under_xy(
             (xy.shape[0],),
             -torch.inf,
             device=xy.device,
-            dtype=xy.dtype,
+            dtype=xy.dtype
         )
 
     box_pos_env = box.data.root_pos_w - env.scene.env_origins
@@ -228,7 +228,7 @@ def _box_surface_height_under_xy(
 
     above_footprint = torch.logical_and(
         dx <= half_size_x,
-        dy <= half_size_y,
+        dy <= half_size_y
     )
 
     box_top_height = box_pos_env[:, 2] + half_size_z
@@ -236,7 +236,7 @@ def _box_surface_height_under_xy(
     return torch.where(
         above_footprint,
         box_top_height,
-        torch.full_like(box_top_height, -torch.inf),
+        torch.full_like(box_top_height, -torch.inf)
     )
 
 
@@ -262,13 +262,13 @@ def _support_surface_height_under_base(
         (root_pos.shape[0],),
         constants.GROUND_HEIGHT,
         device=root_pos.device,
-        dtype=root_pos.dtype,
+        dtype=root_pos.dtype
     )
 
     obstacle_height = _box_surface_height_under_xy(
         env=env,
         xy=base_xy,
-        box_cfg=constants.OBSTACLE_SURFACE,
+        box_cfg=constants.OBSTACLE_SURFACE
     )
 
     return torch.maximum(ground_height, obstacle_height)
@@ -461,7 +461,7 @@ def _root_stability_mask(
 
     return torch.logical_and(
         torch.logical_and(ang_vel_stable, orientation_stable),
-        clearance_stable,
+        clearance_stable
     )
 
 
@@ -510,32 +510,89 @@ def _robot_xy_env(
     return _robot_root_pos_env(env, asset_cfg)[:, :2]
 
 
-def _robot_x_env(
+def _root_forward_xy_w(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Robot root forward direction in world XY.
+
+    Returns:
+        [num_envs, 2]
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    # In the robot's own body frame, we define "forward" as +X.
+    #
+    # So before considering the robot's current orientation, the local forward
+    # vector is:
+    #
+    #     forward_b = [1, 0, 0]
+    #
+    # The suffix "_b" means body frame.
+    forward_b = torch.zeros(
+        (asset.data.root_quat_w.shape[0], 3),
+        device=asset.data.root_quat_w.device,
+        dtype=asset.data.root_quat_w.dtype
+    )
+
+    forward_b[:, 0] = 1.0
+
+    # Rotate the body-frame forward vector into the world frame.
+    #
+    # If q is the robot root orientation, this applies:
+    #
+    #     forward_w = q * forward_b * q^-1
+    #
+    # Examples:
+    #   yaw =   0 deg -> forward_w ≈ [ 1,  0, 0]
+    #   yaw =  90 deg -> forward_w ≈ [ 0,  1, 0]
+    #   yaw = 180 deg -> forward_w ≈ [-1,  0, 0]
+    #
+    # The suffix "_w" means world frame.
+    forward_w = quat_apply(asset.data.root_quat_w, forward_b)
+
+    # Keep only the horizontal part of the world-frame forward vector.
+    #
+    # We discard z because goal navigation uses the ground-plane heading:
+    #
+    #     forward_w  = [x, y, z]
+    #     forward_xy = [x, y]
+    #
+    # This tells us where the robot is facing in the world XY plane.
+    forward_xy = forward_w[:, :2]
+
+    # Normalize the XY vector to unit length.
+    #
+    #     forward_xy_unit = forward_xy / sqrt(x^2 + y^2)
+    #
+    # This makes the result a direction only, independent of vector magnitude.
+    #
+    # clamp_min(1.0e-6) avoids division by zero if the horizontal projection is
+    # extremely small, for example if the robot is nearly vertical.
+    return forward_xy / torch.linalg.norm(
+        forward_xy,
+        dim=-1,
+        keepdim=True
+    ).clamp_min(1.0e-6)
+
+
+def _base_clearance(
     env: ManagerBasedRLEnv,
     asset_cfg=SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
-    Robot root x-position in each environment's local frame.
+    Vertical clearance between robot base/root and the surface underneath it.
 
     Returns:
         [num_envs]
     """
 
-    return _robot_root_pos_env(env, asset_cfg)[:, 0]
+    base_height = _root_height(env, asset_cfg)
+    surface_height = _support_surface_height_under_base(env, asset_cfg)
 
-
-def _robot_y_env(
-    env: ManagerBasedRLEnv,
-    asset_cfg=SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    Robot root y-position in each environment's local frame.
-
-    Returns:
-        [num_envs]
-    """
-
-    return _robot_root_pos_env(env, asset_cfg)[:, 1]
+    return base_height - surface_height
 
 
 def _obstacle_pos_env(
