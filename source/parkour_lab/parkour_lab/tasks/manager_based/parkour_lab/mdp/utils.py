@@ -602,6 +602,29 @@ def _goal_vector_xy(
     return to_goal_xyz[:, :2]
 
 
+def _goal_direction_xy(
+    env: ManagerBasedRLEnv,
+    goal_cfg=SceneEntityCfg("goal"),
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Unit XY direction from robot root to goal.
+
+    Returns:
+        [num_envs, 2]
+    """
+
+    goal_vec_xy = _goal_vector_xy(env, goal_cfg, asset_cfg)
+
+    goal_dist_xy = torch.linalg.norm(
+        goal_vec_xy,
+        dim=-1,
+        keepdim=True
+    ).clamp_min(1.0e-6)
+
+    return goal_vec_xy / goal_dist_xy
+
+
 def _goal_distance_xyz(
     env: ManagerBasedRLEnv,
     goal_cfg=SceneEntityCfg("goal"),
