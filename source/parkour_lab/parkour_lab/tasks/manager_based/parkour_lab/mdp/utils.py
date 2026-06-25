@@ -86,6 +86,22 @@ def _selected_body_lin_vel_w(
     return asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :]
 
 
+def _selected_body_speed_w(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """
+    Speed magnitude of selected articulation bodies in world frame.
+
+    Returns:
+        [num_envs, num_bodies]
+    """
+
+    body_lin_vel_w = _selected_body_lin_vel_w(env, asset_cfg)
+
+    return torch.linalg.norm(body_lin_vel_w, dim=-1)
+
+
 def _selected_contact_forces_w_history(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg
