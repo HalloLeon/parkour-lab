@@ -55,6 +55,20 @@ DEFAULT_FOOT_MOTION_PENALTY = FootMotionPenaltyCfg()
 
 
 @dataclass(frozen=True)
+class GoalHeadingTrackingCfg:
+    """Configuration for aligning the robot heading with the XY goal direction."""
+
+    tracking_scale: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.tracking_scale <= 0.0:
+            raise ValueError("tracking_scale must be positive.")
+
+
+DEFAULT_GOAL_HEADING_TRACKING = GoalHeadingTrackingCfg()
+
+
+@dataclass(frozen=True)
 class GoalVelocityTrackingCfg:
     """
     Configuration for goal-directed XY velocity tracking.
