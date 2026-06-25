@@ -7,6 +7,26 @@ import torch
 from . import constants
 
 
+def _require_body_ids(
+    entity_cfg: SceneEntityCfg,
+    *,
+    role: str
+) -> None:
+    """
+    Ensure that a SceneEntityCfg has resolved body_ids.
+
+    Raises:
+        ValueError: If body_ids are missing.
+    """
+
+    if entity_cfg.body_ids is None:
+        raise ValueError(
+            f"SceneEntityCfg for '{entity_cfg.name}' must resolve body_ids "
+            f"when used for {role}. Pass body_names, for example "
+            "body_names='.*_foot'."
+        )
+
+
 def _root_lin_vel_xy(
     env: ManagerBasedRLEnv,
     asset_cfg=SceneEntityCfg("robot")
