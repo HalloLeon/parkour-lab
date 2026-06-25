@@ -36,6 +36,92 @@ def illegal_contact_l2(
     return has_illegal_contact.float()
 
 
+def velocity_along_goal_xy_exp(
+    env: ManagerBasedRLEnv,
+    tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Reward tracking a desired XY velocity along the direction to the goal.
+
+    Far from the goal:
+        desired velocity is close to tracking_cfg.target_speed.
+
+    Near the goal:
+        desired velocity decreases toward zero to reduce overshooting.
+
+    This reward does not check whether the robot is upright or has enough
+    clearance. Use velocity_along_goal_xy_clearance_exp for the gated version.
+
+    Returns:
+        [num_envs]
+    """
+
+    velocity_along_goal = utils._velocity_along_goal_xy(
+        env,
+        goal_cfg=goal_cfg,
+        asset_cfg=asset_cfg
+    )
+
+    goal_dist_xy = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
+
+    slowdown_scale = torch.clamp(
+        goal_dist_xy / tracking_cfg.slow_down_distance,
+        min=0.0,
+        max=1.0
+    )
+
+    desired_velocity = tracking_cfg.target_speed * slowdown_scale
+
+    velocity_error = velocity_along_goal - desired_velocity
+
+    return torch.exp(
+        -velocity_error.square() / tracking_cfg.speed_tracking_scale**2
+    )
+
+
+def velocity_along_goal_xy_clearance_exp(
+    env: ManagerBasedRLEnv,
+    tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Clearance-gated version of velocity_along_goal_xy_exp.
+
+    The velocity reward is only paid when the robot base/root has enough
+    clearance above the surface underneath it.
+
+    The surface underneath it may be:
+        - flat ground
+        - obstacle top
+        - later, another terrain/support surface
+
+    This prevents rewarding forward velocity while the robot is collapsed,
+    scraping, or too close to the support surface.
+
+    Returns:
+        [num_envs]
+    """
+
+    reward = velocity_along_goal_xy_exp(
+        env,
+        tracking_cfg=tracking_cfg,
+        goal_cfg=goal_cfg,
+        asset_cfg=asset_cfg
+    )
+
+    clearance = utils._base_clearance(
+        env,
+        asset_cfg=asset_cfg
+    )
+
+    has_enough_clearance = clearance > tracking_cfg.min_clearance
+
+    return reward * has_enough_clearance.to(dtype=reward.dtype)
+
+
 def goal_progress_xy_stable(
     env: ManagerBasedRLEnv,
     progress_cfg: constants.StableGoalProgressCfg = constants.DEFAULT_STABLE_GOAL_PROGRESS,
@@ -104,6 +190,25 @@ def goal_progress_xy_stable(
         min=-progress_cfg.max_progress,
         max=progress_cfg.max_progress
     )
+
+
+def reached_goal_xy_l2(
+    env: ManagerBasedRLEnv,
+    threshold: float = 0.25,
+    goal_cfg=SceneEntityCfg("goal"),
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Sparse success reward based on XY goal distance.
+
+    Returns:
+        [num_envs]
+    """
+
+    dist_to_goal = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
+    reached = dist_to_goal < threshold
+
+    return reached.float()
 
 
 def base_clearance_below_l2(
