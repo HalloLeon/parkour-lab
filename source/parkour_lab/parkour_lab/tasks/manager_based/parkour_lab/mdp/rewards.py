@@ -1,9 +1,10 @@
-import torch
 from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
+import torch
 
+from . import constants
 from . import utils
 
 
@@ -34,92 +35,6 @@ def illegal_contact_l2(
     has_illegal_contact = torch.any(force_norm > threshold, dim=(1, 2))
 
     return has_illegal_contact.float()
-
-
-def velocity_along_goal_xy_exp(
-    env: ManagerBasedRLEnv,
-    tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
-    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    Reward tracking a desired XY velocity along the direction to the goal.
-
-    Far from the goal:
-        desired velocity is close to tracking_cfg.target_speed.
-
-    Near the goal:
-        desired velocity decreases toward zero to reduce overshooting.
-
-    This reward does not check whether the robot is upright or has enough
-    clearance. Use velocity_along_goal_xy_clearance_exp for the gated version.
-
-    Returns:
-        [num_envs]
-    """
-
-    velocity_along_goal = utils._velocity_along_goal_xy(
-        env,
-        goal_cfg=goal_cfg,
-        asset_cfg=asset_cfg
-    )
-
-    goal_dist_xy = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
-
-    slowdown_scale = torch.clamp(
-        goal_dist_xy / tracking_cfg.slow_down_distance,
-        min=0.0,
-        max=1.0
-    )
-
-    desired_velocity = tracking_cfg.target_speed * slowdown_scale
-
-    velocity_error = velocity_along_goal - desired_velocity
-
-    return torch.exp(
-        -velocity_error.square() / tracking_cfg.speed_tracking_scale**2
-    )
-
-
-def velocity_along_goal_xy_clearance_exp(
-    env: ManagerBasedRLEnv,
-    tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
-    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    Clearance-gated version of velocity_along_goal_xy_exp.
-
-    The velocity reward is only paid when the robot base/root has enough
-    clearance above the surface underneath it.
-
-    The surface underneath it may be:
-        - flat ground
-        - obstacle top
-        - later, another terrain/support surface
-
-    This prevents rewarding forward velocity while the robot is collapsed,
-    scraping, or too close to the support surface.
-
-    Returns:
-        [num_envs]
-    """
-
-    reward = velocity_along_goal_xy_exp(
-        env,
-        tracking_cfg=tracking_cfg,
-        goal_cfg=goal_cfg,
-        asset_cfg=asset_cfg
-    )
-
-    clearance = utils._base_clearance(
-        env,
-        asset_cfg=asset_cfg
-    )
-
-    has_enough_clearance = clearance > tracking_cfg.min_clearance
-
-    return reward * has_enough_clearance.to(dtype=reward.dtype)
 
 
 def goal_progress_xy_stable(
@@ -233,6 +148,92 @@ def reached_goal_xy_l2(
     return reached.float()
 
 
+def velocity_along_goal_xy_exp(
+    env: ManagerBasedRLEnv,
+    tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Reward tracking a desired XY velocity along the direction to the goal.
+
+    Far from the goal:
+        desired velocity is close to tracking_cfg.target_speed.
+
+    Near the goal:
+        desired velocity decreases toward zero to reduce overshooting.
+
+    This reward does not check whether the robot is upright or has enough
+    clearance. Use velocity_along_goal_xy_clearance_exp for the gated version.
+
+    Returns:
+        [num_envs]
+    """
+
+    velocity_along_goal = utils._velocity_along_goal_xy(
+        env,
+        goal_cfg=goal_cfg,
+        asset_cfg=asset_cfg
+    )
+
+    goal_dist_xy = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
+
+    slowdown_scale = torch.clamp(
+        goal_dist_xy / tracking_cfg.slow_down_distance,
+        min=0.0,
+        max=1.0
+    )
+
+    desired_velocity = tracking_cfg.target_speed * slowdown_scale
+
+    velocity_error = velocity_along_goal - desired_velocity
+
+    return torch.exp(
+        -velocity_error.square() / tracking_cfg.speed_tracking_scale**2
+    )
+
+
+def velocity_along_goal_xy_clearance_exp(
+    env: ManagerBasedRLEnv,
+    tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Clearance-gated version of velocity_along_goal_xy_exp.
+
+    The velocity reward is only paid when the robot base/root has enough
+    clearance above the surface underneath it.
+
+    The surface underneath it may be:
+        - flat ground
+        - obstacle top
+        - later, another terrain/support surface
+
+    This prevents rewarding forward velocity while the robot is collapsed,
+    scraping, or too close to the support surface.
+
+    Returns:
+        [num_envs]
+    """
+
+    reward = velocity_along_goal_xy_exp(
+        env,
+        tracking_cfg=tracking_cfg,
+        goal_cfg=goal_cfg,
+        asset_cfg=asset_cfg
+    )
+
+    clearance = utils._base_clearance(
+        env,
+        asset_cfg=asset_cfg
+    )
+
+    has_enough_clearance = clearance > tracking_cfg.min_clearance
+
+    return reward * has_enough_clearance.to(dtype=reward.dtype)
+
+
 def base_clearance_below_l2(
     env: ManagerBasedRLEnv,
     min_clearance: float,
@@ -282,6 +283,40 @@ def joint_deviation_l2(
     joint_error = utils._selected_joint_pos_error(env, asset_cfg)
 
     return torch.sum(joint_error.square(), dim=-1)
+
+
+def feet_stumble_l2(
+    env: ManagerBasedRLEnv,
+    stumble_cfg: constants.FeetStumbleCfg = constants.DEFAULT_FEET_STUMBLE,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot")
+) -> torch.Tensor:
+    """
+    Penalize feet hitting near-vertical surfaces.
+
+    A stumble is detected when lateral contact force is large compared with
+    vertical contact force.
+
+    Returns:
+        [num_envs]
+    """
+
+    contact_forces = utils._selected_contact_forces_w_history(
+        env,
+        sensor_cfg=sensor_cfg
+    )
+
+    lateral_force = torch.linalg.norm(contact_forces[..., :2], dim=-1)
+    vertical_force = torch.abs(contact_forces[..., 2])
+
+    valid_vertical_contact = vertical_force > stumble_cfg.min_vertical_force
+
+    stumble = torch.logical_and(
+        valid_vertical_contact,
+        lateral_force
+        > stumble_cfg.lateral_to_vertical_force_ratio * vertical_force
+    )
+
+    return torch.any(stumble, dim=(1, 2)).float()
 
 
 def no_feet_contact_l2(
