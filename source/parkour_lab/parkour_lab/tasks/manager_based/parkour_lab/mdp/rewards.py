@@ -299,6 +299,40 @@ def no_feet_contact_l2(
     return no_contact.float()
 
 
+def feet_stumble_l2(
+    env: ManagerBasedRLEnv,
+    stumble_cfg: constants.FeetStumbleCfg = constants.DEFAULT_FEET_STUMBLE,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot")
+) -> torch.Tensor:
+    """
+    Penalize feet hitting near-vertical surfaces.
+
+    A stumble is detected when lateral contact force is large compared with
+    vertical contact force.
+
+    Returns:
+        [num_envs]
+    """
+
+    contact_forces = utils._selected_contact_forces_w_history(
+        env,
+        sensor_cfg=sensor_cfg
+    )
+
+    lateral_force = torch.linalg.norm(contact_forces[..., :2], dim=-1)
+    vertical_force = torch.abs(contact_forces[..., 2])
+
+    valid_vertical_contact = vertical_force > stumble_cfg.min_vertical_force
+
+    stumble = torch.logical_and(
+        valid_vertical_contact,
+        lateral_force
+        > stumble_cfg.lateral_to_vertical_force_ratio * vertical_force
+    )
+
+    return torch.any(stumble, dim=(1, 2)).float()
+
+
 def rapid_feet_motion_l2(
     env: ManagerBasedRLEnv,
     motion_cfg: constants.FeetMotionPenaltyCfg = constants.DEFAULT_FOOT_MOTION_PENALTY,
