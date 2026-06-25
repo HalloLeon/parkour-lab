@@ -141,6 +141,78 @@ def base_clearance_below_l2(
     return clearance_error.square()
 
 
+def rapid_feet_motion_l2(
+    env: ManagerBasedRLEnv,
+    motion_cfg: constants.FeetMotionPenaltyCfg = constants.DEFAULT_FOOT_MOTION_PENALTY,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=".*_foot"),
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot")
+) -> torch.Tensor:
+    """
+    Penalize excessive foot speed in a contact-aware way.
+
+    Stance feet are expected to move slowly.
+    Swing feet are allowed to move faster.
+
+    The penalty is:
+
+        penalty = max(foot_speed - allowed_speed, 0)^2
+
+    where allowed_speed is:
+        - max_stance_speed for feet in contact
+        - max_swing_speed for feet not in contact
+
+    Use with a negative reward weight.
+
+    Returns:
+        [num_envs]
+    """
+
+    motion_cfg.validate()
+
+    foot_speed = utils._selected_body_speed_w(env, asset_cfg)
+
+    in_contact = utils._contact_mask(
+        env,
+        sensor_cfg=sensor_cfg,
+        threshold=motion_cfg.contact_threshold
+    )
+
+    utils._validate_matching_shape(
+        in_contact,
+        foot_speed,
+        lhs_name="foot contact mask",
+        rhs_name="foot speed"
+    )
+
+    stance_speed_limit = torch.full_like(
+        foot_speed,
+        motion_cfg.max_stance_speed
+    )
+
+    swing_speed_limit = torch.full_like(
+        foot_speed,
+        motion_cfg.max_swing_speed
+    )
+
+    speed_limit = torch.where(
+        in_contact,
+        stance_speed_limit,
+        swing_speed_limit
+    )
+
+    excess_speed = torch.clamp(
+        foot_speed - speed_limit,
+        min=0.0
+    )
+
+    penalty_per_foot = torch.clamp(
+        excess_speed.square(),
+        max=motion_cfg.max_penalty_per_foot
+    )
+
+    return penalty_per_foot.mean(dim=-1)
+
+
 def velocity_along_goal_xy_exp(
     env: ManagerBasedRLEnv,
     tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
