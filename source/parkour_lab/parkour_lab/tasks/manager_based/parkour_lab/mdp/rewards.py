@@ -36,6 +36,47 @@ def illegal_contact_l2(
     return has_illegal_contact.float()
 
 
+def velocity_along_goal_xy_clearance_exp(
+    env: ManagerBasedRLEnv,
+    tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Clearance-gated version of velocity_along_goal_xy_exp.
+
+    The velocity reward is only paid when the robot base/root has enough
+    clearance above the surface underneath it.
+
+    The surface underneath it may be:
+        - flat ground
+        - obstacle top
+        - later, another terrain/support surface
+
+    This prevents rewarding forward velocity while the robot is collapsed,
+    scraping, or too close to the support surface.
+
+    Returns:
+        [num_envs]
+    """
+
+    reward = velocity_along_goal_xy_exp(
+        env,
+        tracking_cfg=tracking_cfg,
+        goal_cfg=goal_cfg,
+        asset_cfg=asset_cfg
+    )
+
+    clearance = utils._base_clearance(
+        env,
+        asset_cfg=asset_cfg
+    )
+
+    has_enough_clearance = clearance > tracking_cfg.min_clearance
+
+    return reward * has_enough_clearance.to(dtype=reward.dtype)
+
+
 def velocity_along_goal_xy_exp(
     env: ManagerBasedRLEnv,
     tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
