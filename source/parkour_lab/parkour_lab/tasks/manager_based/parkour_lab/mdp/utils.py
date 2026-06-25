@@ -641,6 +641,30 @@ def _goal_distance_xyz(
     return torch.linalg.norm(to_goal, dim=-1)
 
 
+def _velocity_along_goal_xy(
+    env: ManagerBasedRLEnv,
+    goal_cfg=SceneEntityCfg("goal"),
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Robot root velocity projected onto the XY goal direction.
+
+    Positive:
+        moving toward the goal
+
+    Negative:
+        moving away from the goal
+
+    Returns:
+        [num_envs]
+    """
+
+    goal_dir_xy = _goal_direction_xy(env, goal_cfg, asset_cfg)
+    root_vel_xy = _root_lin_vel_xy(env, asset_cfg)
+
+    return torch.sum(root_vel_xy * goal_dir_xy, dim=-1)
+
+
 def _goal_distance_xy(
     env: ManagerBasedRLEnv,
     goal_cfg=SceneEntityCfg("goal"),
