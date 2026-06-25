@@ -45,6 +45,31 @@ def _selected_contact_forces_w_history(
     return contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
 
 
+def _selected_joint_pos_error(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """
+    Position error of selected joints relative to their default joint positions.
+
+    Returns:
+        [num_envs, num_joints]
+    """
+
+    if asset_cfg.joint_ids is None:
+        raise ValueError(
+            f"SceneEntityCfg for '{asset_cfg.name}' must resolve joint_ids. "
+            "Pass joint_names, for example joint_names='.*_hip_joint'."
+        )
+
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    joint_pos = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    default_joint_pos = asset.data.default_joint_pos[:, asset_cfg.joint_ids]
+
+    return joint_pos - default_joint_pos
+
+
 def _root_lin_vel_xy(
     env: ManagerBasedRLEnv,
     asset_cfg=SceneEntityCfg("robot")
