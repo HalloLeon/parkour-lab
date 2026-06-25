@@ -9,7 +9,7 @@ from . import utils
 
 def illegal_contact_l2(
     env: ManagerBasedRLEnv,
-    threshold: float,
+    threshold: float = 1.0,
     sensor_cfg=SceneEntityCfg("base_contact", body_names="trunk")
 ) -> torch.Tensor:
     """
