@@ -36,6 +36,76 @@ def illegal_contact_l2(
     return has_illegal_contact.float()
 
 
+def goal_progress_xy_stable(
+    env: ManagerBasedRLEnv,
+    progress_cfg: constants.StableGoalProgressCfg = constants.DEFAULT_STABLE_GOAL_PROGRESS,
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Dense reward for stable reduction of XY distance to the goal.
+
+    progress = previous_distance - current_distance
+
+    Positive progress is counted only when the robot root is stable.
+    Negative progress is preserved, so moving away from the goal is still
+    penalized even if the robot is unstable.
+
+    Stability includes:
+      - limited roll/pitch angular velocity,
+      - limited roll/pitch tilt,
+      - sufficient base/root clearance above the support surface underneath it.
+
+    The support surface may be flat ground, an obstacle top, or later another
+    terrain/platform surface.
+
+    Returns:
+        [num_envs]
+    """
+
+    current_distance = utils._goal_distance_xy(
+        env,
+        goal_cfg=goal_cfg,
+        asset_cfg=asset_cfg
+    )
+
+    buffer_name = utils._private_buffer_name(
+        "parkour_prev_goal_distance_xy",
+        goal_cfg.name,
+        asset_cfg.name
+    )
+
+    just_reset = utils._episode_start_mask(
+        env,
+        reference=current_distance,
+        grace_steps=progress_cfg.reset_grace_steps
+    )
+
+    progress = utils._difference_from_previous_env_buffer(
+        env,
+        buffer_name=buffer_name,
+        current_value=current_distance,
+        reset_mask=just_reset
+    )
+
+    stable = utils._root_stability_mask(
+        env,
+        stability_cfg=progress_cfg.stability,
+        asset_cfg=asset_cfg
+    )
+
+    progress = utils._gate_positive_values(
+        values=progress,
+        gate=stable
+    )
+
+    return torch.clamp(
+        progress,
+        min=-progress_cfg.max_progress,
+        max=progress_cfg.max_progress
+    )
+
+
 def velocity_along_goal_xy_exp(
     env: ManagerBasedRLEnv,
     tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
