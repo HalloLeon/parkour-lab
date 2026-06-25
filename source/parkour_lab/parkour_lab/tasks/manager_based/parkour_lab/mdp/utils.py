@@ -174,6 +174,26 @@ def _contact_mask(
     return torch.any(force_norm > threshold, dim=1)
 
 
+def _episode_start_mask(
+    env: ManagerBasedRLEnv,
+    reference: torch.Tensor,
+    grace_steps: int
+) -> torch.Tensor:
+    """
+    Boolean mask for environments that have just reset.
+
+    Returns:
+        [num_envs]
+    """
+
+    if grace_steps <= 0 or not hasattr(env, "episode_length_buf"):
+        return torch.zeros_like(reference, dtype=torch.bool)
+
+    episode_length = env.episode_length_buf.to(device=reference.device)
+
+    return episode_length <= grace_steps
+
+
 def _root_lin_vel_xy(
     env: ManagerBasedRLEnv,
     asset_cfg=SceneEntityCfg("robot")
