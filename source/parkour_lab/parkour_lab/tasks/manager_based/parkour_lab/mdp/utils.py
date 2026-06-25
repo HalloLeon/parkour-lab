@@ -124,6 +124,46 @@ def _set_env_buffer(
     setattr(env, name, value.detach().clone())
 
 
+def _difference_from_previous_env_buffer(
+    env: ManagerBasedRLEnv,
+    *,
+    buffer_name: str,
+    current_value: torch.Tensor,
+    reset_mask: torch.Tensor | None = None
+) -> torch.Tensor:
+    """
+    Compute previous_value - current_value using an environment-level buffer.
+
+    The buffer is always updated, even when reset_mask is true.
+
+    Returns:
+        [num_envs]
+    """
+
+    previous_value = _get_or_init_env_buffer(
+        env=env,
+        name=buffer_name,
+        value=current_value
+    )
+
+    difference = previous_value - current_value
+
+    if reset_mask is not None:
+        difference = torch.where(
+            reset_mask,
+            torch.zeros_like(difference),
+            difference
+        )
+
+    _set_env_buffer(
+        env=env,
+        name=buffer_name,
+        value=current_value
+    )
+
+    return difference
+
+
 def _selected_body_lin_vel_w(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg
