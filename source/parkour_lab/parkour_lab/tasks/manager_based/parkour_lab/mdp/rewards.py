@@ -106,6 +106,41 @@ def goal_progress_xy_stable(
     )
 
 
+def base_clearance_below_l2(
+    env: ManagerBasedRLEnv,
+    min_clearance: float,
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Penalty signal for the robot base/root being too close to the surface
+    directly underneath it.
+
+    The surface may be:
+      - the ground
+      - the top of an obstacle
+      - later, another support surface
+
+    This is an L2 penalty:
+
+        penalty = max(min_clearance - clearance, 0)^2
+
+    where:
+
+        clearance = base_height - support_surface_height_under_base
+
+    Use with a negative reward weight.
+
+    Returns:
+        [num_envs]
+    """
+
+    clearance = utils._base_clearance(env, asset_cfg)
+
+    clearance_error = torch.clamp(min_clearance - clearance, min=0.0)
+
+    return clearance_error.square()
+
+
 def velocity_along_goal_xy_exp(
     env: ManagerBasedRLEnv,
     tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
