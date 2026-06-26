@@ -78,7 +78,7 @@ OBSTACLE_SURFACE = BoxSurfaceCfg(
 
 
 @configclass
-class FeetMotionPenaltyCfg:
+class FeetMotionCfg:
     """
     Configuration for contact-aware foot-speed penalties.
 
@@ -105,15 +105,15 @@ class FeetMotionPenaltyCfg:
             raise ValueError("max_penalty_per_foot must be positive.")
 
 
-DEFAULT_FOOT_MOTION_PENALTY = FeetMotionPenaltyCfg()
+DEFAULT_FOOT_MOTION_PENALTY = FeetMotionCfg()
 
 
 @configclass
 class FeetStumbleCfg:
     """Configuration for detecting foot impacts against near-vertical surfaces."""
 
-    lateral_to_vertical_force_ratio: float = 4.0
-    min_vertical_force: float = 1.0
+    lateral_to_vertical_force_ratio: float = 1.0
+    min_vertical_force: float = 0.5
 
     def __post_init__(self) -> None:
         if self.lateral_to_vertical_force_ratio <= 0.0:
