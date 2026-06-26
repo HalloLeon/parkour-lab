@@ -27,10 +27,10 @@ from . import mdp
 ##
 
 
-OBSTACLE_POS = (1.0, 0.0, 0.06)
-OBSTACLE_SIZE = (0.5, 1.2, 0.03)
+OBSTACLE_POS = (2.0, 0.0, 0.025)
+OBSTACLE_SIZE = (0.5, 1.8, 0.05)
 
-GOAL_POS = (2.0, 0.0, 0.01)
+GOAL_POS = (4.0, 0.0, 0.0)
 
 
 @configclass
