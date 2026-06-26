@@ -1,8 +1,3 @@
-# Copyright (c) 2022-2025, The Isaac Lab Project Developers (https://github.com/isaac-sim/IsaacLab/blob/main/CONTRIBUTORS.md).
-# All rights reserved.
-#
-# SPDX-License-Identifier: BSD-3-Clause
-
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg
 from isaaclab.assets import AssetBaseCfg
@@ -444,6 +439,9 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         # Contact sensors should update every physics step.
         if self.scene.feet_contact is not None:
             self.scene.feet_contact.update_period = self.sim.dt
+
+        if self.scene.leg_contact is not None:
+            self.scene.leg_contact.update_period = self.sim.dt
 
         if self.scene.base_contact is not None:
             self.scene.base_contact.update_period = self.sim.dt
