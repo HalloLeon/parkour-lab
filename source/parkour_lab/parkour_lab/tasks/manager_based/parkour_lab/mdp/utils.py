@@ -8,7 +8,7 @@ from isaaclab.utils.math import quat_apply_inverse
 
 import torch
 
-from . import constants
+from . import term_cfg
 
 
 def _get_scene_entity_or_none(
@@ -111,6 +111,28 @@ def _private_buffer_name(
     ]
 
     return "_" + "_".join((prefix, *safe_parts))
+
+
+def _linear_ramp(
+    value: torch.Tensor,
+    lower: float,
+    upper: float
+) -> torch.Tensor:
+    """
+    Smoothly map value from [lower, upper] to [0, 1].
+
+    Values below lower become 0.
+    Values above upper become 1.
+
+    Returns:
+        Tensor with same shape as value.
+    """
+
+    return torch.clamp(
+        (value - lower) / (upper - lower),
+        min=0.0,
+        max=1.0
+    )
 
 
 def _xy_vector_w_to_xy_vector_b(
