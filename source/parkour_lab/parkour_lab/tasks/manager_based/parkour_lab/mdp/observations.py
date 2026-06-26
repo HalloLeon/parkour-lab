@@ -118,7 +118,7 @@ def foot_contact_state(
 
 def desired_speed_obs(
     env: ManagerBasedRLEnv,
-    target_speed: float = 0.6
+    target_speed: float = 0.75
 ) -> torch.Tensor:
     """
     Constant desired forward speed observation.

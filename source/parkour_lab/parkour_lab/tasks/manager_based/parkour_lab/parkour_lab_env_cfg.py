@@ -211,7 +211,7 @@ class ObservationsCfg:
         desired_speed = ObsTerm(
             func=mdp.desired_speed_obs,
             params={
-                "target_speed": 0.5
+                "target_speed": 0.75
             }
         )
 
