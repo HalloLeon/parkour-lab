@@ -8,7 +8,7 @@ from . import term_cfg
 from . import utils
 
 
-def illegal_contact_l2(
+def base_contact(
     env: ManagerBasedRLEnv,
     threshold: float = 1.0,
     sensor_cfg=SceneEntityCfg("base_contact", body_names="trunk")
@@ -107,7 +107,7 @@ def goal_progress_xy_stable(
     )
 
 
-def goal_heading_alignment_exp(
+def goal_heading_misalignment_l2(
     env: ManagerBasedRLEnv,
     heading_cfg: constants.GoalHeadingTrackingCfg = constants.DEFAULT_GOAL_HEADING_TRACKING,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
