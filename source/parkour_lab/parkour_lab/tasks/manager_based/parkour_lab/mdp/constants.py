@@ -257,13 +257,13 @@ class StableGoalProgressCfg:
     Configuration for stable XY goal-progress reward.
     """
 
-    max_progress: float = 0.25
+    progress_scale: float = 0.03
     reset_grace_steps: int = 1
     stability: RootStabilityCfg = field(default_factory=RootStabilityCfg)
 
     def __post_init__(self) -> None:
-        if self.max_progress <= 0.0:
-            raise ValueError("max_progress must be positive.")
+        if self.progress_scale <= 0.0:
+            raise ValueError("progress_scale must be positive.")
 
         if self.reset_grace_steps < 0:
             raise ValueError("reset_grace_steps must be non-negative.")
