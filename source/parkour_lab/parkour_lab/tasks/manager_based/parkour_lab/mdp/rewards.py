@@ -4,7 +4,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 import torch
 
-from . import constants
+from . import term_cfg
 from . import utils
 
 
@@ -39,7 +39,7 @@ def illegal_contact_l2(
 
 def goal_progress_xy_stable(
     env: ManagerBasedRLEnv,
-    progress_cfg: constants.StableGoalProgressCfg = constants.DEFAULT_STABLE_GOAL_PROGRESS,
+    progress_cfg: term_cfg.StableGoalProgressCfg = term_cfg.DEFAULT_STABLE_GOAL_PROGRESS,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -129,7 +129,7 @@ def goal_heading_alignment_exp(
     return torch.exp(-heading_error / heading_cfg.tracking_scale)
 
 
-def reached_goal_xy_l2(
+def reached_goal_xy(
     env: ManagerBasedRLEnv,
     threshold: float = 0.25,
     goal_cfg=SceneEntityCfg("goal"),
@@ -150,7 +150,7 @@ def reached_goal_xy_l2(
 
 def velocity_along_goal_xy_exp(
     env: ManagerBasedRLEnv,
-    tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
+    tracking_cfg: term_cfg.GoalVelocityCfg = term_cfg.DEFAULT_GOAL_VELOCITY,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -195,7 +195,7 @@ def velocity_along_goal_xy_exp(
 
 def velocity_along_goal_xy_clearance_exp(
     env: ManagerBasedRLEnv,
-    tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
+    tracking_cfg: term_cfg.GoalVelocityCfg = term_cfg.DEFAULT_GOAL_VELOCITY,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -285,9 +285,9 @@ def joint_deviation_l2(
     return torch.sum(joint_error.square(), dim=-1)
 
 
-def feet_stumble_l2(
+def feet_stumble(
     env: ManagerBasedRLEnv,
-    stumble_cfg: constants.FeetStumbleCfg = constants.DEFAULT_FEET_STUMBLE,
+    stumble_cfg: term_cfg.FeetStumbleCfg = term_cfg.DEFAULT_FEET_STUMBLE,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot")
 ) -> torch.Tensor:
     """
@@ -319,7 +319,7 @@ def feet_stumble_l2(
     return torch.any(stumble, dim=(1, 2)).float()
 
 
-def no_feet_contact_l2(
+def no_feet_contact(
     env: ManagerBasedRLEnv,
     threshold: float = 1.0,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot")
@@ -358,7 +358,7 @@ def no_feet_contact_l2(
 
 def rapid_feet_motion_l2(
     env: ManagerBasedRLEnv,
-    motion_cfg: constants.FeetMotionPenaltyCfg = constants.DEFAULT_FOOT_MOTION_PENALTY,
+    motion_cfg: term_cfg.FeetMotionCfg = term_cfg.DEFAULT_FOOT_MOTION_PENALTY,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=".*_foot"),
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot")
 ) -> torch.Tensor:
