@@ -4,7 +4,7 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply
-from isaaclab.utils.math import quat_rotate_inverse
+from isaaclab.utils.math import quat_apply_inverse
 
 import torch
 
@@ -139,7 +139,7 @@ def _xy_vector_w_to_xy_vector_b(
     )
     vector_w[:, :2] = vector_xy_w
 
-    vector_b = quat_rotate_inverse(asset.data.root_quat_w, vector_w)
+    vector_b = quat_apply_inverse(asset.data.root_quat_w, vector_w)
 
     return vector_b[:, :2]
 
@@ -628,21 +628,6 @@ def _base_clearance(
     return base_height - surface_height
 
 
-def _obstacle_pos_env(
-        env: ManagerBasedRLEnv,
-        asset_cfg=SceneEntityCfg("obstacle")
-) -> torch.Tensor:
-    """
-    Obstacle position in each environment's local frame.
-
-    Returns:
-        [num_envs, 3]
-    """
-
-    obstacle: AssetBase = env.scene[asset_cfg.name]
-    return obstacle.data.root_pos_w - env.scene.env_origins
-
-
 def _goal_pos_env(
         env: ManagerBasedRLEnv,
         goal_cfg=SceneEntityCfg("goal")
@@ -846,34 +831,3 @@ def _velocity_along_goal_xy(
     root_vel_xy = _root_lin_vel_xy(env, asset_cfg)
 
     return torch.sum(root_vel_xy * goal_dir_xy, dim=-1)
-
-
-def _goal_distance_xy(
-    env: ManagerBasedRLEnv,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    XY distance from robot root to goal.
-
-    Returns:
-        [num_envs]
-    """
-
-    to_goal_xy = _goal_vector_xy(env, goal_cfg, asset_cfg)
-    return torch.linalg.norm(to_goal_xy, dim=-1)
-
-
-def _robot_base_height(
-        env: ManagerBasedRLEnv,
-        asset_cfg=SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    Robot root/base height in each local environment frame.
-
-    Returns:
-        [num_envs]
-    """
-
-    robot_root_pos = _robot_root_pos_env(env, asset_cfg)
-    return robot_root_pos[:, 2]
