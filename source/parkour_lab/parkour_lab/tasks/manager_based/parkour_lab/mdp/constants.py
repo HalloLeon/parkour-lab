@@ -141,7 +141,7 @@ DEFAULT_GOAL_HEADING_TRACKING = GoalHeadingTrackingCfg()
 
 
 @configclass
-class GoalVelocityTrackingCfg:
+class GoalVelocityCfg:
     """
     Configuration for goal-directed XY velocity tracking.
 
@@ -174,7 +174,50 @@ class GoalVelocityTrackingCfg:
             raise ValueError("min_clearance must be non-negative.")
 
 
-DEFAULT_GOAL_VELOCITY_TRACKING = GoalVelocityTrackingCfg()
+DEFAULT_GOAL_VELOCITY = GoalVelocityCfg()
+
+
+@configclass
+class RootMotionChatterCfg:
+    """
+    Configuration for penalizing small, rapid root/trunk oscillations.
+
+    This targets:
+      - small vertical bounces that quickly reverse,
+      - small roll/pitch wiggles that quickly reverse.
+
+    It does not directly penalize large vertical motion, so larger step-up,
+    jump, or obstacle traversal motions remain possible.
+    """
+
+    small_z_displacement: float = 0.035
+    min_z_reversal_speed: float = 0.10
+    small_tilt_change: float = 0.04
+    min_roll_pitch_reversal_rate: float = 0.75
+    angular_weight: float = 0.25
+    reset_grace_steps: int = 1
+
+    def __post_init__(self) -> None:
+        if self.small_z_displacement <= 0.0:
+            raise ValueError("small_z_displacement must be positive.")
+
+        if self.min_z_reversal_speed < 0.0:
+            raise ValueError("min_z_reversal_speed must be non-negative.")
+
+        if self.small_tilt_change <= 0.0:
+            raise ValueError("small_tilt_change must be positive.")
+
+        if self.min_roll_pitch_reversal_rate < 0.0:
+            raise ValueError("min_roll_pitch_reversal_rate must be non-negative.")
+
+        if self.angular_weight < 0.0:
+            raise ValueError("angular_weight must be non-negative.")
+
+        if self.reset_grace_steps < 0:
+            raise ValueError("reset_grace_steps must be non-negative.")
+
+
+DEFAULT_ROOT_MOTION_CHATTER = RootMotionChatterCfg()
 
 
 @configclass
