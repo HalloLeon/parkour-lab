@@ -51,6 +51,10 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
             static_friction=1.0,
             dynamic_friction=1.0,
             restitution=0.0,
+        ),
+        visual_material=sim_utils.PreviewSurfaceCfg(
+            diffuse_color=(0.55, 0.48, 0.35),
+            roughness=0.8
         )
     )
 
