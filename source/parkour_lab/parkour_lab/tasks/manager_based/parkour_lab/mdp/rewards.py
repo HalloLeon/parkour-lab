@@ -1,4 +1,5 @@
-from isaaclab.assets import Articulation
+from dataclasses import dataclass
+
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
@@ -457,144 +458,21 @@ def rapid_feet_motion_l2(
     return penalty_per_foot.mean(dim=-1)
 
 
-def velocity_along_goal_xy_exp(
+def root_chatter_l2(
     env: ManagerBasedRLEnv,
-    tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
-    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    chatter_cfg: term_cfg.RootMotionChatterCfg = term_cfg.DEFAULT_ROOT_MOTION_CHATTER,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
-    Reward tracking a desired XY velocity along the direction to the goal.
+    Penalize small, rapid root/core oscillations.
 
-    Far from the goal:
-        desired velocity is close to tracking_cfg.target_speed.
+    This targets high-frequency chatter:
+      - small vertical bounces that quickly reverse,
+      - small roll/pitch wiggles that quickly reverse.
 
-    Near the goal:
-        desired velocity decreases toward zero to reduce overshooting.
-
-    This reward does not check whether the robot is upright or has enough
-    clearance. Use velocity_along_goal_xy_clearance_exp for the gated version.
-
-    Returns:
-        [num_envs]
-    """
-
-    velocity_along_goal = utils._velocity_along_goal_xy(
-        env,
-        goal_cfg=goal_cfg,
-        asset_cfg=asset_cfg
-    )
-
-    goal_dist_xy = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
-
-    slowdown_scale = torch.clamp(
-        goal_dist_xy / tracking_cfg.slow_down_distance,
-        min=0.0,
-        max=1.0
-    )
-
-    desired_velocity = tracking_cfg.target_speed * slowdown_scale
-
-    velocity_error = velocity_along_goal - desired_velocity
-
-    return torch.exp(
-        -velocity_error.square() / tracking_cfg.speed_tracking_scale**2
-    )
-
-
-def velocity_along_goal_xy_clearance_exp(
-    env: ManagerBasedRLEnv,
-    tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
-    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    Clearance-gated version of velocity_along_goal_xy_exp.
-
-    The velocity reward is only paid when the robot base/root has enough
-    clearance above the surface underneath it.
-
-    The surface underneath it may be:
-        - flat ground
-        - obstacle top
-        - later, another terrain/support surface
-
-    This prevents rewarding forward velocity while the robot is collapsed,
-    scraping, or too close to the support surface.
-
-    Returns:
-        [num_envs]
-    """
-
-    reward = velocity_along_goal_xy_exp(
-        env,
-        tracking_cfg=tracking_cfg,
-        goal_cfg=goal_cfg,
-        asset_cfg=asset_cfg
-    )
-
-    clearance = utils._base_clearance(
-        env,
-        asset_cfg=asset_cfg
-    )
-
-    has_enough_clearance = clearance > tracking_cfg.min_clearance
-
-    return reward * has_enough_clearance.to(dtype=reward.dtype)
-
-
-def velocity_along_goal_xy_exp(
-    env: ManagerBasedRLEnv,
-    tracking_cfg: constants.GoalVelocityTrackingCfg = constants.DEFAULT_GOAL_VELOCITY_TRACKING,
-    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    Reward tracking a desired XY velocity along the direction to the goal.
-
-    Far from the goal:
-        desired velocity is close to tracking_cfg.target_speed.
-
-    Near the goal:
-        desired velocity decreases toward zero to reduce overshooting.
-
-    This reward does not check whether the robot is upright or has enough
-    clearance. Use velocity_along_goal_xy_clearance_exp for the gated version.
-
-    Returns:
-        [num_envs]
-    """
-
-    velocity_along_goal = utils._velocity_along_goal_xy(
-        env,
-        goal_cfg=goal_cfg,
-        asset_cfg=asset_cfg
-    )
-
-    goal_dist_xy = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
-
-    slowdown_scale = torch.clamp(
-        goal_dist_xy / tracking_cfg.slow_down_distance,
-        min=0.0,
-        max=1.0
-    )
-
-    desired_velocity = tracking_cfg.target_speed * slowdown_scale
-
-    velocity_error = velocity_along_goal - desired_velocity
-
-    return torch.exp(
-        -velocity_error.square() / tracking_cfg.speed_tracking_scale**2
-    )
-
-
-def lateral_velocity_to_goal_xy_l2_sq(
-    env: ManagerBasedRLEnv,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    Penalize velocity perpendicular to the XY goal direction.
+    It does not penalize large vertical motion directly. Larger step-up,
+    jump, or obstacle traversal motions are allowed as long as they are not
+    small rapid reversals.
 
     Use with a negative reward weight.
 
@@ -602,196 +480,235 @@ def lateral_velocity_to_goal_xy_l2_sq(
         [num_envs]
     """
 
-    goal_vec_xy = utils._goal_vector_xy(env, goal_cfg, asset_cfg)
-    goal_dis_xy = torch.linalg.norm(goal_vec_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
-    goal_dir_xy = goal_vec_xy / goal_dis_xy
+    current = _RootChatterState.from_env(
+        env,
+        asset_cfg=asset_cfg
+    )
 
-    asset: Articulation = env.scene[asset_cfg.name]
-    root_vel_xy = asset.data.root_lin_vel_w[:, :2]
+    buffer_prefix = utils._private_buffer_name(
+        "parkour_root_chatter",
+        asset_cfg.name
+    )
 
-    vel_along_goal = torch.sum(root_vel_xy * goal_dir_xy, dim=-1, keepdim=True)
+    previous = _RootChatterState.previous_from_env(
+        env,
+        buffer_prefix=buffer_prefix,
+        current=current
+    )
 
-    vel_parallel_to_goal = vel_along_goal * goal_dir_xy
-    vel_lateral_to_goal = root_vel_xy - vel_parallel_to_goal
+    vertical_penalty = _vertical_root_chatter_l2(
+        current=current,
+        previous=previous,
+        chatter_cfg=chatter_cfg
+    )
 
-    return torch.sum(vel_lateral_to_goal.square(), dim=-1)
+    angular_penalty = _angular_root_chatter_l2(
+        current=current,
+        previous=previous,
+        chatter_cfg=chatter_cfg
+    )
+
+    penalty = vertical_penalty + chatter_cfg.angular_weight * angular_penalty
+
+    just_reset = utils._episode_start_mask(
+        env,
+        reference=penalty,
+        grace_steps=chatter_cfg.reset_grace_steps
+    )
+
+    penalty = torch.where(
+        just_reset,
+        torch.zeros_like(penalty),
+        penalty
+    )
+
+    current.write_to_env(
+        env,
+        buffer_prefix=buffer_prefix
+    )
+
+    return penalty
 
 
-def goal_progress_xy_l2(
-    env: ManagerBasedRLEnv,
-    max_progress: float = 0.25,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
-) -> torch.Tensor:
+@dataclass(frozen=True)
+class _RootChatterState:
     """
-    Dense reward for reducing XY distance to the goal.
+    Root/core signals used by root_chatter_l2.
 
-    progress = previous_distance - current_distance
-
-    Returns:
-        [num_envs]
+    This groups tensors that are always used together, reducing argument-heavy
+    helper functions without hiding the reward logic.
     """
 
-    current_dist = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
+    root_z: torch.Tensor
+    root_z_vel: torch.Tensor
+    projected_gravity_xy: torch.Tensor
+    roll_pitch_rate: torch.Tensor
 
-    buffer_name = "_parkour_prev_goal_distance"
+    @classmethod
+    def from_env(
+        cls,
+        env: ManagerBasedRLEnv,
+        asset_cfg: SceneEntityCfg
+    ) -> "_RootChatterState":
+        """
+        Read current root/core signals from the environment.
+        """
 
-    if (
-        not hasattr(env, buffer_name)
-        or getattr(env, buffer_name).shape != current_dist.shape
-    ):
-        setattr(env, buffer_name, current_dist.detach().clone())
-
-    previous_dist = getattr(env, buffer_name)
-
-    progress = previous_dist - current_dist
-
-    # Avoid artificial progress spikes right after reset.
-    if hasattr(env, "episode_length_buf"):
-        just_reset = env.episode_length_buf <= 1
-        progress = torch.where(
-            just_reset,
-            torch.zeros_like(progress),
-            progress
+        return cls(
+            root_z=utils._root_height_env(env, asset_cfg),
+            root_z_vel=utils._root_lin_vel_z(env, asset_cfg),
+            projected_gravity_xy=utils._root_projected_gravity_xy(env, asset_cfg),
+            roll_pitch_rate=utils._root_roll_pitch_rate(env, asset_cfg)
         )
 
-    # Store current distance for the next step.
-    setattr(env, buffer_name, current_dist.detach().clone())
+    @classmethod
+    def previous_from_env(
+        cls,
+        env: ManagerBasedRLEnv,
+        *,
+        buffer_prefix: str,
+        current: "_RootChatterState"
+    ) -> "_RootChatterState":
+        """
+        Read previous root/core signals from environment buffers.
 
-    return torch.clamp(progress, min=-max_progress, max=max_progress)
+        Missing or stale buffers are initialized from the current state.
+        """
 
-
-def reached_goal_xy_l2(
-    env: ManagerBasedRLEnv,
-    threshold: float,
-    min_base_height: float = 0.25,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    Sparse success reward based on XY goal distance,
-    while requiring the robot base to remain above a minimum height.
-
-    Returns:
-        [num_envs]
-    """
-
-    dist_to_goal = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
-    base_height = utils._robot_base_height(env, asset_cfg)
-
-    reached = dist_to_goal < threshold
-    base_high_enough = base_height > min_base_height
-
-    return torch.logical_and(reached, base_high_enough).float()
-
-
-def obstacle_progress_l2(
-    env: ManagerBasedRLEnv,
-    obstacle_x: float,
-    obstacle_length: float,
-    max_progress: float = 0.25,
-    asset_cfg=SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    Reward actual increase in obstacle-region progress.
-
-    Standing still gives 0.
-    Moving backward gives negative reward.
-    Moving forward gives positive reward.
-
-    Returns:
-        [num_envs]
-    """
-
-    x = utils._robot_x_env(env, asset_cfg)
-
-    obstacle_front_x = obstacle_x - obstacle_length / 2.0
-    obstacle_back_x = obstacle_x + obstacle_length / 2.0
-
-    current_progress = (x - obstacle_front_x) / (obstacle_back_x - obstacle_front_x)
-    current_progress = torch.clamp(current_progress, min=0.0, max=1.0)
-
-    buffer_name = "_parkour_prev_obstacle_progress"
-
-    if (
-        not hasattr(env, buffer_name)
-        or getattr(env, buffer_name).shape != current_progress.shape
-    ):
-        setattr(env, buffer_name, current_progress.detach().clone())
-
-    previous_progress = getattr(env, buffer_name)
-
-    progress_delta = current_progress - previous_progress
-
-    # Avoid artificial progress spikes right after reset.
-    if hasattr(env, "episode_length_buf"):
-        just_reset = env.episode_length_buf <= 1
-        progress_delta = torch.where(
-            just_reset,
-            torch.zeros_like(progress_delta),
-            progress_delta,
+        return cls(
+            root_z=utils._get_or_init_env_buffer(
+                env,
+                f"{buffer_prefix}_root_z",
+                current.root_z
+            ),
+            root_z_vel=utils._get_or_init_env_buffer(
+                env,
+                f"{buffer_prefix}_root_z_vel",
+                current.root_z_vel
+            ),
+            projected_gravity_xy=utils._get_or_init_env_buffer(
+                env,
+                f"{buffer_prefix}_projected_gravity_xy",
+                current.projected_gravity_xy
+            ),
+            roll_pitch_rate=utils._get_or_init_env_buffer(
+                env,
+                f"{buffer_prefix}_roll_pitch_rate",
+                current.roll_pitch_rate
+            )
         )
 
-    setattr(env, buffer_name, current_progress.detach().clone())
+    def write_to_env(
+        self,
+        env: ManagerBasedRLEnv,
+        *,
+        buffer_prefix: str
+    ) -> None:
+        """
+        Store this state as the previous-step root/core state.
+        """
 
-    return torch.clamp(progress_delta, min=-max_progress, max=max_progress)
+        utils._set_env_buffer(env, f"{buffer_prefix}_root_z", self.root_z)
+        utils._set_env_buffer(env, f"{buffer_prefix}_root_z_vel", self.root_z_vel)
+        utils._set_env_buffer(
+            env,
+            f"{buffer_prefix}_projected_gravity_xy",
+            self.projected_gravity_xy
+        )
+        utils._set_env_buffer(
+            env,
+            f"{buffer_prefix}_roll_pitch_rate",
+            self.roll_pitch_rate
+        )
 
 
-def base_height_band_l2(
-    env: ManagerBasedRLEnv,
-    min_height: float = 0.25,
-    max_height: float = 0.50,
-    asset_cfg=SceneEntityCfg("robot")
+def _reversal_excess(
+    current: torch.Tensor,
+    previous: torch.Tensor,
+    min_magnitude: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Detect sign reversal and compute excess reversal magnitude.
+
+    Returns:
+        reversed_direction:
+            Boolean tensor.
+
+        excess:
+            max(min(abs(current), abs(previous)) - min_magnitude, 0)
+    """
+
+    reversed_direction = current * previous < 0.0
+
+    reversal_magnitude = torch.minimum(
+        torch.abs(current),
+        torch.abs(previous)
+    )
+
+    excess = torch.clamp(
+        reversal_magnitude - min_magnitude,
+        min=0.0
+    )
+
+    return reversed_direction, excess
+
+
+def _vertical_root_chatter_l2(
+    current: _RootChatterState,
+    previous: _RootChatterState,
+    chatter_cfg: term_cfg.RootMotionChatterCfg
 ) -> torch.Tensor:
     """
-    Penalize base/root height outside a healthy walking band.
-
-    Use with a negative reward weight.
+    Penalize small vertical bounces that rapidly reverse direction.
 
     Returns:
         [num_envs]
     """
 
-    base_height = utils._robot_base_height(env, asset_cfg)
+    z_displacement = torch.abs(current.root_z - previous.root_z)
 
-    below = torch.clamp(min_height - base_height, min=0.0)
-    above = torch.clamp(base_height - max_height, min=0.0)
+    velocity_reversed, reversal_excess = _reversal_excess(
+        current=current.root_z_vel,
+        previous=previous.root_z_vel,
+        min_magnitude=chatter_cfg.min_z_reversal_speed
+    )
 
-    return below.square() + above.square()
+    small_displacement = z_displacement < chatter_cfg.small_z_displacement
+
+    chatter_active = velocity_reversed & small_displacement
+
+    return reversal_excess.square() * chatter_active.to(dtype=current.root_z.dtype)
 
 
-def no_feet_contact_l2(
-    env: ManagerBasedRLEnv,
-    threshold: float = 1.0,
-    sensor_cfg=SceneEntityCfg("feet_contact", body_names=".*_foot")
+def _angular_root_chatter_l2(
+    current: _RootChatterState,
+    previous: _RootChatterState,
+    chatter_cfg: term_cfg.RootMotionChatterCfg
 ) -> torch.Tensor:
     """
-    Penalty for having no feet in contact with the ground.
-
-    This discourages hopping/skipping in flat walking.
+    Penalize small roll/pitch wiggles that rapidly reverse direction.
 
     Returns:
         [num_envs]
     """
 
-    contact_sensor: ContactSensor = env.scene[sensor_cfg.name]
+    tilt_change = torch.linalg.norm(
+        current.projected_gravity_xy - previous.projected_gravity_xy,
+        dim=-1
+    )
 
-    # [num_envs, history_length, num_bodies, 3]
-    net_forces = contact_sensor.data.net_forces_w_history
+    small_tilt_change = tilt_change < chatter_cfg.small_tilt_change
 
-    if sensor_cfg.body_ids is not None:
-        net_forces = net_forces[:, :, sensor_cfg.body_ids, :]
+    angular_reversed, angular_excess = _reversal_excess(
+        current=current.roll_pitch_rate,
+        previous=previous.roll_pitch_rate,
+        min_magnitude=chatter_cfg.min_roll_pitch_reversal_rate
+    )
 
-    # [num_envs, history_length, num_bodies]
-    force_norm = torch.linalg.norm(net_forces, dim=-1)
+    chatter_active = angular_reversed & small_tilt_change[:, None]
 
-    # Has each foot contacted recently?
-    # [num_envs, num_bodies]
-    feet_in_contact = torch.any(force_norm > threshold, dim=1)
+    penalty_per_axis = angular_excess.square() * chatter_active.to(
+        dtype=current.roll_pitch_rate.dtype
+    )
 
-    # [num_envs]
-    num_feet_in_contact = torch.sum(feet_in_contact.float(), dim=-1)
-
-    no_contact = num_feet_in_contact < 1.0
-
-    return no_contact.float()
+    return torch.sum(penalty_per_axis, dim=-1)
