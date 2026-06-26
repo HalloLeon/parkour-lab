@@ -111,12 +111,21 @@ def goal_progress_xy_stable(
 
 def goal_heading_misalignment_l2(
     env: ManagerBasedRLEnv,
-    heading_cfg: constants.GoalHeadingTrackingCfg = constants.DEFAULT_GOAL_HEADING_TRACKING,
+    heading_cfg: term_cfg.GoalHeadingCfg = term_cfg.DEFAULT_GOAL_HEADING,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
-    Reward the robot for facing the XY goal direction.
+    Penalize heading misalignment only while the robot is advancing toward
+    the XY goal.
+
+    This avoids rewarding the robot for merely staring at the goal while
+    standing still.
+
+    The penalty is active only when velocity along the goal direction is
+    positive enough.
+
+    Use with a negative reward weight.
 
     Returns:
         [num_envs]
@@ -128,7 +137,25 @@ def goal_heading_misalignment_l2(
         asset_cfg=asset_cfg
     )
 
-    return torch.exp(-heading_error / heading_cfg.tracking_scale)
+    velocity_along_goal = utils._velocity_along_goal_xy(
+        env,
+        goal_cfg=goal_cfg,
+        asset_cfg=asset_cfg
+    )
+
+    advancing_gate = utils._linear_ramp(
+        value=velocity_along_goal,
+        lower=heading_cfg.min_forward_speed,
+        upper=heading_cfg.full_forward_speed
+    )
+
+    normalized_heading_error = torch.clamp(
+        heading_error / heading_cfg.max_heading_error,
+        min=0.0,
+        max=1.0
+    )
+
+    return advancing_gate * normalized_heading_error.square()
 
 
 def reached_goal_xy(
