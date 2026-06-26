@@ -127,17 +127,29 @@ DEFAULT_FEET_STUMBLE = FeetStumbleCfg()
 
 
 @configclass
-class GoalHeadingTrackingCfg:
-    """Configuration for aligning the robot heading with the XY goal direction."""
+class GoalHeadingCfg:
+    """
+    Configuration for heading-misalignment penalties while advancing.
+    """
 
-    tracking_scale: float = 0.5
+    max_heading_error: float = 0.5
+    min_forward_speed: float = 0.2
+    full_forward_speed: float = 1.0
 
     def __post_init__(self) -> None:
-        if self.tracking_scale <= 0.0:
-            raise ValueError("tracking_scale must be positive.")
+        if self.max_heading_error <= 0.0:
+            raise ValueError("max_heading_error must be positive.")
+
+        if self.min_forward_speed < 0.0:
+            raise ValueError("min_forward_speed must be non-negative.")
+
+        if self.full_forward_speed <= self.min_forward_speed:
+            raise ValueError(
+                "full_forward_speed must be greater than min_forward_speed."
+            )
 
 
-DEFAULT_GOAL_HEADING_TRACKING = GoalHeadingTrackingCfg()
+DEFAULT_GOAL_HEADING = GoalHeadingCfg()
 
 
 @configclass
