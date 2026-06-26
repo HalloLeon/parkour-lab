@@ -286,59 +286,89 @@ class EventCfg:
 
 @configclass
 class RewardsCfg:
-    """Reward terms for the MDP."""
-
-    alive = RewTerm(func=mdp.is_alive, weight=0.05)
-
-    # Horizontal goal-reaching.
-    forward_velocity_xy = RewTerm(
-        func=mdp.velocity_towards_goal_xy_l2,
+    # Goal task.
+    velocity_along_goal_xy = RewTerm(
+        func=mdp.velocity_along_goal_xy_clearance_exp,
         weight=1.0,
         params={
+            "tracking_cfg": mdp.term_cfg.GoalVelocityCfg(
+                target_speed=0.75,
+                speed_tracking_scale=0.25,
+                slow_down_distance=0.75,
+                min_clearance=0.25
+            ),
             "goal_cfg": SceneEntityCfg("goal"),
             "asset_cfg": SceneEntityCfg("robot")
         }
     )
 
-    goal_closeness_xy = RewTerm(
-        func=mdp.goal_closeness_xy_l2,
-        weight=1.0,
+    goal_progress_xy = RewTerm(
+        func=mdp.goal_progress_xy_stable,
+        weight=4.0,
         params={
-            "max_distance": 2.0,
+            "progress_cfg": mdp.term_cfg.StableGoalProgressCfg(
+                progress_scale=0.03,
+                reset_grace_steps=1,
+                stability=mdp.term_cfg.RootStabilityCfg(
+                    max_roll_pitch_ang_speed=4.0,
+                    max_projected_gravity_xy_norm=0.75,
+                    min_clearance=0.25
+                )
+            ),
+            "goal_cfg": SceneEntityCfg("goal"),
+            "asset_cfg": SceneEntityCfg("robot")
+        }
+    )
+
+    goal_heading_misalignment = RewTerm(
+        func=mdp.goal_heading_misalignment_l2,
+        weight=-0.05,
+        params={
+            "heading_cfg": mdp.term_cfg.GoalHeadingCfg(
+                max_heading_error=1.0,
+                min_forward_speed=0.1,
+                full_forward_speed=0.5
+            ),
             "goal_cfg": SceneEntityCfg("goal"),
             "asset_cfg": SceneEntityCfg("robot")
         }
     )
 
     reached_goal_xy = RewTerm(
-        func=mdp.reached_goal_xy_l2,
-        weight=20.0,
+        func=mdp.reached_goal_xy,
+        weight=100.0,
         params={
             "threshold": 0.30,
-            "min_base_height": 0.22,
             "goal_cfg": SceneEntityCfg("goal"),
             "asset_cfg": SceneEntityCfg("robot")
         }
     )
 
-    # Vertical body-shape control.
-    base_height_error = RewTerm(
-        func=mdp.base_height_error_l2,
-        weight=-1.0,
-        params={
-            "target_height": 0.35,
-            "max_error": 0.5,
-            "asset_cfg": SceneEntityCfg("robot")
-        }
-    )
-
-    # Illegal contact.
+    # Safety.
     illegal_contact = RewTerm(
-        func=mdp.illegal_contact_l2,
-        weight=-1.0,
+        func=mdp.base_contact,
+        weight=-10.0,
         params={
             "threshold": 1.0,
             "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk")
+        }
+    )
+
+    leg_contact = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-0.5,
+        params={
+            "threshold": 1.0,
+            "sensor_cfg": SceneEntityCfg("leg_contact")
+        }
+    )
+
+    base_clearance_below = RewTerm(
+        func=mdp.base_clearance_below_l2,
+        weight=-5.0,
+        params={
+            "min_clearance": 0.25,
+            "asset_cfg": SceneEntityCfg("robot")
         }
     )
 
@@ -349,9 +379,20 @@ class RewardsCfg:
     joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.001)
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
 
+    hip_deviation = RewTerm(
+        func=mdp.joint_deviation_l2,
+        weight=-0.002,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=".*_hip_joint"
+            )
+        }
+    )
+
     feet_slide = RewTerm(
         func=mdp.feet_slide,
-        weight=-0.1,
+        weight=-0.05,
         params={
             "sensor_cfg": SceneEntityCfg(
                 "feet_contact",
@@ -364,12 +405,49 @@ class RewardsCfg:
         }
     )
 
-    no_feet_contact = RewTerm(
-        func=mdp.no_feet_contact_l2,
-        weight=-0.25,
+    feet_stumble = RewTerm(
+        func=mdp.feet_stumble,
+        weight=-0.5,
         params={
-            "threshold": 1.0,
+            "stumble_cfg": mdp.term_cfg.FeetStumbleCfg(
+                lateral_to_vertical_force_ratio=4.0,
+                min_vertical_force=1.0
+            ),
+            "sensor_cfg": SceneEntityCfg(
+                "feet_contact",
+                body_names=".*_foot"
+            )
+        }
+    )
+
+    rapid_feet_motion = RewTerm(
+        func=mdp.rapid_feet_motion_l2,
+        weight=-0.05,
+        params={
+            "motion_cfg": mdp.term_cfg.FeetMotionCfg(
+                max_stance_speed=0.25,
+                max_swing_speed=2.0,
+                contact_threshold=1.0,
+                max_penalty_per_foot=4.0
+            ),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot")
+        }
+    )
+
+    root_chatter = RewTerm(
+        func=mdp.root_chatter_l2,
+        weight=-0.005,
+        params={
+            "chatter_cfg": mdp.term_cfg.RootMotionChatterCfg(
+                small_z_displacement=0.02,
+                min_z_reversal_speed=0.05,
+                small_tilt_change=0.04,
+                min_roll_pitch_reversal_rate=0.75,
+                angular_weight=0.25,
+                reset_grace_steps=1
+            ),
+            "asset_cfg": SceneEntityCfg("robot")
         }
     )
 
@@ -383,8 +461,7 @@ class TerminationsCfg:
     success = DoneTerm(
         func=mdp.reached_goal_xy,
         params={
-            "threshold": 0.35,
-            "min_base_height": 0.22,
+            "threshold": 0.30,
             "goal_cfg": SceneEntityCfg("goal"),
             "asset_cfg": SceneEntityCfg("robot")
         }
