@@ -560,6 +560,40 @@ def _root_height(
     return _root_pos_env(env, asset_cfg)[:, 2]
 
 
+def _root_roll_pitch_rate(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Robot root roll/pitch angular velocity.
+
+    Returns:
+        [num_envs, 2]
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    return asset.data.root_ang_vel_b[:, :2]
+
+
+def _root_projected_gravity_xy(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    Projected gravity XY components.
+
+    This is a compact roll/pitch orientation signal.
+
+    Returns:
+        [num_envs, 2]
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    return asset.data.projected_gravity_b[:, :2]
+
+
 def _root_forward_xy_w(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
