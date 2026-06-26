@@ -546,7 +546,7 @@ def _root_pos_env(
     return asset.data.root_pos_w - env.scene.env_origins
 
 
-def _root_height(
+def _root_height_env(
     env: ManagerBasedRLEnv,
     asset_cfg=SceneEntityCfg("robot")
 ) -> torch.Tensor:
