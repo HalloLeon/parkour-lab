@@ -100,10 +100,12 @@ def goal_progress_xy_stable(
         gate=stable
     )
 
+    normalized_progress = progress / progress_cfg.progress_scale
+
     return torch.clamp(
-        progress,
-        min=-progress_cfg.max_progress,
-        max=progress_cfg.max_progress
+        normalized_progress,
+        min=-1.0,
+        max=1.0
     )
 
 
