@@ -9,7 +9,7 @@ GROUND_HEIGHT = 0.0
 # ==================== OBSERVATION CONFIGURATIONS ====================
 
 
-@dataclass(frozen=True)
+@configclass
 class GoalSlotsObservationCfg:
     """
     Configuration for fixed-size goal-slot observations.
@@ -35,7 +35,7 @@ class GoalSlotsObservationCfg:
 DEFAULT_GOAL_SLOTS_OBSERVATION = GoalSlotsObservationCfg()
 
 
-@dataclass(frozen=True)
+@configclass
 class HeightScanObservationCfg:
     """
     Configuration for terrain/obstacle height-scan observations.
@@ -108,7 +108,7 @@ class FeetMotionPenaltyCfg:
 DEFAULT_FOOT_MOTION_PENALTY = FeetMotionPenaltyCfg()
 
 
-@dataclass(frozen=True)
+@configclass
 class FeetStumbleCfg:
     """Configuration for detecting foot impacts against near-vertical surfaces."""
 
@@ -126,7 +126,7 @@ class FeetStumbleCfg:
 DEFAULT_FEET_STUMBLE = FeetStumbleCfg()
 
 
-@dataclass(frozen=True)
+@configclass
 class GoalHeadingTrackingCfg:
     """Configuration for aligning the robot heading with the XY goal direction."""
 
@@ -140,7 +140,7 @@ class GoalHeadingTrackingCfg:
 DEFAULT_GOAL_HEADING_TRACKING = GoalHeadingTrackingCfg()
 
 
-@dataclass(frozen=True)
+@configclass
 class GoalVelocityTrackingCfg:
     """
     Configuration for goal-directed XY velocity tracking.
