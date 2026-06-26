@@ -514,6 +514,23 @@ def _root_lin_vel_xy(
     return asset.data.root_lin_vel_w[:, :2]
 
 
+def _root_lin_vel_z(
+    env: ManagerBasedRLEnv,
+    asset_cfg=SceneEntityCfg("robot")
+) -> torch.Tensor:
+    """
+    Robot root linear velocity in the world Z direction.
+
+
+    Returns:
+        [num_envs, 2]
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    return asset.data.root_lin_vel_w[:, 2]
+
+
 def _root_pos_env(
         env: ManagerBasedRLEnv,
         asset_cfg=SceneEntityCfg("robot")
