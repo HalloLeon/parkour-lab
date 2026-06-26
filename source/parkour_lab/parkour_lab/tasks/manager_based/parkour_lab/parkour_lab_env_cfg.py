@@ -407,7 +407,7 @@ class TerminationsCfg:
 @configclass
 class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
     # Scene settings.
-    scene: ParkourLabSceneCfg = ParkourLabSceneCfg(num_envs=4096, env_spacing=4.0)
+    scene: ParkourLabSceneCfg = ParkourLabSceneCfg(num_envs=4096, env_spacing=8.0)
 
     # Basic settings.
     observations: ObservationsCfg = ObservationsCfg()
