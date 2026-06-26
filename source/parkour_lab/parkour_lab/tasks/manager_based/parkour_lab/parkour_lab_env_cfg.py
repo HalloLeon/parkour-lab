@@ -122,36 +122,34 @@ class ObservationsCfg:
 
     @configclass
     class PolicyCfg(ObsGroup):
-        """Observations for policy group."""
+        """Deployable actor observations."""
 
-        # Root/body state.
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+        # Body orientation and angular motion.
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
         projected_gravity = ObsTerm(func=mdp.projected_gravity)
 
-        # Goal/task state.
-        goal_distance_xy = ObsTerm(
-            func=mdp.goal_distance_xy_w,
-            params={
-                "goal_cfg": SceneEntityCfg("goal"),
-                "asset_cfg": SceneEntityCfg("robot"),
-            },
-        )
-
-        goal_direction_xy = ObsTerm(
-            func=mdp.goal_direction_xy_w,
+        # Goal-relative task information.
+        goal_direction_body_xy = ObsTerm(
+            func=mdp.goal_direction_body_xy,
             params={
                 "goal_cfg": SceneEntityCfg("goal"),
                 "asset_cfg": SceneEntityCfg("robot")
             }
         )
 
-        # Vertical state.
-        base_height = ObsTerm(
-            func=mdp.base_height_w,
+        goal_distance_xy = ObsTerm(
+            func=mdp.goal_distance_xy_w,
             params={
-                "asset_cfg": SceneEntityCfg("robot"),
-            },
+                "goal_cfg": SceneEntityCfg("goal"),
+                "asset_cfg": SceneEntityCfg("robot")
+            }
+        )
+
+        desired_speed = ObsTerm(
+            func=mdp.desired_speed_obs,
+            params={
+                "target_speed": 0.5
+            }
         )
 
         # Joint state.
@@ -159,13 +157,86 @@ class ObservationsCfg:
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
 
         # Previous action.
-        actions = ObsTerm(func=mdp.last_action)
+        last_action = ObsTerm(func=mdp.last_action)
+
+        # Contact state.
+        foot_contacts = ObsTerm(
+            func=mdp.foot_contact_state,
+            params={
+                "threshold": 1.0,
+                "sensor_cfg": SceneEntityCfg(
+                    "feet_contact",
+                    body_names=".*_foot"
+                )
+            }
+        )
+
+        def __post_init__(self):
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
+    class CriticCfg(ObsGroup):
+        """Privileged critic observations."""
+
+        # Same core observations as the actor.
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+        projected_gravity = ObsTerm(func=mdp.projected_gravity)
+
+        goal_direction_body_xy = ObsTerm(
+            func=mdp.goal_direction_body_xy,
+            params={
+                "goal_cfg": SceneEntityCfg("goal"),
+                "asset_cfg": SceneEntityCfg("robot")
+            }
+        )
+
+        goal_distance_xy = ObsTerm(
+            func=mdp.goal_distance_xy_w,
+            params={
+                "goal_cfg": SceneEntityCfg("goal"),
+                "asset_cfg": SceneEntityCfg("robot")
+            }
+        )
+
+        desired_speed = ObsTerm(
+            func=mdp.desired_speed_obs,
+            params={
+                "target_speed": 0.5
+            }
+        )
+
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        last_action = ObsTerm(func=mdp.last_action)
+
+        foot_contacts = ObsTerm(
+            func=mdp.foot_contact_state,
+            params={
+                "threshold": 1.0,
+                "sensor_cfg": SceneEntityCfg(
+                    "feet_contact",
+                    body_names=".*_foot"
+                )
+            }
+        )
+
+        # Privileged state.
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+
+        base_clearance = ObsTerm(
+            func=mdp.base_clearance_obs,
+            params={
+                "asset_cfg": SceneEntityCfg("robot")
+            }
+        )
 
         def __post_init__(self):
             self.enable_corruption = False
             self.concatenate_terms = True
 
     policy: PolicyCfg = PolicyCfg()
+    critic: CriticCfg = CriticCfg()
 
 
 @configclass
