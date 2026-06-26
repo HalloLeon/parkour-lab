@@ -90,6 +90,11 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         track_air_time=True
     )
 
+    leg_contact: ContactSensorCfg = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/.*_(thigh|calf)",
+        history_length=3,
+    )
+
     base_contact: ContactSensorCfg = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/trunk",
         history_length=3
