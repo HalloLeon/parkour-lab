@@ -246,7 +246,7 @@ def _difference_from_previous_env_buffer(
 def _box_surface_height_under_xy(
     env: ManagerBasedRLEnv,
     xy: torch.Tensor,
-    box_cfg: constants.BoxSurfaceCfg
+    box_cfg: term_cfg.BoxSurfaceCfg
 ) -> torch.Tensor:
     """
     Height of a box top surface under a given XY position.
@@ -315,7 +315,7 @@ def _support_surface_height_under_base(
 
     ground_height = torch.full(
         (root_pos.shape[0],),
-        constants.GROUND_HEIGHT,
+        term_cfg.GROUND_HEIGHT,
         device=root_pos.device,
         dtype=root_pos.dtype
     )
@@ -323,7 +323,7 @@ def _support_surface_height_under_base(
     obstacle_height = _box_surface_height_under_xy(
         env=env,
         xy=base_xy,
-        box_cfg=constants.OBSTACLE_SURFACE
+        box_cfg=term_cfg.OBSTACLE_SURFACE
     )
 
     return torch.maximum(ground_height, obstacle_height)
@@ -457,7 +457,7 @@ def _episode_start_mask(
 
 def _root_stability_mask(
     env: ManagerBasedRLEnv,
-    stability_cfg: constants.RootStabilityCfg,
+    stability_cfg: term_cfg.RootStabilityCfg,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
@@ -695,7 +695,7 @@ def _base_clearance(
         [num_envs]
     """
 
-    base_height = _root_height(env, asset_cfg)
+    base_height = _root_height_env(env, asset_cfg)
     surface_height = _support_surface_height_under_base(env, asset_cfg)
 
     return base_height - surface_height
