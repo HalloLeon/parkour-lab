@@ -1,9 +1,11 @@
 from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import quat_rotate_inverse
+from isaaclab.sensors import RayCaster
+from isaaclab.utils.math import quat_apply_inverse
 import torch
 
+from . import constants
 from . import utils
 
 
@@ -65,7 +67,7 @@ def goal_direction_body_xy(
     #   robot yaw = 180 deg, goal world +x -> goal_vec_b ≈ [-1,  0, 0]
     #
     # The suffix "_b" means body frame.
-    goal_vec_b = quat_rotate_inverse(asset.data.root_quat_w, goal_vec_w)
+    goal_vec_b = quat_apply_inverse(asset.data.root_quat_w, goal_vec_w)
     goal_dir_b_xy = goal_vec_b[:, :2]
 
     return goal_dir_b_xy / torch.linalg.norm(
@@ -132,23 +134,61 @@ def desired_speed_obs(
     )
 
 
-# LEGACY
-
-
-def goal_direction_xy_w(
+def height_scan_or_zeros(
     env: ManagerBasedRLEnv,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
+    obs_cfg: constants.HeightScanObservationCfg = constants.DEFAULT_HEIGHT_SCAN_OBSERVATION,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
-    Normalized XY direction from robot root to goal.
+    Fixed-size terrain/obstacle height scan.
+
+    If the height scanner is not present, returns zeros with the expected size.
+    This keeps observation dimensions stable across simple and terrain-rich
+    environments.
+
+    Intended for critic/teacher use, not the first deployable actor.
 
     Returns:
-        [num_envs, 2]
+        [num_envs, obs_cfg.num_rays]
     """
 
-    to_goal_xy = utils._goal_vector_xy(env, goal_cfg, asset_cfg)
+    sensor = utils._get_scene_entity_or_none(env, sensor_cfg.name)
+    asset: Articulation = env.scene[asset_cfg.name]
 
-    norm = torch.linalg.norm(to_goal_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
+    if sensor is None:
+        return torch.zeros(
+            (env.num_envs, obs_cfg.num_rays),
+            device=asset.data.root_pos_w.device,
+            dtype=asset.data.root_pos_w.dtype
+        )
 
-    return to_goal_xy / norm
+    if not isinstance(sensor, RayCaster):
+        raise TypeError(
+            f"Expected '{sensor_cfg.name}' to be a RayCaster, "
+            f"got {type(sensor).__name__}."
+        )
+
+    root_z = asset.data.root_pos_w[:, 2].unsqueeze(-1)
+    hit_z = sensor.data.ray_hits_w[..., 2]
+
+    if hit_z.shape[-1] != obs_cfg.num_rays:
+        raise RuntimeError(
+            f"Height scan expected {obs_cfg.num_rays} rays, "
+            f"but sensor returned {hit_z.shape[-1]} rays."
+        )
+
+    heights = root_z - obs_cfg.vertical_offset - hit_z
+
+    heights = torch.nan_to_num(
+        heights,
+        nan=0.0,
+        posinf=obs_cfg.clip,
+        neginf=-obs_cfg.clip
+    )
+
+    return torch.clamp(
+        heights,
+        min=-obs_cfg.clip,
+        max=obs_cfg.clip
+    )
