@@ -545,7 +545,7 @@ def _root_lin_vel_z(
 
 
     Returns:
-        [num_envs, 2]
+        [num_envs]
     """
 
     asset: Articulation = env.scene[asset_cfg.name]
