@@ -3,6 +3,8 @@ from dataclasses import field
 
 from isaaclab.utils import configclass
 
+from .curriculums import DEFAULT_PARKOUR_CURRICULUM
+
 
 GROUND_HEIGHT = 0.0
 
@@ -72,7 +74,11 @@ class BoxSurfaceCfg:
 
 OBSTACLE_SURFACE = BoxSurfaceCfg(
     name="obstacle",
-    size=(0.5, 1.8, 0.05),
+    size=(
+        max(level.obstacle_size[0] for level in DEFAULT_PARKOUR_CURRICULUM.levels),
+        max(level.obstacle_size[1] for level in DEFAULT_PARKOUR_CURRICULUM.levels),
+        max(level.obstacle_size[2] for level in DEFAULT_PARKOUR_CURRICULUM.levels)
+    ),
     xy_margin=0.02
 )
 

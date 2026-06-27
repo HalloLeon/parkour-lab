@@ -28,15 +28,36 @@ from . import mdp
 ##
 
 
+PARKOUR_CURRICULUM = mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM
+
+SCENE_OBSTACLE_SIZE = (
+    max(level.obstacle_size[0] for level in PARKOUR_CURRICULUM.levels),
+    max(level.obstacle_size[1] for level in PARKOUR_CURRICULUM.levels),
+    max(level.obstacle_size[2] for level in PARKOUR_CURRICULUM.levels)
+)
+
+DEFAULT_LEVEL = PARKOUR_CURRICULUM.levels[PARKOUR_CURRICULUM.initial_level]
+
+OBSTACLE_SIZE = SCENE_OBSTACLE_SIZE
+OBSTACLE_POS = (
+    DEFAULT_LEVEL.obstacle_pos[0],
+    DEFAULT_LEVEL.obstacle_pos[1],
+    DEFAULT_LEVEL.obstacle_size[2] - 0.5 * SCENE_OBSTACLE_SIZE[2]
+)
+
+GOAL_POS = (
+    DEFAULT_LEVEL.goal_pos[0],
+    DEFAULT_LEVEL.goal_pos[1],
+    DEFAULT_LEVEL.goal_pos[2]
+)
+
+TARGET_SPEED = DEFAULT_LEVEL.target_speed
+MIN_CLEARANCE = DEFAULT_LEVEL.min_clearance
+
+
 ##
 # Scene definition
 ##
-
-
-OBSTACLE_POS = (2.0, 0.0, 0.025)
-OBSTACLE_SIZE = mdp.term_cfg.OBSTACLE_SURFACE.size
-
-GOAL_POS = (4.0, 0.0, 0.01)
 
 
 @configclass
@@ -158,7 +179,7 @@ class ObservationsCfg:
         desired_speed = ObsTerm(
             func=mdp.desired_speed_obs,
             params={
-                "target_speed": 0.75
+                "target_speed": TARGET_SPEED
             }
         )
 
@@ -212,7 +233,7 @@ class ObservationsCfg:
         desired_speed = ObsTerm(
             func=mdp.desired_speed_obs,
             params={
-                "target_speed": 0.75
+                "target_speed": TARGET_SPEED
             }
         )
 
@@ -298,10 +319,10 @@ class RewardsCfg:
         weight=1.0,
         params={
             "tracking_cfg": mdp.config.GoalVelocityCfg(
-                target_speed=0.75,
+                target_speed=TARGET_SPEED,
                 speed_tracking_scale=0.25,
-                slow_down_distance=0.75,
-                min_clearance=0.25
+                slow_down_distance=1.25,
+                min_clearance=MIN_CLEARANCE
             ),
             "goal_cfg": SceneEntityCfg("goal"),
             "asset_cfg": SceneEntityCfg("robot")
@@ -310,15 +331,15 @@ class RewardsCfg:
 
     goal_progress_xy = RewTerm(
         func=mdp.goal_progress_xy_stable,
-        weight=4.0,
+        weight=3.0,
         params={
-            "progress_cfg": mdp.term_cfg.StableGoalProgressCfg(
+            "progress_cfg": mdp.config.StableGoalProgressCfg(
                 progress_scale=0.03,
                 reset_grace_steps=1,
                 stability=mdp.config.RootStabilityCfg(
                     max_roll_pitch_ang_speed=4.0,
                     max_projected_gravity_xy_norm=0.75,
-                    min_clearance=0.25
+                    min_clearance=MIN_CLEARANCE
                 )
             ),
             "goal_cfg": SceneEntityCfg("goal"),
@@ -371,18 +392,18 @@ class RewardsCfg:
 
     base_clearance_below = RewTerm(
         func=mdp.base_clearance_below_l2,
-        weight=-5.0,
+        weight=-3.0,
         params={
-            "min_clearance": 0.25,
+            "min_clearance": MIN_CLEARANCE,
             "asset_cfg": SceneEntityCfg("robot")
         }
     )
 
     # Stability and regularization.
-    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-1.5)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.1)
-    joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.001)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.2)
+    joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.0005)
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
 
     hip_deviation = RewTerm(
@@ -415,7 +436,7 @@ class RewardsCfg:
         func=mdp.feet_stumble,
         weight=-0.5,
         params={
-            "stumble_cfg": mdp.term_cfg.FeetStumbleCfg(
+            "stumble_cfg": mdp.config.FeetStumbleCfg(
                 lateral_to_vertical_force_ratio=4.0,
                 min_vertical_force=1.0
             ),
@@ -428,7 +449,7 @@ class RewardsCfg:
 
     rapid_feet_motion = RewTerm(
         func=mdp.rapid_feet_motion_l2,
-        weight=-0.05,
+        weight=-0.005,
         params={
             "motion_cfg": mdp.config.FeetMotionCfg(
                 max_stance_speed=0.25,
