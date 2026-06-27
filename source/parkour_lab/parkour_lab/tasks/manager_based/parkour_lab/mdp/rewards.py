@@ -12,7 +12,7 @@ from . import utils
 def base_contact(
     env: ManagerBasedRLEnv,
     threshold: float = 1.0,
-    sensor_cfg=SceneEntityCfg("base_contact", body_names="trunk")
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("base_contact", body_names="trunk")
 ) -> torch.Tensor:
     """
     Penalty signal for illegal trunk/base contact.
@@ -162,8 +162,8 @@ def goal_heading_misalignment_l2(
 def reached_goal_xy(
     env: ManagerBasedRLEnv,
     threshold: float = 0.25,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
     Sparse success reward based on XY goal distance.
