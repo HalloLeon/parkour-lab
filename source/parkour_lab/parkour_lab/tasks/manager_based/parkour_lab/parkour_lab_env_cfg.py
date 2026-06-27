@@ -441,6 +441,15 @@ class RewardsCfg:
         }
     )
 
+    no_feet_contact = RewTerm(
+        func=mdp.no_feet_contact,
+        weight=-0.2,
+        params={
+            "threshold": 1.0,
+            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot")
+        }
+    )
+
     root_chatter = RewTerm(
         func=mdp.root_chatter_l2,
         weight=-0.005,
