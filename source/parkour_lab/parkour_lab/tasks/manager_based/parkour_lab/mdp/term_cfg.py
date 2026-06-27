@@ -72,8 +72,8 @@ class BoxSurfaceCfg:
 
 OBSTACLE_SURFACE = BoxSurfaceCfg(
     name="obstacle",
-    size=(0.5, 0.5, 0.12),
-    xy_margin=0.02,
+    size=(0.5, 1.8, 0.05),
+    xy_margin=0.02
 )
 
 

@@ -28,9 +28,9 @@ from . import mdp
 
 
 OBSTACLE_POS = (2.0, 0.0, 0.025)
-OBSTACLE_SIZE = (0.5, 1.8, 0.05)
+OBSTACLE_SIZE = mdp.term_cfg.OBSTACLE_SURFACE.size
 
-GOAL_POS = (4.0, 0.0, 0.0)
+GOAL_POS = (4.0, 0.0, 0.01)
 
 
 @configclass
