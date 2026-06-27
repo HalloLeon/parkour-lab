@@ -8,7 +8,7 @@ from isaaclab.utils.math import quat_apply_inverse
 
 import torch
 
-from . import term_cfg
+from . import config
 
 
 def _get_scene_entity_or_none(
@@ -246,7 +246,7 @@ def _difference_from_previous_env_buffer(
 def _box_surface_height_under_xy(
     env: ManagerBasedRLEnv,
     xy: torch.Tensor,
-    box_cfg: term_cfg.BoxSurfaceCfg
+    box_cfg: config.BoxSurfaceCfg
 ) -> torch.Tensor:
     """
     Height of a box top surface under a given XY position.
@@ -315,7 +315,7 @@ def _support_surface_height_under_base(
 
     ground_height = torch.full(
         (root_pos.shape[0],),
-        term_cfg.GROUND_HEIGHT,
+        config.GROUND_HEIGHT,
         device=root_pos.device,
         dtype=root_pos.dtype
     )
@@ -323,7 +323,7 @@ def _support_surface_height_under_base(
     obstacle_height = _box_surface_height_under_xy(
         env=env,
         xy=base_xy,
-        box_cfg=term_cfg.OBSTACLE_SURFACE
+        box_cfg=config.OBSTACLE_SURFACE
     )
 
     return torch.maximum(ground_height, obstacle_height)
@@ -457,7 +457,7 @@ def _episode_start_mask(
 
 def _root_stability_mask(
     env: ManagerBasedRLEnv,
-    stability_cfg: term_cfg.RootStabilityCfg,
+    stability_cfg: config.RootStabilityCfg,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
