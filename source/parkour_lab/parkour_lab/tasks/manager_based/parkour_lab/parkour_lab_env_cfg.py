@@ -297,7 +297,7 @@ class RewardsCfg:
         func=mdp.velocity_along_goal_xy_clearance_exp,
         weight=1.0,
         params={
-            "tracking_cfg": mdp.term_cfg.GoalVelocityCfg(
+            "tracking_cfg": mdp.config.GoalVelocityCfg(
                 target_speed=0.75,
                 speed_tracking_scale=0.25,
                 slow_down_distance=0.75,
@@ -315,7 +315,7 @@ class RewardsCfg:
             "progress_cfg": mdp.term_cfg.StableGoalProgressCfg(
                 progress_scale=0.03,
                 reset_grace_steps=1,
-                stability=mdp.term_cfg.RootStabilityCfg(
+                stability=mdp.config.RootStabilityCfg(
                     max_roll_pitch_ang_speed=4.0,
                     max_projected_gravity_xy_norm=0.75,
                     min_clearance=0.25
@@ -330,7 +330,7 @@ class RewardsCfg:
         func=mdp.goal_heading_misalignment_l2,
         weight=-0.05,
         params={
-            "heading_cfg": mdp.term_cfg.GoalHeadingCfg(
+            "heading_cfg": mdp.config.GoalHeadingCfg(
                 max_heading_error=1.0,
                 min_forward_speed=0.1,
                 full_forward_speed=0.5
@@ -430,7 +430,7 @@ class RewardsCfg:
         func=mdp.rapid_feet_motion_l2,
         weight=-0.05,
         params={
-            "motion_cfg": mdp.term_cfg.FeetMotionCfg(
+            "motion_cfg": mdp.config.FeetMotionCfg(
                 max_stance_speed=0.25,
                 max_swing_speed=2.0,
                 contact_threshold=1.0,
@@ -454,7 +454,7 @@ class RewardsCfg:
         func=mdp.root_chatter_l2,
         weight=-0.005,
         params={
-            "chatter_cfg": mdp.term_cfg.RootMotionChatterCfg(
+            "chatter_cfg": mdp.config.RootMotionChatterCfg(
                 small_z_displacement=0.02,
                 min_z_reversal_speed=0.05,
                 small_tilt_change=0.04,

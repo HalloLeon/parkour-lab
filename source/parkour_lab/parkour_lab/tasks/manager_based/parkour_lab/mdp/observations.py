@@ -5,7 +5,7 @@ from isaaclab.sensors import RayCaster
 from isaaclab.utils.math import quat_apply_inverse
 import torch
 
-from . import term_cfg
+from . import config
 from . import utils
 
 
@@ -136,7 +136,7 @@ def desired_speed_obs(
 
 def height_scan_or_zeros(
     env: ManagerBasedRLEnv,
-    obs_cfg: term_cfg.HeightScanObservationCfg = term_cfg.DEFAULT_HEIGHT_SCAN_OBSERVATION,
+    obs_cfg: config.HeightScanObservationCfg = config.DEFAULT_HEIGHT_SCAN_OBSERVATION,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:

@@ -11,7 +11,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 import torch
 
-from . import term_cfg
+from . import config
 from . import utils
 
 
@@ -46,7 +46,7 @@ def base_contact(
 
 def goal_progress_xy_stable(
     env: ManagerBasedRLEnv,
-    progress_cfg: term_cfg.StableGoalProgressCfg = term_cfg.DEFAULT_STABLE_GOAL_PROGRESS,
+    progress_cfg: config.StableGoalProgressCfg = config.DEFAULT_STABLE_GOAL_PROGRESS,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -118,7 +118,7 @@ def goal_progress_xy_stable(
 
 def goal_heading_misalignment_l2(
     env: ManagerBasedRLEnv,
-    heading_cfg: term_cfg.GoalHeadingCfg = term_cfg.DEFAULT_GOAL_HEADING,
+    heading_cfg: config.GoalHeadingCfg = config.DEFAULT_GOAL_HEADING,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
@@ -186,7 +186,7 @@ def reached_goal_xy(
 
 def velocity_along_goal_xy_exp(
     env: ManagerBasedRLEnv,
-    tracking_cfg: term_cfg.GoalVelocityCfg = term_cfg.DEFAULT_GOAL_VELOCITY,
+    tracking_cfg: config.GoalVelocityCfg = config.DEFAULT_GOAL_VELOCITY,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -231,7 +231,7 @@ def velocity_along_goal_xy_exp(
 
 def velocity_along_goal_xy_clearance_exp(
     env: ManagerBasedRLEnv,
-    tracking_cfg: term_cfg.GoalVelocityCfg = term_cfg.DEFAULT_GOAL_VELOCITY,
+    tracking_cfg: config.GoalVelocityCfg = config.DEFAULT_GOAL_VELOCITY,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
@@ -323,7 +323,7 @@ def joint_deviation_l2(
 
 def feet_stumble(
     env: ManagerBasedRLEnv,
-    stumble_cfg: term_cfg.FeetStumbleCfg = term_cfg.DEFAULT_FEET_STUMBLE,
+    stumble_cfg: config.FeetStumbleCfg = config.DEFAULT_FEET_STUMBLE,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot")
 ) -> torch.Tensor:
     """
@@ -394,7 +394,7 @@ def no_feet_contact(
 
 def rapid_feet_motion_l2(
     env: ManagerBasedRLEnv,
-    motion_cfg: term_cfg.FeetMotionCfg = term_cfg.DEFAULT_FOOT_MOTION_PENALTY,
+    motion_cfg: config.FeetMotionCfg = config.DEFAULT_FOOT_MOTION_PENALTY,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=".*_foot"),
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot")
 ) -> torch.Tensor:
@@ -466,7 +466,7 @@ def rapid_feet_motion_l2(
 
 def root_chatter_l2(
     env: ManagerBasedRLEnv,
-    chatter_cfg: term_cfg.RootMotionChatterCfg = term_cfg.DEFAULT_ROOT_MOTION_CHATTER,
+    chatter_cfg: config.RootMotionChatterCfg = config.DEFAULT_ROOT_MOTION_CHATTER,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
@@ -662,7 +662,7 @@ def _reversal_excess(
 def _vertical_root_chatter_l2(
     current: _RootChatterState,
     previous: _RootChatterState,
-    chatter_cfg: term_cfg.RootMotionChatterCfg
+    chatter_cfg: config.RootMotionChatterCfg
 ) -> torch.Tensor:
     """
     Penalize small vertical bounces that rapidly reverse direction.
@@ -689,7 +689,7 @@ def _vertical_root_chatter_l2(
 def _angular_root_chatter_l2(
     current: _RootChatterState,
     previous: _RootChatterState,
-    chatter_cfg: term_cfg.RootMotionChatterCfg
+    chatter_cfg: config.RootMotionChatterCfg
 ) -> torch.Tensor:
     """
     Penalize small roll/pitch wiggles that rapidly reverse direction.
