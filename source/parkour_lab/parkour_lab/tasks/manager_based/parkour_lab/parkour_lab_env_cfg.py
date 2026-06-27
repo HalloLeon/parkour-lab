@@ -304,6 +304,15 @@ class EventCfg:
         }
     )
 
+    reset_constant_parkour_commands = EventTerm(
+        func=mdp.reset_constant_parkour_commands,
+        mode="reset",
+        params={
+            "target_speed": TARGET_SPEED,
+            "min_clearance": MIN_CLEARANCE
+        }
+    )
+
 
 @configclass
 class RewardsCfg:

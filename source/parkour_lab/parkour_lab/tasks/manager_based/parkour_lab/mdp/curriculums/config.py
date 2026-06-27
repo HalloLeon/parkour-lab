@@ -63,6 +63,7 @@ class ParkourCurriculumCfg:
     )
 
     initial_level: int = 1
+    distribute_initial_levels: bool = False
     max_level: int = 3
 
     def __post_init__(self) -> None:
