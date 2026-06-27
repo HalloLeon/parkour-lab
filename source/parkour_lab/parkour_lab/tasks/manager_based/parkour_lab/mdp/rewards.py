@@ -13,6 +13,8 @@ import torch
 
 from . import config
 from . import utils
+from .commands import get_min_clearance
+from .commands import get_target_speed
 
 
 def base_contact(
@@ -220,7 +222,12 @@ def velocity_along_goal_xy_exp(
         max=1.0
     )
 
-    desired_velocity = tracking_cfg.target_speed * slowdown_scale
+    target_speed = get_target_speed(env).to(
+        device=goal_dist_xy.device,
+        dtype=goal_dist_xy.dtype
+    )
+
+    desired_velocity = target_speed * slowdown_scale
 
     velocity_error = velocity_along_goal - desired_velocity
 
@@ -265,14 +272,16 @@ def velocity_along_goal_xy_clearance_exp(
         asset_cfg=asset_cfg
     )
 
-    has_enough_clearance = clearance > tracking_cfg.min_clearance
+    has_enough_clearance = clearance > get_min_clearance(env).to(
+        device=clearance.device,
+        dtype=clearance.dtype
+    )
 
     return reward * has_enough_clearance.to(dtype=reward.dtype)
 
 
 def base_clearance_below_l2(
     env: ManagerBasedRLEnv,
-    min_clearance: float,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
@@ -299,6 +308,11 @@ def base_clearance_below_l2(
     """
 
     clearance = utils._base_clearance(env, asset_cfg)
+
+    min_clearance = get_min_clearance(env).to(
+        device=clearance.device,
+        dtype=clearance.dtype
+    )
 
     clearance_error = torch.clamp(min_clearance - clearance, min=0.0)
 

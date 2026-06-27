@@ -177,10 +177,7 @@ class ObservationsCfg:
         )
 
         desired_speed = ObsTerm(
-            func=mdp.desired_speed_obs,
-            params={
-                "target_speed": TARGET_SPEED
-            }
+            func=mdp.desired_speed_obs
         )
 
         # Joint state.
@@ -231,10 +228,7 @@ class ObservationsCfg:
         )
 
         desired_speed = ObsTerm(
-            func=mdp.desired_speed_obs,
-            params={
-                "target_speed": TARGET_SPEED
-            }
+            func=mdp.desired_speed_obs
         )
 
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
@@ -394,7 +388,6 @@ class RewardsCfg:
         func=mdp.base_clearance_below_l2,
         weight=-3.0,
         params={
-            "min_clearance": MIN_CLEARANCE,
             "asset_cfg": SceneEntityCfg("robot")
         }
     )

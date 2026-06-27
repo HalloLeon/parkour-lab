@@ -5,10 +5,10 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import quat_apply
 from isaaclab.utils.math import quat_apply_inverse
-
 import torch
 
 from . import config
+from .commands import get_min_clearance
 
 
 def _get_scene_entity_or_none(
@@ -510,8 +510,13 @@ def _root_stability_mask(
         projected_gravity_xy_norm < stability_cfg.max_projected_gravity_xy_norm
     )
 
+    min_clearance = get_min_clearance(env).to(
+        device=base_clearance.device,
+        dtype=base_clearance.dtype
+    )
+
     clearance_stable = (
-        base_clearance > stability_cfg.min_clearance
+        base_clearance > min_clearance
     )
 
     return torch.logical_and(

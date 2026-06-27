@@ -7,6 +7,7 @@ import torch
 
 from . import config
 from . import utils
+from .commands import get_target_speed
 
 
 def goal_distance_xy_w(
@@ -117,8 +118,7 @@ def foot_contact_state(
 
 
 def desired_speed_obs(
-    env: ManagerBasedRLEnv,
-    target_speed: float = 0.75
+    env: ManagerBasedRLEnv
 ) -> torch.Tensor:
     """
     Constant desired forward speed observation.
@@ -127,11 +127,7 @@ def desired_speed_obs(
         [num_envs, 1]
     """
 
-    return torch.full(
-        (env.num_envs, 1),
-        target_speed,
-        device=env.device
-    )
+    return get_target_speed(env).unsqueeze(-1)
 
 
 def height_scan_or_zeros(
