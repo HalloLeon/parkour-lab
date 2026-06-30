@@ -3,7 +3,7 @@ from isaaclab.managers import SceneEntityCfg
 import torch
 
 from .commands import set_commands
-from .commands import _all_env_ids
+from ._shared.runtime import _all_env_ids
 from .curriculums import curriculums
 from .curriculums import curriculums_config
 

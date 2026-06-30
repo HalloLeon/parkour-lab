@@ -2,15 +2,11 @@ from isaaclab.envs import ManagerBasedRLEnv
 import torch
 
 
+from ._shared.runtime import _all_env_ids
+
+
 _TARGET_SPEED_BUFFER = "_cmd_target_speed"
 _MIN_CLEARANCE_BUFFER = "_cmd_min_clearance"
-
-
-def _all_env_ids(env: ManagerBasedRLEnv, env_ids: torch.Tensor | None) -> torch.Tensor:
-    if env_ids is None:
-        return torch.arange(env.num_envs, device=env.device, dtype=torch.long)
-
-    return env_ids.to(device=env.device, dtype=torch.long)
 
 
 def ensure_parkour_commands(

@@ -2,7 +2,7 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 import torch
 
-from . import utils
+from ._shared import navigation
 
 
 def reached_goal_xy(
@@ -19,7 +19,7 @@ def reached_goal_xy(
         [num_envs]
     """
 
-    dist_to_goal = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
+    dist_to_goal = navigation._goal_distance_xy(env, goal_cfg, asset_cfg)
     reached = dist_to_goal < threshold
 
     return reached

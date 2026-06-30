@@ -12,9 +12,14 @@ from isaaclab.sensors import ContactSensor
 import torch
 
 from . import config
-from . import utils
 from .commands import get_min_clearance
 from .commands import get_target_speed
+from ._shared import contact
+from ._shared import navigation
+from ._shared import stability
+from ._shared import state
+from ._shared import terrain
+from ._shared import runtime
 
 
 def base_contact(
@@ -73,38 +78,38 @@ def goal_progress_xy_stable(
         [num_envs]
     """
 
-    current_distance = utils._goal_distance_xy(
+    current_distance = navigation._goal_distance_xy(
         env,
         goal_cfg=goal_cfg,
         asset_cfg=asset_cfg
     )
 
-    buffer_name = utils._private_buffer_name(
+    buffer_name = runtime._private_buffer_name(
         "parkour_prev_goal_distance_xy",
         goal_cfg.name,
         asset_cfg.name
     )
 
-    just_reset = utils._episode_start_mask(
+    just_reset = runtime._episode_start_mask(
         env,
         reference=current_distance,
         grace_steps=progress_cfg.reset_grace_steps
     )
 
-    progress = utils._difference_from_previous_env_buffer(
+    progress = runtime._difference_from_previous_env_buffer(
         env,
         buffer_name=buffer_name,
         current_value=current_distance,
         reset_mask=just_reset
     )
 
-    stable = utils._root_stability_mask(
+    stable = stability._root_stability_mask(
         env,
         stability_cfg=progress_cfg.stability,
         asset_cfg=asset_cfg
     )
 
-    progress = utils._gate_positive_values(
+    progress = runtime._gate_positive_values(
         values=progress,
         gate=stable
     )
@@ -140,19 +145,19 @@ def goal_heading_misalignment_l2(
         [num_envs]
     """
 
-    heading_error = utils._heading_error_to_goal_xy(
+    heading_error = navigation._heading_error_to_goal_xy(
         env,
         goal_cfg=goal_cfg,
         asset_cfg=asset_cfg
     )
 
-    velocity_along_goal = utils._velocity_along_goal_xy(
+    velocity_along_goal = navigation._velocity_along_goal_xy(
         env,
         goal_cfg=goal_cfg,
         asset_cfg=asset_cfg
     )
 
-    advancing_gate = utils._linear_ramp(
+    advancing_gate = runtime._linear_ramp(
         value=velocity_along_goal,
         lower=heading_cfg.min_forward_speed,
         upper=heading_cfg.full_forward_speed
@@ -180,7 +185,7 @@ def reached_goal_xy(
         [num_envs]
     """
 
-    dist_to_goal = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
+    dist_to_goal = navigation._goal_distance_xy(env, goal_cfg, asset_cfg)
     reached = dist_to_goal < threshold
 
     return reached.float()
@@ -208,13 +213,13 @@ def velocity_along_goal_xy_exp(
         [num_envs]
     """
 
-    velocity_along_goal = utils._velocity_along_goal_xy(
+    velocity_along_goal = navigation._velocity_along_goal_xy(
         env,
         goal_cfg=goal_cfg,
         asset_cfg=asset_cfg
     )
 
-    goal_dist_xy = utils._goal_distance_xy(env, goal_cfg, asset_cfg)
+    goal_dist_xy = navigation._goal_distance_xy(env, goal_cfg, asset_cfg)
 
     slowdown_scale = torch.clamp(
         goal_dist_xy / tracking_cfg.slow_down_distance,
@@ -267,7 +272,7 @@ def velocity_along_goal_xy_clearance_exp(
         asset_cfg=asset_cfg
     )
 
-    clearance = utils._base_clearance(
+    clearance = terrain._base_clearance(
         env,
         asset_cfg=asset_cfg
     )
@@ -307,7 +312,7 @@ def base_clearance_below_l2(
         [num_envs]
     """
 
-    clearance = utils._base_clearance(env, asset_cfg)
+    clearance = terrain._base_clearance(env, asset_cfg)
 
     min_clearance = get_min_clearance(env).to(
         device=clearance.device,
@@ -330,7 +335,7 @@ def joint_deviation_l2(
         [num_envs]
     """
 
-    joint_error = utils._selected_joint_pos_error(env, asset_cfg)
+    joint_error = state._selected_joint_pos_error(env, asset_cfg)
 
     return torch.sum(joint_error.square(), dim=-1)
 
@@ -350,7 +355,7 @@ def feet_stumble(
         [num_envs]
     """
 
-    contact_forces = utils._selected_contact_forces_w_history(
+    contact_forces = contact._selected_contact_forces_w_history(
         env,
         sensor_cfg=sensor_cfg
     )
@@ -434,15 +439,15 @@ def rapid_feet_motion_l2(
 
     motion_cfg.validate()
 
-    foot_speed = utils._selected_body_speed_w(env, asset_cfg)
+    foot_speed = state._selected_body_speed_w(env, asset_cfg)
 
-    in_contact = utils._contact_mask(
+    in_contact = contact._contact_mask(
         env,
         sensor_cfg=sensor_cfg,
         threshold=motion_cfg.contact_threshold
     )
 
-    utils._validate_matching_shape(
+    runtime._validate_matching_shape(
         in_contact,
         foot_speed,
         lhs_name="foot contact mask",
@@ -505,7 +510,7 @@ def root_chatter_l2(
         asset_cfg=asset_cfg
     )
 
-    buffer_prefix = utils._private_buffer_name(
+    buffer_prefix = runtime._private_buffer_name(
         "parkour_root_chatter",
         asset_cfg.name
     )
@@ -530,7 +535,7 @@ def root_chatter_l2(
 
     penalty = vertical_penalty + chatter_cfg.angular_weight * angular_penalty
 
-    just_reset = utils._episode_start_mask(
+    just_reset = runtime._episode_start_mask(
         env,
         reference=penalty,
         grace_steps=chatter_cfg.reset_grace_steps
@@ -575,10 +580,10 @@ class _RootChatterState:
         """
 
         return cls(
-            root_z=utils._root_height_env(env, asset_cfg),
-            root_z_vel=utils._root_lin_vel_z(env, asset_cfg),
-            projected_gravity_xy=utils._root_projected_gravity_xy(env, asset_cfg),
-            roll_pitch_rate=utils._root_roll_pitch_rate(env, asset_cfg)
+            root_z=state._root_height_env(env, asset_cfg),
+            root_z_vel=state._root_lin_vel_z(env, asset_cfg),
+            projected_gravity_xy=state._root_projected_gravity_xy(env, asset_cfg),
+            roll_pitch_rate=state._root_roll_pitch_rate(env, asset_cfg)
         )
 
     @classmethod
@@ -596,22 +601,22 @@ class _RootChatterState:
         """
 
         return cls(
-            root_z=utils._get_or_init_env_buffer(
+            root_z=runtime._get_or_init_env_buffer(
                 env,
                 f"{buffer_prefix}_root_z",
                 current.root_z
             ),
-            root_z_vel=utils._get_or_init_env_buffer(
+            root_z_vel=runtime._get_or_init_env_buffer(
                 env,
                 f"{buffer_prefix}_root_z_vel",
                 current.root_z_vel
             ),
-            projected_gravity_xy=utils._get_or_init_env_buffer(
+            projected_gravity_xy=runtime._get_or_init_env_buffer(
                 env,
                 f"{buffer_prefix}_projected_gravity_xy",
                 current.projected_gravity_xy
             ),
-            roll_pitch_rate=utils._get_or_init_env_buffer(
+            roll_pitch_rate=runtime._get_or_init_env_buffer(
                 env,
                 f"{buffer_prefix}_roll_pitch_rate",
                 current.roll_pitch_rate
@@ -628,14 +633,14 @@ class _RootChatterState:
         Store this state as the previous-step root/core state.
         """
 
-        utils._set_env_buffer(env, f"{buffer_prefix}_root_z", self.root_z)
-        utils._set_env_buffer(env, f"{buffer_prefix}_root_z_vel", self.root_z_vel)
-        utils._set_env_buffer(
+        runtime._set_env_buffer(env, f"{buffer_prefix}_root_z", self.root_z)
+        runtime._set_env_buffer(env, f"{buffer_prefix}_root_z_vel", self.root_z_vel)
+        runtime._set_env_buffer(
             env,
             f"{buffer_prefix}_projected_gravity_xy",
             self.projected_gravity_xy
         )
-        utils._set_env_buffer(
+        runtime._set_env_buffer(
             env,
             f"{buffer_prefix}_roll_pitch_rate",
             self.roll_pitch_rate

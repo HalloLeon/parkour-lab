@@ -6,8 +6,11 @@ from isaaclab.utils.math import quat_apply_inverse
 import torch
 
 from . import config
-from . import utils
 from .commands import get_target_speed
+from ._shared import contact
+from ._shared import navigation
+from ._shared import terrain
+from ._shared import runtime
 
 
 def goal_distance_xy_w(
@@ -22,7 +25,7 @@ def goal_distance_xy_w(
         [num_envs, 1]
     """
 
-    return utils._goal_distance_xy(env, goal_cfg, asset_cfg).unsqueeze(-1)
+    return navigation._goal_distance_xy(env, goal_cfg, asset_cfg).unsqueeze(-1)
 
 
 def goal_direction_body_xy(
@@ -43,7 +46,7 @@ def goal_direction_body_xy(
 
     asset: Articulation = env.scene[asset_cfg.name]
 
-    goal_vec_xy = utils._goal_vector_xy(env, goal_cfg, asset_cfg)
+    goal_vec_xy = navigation._goal_vector_xy(env, goal_cfg, asset_cfg)
 
     goal_vec_w = torch.zeros(
         (goal_vec_xy.shape[0], 3),
@@ -89,7 +92,7 @@ def base_clearance_obs(
         [num_envs, 1]
     """
 
-    return utils._base_clearance(env, asset_cfg).unsqueeze(-1)
+    return terrain._base_clearance(env, asset_cfg).unsqueeze(-1)
 
 
 def foot_contact_state(
@@ -108,13 +111,13 @@ def foot_contact_state(
         [num_envs, num_feet]
     """
 
-    contact = utils._contact_mask(
+    in_contact = contact._contact_mask(
         env,
         sensor_cfg=sensor_cfg,
-        threshold=threshold,
+        threshold=threshold
     )
 
-    return contact.float() - 0.5
+    return in_contact.float() - 0.5
 
 
 def desired_speed_obs(
@@ -149,7 +152,7 @@ def height_scan_or_zeros(
         [num_envs, obs_cfg.num_rays]
     """
 
-    sensor = utils._get_scene_entity_or_none(env, sensor_cfg.name)
+    sensor = runtime._get_scene_entity_or_none(env, sensor_cfg.name)
     asset: Articulation = env.scene[asset_cfg.name]
 
     if sensor is None:
