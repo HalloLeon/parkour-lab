@@ -23,8 +23,19 @@ def reset_goal_and_obstacle_by_level(
     It does not promote or demote levels.
     """
 
-    env_ids = utils._all_env_ids(env, env_ids)
-    levels = utils._parkour_level_index(env, curriculum_cfg)[env_ids]
+    def level_field(level, name: str):
+        """Support both config objects and Hydra/OmegaConf-converted dictionaries."""
+        return level[name] if isinstance(level, dict) else getattr(level, name)
+
+    def level_tensor(name: str, *, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+        return torch.tensor(
+            [level_field(level, name) for level in curriculum_cfg.levels],
+            device=env.device,
+            dtype=dtype
+        )
+
+    env_ids = _all_env_ids(env, env_ids)
+    levels = _parkour_level_index(env, curriculum_cfg)[env_ids]
 
     obstacle: RigidObject = env.scene[obstacle_cfg.name]
     goal: RigidObject = env.scene[goal_cfg.name]
@@ -33,35 +44,11 @@ def reset_goal_and_obstacle_by_level(
     dtype = obstacle.data.default_root_state.dtype
     num_reset_envs = env_ids.numel()
 
-    obstacle_pos_by_level = torch.tensor(
-        [level.obstacle_pos for level in curriculum_cfg.levels],
-        device=device,
-        dtype=dtype
-    )
-
-    obstacle_size_by_level = torch.tensor(
-        [level.obstacle_size for level in curriculum_cfg.levels],
-        device=device,
-        dtype=dtype
-    )
-
-    goal_pos_by_level = torch.tensor(
-        [level.goal_pos for level in curriculum_cfg.levels],
-        device=device,
-        dtype=dtype
-    )
-
-    target_speed_by_level = torch.tensor(
-        [level.target_speed for level in curriculum_cfg.levels],
-        device=device,
-        dtype=torch.float32
-    )
-
-    min_clearance_by_level = torch.tensor(
-        [level.min_clearance for level in curriculum_cfg.levels],
-        device=device,
-        dtype=torch.float32
-    )
+    obstacle_pos_by_level = level_tensor("obstacle_pos", dtype=dtype)
+    obstacle_size_by_level = level_tensor("obstacle_size", dtype=dtype)
+    goal_pos_by_level = level_tensor("goal_pos", dtype=dtype)
+    target_speed_by_level = level_tensor("target_speed")
+    min_clearance_by_level = level_tensor("min_clearance")
 
     level_obstacle_pos = obstacle_pos_by_level[levels]
     level_obstacle_size = obstacle_size_by_level[levels]
