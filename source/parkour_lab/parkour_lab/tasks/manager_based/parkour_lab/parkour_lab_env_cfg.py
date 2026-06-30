@@ -304,12 +304,22 @@ class EventCfg:
         }
     )
 
-    reset_constant_parkour_commands = EventTerm(
-        func=mdp.reset_constant_parkour_commands,
+    # reset_constant_parkour_commands = EventTerm(
+    #     func=mdp.reset_constant_parkour_commands,
+    #     mode="reset",
+    #     params={
+    #         "target_speed": TARGET_SPEED,
+    #         "min_clearance": MIN_CLEARANCE
+    #     }
+    # )
+
+    reset_goal_and_obstacle_by_level = EventTerm(
+        func=mdp.reset_goal_and_obstacle_by_level,
         mode="reset",
         params={
-            "target_speed": TARGET_SPEED,
-            "min_clearance": MIN_CLEARANCE
+            "curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM,
+            "obstacle_cfg": SceneEntityCfg("obstacle"),
+            "goal_cfg": SceneEntityCfg("goal")
         }
     )
 
