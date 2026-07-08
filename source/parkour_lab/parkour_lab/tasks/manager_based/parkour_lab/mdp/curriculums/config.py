@@ -1,6 +1,10 @@
 from dataclasses import dataclass
 
+from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg
+from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 from isaaclab.utils import configclass
+import numpy as np
+import trimesh
 
 
 @dataclass(frozen=True)
@@ -17,6 +21,33 @@ class ParkourObstacleLevelCfg:
     goal_pos: tuple[float, float, float]
     target_speed: float
     min_clearance: float
+
+    def __post_init__(self) -> None:
+        if len(self.obstacle_pos) != 3:
+            raise ValueError(f"{self.name}: obstacle_pos must have length 3.")
+
+        if len(self.obstacle_size) != 3:
+            raise ValueError(f"{self.name}: obstacle_size must have length 3.")
+
+        if len(self.goal_pos) != 3:
+            raise ValueError(f"{self.name}: goal_pos must have length 3.")
+
+        if any(size <= 0.0 for size in self.obstacle_size):
+            raise ValueError(f"{self.name}: obstacle_size entries must be positive.")
+
+        if self.target_speed < 0.0:
+            raise ValueError(f"{self.name}: target_speed must be non-negative.")
+
+        if self.min_clearance < 0.0:
+            raise ValueError(f"{self.name}: min_clearance must be non-negative.")
+
+        expected_center_z = 0.5 * self.obstacle_size[2]
+
+        if abs(self.obstacle_pos[2] - expected_center_z) > 1.0e-6:
+            raise ValueError(
+                f"{self.name}: obstacle_pos.z should be obstacle_size.z / 2 "
+                "for a box resting on ground."
+            )
 
 
 @configclass
