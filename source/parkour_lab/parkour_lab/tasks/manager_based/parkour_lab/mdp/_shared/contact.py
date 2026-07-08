@@ -4,16 +4,15 @@ from isaaclab.sensors import ContactSensor
 import torch
 
 
-def _contact_mask(
+def _force_norm_mask(
     env: ManagerBasedRLEnv,
-    sensor_cfg: SceneEntityCfg,
-    threshold: float
+    sensor_cfg: SceneEntityCfg
 ) -> torch.Tensor:
     """
-    Boolean contact mask for selected contact-sensor bodies.
+    Contact force norm for selected contact-sensor bodies.
 
     Returns:
-        [num_envs, num_bodies]
+        [num_envs, history_length, num_bodies]
     """
 
     _require_body_ids(sensor_cfg, role="contact detection")
@@ -29,8 +28,7 @@ def _contact_mask(
     # [num_envs, history_length, selected_bodies]
     force_norm = torch.linalg.norm(net_forces_w, dim=-1)
 
-    # [num_envs, selected_bodies]
-    return torch.any(force_norm > threshold, dim=1)
+    return force_norm
 
 
 def _require_body_ids(
