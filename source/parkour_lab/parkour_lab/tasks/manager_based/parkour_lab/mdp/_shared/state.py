@@ -5,7 +5,9 @@ from isaaclab.utils.math import quat_apply
 from isaaclab.utils.math import quat_apply_inverse
 import torch
 
+from .runtime import _get_or_init_env_buffer
 from .contact import _require_body_ids
+from .runtime import _set_env_buffer
 
 
 def _root_forward_xy_w(
@@ -170,6 +172,47 @@ def _root_roll_pitch_rate(
     asset: Articulation = env.scene[asset_cfg.name]
 
     return asset.data.root_ang_vel_b[:, :2]
+
+
+def _root_xy_delta_from_previous(
+    env: ManagerBasedRLEnv,
+    *,
+    buffer_name: str,
+    reset_mask: torch.Tensor,
+    asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """
+    Root XY displacement since the previous control step.
+
+    The previous-position buffer is always updated.
+
+    Returns:
+        [num_envs, 2]
+    """
+
+    current_root_xy = _root_pos_env(env, asset_cfg)[:, :2]
+
+    previous_root_xy = _get_or_init_env_buffer(
+        env,
+        name=buffer_name,
+        value=current_root_xy
+    )
+
+    root_delta_xy = current_root_xy - previous_root_xy
+
+    root_delta_xy = torch.where(
+        reset_mask[:, None],
+        torch.zeros_like(root_delta_xy),
+        root_delta_xy
+    )
+
+    _set_env_buffer(
+        env,
+        name=buffer_name,
+        value=current_root_xy
+    )
+
+    return root_delta_xy
 
 
 def _selected_body_lin_vel_w(
