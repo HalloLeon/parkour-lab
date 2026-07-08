@@ -189,6 +189,39 @@ def _heading_error_to_goal_xy(
     return torch.acos(dot)
 
 
+def _lateral_drift_to_goal_xy(
+    env: ManagerBasedRLEnv,
+    *,
+    root_delta_xy: torch.Tensor,
+    goal_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """
+    Lateral part of root displacement relative to the current goal direction.
+
+    Pure motion toward the goal has zero lateral drift.
+
+    Returns:
+        [num_envs]
+    """
+
+    goal_dir_xy = _goal_direction_xy(
+        env,
+        goal_cfg=goal_cfg,
+        asset_cfg=asset_cfg
+    )
+
+    forward_delta = torch.sum(
+        root_delta_xy * goal_dir_xy,
+        dim=-1,
+        keepdim=True
+    )
+
+    lateral_delta_xy = root_delta_xy - forward_delta * goal_dir_xy
+
+    return torch.linalg.norm(lateral_delta_xy, dim=-1)
+
+
 def _velocity_along_goal_xy(
     env: ManagerBasedRLEnv,
     goal_cfg=SceneEntityCfg("goal"),
