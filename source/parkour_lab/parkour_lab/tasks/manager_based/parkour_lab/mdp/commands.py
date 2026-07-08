@@ -117,7 +117,9 @@ def set_commands(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor | None,
     target_speed: torch.Tensor,
-    min_clearance: torch.Tensor
+    min_clearance: torch.Tensor,
+    obstacle_pos: torch.Tensor | None = None,
+    obstacle_size: torch.Tensor | None = None
 ) -> None:
     """
     Set per-environment parkour commands.
@@ -126,20 +128,6 @@ def set_commands(
     ensure_parkour_commands(env)
 
     env_ids = _all_env_ids(env, env_ids)
-
-    if not hasattr(env, _TARGET_SPEED_BUFFER) or getattr(env, _TARGET_SPEED_BUFFER).shape != (env.num_envs,):
-        env._cmd_target_speed = torch.zeros(
-            env.num_envs,
-            device=env.device,
-            dtype=torch.float32
-        )
-
-    if not hasattr(env, _MIN_CLEARANCE_BUFFER) or getattr(env, _MIN_CLEARANCE_BUFFER).shape != (env.num_envs,):
-        env._cmd_min_clearance = torch.zeros(
-            env.num_envs,
-            device=env.device,
-            dtype=torch.float32
-        )
 
     env._cmd_target_speed[env_ids] = target_speed.to(
         device=env.device,
@@ -150,6 +138,30 @@ def set_commands(
         device=env.device,
         dtype=torch.float32
     )
+
+    if obstacle_pos is not None:
+        if obstacle_pos.shape != (env_ids.numel(), 3):
+            raise ValueError(
+                f"obstacle_pos must have shape {(env_ids.numel(), 3)}, "
+                f"got {tuple(obstacle_pos.shape)}."
+            )
+
+        env._cmd_obstacle_pos[env_ids] = obstacle_pos.to(
+            device=env.device,
+            dtype=torch.float32
+        )
+
+    if obstacle_size is not None:
+        if obstacle_size.shape != (env_ids.numel(), 3):
+            raise ValueError(
+                f"obstacle_size must have shape {(env_ids.numel(), 3)}, "
+                f"got {tuple(obstacle_size.shape)}."
+            )
+
+        env._cmd_obstacle_size[env_ids] = obstacle_size.to(
+            device=env.device,
+            dtype=torch.float32
+        )
 
 
 def get_target_speed(env: ManagerBasedRLEnv) -> torch.Tensor:
