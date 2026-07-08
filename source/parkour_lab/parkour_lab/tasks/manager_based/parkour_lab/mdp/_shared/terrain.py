@@ -2,10 +2,11 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.envs import ManagerBasedRLEnv
 import torch
 
-from .runtime import _get_scene_entity_or_none
 from .state import _root_pos_env
 from .state import _root_height_env
 from .. import config
+from ..commands import get_obstacle_pos
+from ..commands import get_obstacle_size
 
 
 def _base_clearance(
@@ -28,84 +29,62 @@ def _base_clearance(
 def _box_surface_height_under_xy(
     env: ManagerBasedRLEnv,
     xy: torch.Tensor,
-    box_cfg: config.BoxSurfaceCfg
+    xy_margin: float = 0.02
 ) -> torch.Tensor:
     """
-    Height of a box top surface under a given XY position.
+    Height of the active curriculum obstacle under XY.
 
-    If the XY position is outside the box footprint, returns -inf.
-
-    Args:
-        env: The RL environment.
-        xy: Query positions in environment-local XY coordinates, shape [num_envs, 2].
-        box_cfg: Box surface configuration.
-
-    Returns:
-        [num_envs]
+    The obstacle is baked into terrain, but its active metadata is stored in
+    per-env command buffers.
     """
 
-    box = _get_scene_entity_or_none(env, box_cfg.name)
+    obstacle_pos = get_obstacle_pos(env).to(device=xy.device, dtype=xy.dtype)
+    obstacle_size = get_obstacle_size(env).to(device=xy.device, dtype=xy.dtype)
 
-    if box is None:
-        return torch.full(
-            (xy.shape[0],),
-            -torch.inf,
-            device=xy.device,
-            dtype=xy.dtype
-        )
+    half_size_x = 0.5 * obstacle_size[:, 0] + xy_margin
+    half_size_y = 0.5 * obstacle_size[:, 1] + xy_margin
+    half_size_z = 0.5 * obstacle_size[:, 2]
 
-    box_pos_env = box.data.root_pos_w - env.scene.env_origins
-
-    half_size_x = 0.5 * box_cfg.size[0] + box_cfg.xy_margin
-    half_size_y = 0.5 * box_cfg.size[1] + box_cfg.xy_margin
-    half_size_z = 0.5 * box_cfg.size[2]
-
-    dx = torch.abs(xy[:, 0] - box_pos_env[:, 0])
-    dy = torch.abs(xy[:, 1] - box_pos_env[:, 1])
+    dx = torch.abs(xy[:, 0] - obstacle_pos[:, 0])
+    dy = torch.abs(xy[:, 1] - obstacle_pos[:, 1])
 
     above_footprint = torch.logical_and(
         dx <= half_size_x,
         dy <= half_size_y
     )
 
-    box_top_height = box_pos_env[:, 2] + half_size_z
+    obstacle_top_height = obstacle_pos[:, 2] + half_size_z
 
     return torch.where(
         above_footprint,
-        box_top_height,
-        torch.full_like(box_top_height, -torch.inf)
+        obstacle_top_height,
+        torch.full_like(obstacle_top_height, -torch.inf)
     )
 
 
 def _support_surface_height_under_base(
     env: ManagerBasedRLEnv,
-    asset_cfg=SceneEntityCfg("robot")
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
-    Highest support surface directly underneath the robot base/root.
+    Support-surface height under the robot base.
 
-    Currently considers:
-      - flat ground
-      - optional box obstacle
-
-    Returns:
-        [num_envs]
+    This mirrors the active curriculum terrain metadata.
     """
 
-    root_pos = _root_pos_env(env, asset_cfg)
-    base_xy = root_pos[:, :2]
+    root_pos_env = _root_pos_env(env, asset_cfg)
 
     ground_height = torch.full(
-        (root_pos.shape[0],),
+        (env.num_envs,),
         config.GROUND_HEIGHT,
-        device=root_pos.device,
-        dtype=root_pos.dtype
+        device=root_pos_env.device,
+        dtype=root_pos_env.dtype
     )
 
     obstacle_height = _box_surface_height_under_xy(
-        env=env,
-        xy=base_xy,
-        box_cfg=config.OBSTACLE_SURFACE
+        env,
+        xy=root_pos_env[:, :2],
+        xy_margin=0.02
     )
 
     return torch.maximum(ground_height, obstacle_height)
