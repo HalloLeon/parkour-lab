@@ -174,3 +174,27 @@ def get_min_clearance(env: ManagerBasedRLEnv) -> torch.Tensor:
 
     ensure_parkour_commands(env)
     return env._cmd_min_clearance
+
+
+def get_obstacle_pos(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """
+    Current per-environment obstacle position in env-local coordinates.
+
+    Returns:
+        [num_envs, 3]
+    """
+
+    ensure_parkour_commands(env)
+    return env._cmd_obstacle_pos
+
+
+def get_obstacle_size(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """
+    Current per-environment obstacle size.
+
+    Returns:
+        [num_envs, 3]
+    """
+
+    ensure_parkour_commands(env)
+    return env._cmd_obstacle_size
