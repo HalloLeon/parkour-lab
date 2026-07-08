@@ -7,19 +7,29 @@ from ._shared.runtime import _all_env_ids
 
 _TARGET_SPEED_BUFFER = "_cmd_target_speed"
 _MIN_CLEARANCE_BUFFER = "_cmd_min_clearance"
+_OBSTACLE_POS_BUFFER = "_cmd_obstacle_pos"
+_OBSTACLE_SIZE_BUFFER = "_cmd_obstacle_size"
 
 
 def ensure_parkour_commands(
     env: ManagerBasedRLEnv,
     default_target_speed: float = 0.75,
-    default_min_clearance: float = 0.25
+    default_min_clearance: float = 0.25,
+    default_obstacle_pos: torch.Tensor | None = None,
+    default_obstacle_size: torch.Tensor | None = None
 ) -> None:
     """
     Ensure parkour command buffers exist.
 
-    This is command-state initialization, not curriculum logic.
-    Curriculum reset events may overwrite these values later.
+    This may be called during ObservationManager construction, before reset
+    events/curriculum have initialized per-env command values.
     """
+
+    if default_obstacle_pos is None:
+        default_obstacle_pos = (2.0, 0.0, 0.025)
+
+    if default_obstacle_size is None:
+        default_obstacle_size = (0.5, 1.8, 0.05)
 
     needs_target_speed = (
         not hasattr(env, _TARGET_SPEED_BUFFER)
@@ -48,6 +58,32 @@ def ensure_parkour_commands(
             device=env.device,
             dtype=torch.float32
         )
+
+    needs_obstacle_pos = (
+        not hasattr(env, _OBSTACLE_POS_BUFFER)
+        or getattr(env, _OBSTACLE_POS_BUFFER).shape != (env.num_envs, 3)
+        or getattr(env, _OBSTACLE_POS_BUFFER).device != env.device
+    )
+
+    if needs_obstacle_pos:
+        env._cmd_obstacle_pos = torch.tensor(
+            default_obstacle_pos,
+            device=env.device,
+            dtype=torch.float32
+        ).unsqueeze(0).repeat(env.num_envs, 1)
+
+    needs_obstacle_size = (
+        not hasattr(env, _OBSTACLE_SIZE_BUFFER)
+        or getattr(env, _OBSTACLE_SIZE_BUFFER).shape != (env.num_envs, 3)
+        or getattr(env, _OBSTACLE_SIZE_BUFFER).device != env.device
+    )
+
+    if needs_obstacle_size:
+        env._cmd_obstacle_size = torch.tensor(
+            default_obstacle_size,
+            device=env.device,
+            dtype=torch.float32
+        ).unsqueeze(0).repeat(env.num_envs, 1)
 
 
 def initialize_commands(
