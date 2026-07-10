@@ -9,6 +9,7 @@ from isaaclab.assets import ArticulationCfg
 from isaaclab.assets import AssetBaseCfg
 from isaaclab.assets import RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -17,10 +18,11 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg
+from isaaclab.sensors import RayCasterCfg
+from isaaclab.sensors import patterns
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab_assets.robots.unitree import UNITREE_A1_CFG
-
 from . import mdp
 
 ##
@@ -30,20 +32,7 @@ from . import mdp
 
 PARKOUR_CURRICULUM = mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM
 
-SCENE_OBSTACLE_SIZE = (
-    max(level.obstacle_size[0] for level in PARKOUR_CURRICULUM.levels),
-    max(level.obstacle_size[1] for level in PARKOUR_CURRICULUM.levels),
-    max(level.obstacle_size[2] for level in PARKOUR_CURRICULUM.levels)
-)
-
 DEFAULT_LEVEL = PARKOUR_CURRICULUM.levels[PARKOUR_CURRICULUM.initial_level]
-
-OBSTACLE_SIZE = SCENE_OBSTACLE_SIZE
-OBSTACLE_POS = (
-    DEFAULT_LEVEL.obstacle_pos[0],
-    DEFAULT_LEVEL.obstacle_pos[1],
-    DEFAULT_LEVEL.obstacle_size[2] - 0.5 * SCENE_OBSTACLE_SIZE[2]
-)
 
 GOAL_POS = (
     DEFAULT_LEVEL.goal_pos[0],
@@ -66,13 +55,15 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
 
     ground: TerrainImporterCfg = TerrainImporterCfg(
         prim_path="/World/Ground",
-        terrain_type="plane",
+        terrain_type="generator",
+        terrain_generator=mdp.curriculums_config.PARKOUR_TERRAIN_GENERATOR_CFG,
+        max_init_terrain_level=PARKOUR_CURRICULUM.initial_level,
+        collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
             static_friction=1.0,
-            dynamic_friction=1.0,
-            restitution=0.0,
+            dynamic_friction=1.0
         ),
         visual_material=sim_utils.PreviewSurfaceCfg(
             diffuse_color=(0.55, 0.48, 0.35),
@@ -80,23 +71,17 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         )
     )
 
-    obstacle: RigidObjectCfg = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Obstacle",
-        spawn=sim_utils.CuboidCfg(
-            size=OBSTACLE_SIZE,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
-            collision_props=sim_utils.CollisionPropertiesCfg()
-        ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=OBSTACLE_POS)
-    )
-
     goal: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Goal",
         spawn=sim_utils.CylinderCfg(
             radius=0.25,
             height=0.02,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
-            collision_props=None,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                kinematic_enabled=True
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                collision_enabled=False
+            ),
             visual_material=sim_utils.PreviewSurfaceCfg(
                 diffuse_color=(0.1, 0.8, 0.1)
             )
@@ -120,6 +105,97 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     base_contact: ContactSensorCfg = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/trunk",
         history_length=3
+    )
+
+    height_scanner: RayCasterCfg = RayCasterCfg(
+        # Attach the ray sensor frame to the robot trunk.
+        #
+        # The scanner moves with the robot. Because the prim path is the trunk,
+        # the scan pattern is defined relative to the trunk frame, then transformed
+        # into the world during simulation.
+        prim_path="{ENV_REGEX_NS}/Robot/trunk",
+
+        # Local offset of the ray-pattern origin relative to the trunk frame.
+        #
+        # x = 0.375:
+        #   Shift the scan grid forward in front of the robot. This is useful for
+        #   parkour/obstacle traversal because we care more about upcoming terrain
+        #   than terrain behind the robot.
+        #
+        # y = 0.0:
+        #   Keep the scan centered laterally.
+        #
+        # z = 20.0:
+        #   Start the rays high above the robot/terrain so all downward rays can
+        #   safely hit the terrain mesh.
+        offset=RayCasterCfg.OffsetCfg(
+            pos=(0.375, 0.0, 20.0)
+        ),
+
+        # Align the ray pattern with the robot's yaw only.
+        #
+        # This means:
+        #   - if the robot turns left/right, the scan turns with it,
+        #   - if the robot rolls or pitches, the scan does NOT tilt with the body.
+        #
+        # This is usually what we want for terrain height scans, because terrain
+        # perception should stay horizontal in the world instead of rolling/pitching
+        # with the trunk.
+        ray_alignment="yaw",
+
+        pattern_cfg=patterns.GridPatternCfg(
+            # Distance between neighboring ray sample points.
+            #
+            # Smaller resolution:
+            #   more rays, better terrain detail, more computation.
+            #
+            # Larger resolution:
+            #   fewer rays, cheaper, less terrain detail.
+            resolution=0.15,
+
+            # Physical size of the scan grid in meters: (x_size, y_size).
+            #
+            # x_size = 1.65:
+            #   scan covers roughly 1.65 m in the robot-forward direction.
+            #
+            # y_size = 1.50:
+            #   scan covers roughly 1.50 m sideways.
+            #
+            # With resolution 0.15, this should produce:
+            #   x samples: 12
+            #   y samples: 11
+            #   total rays: 12 * 11 = 132
+            #
+            # This matches HeightScanObservationCfg(num_rays=132).
+            size=(1.65, 1.50),
+
+            # Direction of each ray in the scanner frame.
+            #
+            # (0, 0, -1) means all rays point downward.
+            direction=(0.0, 0.0, -1.0)
+        ),
+
+        # The mesh that the rays are allowed to hit.
+        #
+        # Important:
+        #   RayCasterCfg supports raycasting against the terrain mesh.
+        #   The obstacle is baked into /World/Ground,
+        #   so this scanner can see both the flat ground and the obstacle.
+        #
+        # If the obstacle were a separate RigidObject, this would NOT see it.
+        mesh_prim_paths=["/World/Ground"],
+
+        # Maximum ray length.
+        #
+        # Rays start 20 m above the trunk and point downward.
+        # max_distance=25.0 is enough to reach the terrain even if the robot moves
+        # over small height variations.
+        max_distance=25.0,
+
+        # Optional:
+        # Set this to True temporarily when debugging to visualize the rays.
+        # Turn it off for training because visualization is expensive.
+        # debug_vis=True
     )
 
     dome_light: AssetBaseCfg = AssetBaseCfg(
@@ -256,6 +332,19 @@ class ObservationsCfg:
             }
         )
 
+        height_scan = ObsTerm(
+            func=mdp.height_scan_or_zeros,
+            params={
+                "obs_cfg": mdp.config.HeightScanObservationCfg(
+                    num_rays=132,
+                    vertical_offset=0.30,
+                    clip=0.50
+                ),
+                "sensor_cfg": SceneEntityCfg("height_scanner"),
+                "asset_cfg": SceneEntityCfg("robot")
+            }
+        )
+
         def __post_init__(self):
             self.enable_corruption = False
             self.concatenate_terms = True
@@ -267,6 +356,15 @@ class ObservationsCfg:
 @configclass
 class EventCfg:
     """Configuration for events."""
+
+    reset_goal_and_commands = EventTerm(
+        func=mdp.reset_goal_and_commands_from_terrain_level,
+        mode="reset",
+        params={
+            "curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM,
+            "goal_cfg": SceneEntityCfg("goal")
+        }
+    )
 
     # Reset the robot base at the beginning of each episode.
     #
@@ -313,13 +411,35 @@ class EventCfg:
     #     }
     # )
 
-    reset_goal_and_obstacle_by_level = EventTerm(
-        func=mdp.reset_goal_and_obstacle_by_level,
-        mode="reset",
+    # reset_goal_and_obstacle_by_level = EventTerm(
+    #     func=mdp.reset_goal_and_obstacle_by_level,
+    #     mode="reset",
+    #     params={
+    #         "curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM,
+    #         "obstacle_cfg": SceneEntityCfg("obstacle"),
+    #         "goal_cfg": SceneEntityCfg("goal")
+    #     }
+    # )
+
+    # update_levels_and_reset_goal_obstacle = EventTerm(
+    #     func=mdp.update_levels_and_reset_goal_obstacle_by_level,
+    #     mode="reset",
+    #     params={
+    #         "curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM,
+    #         "obstacle_cfg": SceneEntityCfg("obstacle"),
+    #         "goal_cfg": SceneEntityCfg("goal")
+    #     }
+    # )
+
+
+@configclass
+class CurriculumCfg:
+    """Curriculum terms."""
+
+    terrain_levels = CurrTerm(
+        func=mdp.parkour_terrain_levels,
         params={
-            "curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM,
-            "obstacle_cfg": SceneEntityCfg("obstacle"),
-            "goal_cfg": SceneEntityCfg("goal")
+            "curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM
         }
     )
 
@@ -349,6 +469,10 @@ class RewardsCfg:
             "progress_cfg": mdp.config.StableGoalProgressCfg(
                 progress_scale=0.03,
                 reset_grace_steps=1,
+                max_positive_reward=2.0,
+                max_negative_penalty=2.0,
+                lateral_drift_weight=0.25,
+                max_lateral_penalty=1.0,
                 stability=mdp.config.RootStabilityCfg(
                     max_roll_pitch_ang_speed=4.0,
                     max_projected_gravity_xy_norm=0.75,
@@ -376,7 +500,7 @@ class RewardsCfg:
 
     reached_goal_xy = RewTerm(
         func=mdp.reached_goal_xy,
-        weight=100.0,
+        weight=300.0,
         params={
             "threshold": 0.30,
             "goal_cfg": SceneEntityCfg("goal"),
@@ -516,7 +640,7 @@ class TerminationsCfg:
     )
 
     trunk_contact = DoneTerm(
-        func=mdp.illegal_contact,
+        func=mdp.base_contact_done,
         params={
             "threshold": 1.0,
             "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk")
@@ -538,6 +662,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     events: EventCfg = EventCfg()
+    curriculum: CurriculumCfg = CurriculumCfg()
 
     # MDP settings.
     rewards: RewardsCfg = RewardsCfg()
@@ -570,3 +695,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
 
         if self.scene.base_contact is not None:
             self.scene.base_contact.update_period = self.sim.dt
+
+        # Height scanner updates at policy rate.
+        if self.scene.height_scanner is not None:
+            self.scene.height_scanner.update_period = self.decimation * self.sim.dt
