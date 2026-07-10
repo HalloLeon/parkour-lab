@@ -7,17 +7,13 @@
 """This sub-module contains the functions that are specific to the environment."""
 
 from isaaclab.envs.mdp import *  # noqa: F401, F403
-
 from isaaclab_tasks.manager_based.locomotion.velocity.mdp import *  # noqa: F401, F403
 
+from . import config as config
 from .commands import *  # noqa: F401, F403
-
+from .curriculums import curriculums_config as curriculums_config
 from .curriculums.curriculums import parkour_terrain_levels
-
 from .events import *  # noqa: F401, F403
-
 from .observations import *  # noqa: F401, F403
-
 from .rewards import *  # noqa: F401, F403
-
 from .terminations import *  # noqa: F401, F403

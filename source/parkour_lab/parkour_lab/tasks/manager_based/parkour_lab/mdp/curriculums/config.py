@@ -1,11 +1,14 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
 
+import numpy as np
+import trimesh
 from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg
 from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 from isaaclab.utils import configclass
-import numpy as np
-import trimesh
+
+from .difficulty import difficulty_to_level
 
 
 @dataclass(frozen=True)
@@ -45,10 +48,7 @@ class ParkourObstacleLevelCfg:
         expected_center_z = 0.5 * self.obstacle_size[2]
 
         if abs(self.obstacle_pos[2] - expected_center_z) > 1.0e-6:
-            raise ValueError(
-                f"{self.name}: obstacle_pos.z should be obstacle_size.z / 2 "
-                "for a box resting on ground."
-            )
+            raise ValueError(f"{self.name}: obstacle_pos.z should be obstacle_size.z / 2 for a box resting on ground.")
 
 
 @configclass
@@ -66,7 +66,7 @@ class ParkourCurriculumCfg:
             obstacle_size=(0.5, 1.8, 0.02),
             goal_pos=(4.0, 0.0, 0.01),
             target_speed=0.60,
-            min_clearance=0.24
+            min_clearance=0.24,
         ),
         ParkourObstacleLevelCfg(
             name="level_1_low_step",
@@ -74,7 +74,7 @@ class ParkourCurriculumCfg:
             obstacle_size=(0.5, 1.8, 0.05),
             goal_pos=(4.0, 0.0, 0.01),
             target_speed=0.70,
-            min_clearance=0.25
+            min_clearance=0.25,
         ),
         ParkourObstacleLevelCfg(
             name="level_2_medium_step",
@@ -82,7 +82,7 @@ class ParkourCurriculumCfg:
             obstacle_size=(0.5, 1.8, 0.08),
             goal_pos=(4.0, 0.0, 0.01),
             target_speed=0.75,
-            min_clearance=0.26
+            min_clearance=0.26,
         ),
         ParkourObstacleLevelCfg(
             name="level_3_higher_step",
@@ -90,27 +90,50 @@ class ParkourCurriculumCfg:
             obstacle_size=(0.5, 1.8, 0.12),
             goal_pos=(4.2, 0.0, 0.01),
             target_speed=0.80,
-            min_clearance=0.27
-        )
+            min_clearance=0.27,
+        ),
     )
 
     initial_level: int = 1
-    distribute_initial_levels: bool = False
+    # Balance the initial population over levels 0..initial_level. This gives
+    # PPO easy examples while avoiding a synchronized single-level population.
+    distribute_initial_levels: bool = True
     max_level: int = 3
 
     # Adaptive curriculum.
     promote_on_success: bool = True
-    demote_on_base_contact: bool = True
+    demote_on_failure: bool = True
 
     success_threshold: float = 0.30
     successes_to_promote: int = 2  # Avoids promotion from one lucky success
-    failures_to_demote: int = 1  # Quickly makes the task easier after trunk-contact failure
+    failures_to_demote: int = 2  # Hysteresis prevents oscillating after one poor episode
 
     base_contact_threshold: float = 1.0
 
     def __post_init__(self) -> None:
+        self.validate_configuration()
+
+    def validate_configuration(self) -> None:
+        """Validate ordering, bounds, and curriculum transition settings."""
+
         if len(self.levels) == 0:
             raise ValueError("ParkourCurriculumCfg.levels must not be empty.")
+
+        names = [level.name for level in self.levels]
+        if len(names) != len(set(names)):
+            raise ValueError("Parkour curriculum level names must be unique.")
+
+        obstacle_heights = [level.obstacle_size[2] for level in self.levels]
+        target_speeds = [level.target_speed for level in self.levels]
+        min_clearances = [level.min_clearance for level in self.levels]
+
+        for field_name, values in (
+            ("obstacle height", obstacle_heights),
+            ("target speed", target_speeds),
+            ("minimum clearance", min_clearances),
+        ):
+            if any(current > following for current, following in zip(values, values[1:])):
+                raise ValueError(f"Parkour curriculum {field_name} must be non-decreasing.")
 
         if self.initial_level < 0 or self.initial_level >= len(self.levels):
             raise ValueError("initial_level is out of range.")
@@ -132,72 +155,49 @@ class ParkourCurriculumCfg:
 
 
 DEFAULT_PARKOUR_CURRICULUM = ParkourCurriculumCfg()
-DEFAULT_PARKOUR_LEVEL = DEFAULT_PARKOUR_CURRICULUM.levels[
-    DEFAULT_PARKOUR_CURRICULUM.initial_level
-]
 
 
-def parkour_box_terrain(
-    difficulty: float,
-    cfg: ParkourBoxTerrainCfg
-) -> tuple[list[trimesh.Trimesh], np.ndarray]:
+def parkour_box_terrain(difficulty: float, cfg: ParkourBoxTerrainCfg) -> tuple[list[trimesh.Trimesh], np.ndarray]:
     """
-    Generate one terrain tile with one obstacle.
+    Generate one terrain tile from the authoritative discrete level table.
 
-    difficulty in [0, 1]:
-        0 -> easiest obstacle height
-        1 -> hardest obstacle height
+    TerrainGenerator adds small within-row difficulty jitter. Converting that
+    value back to a discrete bin ensures every tile in row N has exactly the
+    geometry and command metadata of logical level N.
     """
 
-    difficulty = float(np.clip(difficulty, 0.0, 1.0))
-
-    obstacle_height = (
-        cfg.min_obstacle_height
-        + difficulty * (cfg.max_obstacle_height - cfg.min_obstacle_height)
-    )
-
-    obstacle_size = (
-        cfg.obstacle_length,
-        cfg.obstacle_width,
-        obstacle_height
-    )
-
-    obstacle_pos = (
-        cfg.obstacle_x,
-        cfg.obstacle_y,
-        0.5 * obstacle_height
-    )
+    level = cfg.levels[difficulty_to_level(difficulty, len(cfg.levels))]
+    obstacle_size = level.obstacle_size
+    obstacle_pos = level.obstacle_pos
 
     size_x, size_y = cfg.size
 
-    terrain_local_center = np.array(
-        [0.5 * size_x, 0.5 * size_y, 0.0],
-        dtype=np.float32
-    )
+    terrain_local_center = np.array([0.5 * size_x, 0.5 * size_y, 0.0], dtype=np.float32)
 
     meshes: list[trimesh.Trimesh] = []
 
+    # Create the ground as a rectangular box spanning the complete terrain
+    # tile. ``extents`` contains the box's full dimensions along X, Y, and Z:
+    #   [tile length, tile width, ground thickness].
+    #
+    # Trimesh creates a box around its center. Move that center to the tile's
+    # XY center and to z = -ground_thickness / 2. This places the box entirely
+    # below z = 0, with its top surface exactly at z = 0 for the robot to stand
+    # on. Without the negative half-thickness offset, half of the ground would
+    # protrude above the intended terrain height.
     ground_mesh = trimesh.creation.box(
         extents=(size_x, size_y, cfg.ground_thickness),
         transform=trimesh.transformations.translation_matrix(
-            (
-                terrain_local_center[0],
-                terrain_local_center[1],
-                -0.5 * cfg.ground_thickness
-            )
-        )
+            (terrain_local_center[0], terrain_local_center[1], -0.5 * cfg.ground_thickness)
+        ),
     )
     meshes.append(ground_mesh)
 
     obstacle_mesh = trimesh.creation.box(
         extents=obstacle_size,
         transform=trimesh.transformations.translation_matrix(
-            (
-                terrain_local_center[0] + obstacle_pos[0],
-                terrain_local_center[1] + obstacle_pos[1],
-                obstacle_pos[2]
-            )
-        )
+            (terrain_local_center[0] + obstacle_pos[0], terrain_local_center[1] + obstacle_pos[1], obstacle_pos[2])
+        ),
     )
     meshes.append(obstacle_mesh)
 
@@ -212,13 +212,7 @@ class ParkourBoxTerrainCfg(SubTerrainBaseCfg):
 
     function = parkour_box_terrain
 
-    min_obstacle_height: float = 0.02
-    max_obstacle_height: float = 0.12
-
-    obstacle_x: float = 2.0
-    obstacle_y: float = 0.0
-    obstacle_length: float = 0.5
-    obstacle_width: float = 1.8
+    levels: tuple[ParkourObstacleLevelCfg, ...] = DEFAULT_PARKOUR_CURRICULUM.levels
 
     ground_thickness: float = 0.05
 
@@ -229,19 +223,14 @@ PARKOUR_TERRAIN_GENERATOR_CFG = TerrainGeneratorCfg(
     # With curriculum=True, terrain rows correspond to difficulty levels.
     # In our case, each row is one parkour curriculum level.
     curriculum=True,
-
     # Physical size of one terrain tile in meters: (x_size, y_size).
     size=(8.0, 4.0),
-
     # Extra terrain border around the whole generated terrain.
     border_width=5.0,
-
     # One terrain row per curriculum level.
-    num_rows=10,
-
+    num_rows=len(DEFAULT_PARKOUR_CURRICULUM.levels),
     # Number of terrain columns per curriculum row.
     num_cols=40,
-
     # Horizontal resolution used by height-field/mesh terrain utilities.
     #
     # For this custom trimesh terrain, this is not the main geometric control;
@@ -249,26 +238,22 @@ PARKOUR_TERRAIN_GENERATOR_CFG = TerrainGeneratorCfg(
     #
     # Keep it reasonably small and standard.
     horizontal_scale=0.05,
-
     # Vertical resolution used by terrain utilities.
     #
     # Again, for this custom box mesh, the obstacle heights are defined directly
     # by obstacle_size. This value is still required by TerrainGeneratorCfg.
     vertical_scale=0.005,
-
     # Slope threshold used by some terrain-generation utilities to correct or
     # simplify steep surfaces.
     #
     # Our terrain has flat ground and vertical box sides, so this is not the
     # primary control of obstacle geometry. Keep it at a conservative default.
     slope_threshold=0.75,
-
     # Disable terrain cache.
     #
     # use_cache=False is useful while actively developing terrain code, because
     # changes take effect immediately.
     use_cache=False,
-
     # Dictionary of sub-terrain types.
     #
     # We only define one sub-terrain type, "parkour_box".
@@ -276,14 +261,7 @@ PARKOUR_TERRAIN_GENERATOR_CFG = TerrainGeneratorCfg(
     # ParkourBoxTerrainCfg.
     sub_terrains={
         "parkour_box": ParkourBoxTerrainCfg(
-            proportion=1.0,
-            min_obstacle_height=0.02,
-            max_obstacle_height=0.12,
-            obstacle_x=2.0,
-            obstacle_y=0.0,
-            obstacle_length=0.5,
-            obstacle_width=1.8,
-            ground_thickness=0.05
+            proportion=1.0, levels=DEFAULT_PARKOUR_CURRICULUM.levels, ground_thickness=0.05
         )
-    }
+    },
 )

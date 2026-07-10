@@ -1,40 +1,10 @@
-from dataclasses import dataclass
 from dataclasses import field
 
 from isaaclab.utils import configclass
 
-from .curriculums import curriculums_config
-
-
 GROUND_HEIGHT = 0.0
 
 # ==================== OBSERVATION CONFIGURATIONS ====================
-
-
-@configclass
-class GoalSlotsObservationCfg:
-    """
-    Configuration for fixed-size goal-slot observations.
-
-    Each goal slot contains:
-        direction_body_xy: 2
-        normalized_distance: 1
-
-    So each slot contributes 3 values.
-    """
-
-    num_slots: int = 2
-    max_distance: float = 5.0
-
-    def __post_init__(self) -> None:
-        if self.num_slots <= 0:
-            raise ValueError("num_slots must be positive.")
-
-        if self.max_distance <= 0.0:
-            raise ValueError("max_distance must be positive.")
-
-
-DEFAULT_GOAL_SLOTS_OBSERVATION = GoalSlotsObservationCfg()
 
 
 @configclass
@@ -63,26 +33,6 @@ DEFAULT_HEIGHT_SCAN_OBSERVATION = HeightScanObservationCfg()
 # ==================== REWARD CONFIGURATIONS ====================
 
 
-@dataclass(frozen=True)
-class BoxSurfaceCfg:
-    """Configuration for a box-shaped support surface."""
-
-    name: str
-    size: tuple[float, float, float]
-    xy_margin: float = 0.02
-
-
-OBSTACLE_SURFACE = BoxSurfaceCfg(
-    name="obstacle",
-    size=(
-        max(level.obstacle_size[0] for level in curriculums_config.DEFAULT_PARKOUR_CURRICULUM.levels),
-        max(level.obstacle_size[1] for level in curriculums_config.DEFAULT_PARKOUR_CURRICULUM.levels),
-        max(level.obstacle_size[2] for level in curriculums_config.DEFAULT_PARKOUR_CURRICULUM.levels)
-    ),
-    xy_margin=0.02
-)
-
-
 @configclass
 class FeetMotionCfg:
     """
@@ -97,7 +47,12 @@ class FeetMotionCfg:
     contact_threshold: float = 1.0
     max_penalty_per_foot: float = 4.0
 
-    def validate(self) -> None:
+    def __post_init__(self) -> None:
+        self.validate_configuration()
+
+    def validate_configuration(self) -> None:
+        """Validate contact-aware foot-motion limits."""
+
         if self.max_stance_speed < 0.0:
             raise ValueError("max_stance_speed must be non-negative.")
 
@@ -150,9 +105,7 @@ class GoalHeadingCfg:
             raise ValueError("min_forward_speed must be non-negative.")
 
         if self.full_forward_speed <= self.min_forward_speed:
-            raise ValueError(
-                "full_forward_speed must be greater than min_forward_speed."
-            )
+            raise ValueError("full_forward_speed must be greater than min_forward_speed.")
 
 
 DEFAULT_GOAL_HEADING = GoalHeadingCfg()
@@ -190,6 +143,7 @@ class GoalVelocityCfg:
 
         if self.min_clearance < 0.0:
             raise ValueError("min_clearance must be non-negative.")
+
 
 
 DEFAULT_GOAL_VELOCITY = GoalVelocityCfg()
@@ -267,6 +221,7 @@ class RootStabilityCfg:
 
         if self.min_clearance < 0.0:
             raise ValueError("min_clearance must be non-negative.")
+
 
 
 @configclass

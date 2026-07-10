@@ -5,10 +5,8 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import ArticulationCfg
-from isaaclab.assets import AssetBaseCfg
-from isaaclab.assets import RigidObjectCfg
-from isaaclab.envs import ManagerBasedRLEnvCfg
+from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
+from isaaclab.envs import ManagerBasedRLEnvCfg, ViewerCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
@@ -17,12 +15,11 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sensors import ContactSensorCfg
-from isaaclab.sensors import RayCasterCfg
-from isaaclab.sensors import patterns
+from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab_assets.robots.unitree import UNITREE_A1_CFG
+
 from . import mdp
 
 ##
@@ -34,11 +31,7 @@ PARKOUR_CURRICULUM = mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM
 
 DEFAULT_LEVEL = PARKOUR_CURRICULUM.levels[PARKOUR_CURRICULUM.initial_level]
 
-GOAL_POS = (
-    DEFAULT_LEVEL.goal_pos[0],
-    DEFAULT_LEVEL.goal_pos[1],
-    DEFAULT_LEVEL.goal_pos[2]
-)
+GOAL_POS = DEFAULT_LEVEL.goal_pos
 
 TARGET_SPEED = DEFAULT_LEVEL.target_speed
 MIN_CLEARANCE = DEFAULT_LEVEL.min_clearance
@@ -63,12 +56,9 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
             static_friction=1.0,
-            dynamic_friction=1.0
+            dynamic_friction=1.0,
         ),
-        visual_material=sim_utils.PreviewSurfaceCfg(
-            diffuse_color=(0.55, 0.48, 0.35),
-            roughness=0.8
-        )
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.55, 0.48, 0.35), roughness=0.8),
     )
 
     goal: RigidObjectCfg = RigidObjectCfg(
@@ -76,25 +66,17 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.CylinderCfg(
             radius=0.25,
             height=0.02,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True
-            ),
-            collision_props=sim_utils.CollisionPropertiesCfg(
-                collision_enabled=False
-            ),
-            visual_material=sim_utils.PreviewSurfaceCfg(
-                diffuse_color=(0.1, 0.8, 0.1)
-            )
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
+            collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.8, 0.1)),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=GOAL_POS)
+        init_state=RigidObjectCfg.InitialStateCfg(pos=GOAL_POS),
     )
 
     robot: ArticulationCfg = UNITREE_A1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     feet_contact: ContactSensorCfg = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/.*_foot",
-        history_length=3,
-        track_air_time=True
+        prim_path="{ENV_REGEX_NS}/Robot/.*_foot", history_length=3, track_air_time=True
     )
 
     leg_contact: ContactSensorCfg = ContactSensorCfg(
@@ -102,10 +84,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         history_length=3,
     )
 
-    base_contact: ContactSensorCfg = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/trunk",
-        history_length=3
-    )
+    base_contact: ContactSensorCfg = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/trunk", history_length=3)
 
     height_scanner: RayCasterCfg = RayCasterCfg(
         # Attach the ray sensor frame to the robot trunk.
@@ -114,7 +93,6 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         # the scan pattern is defined relative to the trunk frame, then transformed
         # into the world during simulation.
         prim_path="{ENV_REGEX_NS}/Robot/trunk",
-
         # Local offset of the ray-pattern origin relative to the trunk frame.
         #
         # x = 0.375:
@@ -128,10 +106,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         # z = 20.0:
         #   Start the rays high above the robot/terrain so all downward rays can
         #   safely hit the terrain mesh.
-        offset=RayCasterCfg.OffsetCfg(
-            pos=(0.375, 0.0, 20.0)
-        ),
-
+        offset=RayCasterCfg.OffsetCfg(pos=(0.375, 0.0, 20.0)),
         # Align the ray pattern with the robot's yaw only.
         #
         # This means:
@@ -142,7 +117,6 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         # perception should stay horizontal in the world instead of rolling/pitching
         # with the trunk.
         ray_alignment="yaw",
-
         pattern_cfg=patterns.GridPatternCfg(
             # Distance between neighboring ray sample points.
             #
@@ -152,7 +126,6 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
             # Larger resolution:
             #   fewer rays, cheaper, less terrain detail.
             resolution=0.15,
-
             # Physical size of the scan grid in meters: (x_size, y_size).
             #
             # x_size = 1.65:
@@ -168,13 +141,11 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
             #
             # This matches HeightScanObservationCfg(num_rays=132).
             size=(1.65, 1.50),
-
             # Direction of each ray in the scanner frame.
             #
             # (0, 0, -1) means all rays point downward.
-            direction=(0.0, 0.0, -1.0)
+            direction=(0.0, 0.0, -1.0),
         ),
-
         # The mesh that the rays are allowed to hit.
         #
         # Important:
@@ -184,14 +155,12 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         #
         # If the obstacle were a separate RigidObject, this would NOT see it.
         mesh_prim_paths=["/World/Ground"],
-
         # Maximum ray length.
         #
         # Rays start 20 m above the trunk and point downward.
         # max_distance=25.0 is enough to reach the terrain even if the robot moves
         # over small height variations.
         max_distance=25.0,
-
         # Optional:
         # Set this to True temporarily when debugging to visualize the rays.
         # Turn it off for training because visualization is expensive.
@@ -199,8 +168,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     )
 
     dome_light: AssetBaseCfg = AssetBaseCfg(
-        prim_path="/World/DomeLight",
-        spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0)
+        prim_path="/World/DomeLight", spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0)
     )
 
 
@@ -238,23 +206,15 @@ class ObservationsCfg:
         # Goal-relative task information.
         goal_direction_body_xy = ObsTerm(
             func=mdp.goal_direction_body_xy,
-            params={
-                "goal_cfg": SceneEntityCfg("goal"),
-                "asset_cfg": SceneEntityCfg("robot")
-            }
+            params={"goal_cfg": SceneEntityCfg("goal"), "asset_cfg": SceneEntityCfg("robot")},
         )
 
         goal_distance_xy = ObsTerm(
             func=mdp.goal_distance_xy_w,
-            params={
-                "goal_cfg": SceneEntityCfg("goal"),
-                "asset_cfg": SceneEntityCfg("robot")
-            }
+            params={"goal_cfg": SceneEntityCfg("goal"), "asset_cfg": SceneEntityCfg("robot")},
         )
 
-        desired_speed = ObsTerm(
-            func=mdp.desired_speed_obs
-        )
+        desired_speed = ObsTerm(func=mdp.desired_speed_obs)
 
         # Joint state.
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
@@ -266,16 +226,10 @@ class ObservationsCfg:
         # Contact state.
         foot_contacts = ObsTerm(
             func=mdp.foot_contact_state,
-            params={
-                "threshold": 1.0,
-                "sensor_cfg": SceneEntityCfg(
-                    "feet_contact",
-                    body_names=".*_foot"
-                )
-            }
+            params={"threshold": 1.0, "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot")},
         )
 
-        def __post_init__(self):
+        def __post_init__(self) -> None:
             self.enable_corruption = False
             self.concatenate_terms = True
 
@@ -289,23 +243,15 @@ class ObservationsCfg:
 
         goal_direction_body_xy = ObsTerm(
             func=mdp.goal_direction_body_xy,
-            params={
-                "goal_cfg": SceneEntityCfg("goal"),
-                "asset_cfg": SceneEntityCfg("robot")
-            }
+            params={"goal_cfg": SceneEntityCfg("goal"), "asset_cfg": SceneEntityCfg("robot")},
         )
 
         goal_distance_xy = ObsTerm(
             func=mdp.goal_distance_xy_w,
-            params={
-                "goal_cfg": SceneEntityCfg("goal"),
-                "asset_cfg": SceneEntityCfg("robot")
-            }
+            params={"goal_cfg": SceneEntityCfg("goal"), "asset_cfg": SceneEntityCfg("robot")},
         )
 
-        desired_speed = ObsTerm(
-            func=mdp.desired_speed_obs
-        )
+        desired_speed = ObsTerm(func=mdp.desired_speed_obs)
 
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
         joint_vel = ObsTerm(func=mdp.joint_vel_rel)
@@ -313,39 +259,24 @@ class ObservationsCfg:
 
         foot_contacts = ObsTerm(
             func=mdp.foot_contact_state,
-            params={
-                "threshold": 1.0,
-                "sensor_cfg": SceneEntityCfg(
-                    "feet_contact",
-                    body_names=".*_foot"
-                )
-            }
+            params={"threshold": 1.0, "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot")},
         )
 
         # Privileged state.
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
 
-        base_clearance = ObsTerm(
-            func=mdp.base_clearance_obs,
-            params={
-                "asset_cfg": SceneEntityCfg("robot")
-            }
-        )
+        base_clearance = ObsTerm(func=mdp.base_clearance_obs, params={"asset_cfg": SceneEntityCfg("robot")})
 
         height_scan = ObsTerm(
             func=mdp.height_scan_or_zeros,
             params={
-                "obs_cfg": mdp.config.HeightScanObservationCfg(
-                    num_rays=132,
-                    vertical_offset=0.30,
-                    clip=0.50
-                ),
+                "obs_cfg": mdp.config.HeightScanObservationCfg(num_rays=132, vertical_offset=0.30, clip=0.50),
                 "sensor_cfg": SceneEntityCfg("height_scanner"),
-                "asset_cfg": SceneEntityCfg("robot")
-            }
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
         )
 
-        def __post_init__(self):
+        def __post_init__(self) -> None:
             self.enable_corruption = False
             self.concatenate_terms = True
 
@@ -357,13 +288,22 @@ class ObservationsCfg:
 class EventCfg:
     """Configuration for events."""
 
+    initialize_terrain_levels = EventTerm(
+        func=mdp.initialize_parkour_terrain_levels,
+        mode="startup",
+        params={
+            "curriculum_cfg": PARKOUR_CURRICULUM,
+            "fixed_level": None,
+        },
+    )
+
     reset_goal_and_commands = EventTerm(
         func=mdp.reset_goal_and_commands_from_terrain_level,
         mode="reset",
         params={
-            "curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM,
-            "goal_cfg": SceneEntityCfg("goal")
-        }
+            "curriculum_cfg": PARKOUR_CURRICULUM,
+            "goal_cfg": SceneEntityCfg("goal"),
+        },
     )
 
     # Reset the robot base at the beginning of each episode.
@@ -376,60 +316,24 @@ class EventCfg:
         func=mdp.reset_root_state_uniform,
         mode="reset",
         params={
-            "pose_range": {
-                "x": (0.0, 0.0),
-                "y": (0.0, 0.0),
-                "yaw": (0.0, 0.0)
-            },
+            "pose_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0)},
             "velocity_range": {
                 "x": (0.0, 0.0),
                 "y": (0.0, 0.0),
                 "z": (0.0, 0.0),
                 "roll": (0.0, 0.0),
                 "pitch": (0.0, 0.0),
-                "yaw": (0.0, 0.0)
-            }
-        }
+                "yaw": (0.0, 0.0),
+            },
+        },
     )
 
     # Reset joints to their default positions.
     reset_joints = EventTerm(
         func=mdp.reset_joints_by_scale,
         mode="reset",
-        params={
-            "position_range": (1.0, 1.0),  # default_joint_pos
-            "velocity_range": (0.0, 0.0)
-        }
+        params={"position_range": (1.0, 1.0), "velocity_range": (0.0, 0.0)},  # default_joint_pos
     )
-
-    # reset_constant_parkour_commands = EventTerm(
-    #     func=mdp.reset_constant_parkour_commands,
-    #     mode="reset",
-    #     params={
-    #         "target_speed": TARGET_SPEED,
-    #         "min_clearance": MIN_CLEARANCE
-    #     }
-    # )
-
-    # reset_goal_and_obstacle_by_level = EventTerm(
-    #     func=mdp.reset_goal_and_obstacle_by_level,
-    #     mode="reset",
-    #     params={
-    #         "curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM,
-    #         "obstacle_cfg": SceneEntityCfg("obstacle"),
-    #         "goal_cfg": SceneEntityCfg("goal")
-    #     }
-    # )
-
-    # update_levels_and_reset_goal_obstacle = EventTerm(
-    #     func=mdp.update_levels_and_reset_goal_obstacle_by_level,
-    #     mode="reset",
-    #     params={
-    #         "curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM,
-    #         "obstacle_cfg": SceneEntityCfg("obstacle"),
-    #         "goal_cfg": SceneEntityCfg("goal")
-    #     }
-    # )
 
 
 @configclass
@@ -437,10 +341,7 @@ class CurriculumCfg:
     """Curriculum terms."""
 
     terrain_levels = CurrTerm(
-        func=mdp.parkour_terrain_levels,
-        params={
-            "curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM
-        }
+        func=mdp.parkour_terrain_levels, params={"curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM}
     )
 
 
@@ -455,11 +356,11 @@ class RewardsCfg:
                 target_speed=TARGET_SPEED,
                 speed_tracking_scale=0.25,
                 slow_down_distance=1.25,
-                min_clearance=MIN_CLEARANCE
+                min_clearance=MIN_CLEARANCE,
             ),
             "goal_cfg": SceneEntityCfg("goal"),
-            "asset_cfg": SceneEntityCfg("robot")
-        }
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
     )
 
     goal_progress_xy = RewTerm(
@@ -474,14 +375,12 @@ class RewardsCfg:
                 lateral_drift_weight=0.25,
                 max_lateral_penalty=1.0,
                 stability=mdp.config.RootStabilityCfg(
-                    max_roll_pitch_ang_speed=4.0,
-                    max_projected_gravity_xy_norm=0.75,
-                    min_clearance=MIN_CLEARANCE
-                )
+                    max_roll_pitch_ang_speed=4.0, max_projected_gravity_xy_norm=0.75, min_clearance=MIN_CLEARANCE
+                ),
             ),
             "goal_cfg": SceneEntityCfg("goal"),
-            "asset_cfg": SceneEntityCfg("robot")
-        }
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
     )
 
     goal_heading_misalignment = RewTerm(
@@ -489,23 +388,21 @@ class RewardsCfg:
         weight=-0.05,
         params={
             "heading_cfg": mdp.config.GoalHeadingCfg(
-                max_heading_error=1.0,
-                min_forward_speed=0.1,
-                full_forward_speed=0.5
+                max_heading_error=1.0, min_forward_speed=0.1, full_forward_speed=0.5
             ),
             "goal_cfg": SceneEntityCfg("goal"),
-            "asset_cfg": SceneEntityCfg("robot")
-        }
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
     )
 
     reached_goal_xy = RewTerm(
-        func=mdp.reached_goal_xy,
+        func=mdp.reached_goal_xy_reward,
         weight=300.0,
         params={
-            "threshold": 0.30,
+            "threshold": PARKOUR_CURRICULUM.success_threshold,
             "goal_cfg": SceneEntityCfg("goal"),
-            "asset_cfg": SceneEntityCfg("robot")
-        }
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
     )
 
     # Safety.
@@ -513,26 +410,17 @@ class RewardsCfg:
         func=mdp.base_contact,
         weight=-10.0,
         params={
-            "threshold": 1.0,
-            "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk")
-        }
+            "threshold": PARKOUR_CURRICULUM.base_contact_threshold,
+            "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk"),
+        },
     )
 
     leg_contact = RewTerm(
-        func=mdp.undesired_contacts,
-        weight=-0.5,
-        params={
-            "threshold": 1.0,
-            "sensor_cfg": SceneEntityCfg("leg_contact")
-        }
+        func=mdp.undesired_contacts, weight=-0.5, params={"threshold": 1.0, "sensor_cfg": SceneEntityCfg("leg_contact")}
     )
 
     base_clearance_below = RewTerm(
-        func=mdp.base_clearance_below_l2,
-        weight=-3.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot")
-        }
+        func=mdp.base_clearance_below_l2, weight=-3.0, params={"asset_cfg": SceneEntityCfg("robot")}
     )
 
     # Stability and regularization.
@@ -545,42 +433,25 @@ class RewardsCfg:
     hip_deviation = RewTerm(
         func=mdp.joint_deviation_l2,
         weight=-0.002,
-        params={
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                joint_names=".*_hip_joint"
-            )
-        }
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_hip_joint")},
     )
 
     feet_slide = RewTerm(
         func=mdp.feet_slide,
         weight=-0.05,
         params={
-            "sensor_cfg": SceneEntityCfg(
-                "feet_contact",
-                body_names=".*_foot"
-            ),
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                body_names=".*_foot"
-            )
-        }
+            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+        },
     )
 
     feet_stumble = RewTerm(
         func=mdp.feet_stumble,
         weight=-0.5,
         params={
-            "stumble_cfg": mdp.config.FeetStumbleCfg(
-                lateral_to_vertical_force_ratio=4.0,
-                min_vertical_force=1.0
-            ),
-            "sensor_cfg": SceneEntityCfg(
-                "feet_contact",
-                body_names=".*_foot"
-            )
-        }
+            "stumble_cfg": mdp.config.FeetStumbleCfg(lateral_to_vertical_force_ratio=4.0, min_vertical_force=1.0),
+            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+        },
     )
 
     rapid_feet_motion = RewTerm(
@@ -588,23 +459,17 @@ class RewardsCfg:
         weight=-0.005,
         params={
             "motion_cfg": mdp.config.FeetMotionCfg(
-                max_stance_speed=0.25,
-                max_swing_speed=2.0,
-                contact_threshold=1.0,
-                max_penalty_per_foot=4.0
+                max_stance_speed=0.25, max_swing_speed=2.0, contact_threshold=1.0, max_penalty_per_foot=4.0
             ),
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot")
-        }
+            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+        },
     )
 
     no_feet_contact = RewTerm(
         func=mdp.no_feet_contact,
         weight=-0.2,
-        params={
-            "threshold": 1.0,
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot")
-        }
+        params={"threshold": 1.0, "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot")},
     )
 
     root_chatter = RewTerm(
@@ -617,10 +482,10 @@ class RewardsCfg:
                 small_tilt_change=0.04,
                 min_roll_pitch_reversal_rate=0.75,
                 angular_weight=0.25,
-                reset_grace_steps=1
+                reset_grace_steps=1,
             ),
-            "asset_cfg": SceneEntityCfg("robot")
-        }
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
     )
 
 
@@ -631,20 +496,20 @@ class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
     success = DoneTerm(
-        func=mdp.reached_goal_xy,
+        func=mdp.reached_goal_xy_done,
         params={
-            "threshold": 0.30,
+            "threshold": PARKOUR_CURRICULUM.success_threshold,
             "goal_cfg": SceneEntityCfg("goal"),
-            "asset_cfg": SceneEntityCfg("robot")
-        }
+            "asset_cfg": SceneEntityCfg("robot"),
+        },
     )
 
     trunk_contact = DoneTerm(
         func=mdp.base_contact_done,
         params={
-            "threshold": 1.0,
-            "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk")
-        }
+            "threshold": PARKOUR_CURRICULUM.base_contact_threshold,
+            "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk"),
+        },
     )
 
 
@@ -655,18 +520,33 @@ class TerminationsCfg:
 
 @configclass
 class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
+    # Single source of truth. synchronize_curriculum_config() propagates any
+    # Hydra/programmatic overrides to terrain, events, transitions, and dones.
+    parkour_curriculum: mdp.curriculums_config.ParkourCurriculumCfg = PARKOUR_CURRICULUM
+
     # Scene settings.
     scene: ParkourLabSceneCfg = ParkourLabSceneCfg(num_envs=4096, env_spacing=8.0)
+    viewer: ViewerCfg = ViewerCfg(
+        eye=(-1.0, -6.0, 2.5),
+        lookat=(1.0, 0.0, 0.5),
+        origin_type="asset_root",
+        env_index=0,
+        asset_name="robot",
+        resolution=(1280, 720),
+    )
 
     # Basic settings.
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     events: EventCfg = EventCfg()
-    curriculum: CurriculumCfg = CurriculumCfg()
+    curriculum: CurriculumCfg | None = CurriculumCfg()
 
     # MDP settings.
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
+
+    # None during adaptive training; set to an exact logical level for play.
+    evaluation_level: int | None = None
 
     # Post initialization.
     def __post_init__(self) -> None:
@@ -699,3 +579,88 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         # Height scanner updates at policy rate.
         if self.scene.height_scanner is not None:
             self.scene.height_scanner.update_period = self.decimation * self.sim.dt
+
+        self.synchronize_curriculum_config()
+
+    def synchronize_curriculum_config(self) -> None:
+        """Propagate the authoritative curriculum to every manager consumer."""
+
+        curriculum_cfg = self.parkour_curriculum
+        curriculum_cfg.validate_configuration()
+
+        terrain_generator = self.scene.ground.terrain_generator
+        if terrain_generator is None:
+            raise ValueError("ParkourLabEnvCfg requires a generated terrain.")
+        if not terrain_generator.curriculum or tuple(terrain_generator.difficulty_range) != (0.0, 1.0):
+            raise ValueError(
+                "The discrete parkour row mapping requires terrain curriculum mode " "and difficulty_range=(0.0, 1.0)."
+            )
+        if "parkour_box" not in terrain_generator.sub_terrains:
+            raise ValueError("ParkourLabEnvCfg requires the 'parkour_box' sub-terrain.")
+
+        terrain_generator.num_rows = len(curriculum_cfg.levels)
+        terrain_generator.sub_terrains["parkour_box"].levels = curriculum_cfg.levels
+        self.scene.ground.max_init_terrain_level = curriculum_cfg.initial_level
+        self.scene.goal.init_state.pos = curriculum_cfg.levels[curriculum_cfg.initial_level].goal_pos
+
+        self.events.initialize_terrain_levels.params["curriculum_cfg"] = curriculum_cfg
+        self.events.reset_goal_and_commands.params["curriculum_cfg"] = curriculum_cfg
+        if self.curriculum is not None:
+            self.curriculum.terrain_levels.params["curriculum_cfg"] = curriculum_cfg
+
+        self.rewards.reached_goal_xy.params["threshold"] = curriculum_cfg.success_threshold
+        self.rewards.illegal_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
+        self.terminations.success.params["threshold"] = curriculum_cfg.success_threshold
+        self.terminations.trunk_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
+
+    def set_evaluation_difficulty(self, level: int | None = None, seed: int | None = None) -> None:
+        """Freeze the environment at one reproducible logical difficulty."""
+
+        self.synchronize_curriculum_config()
+        curriculum_cfg = self.parkour_curriculum
+        if level is None:
+            level = curriculum_cfg.max_level
+        if not 0 <= level <= curriculum_cfg.max_level:
+            raise ValueError(f"difficulty level must be in [0, {curriculum_cfg.max_level}], got {level}.")
+
+        self.evaluation_level = level
+        self.curriculum = None
+        self.events.initialize_terrain_levels.params["fixed_level"] = level
+        self.scene.ground.max_init_terrain_level = level
+
+        terrain_generator = self.scene.ground.terrain_generator
+        if terrain_generator is not None:
+            terrain_generator.num_rows = len(curriculum_cfg.levels)
+            terrain_generator.num_cols = max(1, min(terrain_generator.num_cols, self.scene.num_envs))
+            terrain_generator.curriculum = True
+            if seed is not None:
+                terrain_generator.seed = seed
+
+        self.observations.policy.enable_corruption = False
+
+    def evaluation_level_metadata(self) -> dict[str, object]:
+        """Return JSON-friendly metadata for the fixed evaluation level."""
+
+        if self.evaluation_level is None:
+            return {}
+        level = self.parkour_curriculum.levels[self.evaluation_level]
+        return {
+            "index": self.evaluation_level,
+            "name": level.name,
+            "obstacle_pos": list(level.obstacle_pos),
+            "obstacle_size": list(level.obstacle_size),
+            "goal_pos": list(level.goal_pos),
+            "target_speed": level.target_speed,
+            "min_clearance": level.min_clearance,
+        }
+
+
+@configclass
+class ParkourLabEnvCfg_PLAY(ParkourLabEnvCfg):
+    """Small, fixed-difficulty configuration for comparable evaluation/video."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene.num_envs = 1
+        self.scene.ground.terrain_generator.num_cols = 1
+        self.set_evaluation_difficulty(self.parkour_curriculum.max_level)

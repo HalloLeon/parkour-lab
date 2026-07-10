@@ -1,6 +1,6 @@
+import torch
 from isaaclab.assets import AssetBase
 from isaaclab.envs import ManagerBasedRLEnv
-import torch
 
 
 def _all_env_ids(env: ManagerBasedRLEnv, env_ids: torch.Tensor | None) -> torch.Tensor:
@@ -11,11 +11,7 @@ def _all_env_ids(env: ManagerBasedRLEnv, env_ids: torch.Tensor | None) -> torch.
 
 
 def _difference_from_previous_env_buffer(
-    env: ManagerBasedRLEnv,
-    *,
-    buffer_name: str,
-    current_value: torch.Tensor,
-    reset_mask: torch.Tensor | None = None
+    env: ManagerBasedRLEnv, *, buffer_name: str, current_value: torch.Tensor, reset_mask: torch.Tensor | None = None
 ) -> torch.Tensor:
     """
     Compute previous_value - current_value using an environment-level buffer.
@@ -26,35 +22,25 @@ def _difference_from_previous_env_buffer(
         [num_envs]
     """
 
-    previous_value = _get_or_init_env_buffer(
-        env=env,
-        name=buffer_name,
-        value=current_value
-    )
+    previous_value = _get_or_init_env_buffer(env=env, name=buffer_name, value=current_value)
 
     difference = previous_value - current_value
 
     if reset_mask is not None:
-        difference = torch.where(
-            reset_mask,
-            torch.zeros_like(difference),
-            difference
-        )
+        difference = torch.where(reset_mask, torch.zeros_like(difference), difference)
 
-    _set_env_buffer(
-        env=env,
-        name=buffer_name,
-        value=current_value
-    )
+    _set_env_buffer(env=env, name=buffer_name, value=current_value)
 
     return difference
 
 
-def _episode_start_mask(
-    env: ManagerBasedRLEnv,
-    reference: torch.Tensor,
-    grace_steps: int
-) -> torch.Tensor:
+def _env_torch_device(env: ManagerBasedRLEnv) -> torch.device:
+    """Return Isaac Lab's string-valued device as a normalized torch device."""
+
+    return torch.device(env.device)
+
+
+def _episode_start_mask(env: ManagerBasedRLEnv, reference: torch.Tensor, grace_steps: int) -> torch.Tensor:
     """
     Boolean mask for environments that have just reset.
 
@@ -70,10 +56,7 @@ def _episode_start_mask(
     return episode_length <= grace_steps
 
 
-def _gate_positive_values(
-    values: torch.Tensor,
-    gate: torch.Tensor
-) -> torch.Tensor:
+def _gate_positive_values(values: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """
     Keep negative values always, but allow positive values only when gate is true.
 
@@ -87,18 +70,10 @@ def _gate_positive_values(
 
     keep_value = torch.logical_or(values <= 0.0, gate)
 
-    return torch.where(
-        keep_value,
-        values,
-        torch.zeros_like(values)
-    )
+    return torch.where(keep_value, values, torch.zeros_like(values))
 
 
-def _get_or_init_env_buffer(
-    env: ManagerBasedRLEnv,
-    name: str,
-    value: torch.Tensor
-) -> torch.Tensor:
+def _get_or_init_env_buffer(env: ManagerBasedRLEnv, name: str, value: torch.Tensor) -> torch.Tensor:
     """
     Get an environment-level tensor buffer, creating or resizing it if needed.
 
@@ -119,10 +94,7 @@ def _get_or_init_env_buffer(
     return getattr(env, name)
 
 
-def _get_scene_entity_or_none(
-    env: ManagerBasedRLEnv,
-    name: str
-) -> AssetBase | None:
+def _get_scene_entity_or_none(env: ManagerBasedRLEnv, name: str) -> AssetBase | None:
     """
     Return a scene entity if it exists, otherwise None.
 
@@ -136,11 +108,7 @@ def _get_scene_entity_or_none(
         return None
 
 
-def _linear_ramp(
-    value: torch.Tensor,
-    lower: float,
-    upper: float
-) -> torch.Tensor:
+def _linear_ramp(value: torch.Tensor, lower: float, upper: float) -> torch.Tensor:
     """
     Smoothly map value from [lower, upper] to [0, 1].
 
@@ -151,17 +119,10 @@ def _linear_ramp(
         Tensor with same shape as value.
     """
 
-    return torch.clamp(
-        (value - lower) / (upper - lower),
-        min=0.0,
-        max=1.0
-    )
+    return torch.clamp((value - lower) / (upper - lower), min=0.0, max=1.0)
 
 
-def _private_buffer_name(
-    prefix: str,
-    *parts: str
-) -> str:
+def _private_buffer_name(prefix: str, *parts: str) -> str:
     """
     Create a private environment-buffer name.
 
@@ -169,19 +130,12 @@ def _private_buffer_name(
         str
     """
 
-    safe_parts = [
-        str(part).replace("/", "_").replace(" ", "_")
-        for part in parts
-    ]
+    safe_parts = [str(part).replace("/", "_").replace(" ", "_") for part in parts]
 
     return "_" + "_".join((prefix, *safe_parts))
 
 
-def _set_env_buffer(
-    env: ManagerBasedRLEnv,
-    name: str,
-    value: torch.Tensor
-) -> None:
+def _set_env_buffer(env: ManagerBasedRLEnv, name: str, value: torch.Tensor) -> None:
     """
     Store a detached clone as an environment-level tensor buffer.
     """
@@ -189,13 +143,7 @@ def _set_env_buffer(
     setattr(env, name, value.detach().clone())
 
 
-def _validate_matching_shape(
-    lhs: torch.Tensor,
-    rhs: torch.Tensor,
-    *,
-    lhs_name: str,
-    rhs_name: str
-) -> None:
+def _validate_matching_shape(lhs: torch.Tensor, rhs: torch.Tensor, *, lhs_name: str, rhs_name: str) -> None:
     """
     Validate that two tensors have identical shape.
 

@@ -1,16 +1,49 @@
+import torch
 from isaaclab.assets import AssetBase
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
-import torch
 
-from .state import _root_forward_xy_w
-from .state import _root_lin_vel_xy
-from .state import _root_pos_env
+from .state import _root_forward_xy_w, _root_lin_vel_xy, _root_pos_env
+
+
+def _goal_direction_xy(
+    env: ManagerBasedRLEnv,
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    Unit XY direction from robot root to goal.
+
+    Returns:
+        [num_envs, 2]
+    """
+
+    goal_vec_xy = _goal_vector_xy(env, goal_cfg, asset_cfg)
+
+    goal_dist_xy = torch.linalg.norm(goal_vec_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
+
+    return goal_vec_xy / goal_dist_xy
+
+
+def _goal_distance_xy(
+    env: ManagerBasedRLEnv,
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    XY distance from robot root to goal.
+
+    Returns:
+        [num_envs]
+    """
+
+    to_goal_xy = _goal_vector_xy(env, goal_cfg, asset_cfg)
+    return torch.linalg.norm(to_goal_xy, dim=-1)
 
 
 def _goal_pos_env(
-        env: ManagerBasedRLEnv,
-        goal_cfg=SceneEntityCfg("goal")
+    env: ManagerBasedRLEnv,
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
 ) -> torch.Tensor:
     """
     Goal position in each environment's local frame.
@@ -25,8 +58,8 @@ def _goal_pos_env(
 
 def _goal_vector_xy(
     env: ManagerBasedRLEnv,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
     XY vector from robot root to goal.
@@ -41,8 +74,8 @@ def _goal_vector_xy(
 
 def _goal_vector_xyz(
     env: ManagerBasedRLEnv,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
     XYZ vector from robot root to goal.
@@ -57,65 +90,10 @@ def _goal_vector_xyz(
     return goal_pos - robot_root_pos
 
 
-def _goal_direction_xy(
-    env: ManagerBasedRLEnv,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    Unit XY direction from robot root to goal.
-
-    Returns:
-        [num_envs, 2]
-    """
-
-    goal_vec_xy = _goal_vector_xy(env, goal_cfg, asset_cfg)
-
-    goal_dist_xy = torch.linalg.norm(
-        goal_vec_xy,
-        dim=-1,
-        keepdim=True
-    ).clamp_min(1.0e-6)
-
-    return goal_vec_xy / goal_dist_xy
-
-
-def _goal_distance_xy(
-    env: ManagerBasedRLEnv,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    XY distance from robot root to goal.
-
-    Returns:
-        [num_envs]
-    """
-
-    to_goal_xy = _goal_vector_xy(env, goal_cfg, asset_cfg)
-    return torch.linalg.norm(to_goal_xy, dim=-1)
-
-
-def _goal_distance_xyz(
-    env: ManagerBasedRLEnv,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    XYZ distance from robot root to goal.
-
-    Returns:
-        [num_envs]
-    """
-
-    to_goal = _goal_vector_xyz(env, goal_cfg, asset_cfg)
-    return torch.linalg.norm(to_goal, dim=-1)
-
-
 def _heading_error_to_goal_xy(
     env: ManagerBasedRLEnv,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
     Heading error between robot forward direction and XY goal direction.
@@ -150,14 +128,14 @@ def _heading_error_to_goal_xy(
     #   dot =  1 -> same direction       -> theta = 0
     #   dot =  0 -> perpendicular        -> theta = pi / 2
     #   dot = -1 -> opposite directions  -> theta = pi
-    dot = torch.sum(forward_xy * goal_dir_xy, dim=-1).clamp(
-        min=-1.0,
-        max=1.0
-    )
+    dot = torch.sum(forward_xy * goal_dir_xy, dim=-1).clamp(min=-1.0, max=1.0)
 
     # Convert cosine similarity into an angle.
     #
-    # For two unit vectors in the XY plane, we can write:
+    # Any 2D vector can be described in polar coordinates by its length r and
+    # its angle from the positive X axis:
+    #
+    #     [x, y] = [r cos(angle), r sin(angle)]
     #
     #     forward_xy = [cos(a), sin(a)]
     #     goal_dir_xy = [cos(b), sin(b)]
@@ -190,11 +168,7 @@ def _heading_error_to_goal_xy(
 
 
 def _lateral_drift_to_goal_xy(
-    env: ManagerBasedRLEnv,
-    *,
-    root_delta_xy: torch.Tensor,
-    goal_cfg: SceneEntityCfg,
-    asset_cfg: SceneEntityCfg
+    env: ManagerBasedRLEnv, *, root_delta_xy: torch.Tensor, goal_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg
 ) -> torch.Tensor:
     """
     Lateral part of root displacement relative to the current goal direction.
@@ -205,27 +179,34 @@ def _lateral_drift_to_goal_xy(
         [num_envs]
     """
 
-    goal_dir_xy = _goal_direction_xy(
-        env,
-        goal_cfg=goal_cfg,
-        asset_cfg=asset_cfg
-    )
+    # Let d be the robot's XY displacement and g the unit vector pointing
+    # toward the goal. The dot product d · g is the signed scalar amount of d
+    # along g: positive means toward the goal and negative means away from it.
+    goal_dir_xy = _goal_direction_xy(env, goal_cfg=goal_cfg, asset_cfg=asset_cfg)
 
-    forward_delta = torch.sum(
-        root_delta_xy * goal_dir_xy,
-        dim=-1,
-        keepdim=True
-    )
+    # keepdim=True keeps the result shaped [num_envs, 1], allowing it to
+    # broadcast across the X and Y components of goal_dir_xy [num_envs, 2].
+    forward_delta = torch.sum(root_delta_xy * goal_dir_xy, dim=-1, keepdim=True)
 
+    # Because g has unit length, (d · g)g is the vector projection of d onto
+    # the goal direction. Subtracting that parallel component from d leaves
+    # only the perpendicular component:
+    #
+    #     d_lateral = d - (d · g)g
+    #
+    # If the robot moves exactly toward or away from the goal, d is parallel
+    # to g and this residual is zero.
     lateral_delta_xy = root_delta_xy - forward_delta * goal_dir_xy
 
+    # The Euclidean norm converts the lateral XY vector into one non-negative
+    # drift magnitude per environment.
     return torch.linalg.norm(lateral_delta_xy, dim=-1)
 
 
 def _velocity_along_goal_xy(
     env: ManagerBasedRLEnv,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
     Robot root velocity projected onto the XY goal direction.

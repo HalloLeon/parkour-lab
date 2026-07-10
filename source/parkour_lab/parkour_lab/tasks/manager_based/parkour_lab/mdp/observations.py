@@ -1,22 +1,19 @@
+import torch
 from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCaster
 from isaaclab.utils.math import quat_apply_inverse
-import torch
 
 from . import config
+from ._shared import contact, navigation, runtime, terrain
 from .commands import get_target_speed
-from ._shared import contact
-from ._shared import navigation
-from ._shared import terrain
-from ._shared import runtime
 
 
 def goal_distance_xy_w(
     env: ManagerBasedRLEnv,
-    goal_cfg=SceneEntityCfg("goal"),
-    asset_cfg=SceneEntityCfg("robot")
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
     XY distance from robot root to goal.
@@ -31,7 +28,7 @@ def goal_distance_xy_w(
 def goal_direction_body_xy(
     env: ManagerBasedRLEnv,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
     Direction from robot to goal, expressed in the robot body frame.
@@ -48,11 +45,7 @@ def goal_direction_body_xy(
 
     goal_vec_xy = navigation._goal_vector_xy(env, goal_cfg, asset_cfg)
 
-    goal_vec_w = torch.zeros(
-        (goal_vec_xy.shape[0], 3),
-        device=goal_vec_xy.device,
-        dtype=goal_vec_xy.dtype
-    )
+    goal_vec_w = torch.zeros((goal_vec_xy.shape[0], 3), device=goal_vec_xy.device, dtype=goal_vec_xy.dtype)
     goal_vec_w[:, :2] = goal_vec_xy
 
     # Rotate the world-frame goal vector into the robot body frame.
@@ -74,17 +67,10 @@ def goal_direction_body_xy(
     goal_vec_b = quat_apply_inverse(asset.data.root_quat_w, goal_vec_w)
     goal_dir_b_xy = goal_vec_b[:, :2]
 
-    return goal_dir_b_xy / torch.linalg.norm(
-        goal_dir_b_xy,
-        dim=-1,
-        keepdim=True
-    ).clamp_min(1.0e-6)
+    return goal_dir_b_xy / torch.linalg.norm(goal_dir_b_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
 
 
-def base_clearance_obs(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
+def base_clearance_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """
     Base/root clearance above the support surface underneath the robot.
 
@@ -98,7 +84,7 @@ def base_clearance_obs(
 def foot_contact_state(
     env: ManagerBasedRLEnv,
     threshold: float = 1.0,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot")
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot"),
 ) -> torch.Tensor:
     """
     Foot contact state, centered.
@@ -111,21 +97,16 @@ def foot_contact_state(
         [num_envs, num_feet]
     """
 
-    force_norm = contact._force_norm_mask(
-        env,
-        sensor_cfg=sensor_cfg
-    )
+    force_norm = contact._force_norm_mask(env, sensor_cfg=sensor_cfg)
 
     in_contact = torch.any(force_norm > threshold, dim=1)
 
     return in_contact.float() - 0.5
 
 
-def desired_speed_obs(
-    env: ManagerBasedRLEnv
-) -> torch.Tensor:
+def desired_speed_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
     """
-    Constant desired forward speed observation.
+    Per-environment desired forward speed observation.
 
     Returns:
         [num_envs, 1]
@@ -138,7 +119,7 @@ def height_scan_or_zeros(
     env: ManagerBasedRLEnv,
     obs_cfg: config.HeightScanObservationCfg = config.DEFAULT_HEIGHT_SCAN_OBSERVATION,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
     Fixed-size terrain/obstacle height scan.
@@ -158,37 +139,20 @@ def height_scan_or_zeros(
 
     if sensor is None:
         return torch.zeros(
-            (env.num_envs, obs_cfg.num_rays),
-            device=asset.data.root_pos_w.device,
-            dtype=asset.data.root_pos_w.dtype
+            (env.num_envs, obs_cfg.num_rays), device=asset.data.root_pos_w.device, dtype=asset.data.root_pos_w.dtype
         )
 
     if not isinstance(sensor, RayCaster):
-        raise TypeError(
-            f"Expected '{sensor_cfg.name}' to be a RayCaster, "
-            f"got {type(sensor).__name__}."
-        )
+        raise TypeError(f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}.")
 
     root_z = asset.data.root_pos_w[:, 2].unsqueeze(-1)
     hit_z = sensor.data.ray_hits_w[..., 2]
 
     if hit_z.shape[-1] != obs_cfg.num_rays:
-        raise RuntimeError(
-            f"Height scan expected {obs_cfg.num_rays} rays, "
-            f"but sensor returned {hit_z.shape[-1]} rays."
-        )
+        raise RuntimeError(f"Height scan expected {obs_cfg.num_rays} rays, but sensor returned {hit_z.shape[-1]} rays.")
 
     heights = root_z - obs_cfg.vertical_offset - hit_z
 
-    heights = torch.nan_to_num(
-        heights,
-        nan=0.0,
-        posinf=obs_cfg.clip,
-        neginf=-obs_cfg.clip
-    )
+    heights = torch.nan_to_num(heights, nan=0.0, posinf=obs_cfg.clip, neginf=-obs_cfg.clip)
 
-    return torch.clamp(
-        heights,
-        min=-obs_cfg.clip,
-        max=obs_cfg.clip
-    )
+    return torch.clamp(heights, min=-obs_cfg.clip, max=obs_cfg.clip)
