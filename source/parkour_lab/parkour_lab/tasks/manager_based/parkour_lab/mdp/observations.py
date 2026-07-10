@@ -111,11 +111,12 @@ def foot_contact_state(
         [num_envs, num_feet]
     """
 
-    in_contact = contact._contact_mask(
+    force_norm = contact._force_norm_mask(
         env,
-        sensor_cfg=sensor_cfg,
-        threshold=threshold
+        sensor_cfg=sensor_cfg
     )
+
+    in_contact = torch.any(force_norm > threshold, dim=1)
 
     return in_contact.float() - 0.5
 
