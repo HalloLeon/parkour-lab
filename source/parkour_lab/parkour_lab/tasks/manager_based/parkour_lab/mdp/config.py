@@ -273,11 +273,25 @@ class RootStabilityCfg:
 class StableGoalProgressCfg:
     """
     Configuration for stable XY goal-progress reward.
+
+    The reward has three parts:
+      - positive reward for reducing XY distance to the goal,
+      - negative penalty for increasing XY distance,
+      - small penalty for sideways/lateral drift while making progress.
     """
 
     progress_scale: float = 0.03
     reset_grace_steps: int = 1
     stability: RootStabilityCfg = field(default_factory=RootStabilityCfg)
+
+    # Do not clamp progress to [-1, 1] too early.
+    # Higher caps preserve a gradient between okay progress and very direct progress.
+    max_positive_reward: float = 2.0
+    max_negative_penalty: float = 2.0
+
+    # Penalizes curved/sideways motion while still allowing small corrections.
+    lateral_drift_weight: float = 0.25
+    max_lateral_penalty: float = 1.0
 
     def __post_init__(self) -> None:
         if self.progress_scale <= 0.0:
@@ -285,6 +299,18 @@ class StableGoalProgressCfg:
 
         if self.reset_grace_steps < 0:
             raise ValueError("reset_grace_steps must be non-negative.")
+
+        if self.max_positive_reward <= 0.0:
+            raise ValueError("max_positive_reward must be positive.")
+
+        if self.max_negative_penalty <= 0.0:
+            raise ValueError("max_negative_penalty must be positive.")
+
+        if self.lateral_drift_weight < 0.0:
+            raise ValueError("lateral_drift_weight must be non-negative.")
+
+        if self.max_lateral_penalty <= 0.0:
+            raise ValueError("max_lateral_penalty must be positive.")
 
 
 DEFAULT_STABLE_GOAL_PROGRESS = StableGoalProgressCfg()
