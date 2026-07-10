@@ -52,6 +52,11 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # actions, or critic targets can quickly destroy PPO training.
     check_for_nan = True
 
+    obs_groups = {
+        "actor": ["policy"],
+        "critic": ["critic"]
+    }
+
     # Configuration for the actor-critic policy network used by PPO.
     #
     # The actor predicts actions.
