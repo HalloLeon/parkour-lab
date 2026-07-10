@@ -12,6 +12,8 @@ from isaaclab_tasks.manager_based.locomotion.velocity.mdp import *  # noqa: F401
 
 from .commands import *  # noqa: F401, F403
 
+from .curriculums.curriculums import parkour_terrain_levels
+
 from .events import *  # noqa: F401, F403
 
 from .observations import *  # noqa: F401, F403
