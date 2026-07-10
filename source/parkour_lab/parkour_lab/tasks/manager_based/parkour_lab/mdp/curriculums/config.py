@@ -1,3 +1,4 @@
+from __future__ import annotations
 from dataclasses import dataclass
 
 from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg
@@ -97,6 +98,16 @@ class ParkourCurriculumCfg:
     distribute_initial_levels: bool = False
     max_level: int = 3
 
+    # Adaptive curriculum.
+    promote_on_success: bool = True
+    demote_on_base_contact: bool = True
+
+    success_threshold: float = 0.30
+    successes_to_promote: int = 2  # Avoids promotion from one lucky success
+    failures_to_demote: int = 1  # Quickly makes the task easier after trunk-contact failure
+
+    base_contact_threshold: float = 1.0
+
     def __post_init__(self) -> None:
         if len(self.levels) == 0:
             raise ValueError("ParkourCurriculumCfg.levels must not be empty.")
@@ -106,6 +117,18 @@ class ParkourCurriculumCfg:
 
         if self.max_level < self.initial_level or self.max_level >= len(self.levels):
             raise ValueError("max_level is out of range.")
+
+        if self.success_threshold <= 0.0:
+            raise ValueError("success_threshold must be positive.")
+
+        if self.successes_to_promote <= 0:
+            raise ValueError("successes_to_promote must be positive.")
+
+        if self.failures_to_demote <= 0:
+            raise ValueError("failures_to_demote must be positive.")
+
+        if self.base_contact_threshold < 0.0:
+            raise ValueError("base_contact_threshold must be non-negative.")
 
 
 DEFAULT_PARKOUR_CURRICULUM = ParkourCurriculumCfg()
