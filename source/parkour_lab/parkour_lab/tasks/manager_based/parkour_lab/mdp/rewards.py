@@ -84,8 +84,14 @@ def goal_progress_xy_stable(
         asset_cfg=asset_cfg
     )
 
-    buffer_name = runtime._private_buffer_name(
+    distance_buffer_name = runtime._private_buffer_name(
         "parkour_prev_goal_distance_xy",
+        goal_cfg.name,
+        asset_cfg.name
+    )
+
+    root_xy_buffer_name = runtime._private_buffer_name(
+        "parkour_prev_root_xy_for_goal_progress",
         goal_cfg.name,
         asset_cfg.name
     )
@@ -98,9 +104,16 @@ def goal_progress_xy_stable(
 
     progress = runtime._difference_from_previous_env_buffer(
         env,
-        buffer_name=buffer_name,
+        buffer_name=distance_buffer_name,
         current_value=current_distance,
         reset_mask=just_reset
+    )
+
+    root_delta_xy = state._root_xy_delta_from_previous(
+        env,
+        buffer_name=root_xy_buffer_name,
+        reset_mask=just_reset,
+        asset_cfg=asset_cfg
     )
 
     stable = stability._root_stability_mask(
@@ -114,12 +127,43 @@ def goal_progress_xy_stable(
         gate=stable
     )
 
-    normalized_progress = progress / progress_cfg.progress_scale
+    positive_progress = torch.clamp(progress, min=0.0)
+    negative_progress = torch.clamp(-progress, min=0.0)
 
-    return torch.clamp(
-        normalized_progress,
-        min=-1.0,
-        max=1.0
+    positive_reward = torch.clamp(
+        positive_progress / progress_cfg.progress_scale,
+        max=progress_cfg.max_positive_reward,
+    )
+
+    negative_penalty = torch.clamp(
+        negative_progress / progress_cfg.progress_scale,
+        max=progress_cfg.max_negative_penalty,
+    )
+
+    lateral_drift = navigation._lateral_drift_to_goal_xy(
+        env,
+        root_delta_xy=root_delta_xy,
+        goal_cfg=goal_cfg,
+        asset_cfg=asset_cfg
+    )
+
+    lateral_penalty = torch.clamp(
+        lateral_drift / progress_cfg.progress_scale,
+        max=progress_cfg.max_lateral_penalty
+    )
+
+    # Only penalize lateral drift while stable and making positive progress.
+    # This avoids over-penalizing reset artifacts, falls, and recovery behavior.
+    lateral_penalty = torch.where(
+        stable & (positive_progress > 0.0),
+        lateral_penalty,
+        torch.zeros_like(lateral_penalty)
+    )
+
+    return (
+        positive_reward
+        - negative_penalty
+        - progress_cfg.lateral_drift_weight * lateral_penalty
     )
 
 
@@ -186,9 +230,15 @@ def reached_goal_xy(
     """
 
     dist_to_goal = navigation._goal_distance_xy(env, goal_cfg, asset_cfg)
-    reached = dist_to_goal < threshold
+    clearance = terrain._base_clearance(env, asset_cfg)
 
-    return reached.float()
+    reached = dist_to_goal < threshold
+    clear_enough = clearance > get_min_clearance(env).to(
+        device=clearance.device,
+        dtype=clearance.dtype
+    )
+
+    return torch.logical_and(reached, clear_enough).float()
 
 
 def velocity_along_goal_xy_exp(
@@ -441,11 +491,12 @@ def rapid_feet_motion_l2(
 
     foot_speed = state._selected_body_speed_w(env, asset_cfg)
 
-    in_contact = contact._contact_mask(
+    force_norm = contact._force_norm_mask(
         env,
-        sensor_cfg=sensor_cfg,
-        threshold=motion_cfg.contact_threshold
+        sensor_cfg=sensor_cfg
     )
+
+    in_contact = torch.any(force_norm > motion_cfg.contact_threshold, dim=1)
 
     runtime._validate_matching_shape(
         in_contact,
