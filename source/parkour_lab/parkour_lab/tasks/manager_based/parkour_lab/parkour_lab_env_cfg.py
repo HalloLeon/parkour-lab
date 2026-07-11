@@ -82,89 +82,60 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
 
     base_contact: ContactSensorCfg = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/trunk", history_length=3)
 
-    height_scanner: RayCasterCfg = RayCasterCfg(
-        # Attach the ray sensor frame to the robot trunk.
-        #
-        # The scanner moves with the robot. Because the prim path is the trunk,
-        # the scan pattern is defined relative to the trunk frame, then transformed
-        # into the world during simulation.
+    # One downward terrain ray at the trunk origin provides geometry-agnostic
+    # base clearance for flat ground, slopes, and arbitrary terrain meshes.
+    base_height_scanner: RayCasterCfg = RayCasterCfg(
+        # Attach the sensor to the trunk so its ray origin follows the robot.
         prim_path="{ENV_REGEX_NS}/Robot/trunk",
-        # Local offset of the ray-pattern origin relative to the trunk frame.
-        #
-        # x = 0.375:
-        #   Shift the scan grid forward in front of the robot. This is useful for
-        #   parkour/obstacle traversal because we care more about upcoming terrain
-        #   than terrain behind the robot.
-        #
-        # y = 0.0:
-        #   Keep the scan centered laterally.
-        #
-        # z = 20.0:
-        #   Start the rays high above the robot/terrain so all downward rays can
-        #   safely hit the terrain mesh.
-        offset=RayCasterCfg.OffsetCfg(pos=(0.375, 0.0, 20.0)),
-        # Align the ray pattern with the robot's yaw only.
-        #
-        # This means:
-        #   - if the robot turns left/right, the scan turns with it,
-        #   - if the robot rolls or pitches, the scan does NOT tilt with the body.
-        #
-        # This is usually what we want for terrain height scans, because terrain
-        # perception should stay horizontal in the world instead of rolling/pitching
-        # with the trunk.
+        # Cast from the trunk origin: the measured hit is therefore the terrain
+        # surface directly underneath the base, not a nearby grid sample.
+        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
+        # Follow heading while ignoring roll and pitch, keeping the ray vertical
+        # even when the trunk tilts. Yaw has no effect on this centered ray.
         ray_alignment="yaw",
         pattern_cfg=patterns.GridPatternCfg(
-            # Distance between neighboring ray sample points.
-            #
-            # Smaller resolution:
-            #   more rays, better terrain detail, more computation.
-            #
-            # Larger resolution:
-            #   fewer rays, cheaper, less terrain detail.
-            resolution=0.15,
-            # Physical size of the scan grid in meters: (x_size, y_size).
-            #
-            # x_size = 1.65:
-            #   scan covers roughly 1.65 m in the robot-forward direction.
-            #
-            # y_size = 1.50:
-            #   scan covers roughly 1.50 m sideways.
-            #
-            # With resolution 0.15, this should produce:
-            #   x samples: 12
-            #   y samples: 11
-            #   total rays: 12 * 11 = 132
-            #
-            # This matches HeightScanObservationCfg(num_rays=132).
-            size=(1.65, 1.50),
-            # Direction of each ray in the scanner frame.
-            #
-            # (0, 0, -1) means all rays point downward.
+            # A zero-size grid contains exactly one ray. Resolution remains a
+            # required GridPatternCfg field but does not affect this pattern.
+            resolution=1.0,
+            size=(0.0, 0.0),
+            # Ray directions use the sensor frame; negative Z points downward.
             direction=(0.0, 0.0, -1.0),
         ),
-        # The mesh that the rays are allowed to hit.
-        #
-        # Important:
-        #   RayCasterCfg supports raycasting against the terrain mesh.
-        #   The obstacle is baked into /World/Ground,
-        #   so this scanner can see both the flat ground and the obstacle.
-        #
-        # If the obstacle were a separate RigidObject, this would NOT see it.
+        # Generated terrain and all configured structures are combined under
+        # /World/Ground, so the ray measures the real supporting surface.
         mesh_prim_paths=["/World/Ground"],
-        # Maximum ray length.
-        #
-        # Rays start 20 m above the trunk and point downward.
-        # max_distance=25.0 is enough to reach the terrain even if the robot moves
-        # over small height variations.
+        # The trunk normally remains well within five meters of the terrain.
+        max_distance=5.0,
+        # Set debug_vis=True temporarily when inspecting ray placement. Keep it
+        # disabled during training to avoid visualization overhead.
+    )
+
+    # Dense, forward-looking terrain scan for the privileged critic/teacher
+    # observation. It shares the attachment, alignment, direction, and terrain
+    # mesh conventions documented above, but samples a 2-D grid instead of the
+    # single point directly beneath the trunk.
+    height_scanner: RayCasterCfg = RayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/trunk",
+        # Shift the grid forward for upcoming-terrain coverage and start it high
+        # enough that every downward ray begins above the course geometry.
+        offset=RayCasterCfg.OffsetCfg(pos=(0.375, 0.0, 20.0)),
+        ray_alignment="yaw",
+        pattern_cfg=patterns.GridPatternCfg(
+            # Smaller spacing improves terrain detail at additional ray-cast cost.
+            resolution=0.15,
+            # The 1.65 m by 1.50 m grid produces 12 * 11 = 132 rays, matching
+            # HeightScanObservationCfg(num_rays=132).
+            size=(1.65, 1.50),
+            direction=(0.0, 0.0, -1.0),
+        ),
+        mesh_prim_paths=["/World/Ground"],
+        # Reach the terrain from the 20 m vertical offset with ample margin.
         max_distance=25.0,
-        # Optional:
-        # Set this to True temporarily when debugging to visualize the rays.
-        # Turn it off for training because visualization is expensive.
-        # debug_vis=True
     )
 
     dome_light: AssetBaseCfg = AssetBaseCfg(
-        prim_path="/World/DomeLight", spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0)
+        prim_path="/World/DomeLight",
+        spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0),
     )
 
 
@@ -202,12 +173,18 @@ class ObservationsCfg:
         # Goal-relative task information.
         goal_direction_body_xy = ObsTerm(
             func=mdp.goal_direction_body_xy,
-            params={"goal_cfg": SceneEntityCfg("goal"), "asset_cfg": SceneEntityCfg("robot")},
+            params={
+                "goal_cfg": SceneEntityCfg("goal"),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
         )
 
         goal_distance_xy = ObsTerm(
             func=mdp.goal_distance_xy_w,
-            params={"goal_cfg": SceneEntityCfg("goal"), "asset_cfg": SceneEntityCfg("robot")},
+            params={
+                "goal_cfg": SceneEntityCfg("goal"),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
         )
 
         desired_speed = ObsTerm(func=mdp.desired_speed_obs)
@@ -222,7 +199,10 @@ class ObservationsCfg:
         # Contact state.
         foot_contacts = ObsTerm(
             func=mdp.foot_contact_state,
-            params={"threshold": 1.0, "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot")},
+            params={
+                "threshold": 1.0,
+                "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+            },
         )
 
         def __post_init__(self) -> None:
@@ -239,12 +219,18 @@ class ObservationsCfg:
 
         goal_direction_body_xy = ObsTerm(
             func=mdp.goal_direction_body_xy,
-            params={"goal_cfg": SceneEntityCfg("goal"), "asset_cfg": SceneEntityCfg("robot")},
+            params={
+                "goal_cfg": SceneEntityCfg("goal"),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
         )
 
         goal_distance_xy = ObsTerm(
             func=mdp.goal_distance_xy_w,
-            params={"goal_cfg": SceneEntityCfg("goal"), "asset_cfg": SceneEntityCfg("robot")},
+            params={
+                "goal_cfg": SceneEntityCfg("goal"),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
         )
 
         desired_speed = ObsTerm(func=mdp.desired_speed_obs)
@@ -255,7 +241,10 @@ class ObservationsCfg:
 
         foot_contacts = ObsTerm(
             func=mdp.foot_contact_state,
-            params={"threshold": 1.0, "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot")},
+            params={
+                "threshold": 1.0,
+                "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+            },
         )
 
         # Privileged state.
@@ -328,7 +317,10 @@ class EventCfg:
     reset_joints = EventTerm(
         func=mdp.reset_joints_by_scale,
         mode="reset",
-        params={"position_range": (1.0, 1.0), "velocity_range": (0.0, 0.0)},  # default_joint_pos
+        params={
+            "position_range": (1.0, 1.0),
+            "velocity_range": (0.0, 0.0),
+        },  # default_joint_pos
     )
 
 
@@ -337,7 +329,8 @@ class CurriculumCfg:
     """Curriculum terms."""
 
     terrain_levels = CurrTerm(
-        func=mdp.parkour_terrain_levels, params={"curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM}
+        func=mdp.parkour_terrain_levels,
+        params={"curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM},
     )
 
 
@@ -411,11 +404,15 @@ class RewardsCfg:
     )
 
     leg_contact = RewTerm(
-        func=mdp.undesired_contacts, weight=-0.5, params={"threshold": 1.0, "sensor_cfg": SceneEntityCfg("leg_contact")}
+        func=mdp.undesired_contacts,
+        weight=-0.5,
+        params={"threshold": 1.0, "sensor_cfg": SceneEntityCfg("leg_contact")},
     )
 
     base_clearance_below = RewTerm(
-        func=mdp.base_clearance_below_l2, weight=-3.0, params={"asset_cfg": SceneEntityCfg("robot")}
+        func=mdp.base_clearance_below_l2,
+        weight=-3.0,
+        params={"asset_cfg": SceneEntityCfg("robot")},
     )
 
     # Stability and regularization.
@@ -454,7 +451,10 @@ class RewardsCfg:
         weight=-0.005,
         params={
             "motion_cfg": mdp.config.FeetMotionCfg(
-                max_stance_speed=0.25, max_swing_speed=2.0, contact_threshold=1.0, max_penalty_per_foot=4.0
+                max_stance_speed=0.25,
+                max_swing_speed=2.0,
+                contact_threshold=1.0,
+                max_penalty_per_foot=4.0,
             ),
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
@@ -464,7 +464,10 @@ class RewardsCfg:
     no_feet_contact = RewTerm(
         func=mdp.no_feet_contact,
         weight=-0.2,
-        params={"threshold": 1.0, "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot")},
+        params={
+            "threshold": 1.0,
+            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+        },
     )
 
     root_chatter = RewTerm(
@@ -575,6 +578,9 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         if self.scene.height_scanner is not None:
             self.scene.height_scanner.update_period = self.decimation * self.sim.dt
 
+        if self.scene.base_height_scanner is not None:
+            self.scene.base_height_scanner.update_period = self.decimation * self.sim.dt
+
         self.synchronize_curriculum_config()
 
     def synchronize_curriculum_config(self) -> None:
@@ -590,11 +596,11 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
             raise ValueError(
                 "The discrete parkour row mapping requires terrain curriculum mode and difficulty_range=(0.0, 1.0)."
             )
-        if "parkour_box" not in terrain_generator.sub_terrains:
-            raise ValueError("ParkourLabEnvCfg requires the 'parkour_box' sub-terrain.")
+        if "parkour_course" not in terrain_generator.sub_terrains:
+            raise ValueError("ParkourLabEnvCfg requires the 'parkour_course' sub-terrain.")
 
         terrain_generator.num_rows = len(curriculum_cfg.levels)
-        terrain_generator.sub_terrains["parkour_box"].levels = curriculum_cfg.levels
+        terrain_generator.sub_terrains["parkour_course"].levels = curriculum_cfg.levels
         self.scene.ground.max_init_terrain_level = curriculum_cfg.initial_level
         self.scene.goal.init_state.pos = curriculum_cfg.levels[curriculum_cfg.initial_level].goal_pos
 
@@ -642,8 +648,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         return {
             "index": self.evaluation_level,
             "name": level.name,
-            "obstacle_pos": list(level.obstacle_pos),
-            "obstacle_size": list(level.obstacle_size),
+            "structures": [structure.metadata() for structure in level.structures],
             "goal_pos": list(level.goal_pos),
             "target_speed": level.target_speed,
             "min_clearance": level.min_clearance,
@@ -651,7 +656,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
 
 
 @configclass
-class ParkourLabEnvCfg_PLAY(ParkourLabEnvCfg):
+class ParkourLabEnvCfgPlay(ParkourLabEnvCfg):
     """Small, fixed-difficulty configuration for comparable evaluation/video."""
 
     def __post_init__(self) -> None:

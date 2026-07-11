@@ -2,8 +2,6 @@ from dataclasses import field
 
 from isaaclab.utils import configclass
 
-GROUND_HEIGHT = 0.0
-
 # ==================== OBSERVATION CONFIGURATIONS ====================
 
 

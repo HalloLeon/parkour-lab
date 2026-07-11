@@ -24,10 +24,14 @@ def velocity_along_goal_xy_exp(
     Reward tracking a desired XY velocity along the direction to the goal.
 
     Far from the goal:
-        desired velocity is close to tracking_cfg.target_speed.
+        desired velocity is the current per-environment target-speed command.
 
     Near the goal:
         desired velocity decreases toward zero to reduce overshooting.
+
+    The exponential tracking kernel reduces the reward for both underspeed
+    and overspeed. It shapes the policy toward the commanded speed; it does
+    not clamp the robot's physical velocity.
 
     This reward does not check whether the robot is upright or has enough
     clearance. Use velocity_along_goal_xy_clearance_exp for the gated version.
@@ -46,6 +50,8 @@ def velocity_along_goal_xy_exp(
 
     desired_velocity = target_speed * slowdown_scale
 
+    # Symmetric command tracking is intentional: overspeed must lose reward,
+    # especially while the desired velocity is reduced near the goal.
     velocity_error = velocity_along_goal - desired_velocity
 
     return torch.exp(-velocity_error.square() / tracking_cfg.speed_tracking_scale**2)

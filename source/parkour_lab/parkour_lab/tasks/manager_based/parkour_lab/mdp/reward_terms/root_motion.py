@@ -180,7 +180,7 @@ def _angular_root_chatter_l2(
     )
 
     # angular_reversed has shape [num_envs, 2] for the roll and pitch axes,
-    # while small_tilt_change has shape [num_envs]. ``None`` inserts a
+    # while small_tilt_change has shape [num_envs]. `None` inserts a
     # singleton axis, producing [num_envs, 1], so PyTorch broadcasts the same
     # per-environment tilt gate across both angular axes.
     chatter_active = angular_reversed & small_tilt_change[:, None]
