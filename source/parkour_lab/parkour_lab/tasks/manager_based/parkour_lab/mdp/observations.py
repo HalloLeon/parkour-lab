@@ -62,8 +62,6 @@ def goal_direction_body_xy(
     #   robot yaw =   0 deg, goal world +x -> goal_vec_b ≈ [ 1,  0, 0]
     #   robot yaw =  90 deg, goal world +x -> goal_vec_b ≈ [ 0, -1, 0]
     #   robot yaw = 180 deg, goal world +x -> goal_vec_b ≈ [-1,  0, 0]
-    #
-    # The suffix "_b" means body frame.
     goal_vec_b = quat_apply_inverse(asset.data.root_quat_w, goal_vec_w)
     goal_dir_b_xy = goal_vec_b[:, :2]
 
