@@ -15,8 +15,13 @@ class HeightScanObservationCfg:
     """
 
     num_rays: int = 132
+    """Fixed number of ray samples in the flattened observation."""
+
     vertical_offset: float = 0.3
+    """Reference-plane distance below the robot root, in metres."""
+
     clip: float = 1.0
+    """Symmetric metric clipping bound in metres, also used as the fixed normalization divisor."""
 
     def __post_init__(self) -> None:
         if self.num_rays <= 0:

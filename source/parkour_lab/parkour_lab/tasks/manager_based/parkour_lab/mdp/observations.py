@@ -124,10 +124,15 @@ def terrain_height_scan(
 
     The configured ray caster is required. Failing when it is absent prevents
     training a supposedly terrain-aware teacher on an accidental all-zero
-    terrain input.
+    terrain input. Heights are clipped in metres using `obs_cfg.clip` and
+    then divided by that fixed bound, producing values in `[-1, 1]`.
+
+    A value of zero places the surface at `root_z - vertical_offset`.
+    Negative values represent surfaces above that reference plane; positive
+    values represent surfaces below it.
 
     Returns:
-        [num_envs, obs_cfg.num_rays]
+        Normalized heights with shape `[num_envs, obs_cfg.num_rays]`.
     """
 
     sensor = env.scene[sensor_cfg.name]
@@ -142,8 +147,9 @@ def terrain_height_scan(
     if hit_z.shape[-1] != obs_cfg.num_rays:
         raise RuntimeError(f"Height scan expected {obs_cfg.num_rays} rays, but sensor returned {hit_z.shape[-1]} rays.")
 
-    heights = root_z - obs_cfg.vertical_offset - hit_z
+    heights_m = root_z - obs_cfg.vertical_offset - hit_z
 
-    heights = torch.nan_to_num(heights, nan=0.0, posinf=obs_cfg.clip, neginf=-obs_cfg.clip)
+    heights_m = torch.nan_to_num(heights_m, nan=0.0, posinf=obs_cfg.clip, neginf=-obs_cfg.clip)
+    clipped_heights_m = torch.clamp(heights_m, min=-obs_cfg.clip, max=obs_cfg.clip)
 
-    return torch.clamp(heights, min=-obs_cfg.clip, max=obs_cfg.clip)
+    return clipped_heights_m / obs_cfg.clip
