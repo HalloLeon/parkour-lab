@@ -68,7 +68,7 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
         f" and required version is: '{RSL_RL_VERSION}'.\nTo install the correct version, run:"
         f"\n\n\t{' '.join(cmd)}\n"
     )
-    exit(1)
+    sys.exit(1)
 
 """Rest everything follows."""
 
@@ -101,7 +101,10 @@ torch.backends.cudnn.benchmark = False
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
-def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
+def main(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    agent_cfg: RslRlBaseRunnerCfg,
+) -> None:
     """Train with RSL-RL agent."""
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
@@ -109,6 +112,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
+    synchronize_curriculum = getattr(env_cfg, "synchronize_curriculum_config", None)
+    if callable(synchronize_curriculum):
+        synchronize_curriculum()
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -201,14 +207,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
     # run training
-    runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
-
-    # close the simulator
-    env.close()
+    # Curriculum decisions use complete episode outcomes. Randomizing the first
+    # episode length would turn artificial partial timeouts into failures.
+    try:
+        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=False)
+    finally:
+        env.close()
 
 
 if __name__ == "__main__":
-    # run the main function
-    main()
-    # close sim app
-    simulation_app.close()
+    try:
+        main()
+    finally:
+        simulation_app.close()

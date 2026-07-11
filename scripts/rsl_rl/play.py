@@ -119,8 +119,6 @@ from isaaclab_rl.rsl_rl import (
     RslRlVecEnvWrapper,
     export_policy_as_jit,
     export_policy_as_onnx,
-    handle_deprecated_rsl_rl_cfg,
-    handle_deprecated_rsl_rl_checkpoint,
 )
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
 from isaaclab_tasks.utils import get_checkpoint_path
@@ -281,8 +279,6 @@ def main(
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
-    agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
-
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
@@ -305,13 +301,12 @@ def main(
     else:
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
-    source_checkpoint_path = os.path.abspath(resume_path)
-    checkpoint_sha256 = sha256_file(source_checkpoint_path)
-    resume_path = handle_deprecated_rsl_rl_checkpoint(source_checkpoint_path, installed_version)
-    log_dir = os.path.dirname(source_checkpoint_path)
+    checkpoint_path = os.path.abspath(resume_path)
+    checkpoint_sha256 = sha256_file(checkpoint_path)
+    log_dir = os.path.dirname(checkpoint_path)
 
     # keep each checkpoint/level/seed evaluation in a self-describing folder
-    checkpoint_stem = path_component(os.path.splitext(os.path.basename(source_checkpoint_path))[0], "checkpoint")
+    checkpoint_stem = path_component(os.path.splitext(os.path.basename(checkpoint_path))[0], "checkpoint")
     checkpoint_id = f"{checkpoint_stem}-{checkpoint_sha256[:8]}"
     level_component = path_component(evaluation_level, "default")
     seed_component = path_component(env_cfg.seed, "default")
@@ -365,7 +360,7 @@ def main(
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-    print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+    print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
     # load previously trained model
     if agent_cfg.class_name == "OnPolicyRunner":
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
@@ -373,7 +368,7 @@ def main(
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
+    runner.load(checkpoint_path)
 
     # obtain the trained policy for inference
     policy = runner.get_inference_policy(device=env.unwrapped.device)
@@ -387,7 +382,7 @@ def main(
             policy_nn = runner.alg.actor_critic
 
     if args_cli.export_policy:
-        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+        export_model_dir = os.path.join(os.path.dirname(checkpoint_path), "exported")
         if version.parse(installed_version) >= version.parse("4.0.0"):
             runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
             runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
@@ -502,8 +497,8 @@ def main(
     }
     metrics = {
         "task": args_cli.task,
-        "checkpoint": source_checkpoint_path,
-        "loaded_checkpoint": resume_path,
+        "checkpoint": checkpoint_path,
+        "loaded_checkpoint": checkpoint_path,
         "checkpoint_stem": checkpoint_stem,
         "checkpoint_id": checkpoint_id,
         "checkpoint_sha256": checkpoint_sha256,
