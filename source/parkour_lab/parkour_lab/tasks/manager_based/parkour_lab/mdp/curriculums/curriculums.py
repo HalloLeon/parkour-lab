@@ -162,12 +162,11 @@ def reset_goal_and_commands_from_terrain_level(
     reset events are applied.
     """
 
-    def level_field(level, name: str):
-        return level[name] if isinstance(level, dict) else getattr(level, name)
-
     def level_tensor(name: str, *, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         return torch.tensor(
-            [level_field(level, name) for level in curriculum_cfg.levels], device=env.device, dtype=dtype
+            [getattr(config.coerce_level_cfg(level), name) for level in curriculum_cfg.levels],
+            device=env.device,
+            dtype=dtype,
         )
 
     env_ids = _all_env_ids(env, env_ids)

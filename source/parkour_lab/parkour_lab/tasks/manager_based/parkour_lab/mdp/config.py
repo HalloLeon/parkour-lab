@@ -145,7 +145,6 @@ class GoalVelocityCfg:
             raise ValueError("min_clearance must be non-negative.")
 
 
-
 DEFAULT_GOAL_VELOCITY = GoalVelocityCfg()
 
 
@@ -221,7 +220,6 @@ class RootStabilityCfg:
 
         if self.min_clearance < 0.0:
             raise ValueError("min_clearance must be non-negative.")
-
 
 
 @configclass

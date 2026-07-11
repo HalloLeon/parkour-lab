@@ -593,7 +593,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
             raise ValueError("ParkourLabEnvCfg requires a generated terrain.")
         if not terrain_generator.curriculum or tuple(terrain_generator.difficulty_range) != (0.0, 1.0):
             raise ValueError(
-                "The discrete parkour row mapping requires terrain curriculum mode " "and difficulty_range=(0.0, 1.0)."
+                "The discrete parkour row mapping requires terrain curriculum mode and difficulty_range=(0.0, 1.0)."
             )
         if "parkour_box" not in terrain_generator.sub_terrains:
             raise ValueError("ParkourLabEnvCfg requires the 'parkour_box' sub-terrain.")

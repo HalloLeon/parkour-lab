@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import numpy as np
 import trimesh
 from isaaclab.terrains.sub_terrain_cfg import SubTerrainBaseCfg
@@ -9,46 +7,7 @@ from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 from isaaclab.utils import configclass
 
 from .difficulty import difficulty_to_level
-
-
-@dataclass(frozen=True)
-class ParkourObstacleLevelCfg:
-    """
-    One obstacle-curriculum level.
-
-    This describes the task geometry and a few training targets for that level.
-    """
-
-    name: str
-    obstacle_pos: tuple[float, float, float]
-    obstacle_size: tuple[float, float, float]
-    goal_pos: tuple[float, float, float]
-    target_speed: float
-    min_clearance: float
-
-    def __post_init__(self) -> None:
-        if len(self.obstacle_pos) != 3:
-            raise ValueError(f"{self.name}: obstacle_pos must have length 3.")
-
-        if len(self.obstacle_size) != 3:
-            raise ValueError(f"{self.name}: obstacle_size must have length 3.")
-
-        if len(self.goal_pos) != 3:
-            raise ValueError(f"{self.name}: goal_pos must have length 3.")
-
-        if any(size <= 0.0 for size in self.obstacle_size):
-            raise ValueError(f"{self.name}: obstacle_size entries must be positive.")
-
-        if self.target_speed < 0.0:
-            raise ValueError(f"{self.name}: target_speed must be non-negative.")
-
-        if self.min_clearance < 0.0:
-            raise ValueError(f"{self.name}: min_clearance must be non-negative.")
-
-        expected_center_z = 0.5 * self.obstacle_size[2]
-
-        if abs(self.obstacle_pos[2] - expected_center_z) > 1.0e-6:
-            raise ValueError(f"{self.name}: obstacle_pos.z should be obstacle_size.z / 2 for a box resting on ground.")
+from .levels import ParkourObstacleLevelCfg, coerce_level_cfg
 
 
 @configclass
@@ -119,6 +78,10 @@ class ParkourCurriculumCfg:
         if len(self.levels) == 0:
             raise ValueError("ParkourCurriculumCfg.levels must not be empty.")
 
+        # Hydra can turn nested dataclasses into dictionaries. Convert them
+        # back once so all downstream consumers receive one representation.
+        self.levels = tuple(coerce_level_cfg(level) for level in self.levels)
+
         names = [level.name for level in self.levels]
         if len(names) != len(set(names)):
             raise ValueError("Parkour curriculum level names must be unique.")
@@ -166,7 +129,7 @@ def parkour_box_terrain(difficulty: float, cfg: ParkourBoxTerrainCfg) -> tuple[l
     geometry and command metadata of logical level N.
     """
 
-    level = cfg.levels[difficulty_to_level(difficulty, len(cfg.levels))]
+    level = coerce_level_cfg(cfg.levels[difficulty_to_level(difficulty, len(cfg.levels))])
     obstacle_size = level.obstacle_size
     obstacle_pos = level.obstacle_pos
 
