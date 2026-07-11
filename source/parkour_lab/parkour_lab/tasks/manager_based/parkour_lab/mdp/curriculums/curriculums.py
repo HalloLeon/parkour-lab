@@ -189,14 +189,10 @@ def reset_goal_and_commands_from_terrain_level(
     )
 
     goal_pos_by_level = level_tensor("goal_pos", dtype=dtype)
-    obstacle_pos_by_level = level_tensor("obstacle_pos", dtype=dtype)
-    obstacle_size_by_level = level_tensor("obstacle_size", dtype=dtype)
     target_speed_by_level = level_tensor("target_speed")
     min_clearance_by_level = level_tensor("min_clearance")
 
     level_goal_pos = goal_pos_by_level[levels]
-    level_obstacle_pos = obstacle_pos_by_level[levels]
-    level_obstacle_size = obstacle_size_by_level[levels]
 
     goal_pos_w = level_goal_pos + env.scene.env_origins[env_ids]
 
@@ -223,8 +219,6 @@ def reset_goal_and_commands_from_terrain_level(
         env_ids=env_ids,
         target_speed=target_speed_by_level[levels],
         min_clearance=min_clearance_by_level[levels],
-        obstacle_pos=level_obstacle_pos,
-        obstacle_size=level_obstacle_size,
     )
 
 
@@ -288,7 +282,9 @@ def _ensure_curriculum_stat_buffers(env: ManagerBasedRLEnv) -> None:
 
 
 def _logical_level_from_terrain_level(
-    env: ManagerBasedRLEnv, terrain_level: torch.Tensor, curriculum_cfg: config.ParkourCurriculumCfg
+    env: ManagerBasedRLEnv,
+    terrain_level: torch.Tensor,
+    curriculum_cfg: config.ParkourCurriculumCfg,
 ) -> torch.Tensor:
     """Map terrain rows one-to-one to the authoritative logical levels.
 
