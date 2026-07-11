@@ -33,10 +33,6 @@ DEFAULT_LEVEL = PARKOUR_CURRICULUM.levels[PARKOUR_CURRICULUM.initial_level]
 
 GOAL_POS = DEFAULT_LEVEL.goal_pos
 
-TARGET_SPEED = DEFAULT_LEVEL.target_speed
-MIN_CLEARANCE = DEFAULT_LEVEL.min_clearance
-
-
 ##
 # Scene definition
 ##
@@ -353,10 +349,8 @@ class RewardsCfg:
         weight=1.0,
         params={
             "tracking_cfg": mdp.config.GoalVelocityCfg(
-                target_speed=TARGET_SPEED,
                 speed_tracking_scale=0.25,
                 slow_down_distance=1.25,
-                min_clearance=MIN_CLEARANCE,
             ),
             "goal_cfg": SceneEntityCfg("goal"),
             "asset_cfg": SceneEntityCfg("robot"),
@@ -375,7 +369,8 @@ class RewardsCfg:
                 lateral_drift_weight=0.25,
                 max_lateral_penalty=1.0,
                 stability=mdp.config.RootStabilityCfg(
-                    max_roll_pitch_ang_speed=4.0, max_projected_gravity_xy_norm=0.75, min_clearance=MIN_CLEARANCE
+                    max_roll_pitch_ang_speed=4.0,
+                    max_projected_gravity_xy_norm=0.75,
                 ),
             ),
             "goal_cfg": SceneEntityCfg("goal"),
@@ -397,7 +392,7 @@ class RewardsCfg:
 
     reached_goal_xy = RewTerm(
         func=mdp.reached_goal_xy_reward,
-        weight=300.0,
+        weight=200.0,
         params={
             "threshold": PARKOUR_CURRICULUM.success_threshold,
             "goal_cfg": SceneEntityCfg("goal"),
@@ -408,7 +403,7 @@ class RewardsCfg:
     # Safety.
     illegal_contact = RewTerm(
         func=mdp.base_contact,
-        weight=-10.0,
+        weight=-200.0,
         params={
             "threshold": PARKOUR_CURRICULUM.base_contact_threshold,
             "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk"),

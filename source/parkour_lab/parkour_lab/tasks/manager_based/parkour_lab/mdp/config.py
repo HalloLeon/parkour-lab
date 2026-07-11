@@ -116,33 +116,25 @@ class GoalVelocityCfg:
     """
     Configuration for goal-directed XY velocity tracking.
 
-    The robot is rewarded for matching a desired velocity along the
-    direction to the goal.
+    The target speed is a per-environment command set by the curriculum.
+    This configuration only controls velocity-reward shaping.
 
     Far from the goal:
-        desired speed ≈ target_speed
+        desired speed is the current target-speed command.
 
     Near the goal:
         desired speed smoothly decreases to avoid overshooting.
     """
 
-    target_speed: float = 0.6
     speed_tracking_scale: float = 0.2
     slow_down_distance: float = 0.5
-    min_clearance: float = 0.25
 
     def __post_init__(self) -> None:
-        if self.target_speed < 0.0:
-            raise ValueError("target_speed must be non-negative.")
-
         if self.speed_tracking_scale <= 0.0:
             raise ValueError("speed_tracking_scale must be positive.")
 
         if self.slow_down_distance <= 0.0:
             raise ValueError("slow_down_distance must be positive.")
-
-        if self.min_clearance < 0.0:
-            raise ValueError("min_clearance must be non-negative.")
 
 
 DEFAULT_GOAL_VELOCITY = GoalVelocityCfg()
@@ -209,7 +201,6 @@ class RootStabilityCfg:
 
     max_roll_pitch_ang_speed: float = 4.0
     max_projected_gravity_xy_norm: float = 0.75
-    min_clearance: float = 0.25
 
     def __post_init__(self) -> None:
         if self.max_roll_pitch_ang_speed <= 0.0:
@@ -217,9 +208,6 @@ class RootStabilityCfg:
 
         if self.max_projected_gravity_xy_norm <= 0.0:
             raise ValueError("max_projected_gravity_xy_norm must be positive.")
-
-        if self.min_clearance < 0.0:
-            raise ValueError("min_clearance must be non-negative.")
 
 
 @configclass

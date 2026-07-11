@@ -19,7 +19,7 @@ def initialize_parkour_terrain_levels(
 ) -> None:
     """Place environments on exact terrain rows before the first reset.
 
-    ``TerrainImporterCfg.max_init_terrain_level`` is an upper bound for random
+    `TerrainImporterCfg.max_init_terrain_level` is an upper bound for random
     sampling, not an exact initial level. This startup event makes the training
     distribution explicit and is also what pins deterministic evaluation to a
     single difficulty.
@@ -292,8 +292,8 @@ def _logical_level_from_terrain_level(
 ) -> torch.Tensor:
     """Map terrain rows one-to-one to the authoritative logical levels.
 
-    ``terrain_level`` contains integer row indices maintained by
-    ``TerrainImporter``; it is not the normalized floating-point difficulty
+    `terrain_level` contains integer row indices maintained by
+    `TerrainImporter`; it is not the normalized floating-point difficulty
     passed to the terrain-generation function. The parkour configuration
     enforces exactly one terrain row per logical level, so the mapping is:
 

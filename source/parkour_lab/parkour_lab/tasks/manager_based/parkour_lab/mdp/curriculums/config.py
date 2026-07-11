@@ -140,7 +140,7 @@ def parkour_box_terrain(difficulty: float, cfg: ParkourBoxTerrainCfg) -> tuple[l
     meshes: list[trimesh.Trimesh] = []
 
     # Create the ground as a rectangular box spanning the complete terrain
-    # tile. ``extents`` contains the box's full dimensions along X, Y, and Z:
+    # tile. `extents` contains the box's full dimensions along X, Y, and Z:
     #   [tile length, tile width, ground thickness].
     #
     # Trimesh creates a box around its center. Move that center to the tile's

@@ -8,8 +8,8 @@ import math
 def difficulty_to_level(difficulty: float, num_levels: int) -> int:
     """Map a normalized difficulty to an equally sized discrete level bin.
 
-    Isaac Lab generates row ``r`` with a difficulty in
-    ``[r / num_rows, (r + 1) / num_rows)``. When ``num_rows`` equals the
+    Isaac Lab generates row `r` with a difficulty in
+    `[r / num_rows, (r + 1) / num_rows)`. When `num_rows` equals the
     number of logical levels, this mapping makes the physical terrain row and
     the task level identical. The upper endpoint is assigned to the last bin.
     """
