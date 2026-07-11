@@ -6,7 +6,7 @@ from isaaclab.sensors import RayCaster
 from isaaclab.utils.math import quat_apply_inverse
 
 from . import config
-from ._shared import contact, navigation, runtime, terrain
+from ._shared import contact, navigation, terrain
 from .commands import get_target_speed
 
 
@@ -113,32 +113,25 @@ def desired_speed_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
     return get_target_speed(env).unsqueeze(-1)
 
 
-def height_scan_or_zeros(
+def terrain_height_scan(
     env: ManagerBasedRLEnv,
     obs_cfg: config.HeightScanObservationCfg = config.DEFAULT_HEIGHT_SCAN_OBSERVATION,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
-    Fixed-size terrain/obstacle height scan.
+    Fixed-size privileged terrain-height scan for the Phase 1 teacher.
 
-    If the height scanner is not present, returns zeros with the expected size.
-    This keeps observation dimensions stable across simple and terrain-rich
-    environments.
-
-    Intended for critic/teacher use, not the first deployable actor.
+    The configured ray caster is required. Failing when it is absent prevents
+    training a supposedly terrain-aware teacher on an accidental all-zero
+    terrain input.
 
     Returns:
         [num_envs, obs_cfg.num_rays]
     """
 
-    sensor = runtime._get_scene_entity_or_none(env, sensor_cfg.name)
+    sensor = env.scene[sensor_cfg.name]
     asset: Articulation = env.scene[asset_cfg.name]
-
-    if sensor is None:
-        return torch.zeros(
-            (env.num_envs, obs_cfg.num_rays), device=asset.data.root_pos_w.device, dtype=asset.data.root_pos_w.dtype
-        )
 
     if not isinstance(sensor, RayCaster):
         raise TypeError(f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}.")

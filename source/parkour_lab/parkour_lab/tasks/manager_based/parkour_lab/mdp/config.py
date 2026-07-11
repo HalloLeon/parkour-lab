@@ -8,9 +8,10 @@ from isaaclab.utils import configclass
 @configclass
 class HeightScanObservationCfg:
     """
-    Configuration for terrain/obstacle height-scan observations.
+    Configuration for the Phase 1 teacher's privileged terrain-height scan.
 
-    This is intended for teacher/critic use, not for the first deployable actor.
+    The future deployable student will not consume this simulator ray cast;
+    its terrain representation is planned to come from onboard depth instead.
     """
 
     num_rays: int = 132

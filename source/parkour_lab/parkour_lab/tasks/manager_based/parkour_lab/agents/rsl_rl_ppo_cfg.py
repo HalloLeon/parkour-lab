@@ -50,7 +50,10 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # actions, or critic targets can quickly destroy PPO training.
     check_for_nan = True
 
-    obs_groups = {"actor": ["policy"], "critic": ["critic"]}
+    # The action-producing PPO actor consumes the privileged teacher group,
+    # including its terrain-height scan. The critic receives that exact group
+    # plus the small critic-only simulator-state group.
+    obs_groups = {"actor": ["policy"], "critic": ["policy", "critic"]}
 
     # Configuration for the actor-critic policy network used by PPO.
     #

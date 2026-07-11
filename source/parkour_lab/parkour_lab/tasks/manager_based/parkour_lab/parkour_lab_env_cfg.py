@@ -110,10 +110,9 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         # disabled during training to avoid visualization overhead.
     )
 
-    # Dense, forward-looking terrain scan for the privileged critic/teacher
-    # observation. It shares the attachment, alignment, direction, and terrain
-    # mesh conventions documented above, but samples a 2-D grid instead of the
-    # single point directly beneath the trunk.
+    # Dense, forward-looking terrain scan for the Phase 1 teacher actor. The
+    # critic receives the same scan through the shared teacher observation set.
+    # It samples a 2-D grid instead of the single point beneath the trunk.
     height_scanner: RayCasterCfg = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/trunk",
         # Shift the grid forward for upcoming-terrain coverage and start it high
@@ -160,11 +159,17 @@ class ActionsCfg:
 
 @configclass
 class ObservationsCfg:
-    """Observation specifications for the MDP."""
+    """Phase 1 teacher-actor and asymmetric critic observations."""
 
     @configclass
-    class PolicyCfg(ObsGroup):
-        """Deployable actor observations."""
+    class TeacherActorCfg(ObsGroup):
+        """Privileged teacher observations consumed by the PPO actor.
+
+        The proprioceptive and task terms form the future student's deployable
+        core. `height_scan` is privileged geometric information used only by
+        the Phase 1 teacher; it will eventually be replaced by onboard depth
+        perception during distillation.
+        """
 
         # Body orientation and angular motion.
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
@@ -205,55 +210,10 @@ class ObservationsCfg:
             },
         )
 
-        def __post_init__(self) -> None:
-            self.enable_corruption = False
-            self.concatenate_terms = True
-
-    @configclass
-    class CriticCfg(ObsGroup):
-        """Privileged critic observations."""
-
-        # Same core observations as the actor.
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
-        projected_gravity = ObsTerm(func=mdp.projected_gravity)
-
-        goal_direction_body_xy = ObsTerm(
-            func=mdp.goal_direction_body_xy,
-            params={
-                "goal_cfg": SceneEntityCfg("goal"),
-                "asset_cfg": SceneEntityCfg("robot"),
-            },
-        )
-
-        goal_distance_xy = ObsTerm(
-            func=mdp.goal_distance_xy_w,
-            params={
-                "goal_cfg": SceneEntityCfg("goal"),
-                "asset_cfg": SceneEntityCfg("robot"),
-            },
-        )
-
-        desired_speed = ObsTerm(func=mdp.desired_speed_obs)
-
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
-        last_action = ObsTerm(func=mdp.last_action)
-
-        foot_contacts = ObsTerm(
-            func=mdp.foot_contact_state,
-            params={
-                "threshold": 1.0,
-                "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
-            },
-        )
-
-        # Privileged state.
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
-
-        base_clearance = ObsTerm(func=mdp.base_clearance_obs, params={"asset_cfg": SceneEntityCfg("robot")})
-
+        # Fixed-dimensional privileged terrain geometry. This belongs to the
+        # action-producing teacher actor, not only to the value function.
         height_scan = ObsTerm(
-            func=mdp.height_scan_or_zeros,
+            func=mdp.terrain_height_scan,
             params={
                 "obs_cfg": mdp.config.HeightScanObservationCfg(num_rays=132, vertical_offset=0.30, clip=0.50),
                 "sensor_cfg": SceneEntityCfg("height_scanner"),
@@ -265,8 +225,24 @@ class ObservationsCfg:
             self.enable_corruption = False
             self.concatenate_terms = True
 
-    policy: PolicyCfg = PolicyCfg()
-    critic: CriticCfg = CriticCfg()
+    @configclass
+    class CriticPrivilegedCfg(ObsGroup):
+        """Small set of simulator-only terms appended to teacher observations."""
+
+        # RSL-RL composes the complete critic input as [policy, critic]. Keep
+        # this group limited to state that materially improves value estimation.
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+
+        base_clearance = ObsTerm(func=mdp.base_clearance_obs, params={"asset_cfg": SceneEntityCfg("robot")})
+
+        def __post_init__(self) -> None:
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    # Retain the conventional `policy` group name for Isaac Lab tooling. In
+    # Phase 1 it is specifically the privileged teacher-actor observation set.
+    policy: TeacherActorCfg = TeacherActorCfg()
+    critic: CriticPrivilegedCfg = CriticPrivilegedCfg()
 
 
 @configclass
@@ -385,7 +361,7 @@ class RewardsCfg:
 
     reached_goal_xy = RewTerm(
         func=mdp.reached_goal_xy_reward,
-        weight=200.0,
+        weight=100.0,
         params={
             "threshold": PARKOUR_CURRICULUM.success_threshold,
             "goal_cfg": SceneEntityCfg("goal"),
