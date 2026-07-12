@@ -45,7 +45,9 @@ def goal_direction_body_xy(
 
     goal_vec_xy = navigation._goal_vector_xy(env, goal_cfg, asset_cfg)
 
-    goal_vec_w = torch.zeros((goal_vec_xy.shape[0], 3), device=goal_vec_xy.device, dtype=goal_vec_xy.dtype)
+    goal_vec_w = torch.zeros(
+        (goal_vec_xy.shape[0], 3), device=goal_vec_xy.device, dtype=goal_vec_xy.dtype
+    )
     goal_vec_w[:, :2] = goal_vec_xy
 
     # Rotate the world-frame goal vector into the robot body frame.
@@ -65,10 +67,14 @@ def goal_direction_body_xy(
     goal_vec_b = quat_apply_inverse(asset.data.root_quat_w, goal_vec_w)
     goal_dir_b_xy = goal_vec_b[:, :2]
 
-    return goal_dir_b_xy / torch.linalg.norm(goal_dir_b_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
+    return goal_dir_b_xy / torch.linalg.norm(
+        goal_dir_b_xy, dim=-1, keepdim=True
+    ).clamp_min(1.0e-6)
 
 
-def base_clearance_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def base_clearance_obs(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
     """
     Base/root clearance above the support surface underneath the robot.
 
@@ -113,6 +119,31 @@ def desired_speed_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
     return get_target_speed(env).unsqueeze(-1)
 
 
+def _terrain_height_scan_components(
+    env: ManagerBasedRLEnv,
+    obs_cfg: config.HeightScanObservationCfg = config.DEFAULT_HEIGHT_SCAN_OBSERVATION,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read and process the configured privileged terrain ray caster."""
+
+    sensor = env.scene[sensor_cfg.name]
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    if not isinstance(sensor, RayCaster):
+        raise TypeError(
+            f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}."
+        )
+
+    return terrain.terrain_height_components(
+        asset.data.root_pos_w[:, 2],
+        sensor.data.ray_hits_w,
+        num_rays=obs_cfg.num_rays,
+        vertical_offset=obs_cfg.vertical_offset,
+        clip=obs_cfg.clip,
+    )
+
+
 def terrain_height_scan(
     env: ManagerBasedRLEnv,
     obs_cfg: config.HeightScanObservationCfg = config.DEFAULT_HEIGHT_SCAN_OBSERVATION,
@@ -124,32 +155,48 @@ def terrain_height_scan(
 
     The configured ray caster is required. Failing when it is absent prevents
     training a supposedly terrain-aware teacher on an accidental all-zero
-    terrain input. Heights are clipped in metres using `obs_cfg.clip` and
-    then divided by that fixed bound, producing values in `[-1, 1]`.
+    terrain input. Heights are clipped in metres using ``obs_cfg.clip`` and
+    then divided by that fixed bound, producing values in ``[-1, 1]``.
 
-    A value of zero places the surface at `root_z - vertical_offset`.
+    A value of zero places the surface at ``root_z - vertical_offset``.
     Negative values represent surfaces above that reference plane; positive
-    values represent surfaces below it.
+    values represent surfaces below it. Missing hits use the deterministic
+    value ``+1``; consume :func:`terrain_height_scan_validity` alongside this
+    term to distinguish them from genuinely clipped-low surfaces.
 
     Returns:
-        Normalized heights with shape `[num_envs, obs_cfg.num_rays]`.
+        Normalized heights with shape ``[num_envs, obs_cfg.num_rays]``.
     """
 
-    sensor = env.scene[sensor_cfg.name]
-    asset: Articulation = env.scene[asset_cfg.name]
+    heights, _ = _terrain_height_scan_components(
+        env,
+        obs_cfg=obs_cfg,
+        sensor_cfg=sensor_cfg,
+        asset_cfg=asset_cfg,
+    )
+    return heights
 
-    if not isinstance(sensor, RayCaster):
-        raise TypeError(f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}.")
 
-    root_z = asset.data.root_pos_w[:, 2].unsqueeze(-1)
-    hit_z = sensor.data.ray_hits_w[..., 2]
+def terrain_height_scan_validity(
+    env: ManagerBasedRLEnv,
+    obs_cfg: config.HeightScanObservationCfg = config.DEFAULT_HEIGHT_SCAN_OBSERVATION,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return a fixed-size floating mask identifying finite terrain-ray hits.
 
-    if hit_z.shape[-1] != obs_cfg.num_rays:
-        raise RuntimeError(f"Height scan expected {obs_cfg.num_rays} rays, but sensor returned {hit_z.shape[-1]} rays.")
+    ``1`` denotes a valid surface hit and ``0`` denotes a missing or otherwise
+    non-finite hit. The mask has the same stable ray ordering as
+    :func:`terrain_height_scan`.
 
-    heights_m = root_z - obs_cfg.vertical_offset - hit_z
+    Returns:
+        Validity mask with shape ``[num_envs, obs_cfg.num_rays]``.
+    """
 
-    heights_m = torch.nan_to_num(heights_m, nan=0.0, posinf=obs_cfg.clip, neginf=-obs_cfg.clip)
-    clipped_heights_m = torch.clamp(heights_m, min=-obs_cfg.clip, max=obs_cfg.clip)
-
-    return clipped_heights_m / obs_cfg.clip
+    _, validity = _terrain_height_scan_components(
+        env,
+        obs_cfg=obs_cfg,
+        sensor_cfg=sensor_cfg,
+        asset_cfg=asset_cfg,
+    )
+    return validity

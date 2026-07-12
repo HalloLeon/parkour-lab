@@ -15,7 +15,7 @@ class HeightScanObservationCfg:
     """
 
     num_rays: int = 132
-    """Fixed number of ray samples in the flattened observation."""
+    """Fixed number of ray samples in each flattened height and validity term."""
 
     vertical_offset: float = 0.3
     """Reference-plane distance below the robot root, in metres."""

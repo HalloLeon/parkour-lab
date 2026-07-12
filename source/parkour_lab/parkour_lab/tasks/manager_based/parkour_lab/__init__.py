@@ -19,6 +19,10 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.parkour_lab_env_cfg:ParkourLabEnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        "rsl_rl_privileged_critic_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:PPOPrivilegedCriticRunnerCfg"
+        ),
+        "rsl_rl_baseline_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPOBaselineRunnerCfg",
     },
 )
 
@@ -29,5 +33,9 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.parkour_lab_env_cfg:ParkourLabEnvCfgPlay",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        "rsl_rl_privileged_critic_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:PPOPrivilegedCriticRunnerCfg"
+        ),
+        "rsl_rl_baseline_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPOBaselineRunnerCfg",
     },
 )

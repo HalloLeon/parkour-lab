@@ -6,8 +6,8 @@
 
 """Public reward terms for the parkour environment.
 
-Implementations are grouped by domain in the `reward_terms` package.
-They are imported here so references such as `mdp.base_contact` continue
+Implementations are grouped by domain in the ``reward_terms`` package.
+They are imported here so references such as ``mdp.base_contact`` continue
 to work.
 """
 

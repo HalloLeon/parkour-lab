@@ -54,7 +54,9 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
             static_friction=1.0,
             dynamic_friction=1.0,
         ),
-        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.55, 0.48, 0.35), roughness=0.8),
+        visual_material=sim_utils.PreviewSurfaceCfg(
+            diffuse_color=(0.55, 0.48, 0.35), roughness=0.8
+        ),
     )
 
     goal: RigidObjectCfg = RigidObjectCfg(
@@ -80,7 +82,9 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         history_length=3,
     )
 
-    base_contact: ContactSensorCfg = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/trunk", history_length=3)
+    base_contact: ContactSensorCfg = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/trunk", history_length=3
+    )
 
     # One downward terrain ray at the trunk origin provides geometry-agnostic
     # base clearance for flat ground, slopes, and arbitrary terrain meshes.
@@ -111,8 +115,9 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     )
 
     # Dense, forward-looking terrain scan for the Phase 1 teacher actor. The
-    # critic receives the same scan through the shared teacher observation set.
-    # It samples a 2-D grid instead of the single point beneath the trunk.
+    # explicit RSL-RL routing supplies this independent terrain group to both
+    # actor and critic. It samples a 2-D grid instead of the single point
+    # beneath the trunk.
     height_scanner: RayCasterCfg = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/trunk",
         # Shift the grid forward for upcoming-terrain coverage and start it high
@@ -126,6 +131,9 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
             # HeightScanObservationCfg(num_rays=132).
             size=(1.65, 1.50),
             direction=(0.0, 0.0, -1.0),
+            # Flatten with longitudinal X as the inner/fast-changing index and
+            # lateral Y as the outer/slow-changing index.
+            ordering="xy",
         ),
         mesh_prim_paths=["/World/Ground"],
         # Reach the terrain from the 20 m vertical offset with ample margin.
@@ -154,22 +162,18 @@ class ActionsCfg:
     #
     # target_joint_pos = default_joint_pos + scale * policy_action
 
-    joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], scale=0.25, use_default_offset=True)
+    joint_pos = mdp.JointPositionActionCfg(
+        asset_name="robot", joint_names=[".*"], scale=0.25, use_default_offset=True
+    )
 
 
 @configclass
 class ObservationsCfg:
-    """Phase 1 teacher-actor and asymmetric critic observations."""
+    """Additive Phase 1 teacher-actor and asymmetric critic observations."""
 
     @configclass
-    class TeacherActorCfg(ObsGroup):
-        """Privileged teacher observations consumed by the PPO actor.
-
-        The proprioceptive and task terms form the future student's deployable
-        core. `height_scan` is privileged geometric information used only by
-        the Phase 1 teacher; it will eventually be replaced by onboard depth
-        perception during distillation.
-        """
+    class DeployableCoreCfg(ObsGroup):
+        """Proprioceptive and task observations reusable by a future student."""
 
         # Body orientation and angular motion.
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
@@ -210,12 +214,35 @@ class ObservationsCfg:
             },
         )
 
-        # Fixed-dimensional privileged terrain geometry. This belongs to the
-        # action-producing teacher actor, not only to the value function.
+        def __post_init__(self) -> None:
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
+    class PrivilegedTerrainCfg(ObsGroup):
+        """Simulator ray-cast geometry consumed by the Phase 1 teacher."""
+
+        # Fixed-dimensional robot-relative terrain geometry. The PPO routing
+        # explicitly appends this group to both actor and critic inputs.
         height_scan = ObsTerm(
             func=mdp.terrain_height_scan,
             params={
-                "obs_cfg": mdp.config.HeightScanObservationCfg(num_rays=132, vertical_offset=0.30, clip=0.50),
+                "obs_cfg": mdp.config.HeightScanObservationCfg(
+                    num_rays=132, vertical_offset=0.30, clip=0.50
+                ),
+                "sensor_cfg": SceneEntityCfg("height_scanner"),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        # Keep missing-hit information separate from the height value so future
+        # gap terrain cannot be confused with a surface at the fallback height.
+        height_scan_validity = ObsTerm(
+            func=mdp.terrain_height_scan_validity,
+            params={
+                "obs_cfg": mdp.config.HeightScanObservationCfg(
+                    num_rays=132, vertical_offset=0.30, clip=0.50
+                ),
                 "sensor_cfg": SceneEntityCfg("height_scanner"),
                 "asset_cfg": SceneEntityCfg("robot"),
             },
@@ -227,22 +254,25 @@ class ObservationsCfg:
 
     @configclass
     class CriticPrivilegedCfg(ObsGroup):
-        """Small set of simulator-only terms appended to teacher observations."""
+        """Simulator-only state appended exclusively to the critic input."""
 
-        # RSL-RL composes the complete critic input as [policy, critic]. Keep
-        # this group limited to state that materially improves value estimation.
+        # Keep this group limited to state that materially improves value
+        # estimation and is absent from both policy and terrain groups.
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
 
-        base_clearance = ObsTerm(func=mdp.base_clearance_obs, params={"asset_cfg": SceneEntityCfg("robot")})
+        base_clearance = ObsTerm(
+            func=mdp.base_clearance_obs, params={"asset_cfg": SceneEntityCfg("robot")}
+        )
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
             self.concatenate_terms = True
 
-    # Retain the conventional `policy` group name for Isaac Lab tooling. In
-    # Phase 1 it is specifically the privileged teacher-actor observation set.
-    policy: TeacherActorCfg = TeacherActorCfg()
-    critic: CriticPrivilegedCfg = CriticPrivilegedCfg()
+    # ``policy`` remains the reusable deployable core for Isaac Lab tooling. RSL-
+    # RL routing is explicit and never relies on this conventional name.
+    policy: DeployableCoreCfg = DeployableCoreCfg()
+    terrain: PrivilegedTerrainCfg = PrivilegedTerrainCfg()
+    critic_privileged: CriticPrivilegedCfg = CriticPrivilegedCfg()
 
 
 @configclass
@@ -413,7 +443,9 @@ class RewardsCfg:
         func=mdp.feet_stumble,
         weight=-0.5,
         params={
-            "stumble_cfg": mdp.config.FeetStumbleCfg(lateral_to_vertical_force_ratio=4.0, min_vertical_force=1.0),
+            "stumble_cfg": mdp.config.FeetStumbleCfg(
+                lateral_to_vertical_force_ratio=4.0, min_vertical_force=1.0
+            ),
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
         },
     )
@@ -564,29 +596,43 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         terrain_generator = self.scene.ground.terrain_generator
         if terrain_generator is None:
             raise ValueError("ParkourLabEnvCfg requires a generated terrain.")
-        if not terrain_generator.curriculum or tuple(terrain_generator.difficulty_range) != (0.0, 1.0):
+        if not terrain_generator.curriculum or tuple(
+            terrain_generator.difficulty_range
+        ) != (0.0, 1.0):
             raise ValueError(
                 "The discrete parkour row mapping requires terrain curriculum mode and difficulty_range=(0.0, 1.0)."
             )
         if "parkour_course" not in terrain_generator.sub_terrains:
-            raise ValueError("ParkourLabEnvCfg requires the 'parkour_course' sub-terrain.")
+            raise ValueError(
+                "ParkourLabEnvCfg requires the 'parkour_course' sub-terrain."
+            )
 
         terrain_generator.num_rows = len(curriculum_cfg.levels)
         terrain_generator.sub_terrains["parkour_course"].levels = curriculum_cfg.levels
         self.scene.ground.max_init_terrain_level = curriculum_cfg.initial_level
-        self.scene.goal.init_state.pos = curriculum_cfg.levels[curriculum_cfg.initial_level].goal_pos
+        self.scene.goal.init_state.pos = curriculum_cfg.levels[
+            curriculum_cfg.initial_level
+        ].goal_pos
 
         self.events.initialize_terrain_levels.params["curriculum_cfg"] = curriculum_cfg
         self.events.reset_goal_and_commands.params["curriculum_cfg"] = curriculum_cfg
         if self.curriculum is not None:
             self.curriculum.terrain_levels.params["curriculum_cfg"] = curriculum_cfg
 
-        self.rewards.reached_goal_xy.params["threshold"] = curriculum_cfg.success_threshold
-        self.rewards.illegal_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
+        self.rewards.reached_goal_xy.params["threshold"] = (
+            curriculum_cfg.success_threshold
+        )
+        self.rewards.illegal_contact.params["threshold"] = (
+            curriculum_cfg.base_contact_threshold
+        )
         self.terminations.success.params["threshold"] = curriculum_cfg.success_threshold
-        self.terminations.trunk_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
+        self.terminations.trunk_contact.params["threshold"] = (
+            curriculum_cfg.base_contact_threshold
+        )
 
-    def set_evaluation_difficulty(self, level: int | None = None, seed: int | None = None) -> None:
+    def set_evaluation_difficulty(
+        self, level: int | None = None, seed: int | None = None
+    ) -> None:
         """Freeze the environment at one reproducible logical difficulty."""
 
         self.synchronize_curriculum_config()
@@ -594,7 +640,9 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         if level is None:
             level = curriculum_cfg.max_level
         if not 0 <= level <= curriculum_cfg.max_level:
-            raise ValueError(f"difficulty level must be in [0, {curriculum_cfg.max_level}], got {level}.")
+            raise ValueError(
+                f"difficulty level must be in [0, {curriculum_cfg.max_level}], got {level}."
+            )
 
         self.evaluation_level = level
         self.curriculum = None
@@ -604,7 +652,9 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         terrain_generator = self.scene.ground.terrain_generator
         if terrain_generator is not None:
             terrain_generator.num_rows = len(curriculum_cfg.levels)
-            terrain_generator.num_cols = max(1, min(terrain_generator.num_cols, self.scene.num_envs))
+            terrain_generator.num_cols = max(
+                1, min(terrain_generator.num_cols, self.scene.num_envs)
+            )
             terrain_generator.curriculum = True
             if seed is not None:
                 terrain_generator.seed = seed
