@@ -314,13 +314,9 @@ class CurriculumCfg:
 class RewardsCfg:
     # Goal task.
     velocity_along_goal_xy = RewTerm(
-        func=mdp.velocity_along_goal_xy_clearance_exp,
+        func=mdp.velocity_along_goal_xy_clearance_capped,
         weight=1.0,
         params={
-            "tracking_cfg": mdp.config.GoalVelocityCfg(
-                speed_tracking_scale=0.25,
-                slow_down_distance=1.25,
-            ),
             "goal_cfg": SceneEntityCfg("goal"),
             "asset_cfg": SceneEntityCfg("robot"),
         },

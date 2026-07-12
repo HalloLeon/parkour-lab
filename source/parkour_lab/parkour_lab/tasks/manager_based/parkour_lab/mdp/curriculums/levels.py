@@ -62,8 +62,8 @@ class ParkourLevelCfg:
         if not all(isinstance(structure, ParkourStructureCfg) for structure in self.structures):
             raise TypeError(f"{self.name}: structures must contain supported parkour structure configurations.")
 
-        if self.target_speed < 0.0:
-            raise ValueError(f"{self.name}: target_speed must be non-negative.")
+        if self.target_speed <= 0.0:
+            raise ValueError(f"{self.name}: target_speed must be positive.")
 
         if self.min_clearance < 0.0:
             raise ValueError(f"{self.name}: min_clearance must be non-negative.")

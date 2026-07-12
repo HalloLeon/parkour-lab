@@ -116,35 +116,6 @@ DEFAULT_GOAL_HEADING = GoalHeadingCfg()
 
 
 @configclass
-class GoalVelocityCfg:
-    """
-    Configuration for goal-directed XY velocity tracking.
-
-    The target speed is a per-environment command set by the curriculum.
-    This configuration only controls velocity-reward shaping.
-
-    Far from the goal:
-        desired speed is the current target-speed command.
-
-    Near the goal:
-        desired speed smoothly decreases to avoid overshooting.
-    """
-
-    speed_tracking_scale: float = 0.2
-    slow_down_distance: float = 0.5
-
-    def __post_init__(self) -> None:
-        if self.speed_tracking_scale <= 0.0:
-            raise ValueError("speed_tracking_scale must be positive.")
-
-        if self.slow_down_distance <= 0.0:
-            raise ValueError("slow_down_distance must be positive.")
-
-
-DEFAULT_GOAL_VELOCITY = GoalVelocityCfg()
-
-
-@configclass
 class RootMotionChatterCfg:
     """
     Configuration for penalizing small, rapid root/trunk oscillations.

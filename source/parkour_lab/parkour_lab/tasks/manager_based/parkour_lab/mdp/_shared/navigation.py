@@ -12,7 +12,11 @@ def _goal_direction_xy(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
-    Unit XY direction from robot root to goal.
+    Unit XY direction from robot root to goal in world-aligned axes.
+
+    Positions are expressed relative to each environment origin before
+    subtraction, but environment origins are translations only. The resulting
+    direction therefore retains the world-frame XY orientation.
 
     Returns:
         [num_envs, 2]
@@ -209,7 +213,7 @@ def _velocity_along_goal_xy(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
-    Robot root velocity projected onto the XY goal direction.
+    World-frame root velocity projected onto the world-aligned XY goal direction.
 
     Positive:
         moving toward the goal

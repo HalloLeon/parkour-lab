@@ -14,27 +14,29 @@ from .._shared import navigation, runtime, stability, state, terrain
 from ..commands import get_min_clearance, get_target_speed
 
 
-def velocity_along_goal_xy_exp(
+def velocity_along_goal_xy_capped(
     env: ManagerBasedRLEnv,
-    tracking_cfg: config.GoalVelocityCfg = config.DEFAULT_GOAL_VELOCITY,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
-    Reward tracking a desired XY velocity along the direction to the goal.
+    Reward normalized world-frame XY velocity toward the goal.
 
-    Far from the goal:
-        desired velocity is the current per-environment target-speed command.
+    The reward follows:
 
-    Near the goal:
-        desired velocity decreases toward zero to reduce overshooting.
+        min(dot(root_velocity_xy_w, goal_direction_xy_w), target_speed)
+        ----------------------------------------------------------------
+                              target_speed
 
-    The exponential tracking kernel reduces the reward for both underspeed
-    and overspeed. It shapes the policy toward the commanded speed; it does
-    not clamp the robot's physical velocity.
+    Projecting world-frame velocity onto the world-frame goal direction avoids
+    rewarding a robot that turns around and moves in its body-forward direction
+    away from the goal. Capping at the command prevents additional reward for
+    overspeed without penalizing short speed bursts needed for parkour. Dividing
+    by the command gives every curriculum level the same maximum reward of 1.0.
+    Moving away from the goal produces a negative reward.
 
     This reward does not check whether the robot is upright or has enough
-    clearance. Use velocity_along_goal_xy_clearance_exp for the gated version.
+    clearance. Use velocity_along_goal_xy_clearance_capped for the gated version.
 
     Returns:
         [num_envs]
@@ -42,29 +44,19 @@ def velocity_along_goal_xy_exp(
 
     velocity_along_goal = navigation._velocity_along_goal_xy(env, goal_cfg=goal_cfg, asset_cfg=asset_cfg)
 
-    goal_dist_xy = navigation._goal_distance_xy(env, goal_cfg, asset_cfg)
+    target_speed = get_target_speed(env).to(device=velocity_along_goal.device, dtype=velocity_along_goal.dtype)
+    normalization_speed = target_speed.clamp_min(torch.finfo(target_speed.dtype).eps)
 
-    slowdown_scale = torch.clamp(goal_dist_xy / tracking_cfg.slow_down_distance, min=0.0, max=1.0)
-
-    target_speed = get_target_speed(env).to(device=goal_dist_xy.device, dtype=goal_dist_xy.dtype)
-
-    desired_velocity = target_speed * slowdown_scale
-
-    # Symmetric command tracking is intentional: overspeed must lose reward,
-    # especially while the desired velocity is reduced near the goal.
-    velocity_error = velocity_along_goal - desired_velocity
-
-    return torch.exp(-velocity_error.square() / tracking_cfg.speed_tracking_scale**2)
+    return torch.minimum(velocity_along_goal, target_speed) / normalization_speed
 
 
-def velocity_along_goal_xy_clearance_exp(
+def velocity_along_goal_xy_clearance_capped(
     env: ManagerBasedRLEnv,
-    tracking_cfg: config.GoalVelocityCfg = config.DEFAULT_GOAL_VELOCITY,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
-    Clearance-gated version of velocity_along_goal_xy_exp.
+    Clearance-gated version of velocity_along_goal_xy_capped.
 
     The velocity reward is only paid when the robot base/root has enough
     clearance above the surface underneath it.
@@ -81,7 +73,7 @@ def velocity_along_goal_xy_clearance_exp(
         [num_envs]
     """
 
-    reward = velocity_along_goal_xy_exp(env, tracking_cfg=tracking_cfg, goal_cfg=goal_cfg, asset_cfg=asset_cfg)
+    reward = velocity_along_goal_xy_capped(env, goal_cfg=goal_cfg, asset_cfg=asset_cfg)
 
     clearance = terrain._base_clearance(env, asset_cfg=asset_cfg)
 
