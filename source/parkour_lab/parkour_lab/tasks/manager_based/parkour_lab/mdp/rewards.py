@@ -18,7 +18,12 @@ from .reward_terms.goal import (
     velocity_along_goal_xy_capped,
     velocity_along_goal_xy_clearance_capped,
 )
-from .reward_terms.limb import feet_stumble, joint_deviation_l2, no_feet_contact, rapid_feet_motion_l2
+from .reward_terms.limb import (
+    feet_stumble,
+    joint_deviation_l2,
+    no_feet_contact,
+    rapid_feet_motion_l2,
+)
 from .reward_terms.root_motion import root_chatter_l2
 from .reward_terms.safety import base_clearance_below_l2, base_contact
 

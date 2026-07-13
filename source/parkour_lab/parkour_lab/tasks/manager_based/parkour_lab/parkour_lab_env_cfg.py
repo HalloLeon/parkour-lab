@@ -587,6 +587,52 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
 
         self.synchronize_curriculum_config()
 
+    def evaluation_level_metadata(self) -> dict[str, object]:
+        """Return JSON-friendly metadata for the fixed evaluation level."""
+
+        if self.evaluation_level is None:
+            return {}
+        level = self.parkour_curriculum.levels[self.evaluation_level]
+        return {
+            "index": self.evaluation_level,
+            "name": level.name,
+            "structures": [structure.metadata() for structure in level.structures],
+            "goal_pos": list(level.goal_pos),
+            "target_speed": level.target_speed,
+            "min_clearance": level.min_clearance,
+        }
+
+    def set_evaluation_difficulty(
+        self, level: int | None = None, seed: int | None = None
+    ) -> None:
+        """Freeze the environment at one reproducible logical difficulty."""
+
+        self.synchronize_curriculum_config()
+        curriculum_cfg = self.parkour_curriculum
+        if level is None:
+            level = curriculum_cfg.max_level
+        if not 0 <= level <= curriculum_cfg.max_level:
+            raise ValueError(
+                f"difficulty level must be in [0, {curriculum_cfg.max_level}], got {level}."
+            )
+
+        self.evaluation_level = level
+        self.curriculum = None
+        self.events.initialize_terrain_levels.params["fixed_level"] = level
+        self.scene.ground.max_init_terrain_level = level
+
+        terrain_generator = self.scene.ground.terrain_generator
+        if terrain_generator is not None:
+            terrain_generator.num_rows = len(curriculum_cfg.levels)
+            terrain_generator.num_cols = max(
+                1, min(terrain_generator.num_cols, self.scene.num_envs)
+            )
+            terrain_generator.curriculum = True
+            if seed is not None:
+                terrain_generator.seed = seed
+
+        self.observations.policy.enable_corruption = False
+
     def synchronize_curriculum_config(self) -> None:
         """Propagate the authoritative curriculum to every manager consumer."""
 
@@ -629,52 +675,6 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         self.terminations.trunk_contact.params["threshold"] = (
             curriculum_cfg.base_contact_threshold
         )
-
-    def set_evaluation_difficulty(
-        self, level: int | None = None, seed: int | None = None
-    ) -> None:
-        """Freeze the environment at one reproducible logical difficulty."""
-
-        self.synchronize_curriculum_config()
-        curriculum_cfg = self.parkour_curriculum
-        if level is None:
-            level = curriculum_cfg.max_level
-        if not 0 <= level <= curriculum_cfg.max_level:
-            raise ValueError(
-                f"difficulty level must be in [0, {curriculum_cfg.max_level}], got {level}."
-            )
-
-        self.evaluation_level = level
-        self.curriculum = None
-        self.events.initialize_terrain_levels.params["fixed_level"] = level
-        self.scene.ground.max_init_terrain_level = level
-
-        terrain_generator = self.scene.ground.terrain_generator
-        if terrain_generator is not None:
-            terrain_generator.num_rows = len(curriculum_cfg.levels)
-            terrain_generator.num_cols = max(
-                1, min(terrain_generator.num_cols, self.scene.num_envs)
-            )
-            terrain_generator.curriculum = True
-            if seed is not None:
-                terrain_generator.seed = seed
-
-        self.observations.policy.enable_corruption = False
-
-    def evaluation_level_metadata(self) -> dict[str, object]:
-        """Return JSON-friendly metadata for the fixed evaluation level."""
-
-        if self.evaluation_level is None:
-            return {}
-        level = self.parkour_curriculum.levels[self.evaluation_level]
-        return {
-            "index": self.evaluation_level,
-            "name": level.name,
-            "structures": [structure.metadata() for structure in level.structures],
-            "goal_pos": list(level.goal_pos),
-            "target_speed": level.target_speed,
-            "min_clearance": level.min_clearance,
-        }
 
 
 @configclass

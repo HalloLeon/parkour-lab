@@ -9,7 +9,9 @@ from .terrain import _base_clearance
 
 
 def _root_stability_mask(
-    env: ManagerBasedRLEnv, stability_cfg: config.RootStabilityCfg, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+    env: ManagerBasedRLEnv,
+    stability_cfg: config.RootStabilityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
     Check whether the robot root is stable and sufficiently clear of the
@@ -37,7 +39,9 @@ def _root_stability_mask(
 
     # Projected gravity x/y norm is small when the base is upright.
     # [num_envs]
-    projected_gravity_xy_norm = torch.linalg.norm(asset.data.projected_gravity_b[:, :2], dim=-1)
+    projected_gravity_xy_norm = torch.linalg.norm(
+        asset.data.projected_gravity_b[:, :2], dim=-1
+    )
 
     # Clearance above whatever support surface is underneath the base.
     # This is not raw world height.
@@ -46,10 +50,16 @@ def _root_stability_mask(
 
     ang_vel_stable = roll_pitch_ang_speed < stability_cfg.max_roll_pitch_ang_speed
 
-    orientation_stable = projected_gravity_xy_norm < stability_cfg.max_projected_gravity_xy_norm
+    orientation_stable = (
+        projected_gravity_xy_norm < stability_cfg.max_projected_gravity_xy_norm
+    )
 
-    min_clearance = get_min_clearance(env).to(device=base_clearance.device, dtype=base_clearance.dtype)
+    min_clearance = get_min_clearance(env).to(
+        device=base_clearance.device, dtype=base_clearance.dtype
+    )
 
     clearance_stable = base_clearance > min_clearance
 
-    return torch.logical_and(torch.logical_and(ang_vel_stable, orientation_stable), clearance_stable)
+    return torch.logical_and(
+        torch.logical_and(ang_vel_stable, orientation_stable), clearance_stable
+    )

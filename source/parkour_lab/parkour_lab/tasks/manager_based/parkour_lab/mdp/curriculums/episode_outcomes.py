@@ -27,7 +27,9 @@ def ensure_episode_outcome_buffers(env: ManagerBasedRLEnv) -> None:
         or getattr(env, _SUCCESS_BUFFER).device != device
         or getattr(env, _SUCCESS_BUFFER).dtype != torch.bool
     ):
-        env._parkour_episode_success = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+        env._parkour_episode_success = torch.zeros(
+            env.num_envs, device=env.device, dtype=torch.bool
+        )
 
     if (
         not hasattr(env, _BASE_CONTACT_BUFFER)
@@ -35,7 +37,9 @@ def ensure_episode_outcome_buffers(env: ManagerBasedRLEnv) -> None:
         or getattr(env, _BASE_CONTACT_BUFFER).device != device
         or getattr(env, _BASE_CONTACT_BUFFER).dtype != torch.bool
     ):
-        env._parkour_episode_base_contact = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+        env._parkour_episode_base_contact = torch.zeros(
+            env.num_envs, device=env.device, dtype=torch.bool
+        )
 
 
 def get_base_contact(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -52,15 +56,17 @@ def get_success(env: ManagerBasedRLEnv) -> torch.Tensor:
     return env._parkour_episode_success
 
 
+def mark_base_contact(env: ManagerBasedRLEnv, base_contact: torch.Tensor) -> None:
+    """Accumulate base-contact failure flags for the current episode."""
+
+    ensure_episode_outcome_buffers(env)
+    env._parkour_episode_base_contact |= base_contact.to(
+        device=env.device, dtype=torch.bool
+    )
+
+
 def mark_success(env: ManagerBasedRLEnv, success: torch.Tensor) -> None:
     """Accumulate success flags for the current episode."""
 
     ensure_episode_outcome_buffers(env)
     env._parkour_episode_success |= success.to(device=env.device, dtype=torch.bool)
-
-
-def mark_base_contact(env: ManagerBasedRLEnv, base_contact: torch.Tensor) -> None:
-    """Accumulate base-contact failure flags for the current episode."""
-
-    ensure_episode_outcome_buffers(env)
-    env._parkour_episode_base_contact |= base_contact.to(device=env.device, dtype=torch.bool)

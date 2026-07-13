@@ -15,7 +15,41 @@ from isaaclab.sensors import RayCaster
 from .state import _root_height_env
 
 
-def terrain_height_components(
+def _base_clearance(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("base_height_scanner"),
+) -> torch.Tensor:
+    """Return vertical root clearance above the underlying surface.
+
+    Returns:
+        Clearance with shape ``[num_envs]``.
+    """
+
+    sensor = env.scene[sensor_cfg.name]
+    if not isinstance(sensor, RayCaster):
+        raise TypeError(
+            f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}."
+        )
+
+    ray_hits_w = sensor.data.ray_hits_w
+    if ray_hits_w.shape[1] != 1:
+        raise RuntimeError(
+            f"'{sensor_cfg.name}' must contain exactly one downward ray."
+        )
+
+    base_height = _root_height_env(env, asset_cfg)
+    surface_height = ray_hits_w[:, 0, 2] - env.scene.env_origins[:, 2]
+    clearance = base_height - surface_height
+
+    # A missed ray is unsafe, but it should not inject non-finite values into
+    # rewards or observations during a temporary out-of-range state.
+    return torch.where(
+        torch.isfinite(clearance), clearance, torch.zeros_like(clearance)
+    )
+
+
+def _terrain_height_components(
     root_z: torch.Tensor,
     ray_hits_w: torch.Tensor,
     *,
@@ -85,37 +119,3 @@ def terrain_height_components(
     validity_mask = valid_hits.to(dtype=normalized_heights.dtype)
 
     return normalized_heights, validity_mask
-
-
-def _base_clearance(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("base_height_scanner"),
-) -> torch.Tensor:
-    """Return vertical root clearance above the underlying surface.
-
-    Returns:
-        Clearance with shape ``[num_envs]``.
-    """
-
-    sensor = env.scene[sensor_cfg.name]
-    if not isinstance(sensor, RayCaster):
-        raise TypeError(
-            f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}."
-        )
-
-    ray_hits_w = sensor.data.ray_hits_w
-    if ray_hits_w.shape[1] != 1:
-        raise RuntimeError(
-            f"'{sensor_cfg.name}' must contain exactly one downward ray."
-        )
-
-    base_height = _root_height_env(env, asset_cfg)
-    surface_height = ray_hits_w[:, 0, 2] - env.scene.env_origins[:, 2]
-    clearance = base_height - surface_height
-
-    # A missed ray is unsafe, but it should not inject non-finite values into
-    # rewards or observations during a temporary out-of-range state.
-    return torch.where(
-        torch.isfinite(clearance), clearance, torch.zeros_like(clearance)
-    )

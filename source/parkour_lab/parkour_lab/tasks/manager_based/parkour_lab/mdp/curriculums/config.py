@@ -87,7 +87,9 @@ class ParkourCurriculumCfg:
 
     success_threshold: float = 0.30
     successes_to_promote: int = 2  # Avoids promotion from one lucky success
-    failures_to_demote: int = 2  # Hysteresis prevents oscillating after one poor episode
+    failures_to_demote: int = (
+        2  # Hysteresis prevents oscillating after one poor episode
+    )
 
     base_contact_threshold: float = 1.0
 
@@ -115,8 +117,12 @@ class ParkourCurriculumCfg:
             ("target speed", target_speeds),
             ("minimum clearance", min_clearances),
         ):
-            if any(current > following for current, following in zip(values, values[1:])):
-                raise ValueError(f"Parkour curriculum {field_name} must be non-decreasing.")
+            if any(
+                current > following for current, following in zip(values, values[1:])
+            ):
+                raise ValueError(
+                    f"Parkour curriculum {field_name} must be non-decreasing."
+                )
 
         if self.initial_level < 0 or self.initial_level >= len(self.levels):
             raise ValueError("initial_level is out of range.")
@@ -140,51 +146,14 @@ class ParkourCurriculumCfg:
 DEFAULT_PARKOUR_CURRICULUM = ParkourCurriculumCfg()
 
 
-def _terrain_local_center(cfg: ParkourTerrainCfg) -> np.ndarray:
-    """Return the terrain tile center used as its environment origin."""
-
-    size_x, size_y = cfg.size
-    return np.array([0.5 * size_x, 0.5 * size_y, 0.0], dtype=np.float32)
-
-
-def _normalize_mesh_result(result: object, factory: object) -> list[trimesh.Trimesh]:
-    """Normalize common Trimesh factory outputs into independent meshes."""
-
-    if isinstance(result, trimesh.Trimesh):
-        return [result.copy()]
-    if isinstance(result, trimesh.Scene):
-        result = result.dump(concatenate=False)
-        if isinstance(result, trimesh.Trimesh):
-            return [result.copy()]
-    if isinstance(result, Iterable) and not isinstance(result, (str, bytes)):
-        meshes = list(result)
-        if all(isinstance(mesh, trimesh.Trimesh) for mesh in meshes):
-            return [mesh.copy() for mesh in meshes]
-    raise TypeError(f"Mesh factory {factory!r} must return a Trimesh, Scene, or iterable of Trimesh objects.")
-
-
-def _structure_meshes(structure: ParkourStructureCfg, terrain_center: np.ndarray) -> list[trimesh.Trimesh]:
-    """Create and rigidly transform all meshes produced by one structure."""
-
-    meshes = _normalize_mesh_result(
-        structure.mesh_factory(**dict(structure.mesh_kwargs)),
-        structure.mesh_factory,
-    )
-    translation = terrain_center + np.asarray(structure.position, dtype=np.float64)
-    transform = trimesh.transformations.compose_matrix(
-        translate=translation,
-        angles=structure.orientation_rpy,
-    )
-
-    for mesh in meshes:
-        mesh.apply_transform(transform)
-    return meshes
-
-
-def parkour_terrain(difficulty: float, cfg: ParkourTerrainCfg) -> tuple[list[trimesh.Trimesh], np.ndarray]:
+def parkour_terrain(
+    difficulty: float, cfg: ParkourTerrainCfg
+) -> tuple[list[trimesh.Trimesh], np.ndarray]:
     """Generate a terrain tile by composing configured mesh factories."""
 
-    level = coerce_level_cfg(cfg.levels[difficulty_to_level(difficulty, len(cfg.levels))])
+    level = coerce_level_cfg(
+        cfg.levels[difficulty_to_level(difficulty, len(cfg.levels))]
+    )
     terrain_center = _terrain_local_center(cfg)
     ground = ParkourStructureCfg(
         mesh_factory=trimesh.creation.box,
@@ -260,3 +229,48 @@ PARKOUR_TERRAIN_GENERATOR_CFG = TerrainGeneratorCfg(
         )
     },
 )
+
+
+def _normalize_mesh_result(result: object, factory: object) -> list[trimesh.Trimesh]:
+    """Normalize common Trimesh factory outputs into independent meshes."""
+
+    if isinstance(result, trimesh.Trimesh):
+        return [result.copy()]
+    if isinstance(result, trimesh.Scene):
+        result = result.dump(concatenate=False)
+        if isinstance(result, trimesh.Trimesh):
+            return [result.copy()]
+    if isinstance(result, Iterable) and not isinstance(result, (str, bytes)):
+        meshes = list(result)
+        if all(isinstance(mesh, trimesh.Trimesh) for mesh in meshes):
+            return [mesh.copy() for mesh in meshes]
+    raise TypeError(
+        f"Mesh factory {factory!r} must return a Trimesh, Scene, or iterable of Trimesh objects."
+    )
+
+
+def _structure_meshes(
+    structure: ParkourStructureCfg, terrain_center: np.ndarray
+) -> list[trimesh.Trimesh]:
+    """Create and rigidly transform all meshes produced by one structure."""
+
+    meshes = _normalize_mesh_result(
+        structure.mesh_factory(**dict(structure.mesh_kwargs)),
+        structure.mesh_factory,
+    )
+    translation = terrain_center + np.asarray(structure.position, dtype=np.float64)
+    transform = trimesh.transformations.compose_matrix(
+        translate=translation,
+        angles=structure.orientation_rpy,
+    )
+
+    for mesh in meshes:
+        mesh.apply_transform(transform)
+    return meshes
+
+
+def _terrain_local_center(cfg: ParkourTerrainCfg) -> np.ndarray:
+    """Return the terrain tile center used as its environment origin."""
+
+    size_x, size_y = cfg.size
+    return np.array([0.5 * size_x, 0.5 * size_y, 0.0], dtype=np.float32)

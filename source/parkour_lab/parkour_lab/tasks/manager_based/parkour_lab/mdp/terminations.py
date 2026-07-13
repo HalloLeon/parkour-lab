@@ -45,7 +45,9 @@ def reached_goal_xy_done(
     dist_to_goal = navigation._goal_distance_xy(env, goal_cfg, asset_cfg)
     clearance = terrain._base_clearance(env, asset_cfg)
 
-    min_clearance = get_min_clearance(env).to(device=clearance.device, dtype=clearance.dtype)
+    min_clearance = get_min_clearance(env).to(
+        device=clearance.device, dtype=clearance.dtype
+    )
 
     success = torch.logical_and(dist_to_goal < threshold, clearance > min_clearance)
 

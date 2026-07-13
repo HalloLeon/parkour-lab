@@ -19,7 +19,7 @@ def initialize_parkour_terrain_levels(
 ) -> None:
     """Place environments on exact terrain rows before the first reset.
 
-    `TerrainImporterCfg.max_init_terrain_level` is an upper bound for random
+    ``TerrainImporterCfg.max_init_terrain_level`` is an upper bound for random
     sampling, not an exact initial level. This startup event makes the training
     distribution explicit and is also what pins deterministic evaluation to a
     single difficulty.
@@ -29,7 +29,9 @@ def initialize_parkour_terrain_levels(
     _validate_terrain_layout(terrain, curriculum_cfg)
 
     if fixed_level is not None and not 0 <= fixed_level <= curriculum_cfg.max_level:
-        raise ValueError(f"fixed_level must be in [0, {curriculum_cfg.max_level}], got {fixed_level}.")
+        raise ValueError(
+            f"fixed_level must be in [0, {curriculum_cfg.max_level}], got {fixed_level}."
+        )
 
     if env_ids is None:
         env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
@@ -49,7 +51,9 @@ def initialize_parkour_terrain_levels(
     # generated-tile lookup table (difficulty row, terrain column/type, XYZ).
     # env_origins has shape [num_envs, 3] and stores the selected tile origin
     # for each environment.
-    terrain.env_origins[env_ids] = terrain.terrain_origins[levels, terrain.terrain_types[env_ids]]
+    terrain.env_origins[env_ids] = terrain.terrain_origins[
+        levels, terrain.terrain_types[env_ids]
+    ]
 
     _ensure_curriculum_stat_buffers(env)
     env._parkour_success_streak[env_ids] = 0
@@ -89,9 +93,13 @@ def parkour_terrain_levels(
     # buffers keep the initial/manual reset neutral. Success wins if multiple
     # termination terms fire on the same step.
     if hasattr(env, "reset_buf"):
-        terminal_event = env.reset_buf[env_ids_tensor].to(device=env.device, dtype=torch.bool)
+        terminal_event = env.reset_buf[env_ids_tensor].to(
+            device=env.device, dtype=torch.bool
+        )
     else:
-        terminal_event = episode_outcomes.get_base_contact(env)[env_ids_tensor] | success_event
+        terminal_event = (
+            episode_outcomes.get_base_contact(env)[env_ids_tensor] | success_event
+        )
     failure_event = terminal_event & (~success_event)
 
     success_streak = env._parkour_success_streak[env_ids_tensor]
@@ -122,7 +130,9 @@ def parkour_terrain_levels(
 
     # Important:
     # Let TerrainImporter own terrain_levels and env_origins.
-    terrain.update_env_origins(env_ids=env_ids_tensor, move_up=move_up, move_down=move_down)
+    terrain.update_env_origins(
+        env_ids=env_ids_tensor, move_up=move_up, move_down=move_down
+    )
 
     new_levels = terrain.terrain_levels[env_ids_tensor]
     actual_change = new_levels - old_levels
@@ -162,9 +172,12 @@ def reset_goal_and_commands_from_terrain_level(
     reset events are applied.
     """
 
-    def level_tensor(name: str, *, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    def _level_tensor(name: str, *, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         return torch.tensor(
-            [getattr(config.coerce_level_cfg(level), name) for level in curriculum_cfg.levels],
+            [
+                getattr(config.coerce_level_cfg(level), name)
+                for level in curriculum_cfg.levels
+            ],
             device=env.device,
             dtype=dtype,
         )
@@ -173,7 +186,9 @@ def reset_goal_and_commands_from_terrain_level(
 
     terrain = env.scene.terrain
     if terrain is None or terrain.terrain_origins is None:
-        raise RuntimeError("reset_goal_and_commands_from_terrain_level requires generated terrain.")
+        raise RuntimeError(
+            "reset_goal_and_commands_from_terrain_level requires generated terrain."
+        )
 
     goal: RigidObject = env.scene[goal_cfg.name]
 
@@ -188,9 +203,9 @@ def reset_goal_and_commands_from_terrain_level(
         curriculum_cfg=curriculum_cfg,
     )
 
-    goal_pos_by_level = level_tensor("goal_pos", dtype=dtype)
-    target_speed_by_level = level_tensor("target_speed")
-    min_clearance_by_level = level_tensor("min_clearance")
+    goal_pos_by_level = _level_tensor("goal_pos", dtype=dtype)
+    target_speed_by_level = _level_tensor("target_speed")
+    min_clearance_by_level = _level_tensor("min_clearance")
 
     level_goal_pos = goal_pos_by_level[levels]
 
@@ -234,7 +249,7 @@ def _curriculum_stats(
     levels = terrain.terrain_levels
     zero = torch.zeros((), device=levels.device, dtype=torch.float32)
 
-    def event_rate(event: torch.Tensor) -> torch.Tensor:
+    def _event_rate(event: torch.Tensor) -> torch.Tensor:
         return event.float().mean() if event.numel() > 0 else zero
 
     return {
@@ -242,10 +257,10 @@ def _curriculum_stats(
         "min_level": levels.min().float(),
         "max_level": levels.max().float(),
         "top_level_fraction": (levels == curriculum_cfg.max_level).float().mean(),
-        "success_rate": event_rate(success_event),
-        "failure_rate": event_rate(failure_event),
-        "promotion_rate": event_rate(actual_change > 0),
-        "demotion_rate": event_rate(actual_change < 0),
+        "success_rate": _event_rate(success_event),
+        "failure_rate": _event_rate(failure_event),
+        "promotion_rate": _event_rate(actual_change > 0),
+        "demotion_rate": _event_rate(actual_change < 0),
     }
 
 
@@ -262,7 +277,9 @@ def _ensure_curriculum_stat_buffers(env: ManagerBasedRLEnv) -> None:
         or env._parkour_success_streak.device != device
         or env._parkour_success_streak.dtype != torch.long
     ):
-        env._parkour_success_streak = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+        env._parkour_success_streak = torch.zeros(
+            env.num_envs, device=env.device, dtype=torch.long
+        )
 
     if (
         not hasattr(env, "_parkour_failure_streak")
@@ -270,7 +287,9 @@ def _ensure_curriculum_stat_buffers(env: ManagerBasedRLEnv) -> None:
         or env._parkour_failure_streak.device != device
         or env._parkour_failure_streak.dtype != torch.long
     ):
-        env._parkour_failure_streak = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+        env._parkour_failure_streak = torch.zeros(
+            env.num_envs, device=env.device, dtype=torch.long
+        )
 
     if (
         not hasattr(env, "_parkour_last_level_change")
@@ -278,7 +297,9 @@ def _ensure_curriculum_stat_buffers(env: ManagerBasedRLEnv) -> None:
         or env._parkour_last_level_change.device != device
         or env._parkour_last_level_change.dtype != torch.long
     ):
-        env._parkour_last_level_change = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+        env._parkour_last_level_change = torch.zeros(
+            env.num_envs, device=env.device, dtype=torch.long
+        )
 
 
 def _logical_level_from_terrain_level(
@@ -288,8 +309,8 @@ def _logical_level_from_terrain_level(
 ) -> torch.Tensor:
     """Map terrain rows one-to-one to the authoritative logical levels.
 
-    `terrain_level` contains integer row indices maintained by
-    `TerrainImporter`; it is not the normalized floating-point difficulty
+    ``terrain_level`` contains integer row indices maintained by
+    ``TerrainImporter``; it is not the normalized floating-point difficulty
     passed to the terrain-generation function. The parkour configuration
     enforces exactly one terrain row per logical level, so the mapping is:
 
@@ -324,7 +345,9 @@ def _validate_terrain_layout(
     """Require an exact physical-row to logical-level mapping."""
 
     if terrain is None or terrain.terrain_origins is None:
-        raise RuntimeError("The parkour curriculum requires TerrainImporterCfg with terrain_type='generator'.")
+        raise RuntimeError(
+            "The parkour curriculum requires TerrainImporterCfg with terrain_type='generator'."
+        )
 
     num_rows = terrain.terrain_origins.shape[0]
     num_levels = len(curriculum_cfg.levels)

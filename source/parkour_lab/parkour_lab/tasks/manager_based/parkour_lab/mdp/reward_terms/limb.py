@@ -29,7 +29,9 @@ def feet_stumble(
         [num_envs]
     """
 
-    contact_forces = contact._selected_contact_forces_w_history(env, sensor_cfg=sensor_cfg)
+    contact_forces = contact._selected_contact_forces_w_history(
+        env, sensor_cfg=sensor_cfg
+    )
 
     lateral_force = torch.linalg.norm(contact_forces[..., :2], dim=-1)
     vertical_force = torch.abs(contact_forces[..., 2])
@@ -37,13 +39,16 @@ def feet_stumble(
     valid_vertical_contact = vertical_force > stumble_cfg.min_vertical_force
 
     stumble = torch.logical_and(
-        valid_vertical_contact, lateral_force > stumble_cfg.lateral_to_vertical_force_ratio * vertical_force
+        valid_vertical_contact,
+        lateral_force > stumble_cfg.lateral_to_vertical_force_ratio * vertical_force,
     )
 
     return torch.any(stumble, dim=(1, 2)).float()
 
 
-def joint_deviation_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def joint_deviation_l2(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
     """
     Penalize selected joints deviating from their default pose.
 
@@ -125,7 +130,9 @@ def rapid_feet_motion_l2(
 
     in_contact = torch.any(force_norm > motion_cfg.contact_threshold, dim=1)
 
-    runtime._validate_matching_shape(in_contact, foot_speed, lhs_name="foot contact mask", rhs_name="foot speed")
+    runtime._validate_matching_shape(
+        in_contact, foot_speed, lhs_name="foot contact mask", rhs_name="foot speed"
+    )
 
     stance_speed_limit = torch.full_like(foot_speed, motion_cfg.max_stance_speed)
 
@@ -135,6 +142,8 @@ def rapid_feet_motion_l2(
 
     excess_speed = torch.clamp(foot_speed - speed_limit, min=0.0)
 
-    penalty_per_foot = torch.clamp(excess_speed.square(), max=motion_cfg.max_penalty_per_foot)
+    penalty_per_foot = torch.clamp(
+        excess_speed.square(), max=motion_cfg.max_penalty_per_foot
+    )
 
     return penalty_per_foot.mean(dim=-1)

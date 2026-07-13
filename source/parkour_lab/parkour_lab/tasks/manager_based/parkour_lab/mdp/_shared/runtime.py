@@ -11,7 +11,11 @@ def _all_env_ids(env: ManagerBasedRLEnv, env_ids: torch.Tensor | None) -> torch.
 
 
 def _difference_from_previous_env_buffer(
-    env: ManagerBasedRLEnv, *, buffer_name: str, current_value: torch.Tensor, reset_mask: torch.Tensor | None = None
+    env: ManagerBasedRLEnv,
+    *,
+    buffer_name: str,
+    current_value: torch.Tensor,
+    reset_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Compute previous_value - current_value using an environment-level buffer.
@@ -22,7 +26,9 @@ def _difference_from_previous_env_buffer(
         [num_envs]
     """
 
-    previous_value = _get_or_init_env_buffer(env=env, name=buffer_name, value=current_value)
+    previous_value = _get_or_init_env_buffer(
+        env=env, name=buffer_name, value=current_value
+    )
 
     difference = previous_value - current_value
 
@@ -40,7 +46,9 @@ def _env_torch_device(env: ManagerBasedRLEnv) -> torch.device:
     return torch.device(env.device)
 
 
-def _episode_start_mask(env: ManagerBasedRLEnv, reference: torch.Tensor, grace_steps: int) -> torch.Tensor:
+def _episode_start_mask(
+    env: ManagerBasedRLEnv, reference: torch.Tensor, grace_steps: int
+) -> torch.Tensor:
     """
     Boolean mask for environments that have just reset.
 
@@ -73,7 +81,9 @@ def _gate_positive_values(values: torch.Tensor, gate: torch.Tensor) -> torch.Ten
     return torch.where(keep_value, values, torch.zeros_like(values))
 
 
-def _get_or_init_env_buffer(env: ManagerBasedRLEnv, name: str, value: torch.Tensor) -> torch.Tensor:
+def _get_or_init_env_buffer(
+    env: ManagerBasedRLEnv, name: str, value: torch.Tensor
+) -> torch.Tensor:
     """
     Get an environment-level tensor buffer, creating or resizing it if needed.
 
@@ -143,7 +153,9 @@ def _set_env_buffer(env: ManagerBasedRLEnv, name: str, value: torch.Tensor) -> N
     setattr(env, name, value.detach().clone())
 
 
-def _validate_matching_shape(lhs: torch.Tensor, rhs: torch.Tensor, *, lhs_name: str, rhs_name: str) -> None:
+def _validate_matching_shape(
+    lhs: torch.Tensor, rhs: torch.Tensor, *, lhs_name: str, rhs_name: str
+) -> None:
     """
     Validate that two tensors have identical shape.
 

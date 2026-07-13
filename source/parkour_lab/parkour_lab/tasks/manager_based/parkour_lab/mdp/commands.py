@@ -52,6 +52,20 @@ def ensure_parkour_commands(
         )
 
 
+def get_min_clearance(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return the current per-environment minimum clearance with shape [num_envs]."""
+
+    ensure_parkour_commands(env)
+    return env._cmd_min_clearance
+
+
+def get_target_speed(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return the current per-environment target speed with shape [num_envs]."""
+
+    ensure_parkour_commands(env)
+    return env._cmd_target_speed
+
+
 def set_commands(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor | None,
@@ -64,19 +78,9 @@ def set_commands(
 
     env_ids = _all_env_ids(env, env_ids)
 
-    env._cmd_target_speed[env_ids] = target_speed.to(device=env.device, dtype=torch.float32)
-    env._cmd_min_clearance[env_ids] = min_clearance.to(device=env.device, dtype=torch.float32)
-
-
-def get_target_speed(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the current per-environment target speed with shape [num_envs]."""
-
-    ensure_parkour_commands(env)
-    return env._cmd_target_speed
-
-
-def get_min_clearance(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the current per-environment minimum clearance with shape [num_envs]."""
-
-    ensure_parkour_commands(env)
-    return env._cmd_min_clearance
+    env._cmd_target_speed[env_ids] = target_speed.to(
+        device=env.device, dtype=torch.float32
+    )
+    env._cmd_min_clearance[env_ids] = min_clearance.to(
+        device=env.device, dtype=torch.float32
+    )

@@ -10,19 +10,51 @@ from ._shared import contact, navigation, terrain
 from .commands import get_target_speed
 
 
-def goal_distance_xy_w(
-    env: ManagerBasedRLEnv,
-    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+def base_clearance_obs(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:
     """
-    XY distance from robot root to goal.
+    Base/root clearance above the support surface underneath the robot.
 
     Returns:
         [num_envs, 1]
     """
 
-    return navigation._goal_distance_xy(env, goal_cfg, asset_cfg).unsqueeze(-1)
+    return terrain._base_clearance(env, asset_cfg).unsqueeze(-1)
+
+
+def desired_speed_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """
+    Per-environment desired forward speed observation.
+
+    Returns:
+        [num_envs, 1]
+    """
+
+    return get_target_speed(env).unsqueeze(-1)
+
+
+def foot_contact_state(
+    env: ManagerBasedRLEnv,
+    threshold: float = 1.0,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot"),
+) -> torch.Tensor:
+    """
+    Foot contact state, centered.
+
+    Official-style convention:
+        no contact -> -0.5
+        contact    ->  0.5
+
+    Returns:
+        [num_envs, num_feet]
+    """
+
+    force_norm = contact._force_norm_mask(env, sensor_cfg=sensor_cfg)
+
+    in_contact = torch.any(force_norm > threshold, dim=1)
+
+    return in_contact.float() - 0.5
 
 
 def goal_direction_body_xy(
@@ -72,76 +104,19 @@ def goal_direction_body_xy(
     ).clamp_min(1.0e-6)
 
 
-def base_clearance_obs(
-    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
-    """
-    Base/root clearance above the support surface underneath the robot.
-
-    Returns:
-        [num_envs, 1]
-    """
-
-    return terrain._base_clearance(env, asset_cfg).unsqueeze(-1)
-
-
-def foot_contact_state(
+def goal_distance_xy_w(
     env: ManagerBasedRLEnv,
-    threshold: float = 1.0,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot"),
-) -> torch.Tensor:
-    """
-    Foot contact state, centered.
-
-    Official-style convention:
-        no contact -> -0.5
-        contact    ->  0.5
-
-    Returns:
-        [num_envs, num_feet]
-    """
-
-    force_norm = contact._force_norm_mask(env, sensor_cfg=sensor_cfg)
-
-    in_contact = torch.any(force_norm > threshold, dim=1)
-
-    return in_contact.float() - 0.5
-
-
-def desired_speed_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """
-    Per-environment desired forward speed observation.
-
-    Returns:
-        [num_envs, 1]
-    """
-
-    return get_target_speed(env).unsqueeze(-1)
-
-
-def _terrain_height_scan_components(
-    env: ManagerBasedRLEnv,
-    obs_cfg: config.HeightScanObservationCfg = config.DEFAULT_HEIGHT_SCAN_OBSERVATION,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Read and process the configured privileged terrain ray caster."""
+) -> torch.Tensor:
+    """
+    XY distance from robot root to goal.
 
-    sensor = env.scene[sensor_cfg.name]
-    asset: Articulation = env.scene[asset_cfg.name]
+    Returns:
+        [num_envs, 1]
+    """
 
-    if not isinstance(sensor, RayCaster):
-        raise TypeError(
-            f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}."
-        )
-
-    return terrain.terrain_height_components(
-        asset.data.root_pos_w[:, 2],
-        sensor.data.ray_hits_w,
-        num_rays=obs_cfg.num_rays,
-        vertical_offset=obs_cfg.vertical_offset,
-        clip=obs_cfg.clip,
-    )
+    return navigation._goal_distance_xy(env, goal_cfg, asset_cfg).unsqueeze(-1)
 
 
 def terrain_height_scan(
@@ -200,3 +175,28 @@ def terrain_height_scan_validity(
         asset_cfg=asset_cfg,
     )
     return validity
+
+
+def _terrain_height_scan_components(
+    env: ManagerBasedRLEnv,
+    obs_cfg: config.HeightScanObservationCfg = config.DEFAULT_HEIGHT_SCAN_OBSERVATION,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read and process the configured privileged terrain ray caster."""
+
+    sensor = env.scene[sensor_cfg.name]
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    if not isinstance(sensor, RayCaster):
+        raise TypeError(
+            f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}."
+        )
+
+    return terrain._terrain_height_components(
+        asset.data.root_pos_w[:, 2],
+        sensor.data.ray_hits_w,
+        num_rays=obs_cfg.num_rays,
+        vertical_offset=obs_cfg.vertical_offset,
+        clip=obs_cfg.clip,
+    )

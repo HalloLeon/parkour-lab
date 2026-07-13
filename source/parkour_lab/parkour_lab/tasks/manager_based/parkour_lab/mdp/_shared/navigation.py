@@ -24,7 +24,9 @@ def _goal_direction_xy(
 
     goal_vec_xy = _goal_vector_xy(env, goal_cfg, asset_cfg)
 
-    goal_dist_xy = torch.linalg.norm(goal_vec_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
+    goal_dist_xy = torch.linalg.norm(goal_vec_xy, dim=-1, keepdim=True).clamp_min(
+        1.0e-6
+    )
 
     return goal_vec_xy / goal_dist_xy
 
@@ -172,7 +174,11 @@ def _heading_error_to_goal_xy(
 
 
 def _lateral_drift_to_goal_xy(
-    env: ManagerBasedRLEnv, *, root_delta_xy: torch.Tensor, goal_cfg: SceneEntityCfg, asset_cfg: SceneEntityCfg
+    env: ManagerBasedRLEnv,
+    *,
+    root_delta_xy: torch.Tensor,
+    goal_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg
 ) -> torch.Tensor:
     """
     Lateral part of root displacement relative to the current goal direction.

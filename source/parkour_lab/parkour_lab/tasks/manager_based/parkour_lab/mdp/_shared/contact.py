@@ -4,7 +4,9 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
 
-def _force_norm_mask(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+def _force_norm_mask(
+    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg
+) -> torch.Tensor:
     """
     Contact force norm for selected contact-sensor bodies.
 
@@ -44,7 +46,9 @@ def _require_body_ids(entity_cfg: SceneEntityCfg, *, role: str) -> None:
         )
 
 
-def _selected_contact_forces_w_history(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+def _selected_contact_forces_w_history(
+    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg
+) -> torch.Tensor:
     """
     Contact forces for selected contact-sensor bodies.
 

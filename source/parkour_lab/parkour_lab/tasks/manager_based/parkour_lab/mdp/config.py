@@ -109,7 +109,9 @@ class GoalHeadingCfg:
             raise ValueError("min_forward_speed must be non-negative.")
 
         if self.full_forward_speed <= self.min_forward_speed:
-            raise ValueError("full_forward_speed must be greater than min_forward_speed.")
+            raise ValueError(
+                "full_forward_speed must be greater than min_forward_speed."
+            )
 
 
 DEFAULT_GOAL_HEADING = GoalHeadingCfg()
