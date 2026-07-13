@@ -342,32 +342,20 @@ class CurriculumCfg:
 
 @configclass
 class RewardsCfg:
+    """
+    Task, safety, and motion-quality rewards for parkour locomotion.
+
+    Normalized world-frame velocity toward the goal is the only dense progress
+    signal. Safety remains separate so low clearance or recovery does not erase
+    the directional learning signal. Flight and absolute roll/pitch are not
+    penalized directly because both can be necessary on parkour terrain.
+    """
+
     # Goal task.
     velocity_along_goal_xy = RewTerm(
-        func=mdp.velocity_along_goal_xy_clearance_capped,
+        func=mdp.velocity_along_goal_xy_capped,
         weight=1.0,
         params={
-            "goal_cfg": SceneEntityCfg("goal"),
-            "asset_cfg": SceneEntityCfg("robot"),
-        },
-    )
-
-    goal_progress_xy = RewTerm(
-        func=mdp.goal_progress_xy_stable,
-        weight=3.0,
-        params={
-            "progress_cfg": mdp.config.StableGoalProgressCfg(
-                progress_scale=0.03,
-                reset_grace_steps=1,
-                max_positive_reward=2.0,
-                max_negative_penalty=2.0,
-                lateral_drift_weight=0.25,
-                max_lateral_penalty=1.0,
-                stability=mdp.config.RootStabilityCfg(
-                    max_roll_pitch_ang_speed=4.0,
-                    max_projected_gravity_xy_norm=0.75,
-                ),
-            ),
             "goal_cfg": SceneEntityCfg("goal"),
             "asset_cfg": SceneEntityCfg("robot"),
         },
@@ -417,11 +405,11 @@ class RewardsCfg:
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
 
-    # Stability and regularization.
-    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-1.5)
+    # Motion quality and regularization.
+    # Keep vertical motion affordable enough for deliberate takeoff and landing.
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.2)
-    joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.0005)
+    joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.0002)
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
 
     hip_deviation = RewTerm(
@@ -447,46 +435,6 @@ class RewardsCfg:
                 lateral_to_vertical_force_ratio=4.0, min_vertical_force=1.0
             ),
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
-        },
-    )
-
-    rapid_feet_motion = RewTerm(
-        func=mdp.rapid_feet_motion_l2,
-        weight=-0.005,
-        params={
-            "motion_cfg": mdp.config.FeetMotionCfg(
-                max_stance_speed=0.25,
-                max_swing_speed=2.0,
-                contact_threshold=1.0,
-                max_penalty_per_foot=4.0,
-            ),
-            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
-        },
-    )
-
-    no_feet_contact = RewTerm(
-        func=mdp.no_feet_contact,
-        weight=-0.2,
-        params={
-            "threshold": 1.0,
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
-        },
-    )
-
-    root_chatter = RewTerm(
-        func=mdp.root_chatter_l2,
-        weight=-0.005,
-        params={
-            "chatter_cfg": mdp.config.RootMotionChatterCfg(
-                small_z_displacement=0.02,
-                min_z_reversal_speed=0.05,
-                small_tilt_change=0.04,
-                min_roll_pitch_reversal_rate=0.75,
-                angular_weight=0.25,
-                reset_grace_steps=1,
-            ),
-            "asset_cfg": SceneEntityCfg("robot"),
         },
     )
 
