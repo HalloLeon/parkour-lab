@@ -3,13 +3,16 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""This script sets up the vs-code settings for the Isaac Lab project.
+"""Generate project-local VS Code settings for Isaac Lab development.
 
-This script merges the python.analysis.extraPaths from the "{ISAACSIM_DIR}/.vscode/settings.json" file into
-the ".vscode/settings.json" file.
+The script locates the active Isaac Sim installation, reads its configured
+``python.analysis.extraPaths``, and combines those paths with every extension
+under this project's ``source`` directory. It then writes the resulting paths
+and the active Isaac Sim Python interpreter into ``.vscode/settings.json``.
 
-This is necessary because Isaac Sim 2022.2.1 onwards does not add the necessary python packages to the python path
-when the "setup_python_env.sh" is run as part of the vs-code launch configuration.
+If ``.vscode/launch.json`` does not exist, the script also creates it from the
+project template. Generated settings improve editor imports, completion, and
+debugging; they do not change the runtime behavior of Parkour Lab.
 """
 
 import argparse
@@ -20,33 +23,48 @@ import re
 import sys
 
 PROJECT_DIR = pathlib.Path(__file__).parents[2]
-"""Path to the the project directory."""
+"""Path to the project root containing ``.vscode`` and ``source``."""
 
 try:
     import isaacsim  # noqa: F401
 
     isaacsim_dir = os.environ.get("ISAAC_PATH", "")
-except ModuleNotFoundError or ImportError:
-    # Create a parser to get the isaac-sim path
-    parser = argparse.ArgumentParser(description="Setup the VSCode settings for the project.")
-    parser.add_argument("--isaac_path", type=str, help="The absolute path to the Isaac Sim installation.")
+except ModuleNotFoundError as error:
+    # Only fall back when ``isaacsim`` itself is absent. A missing dependency
+    # inside an installed Isaac Sim package indicates a broken environment and
+    # should retain its original traceback instead of being misdiagnosed as a
+    # missing installation path.
+    if error.name != "isaacsim":
+        raise
+
+    # Accept an explicit Isaac Sim path when its Python package is unavailable.
+    parser = argparse.ArgumentParser(
+        description="Setup the VSCode settings for the project."
+    )
+    parser.add_argument(
+        "--isaac_path",
+        type=str,
+        required=True,
+        help="The absolute path to the Isaac Sim installation.",
+    )
     args = parser.parse_args()
 
-    # parse the isaac-sim directory
+    # Resolve and validate the path supplied on the command line.
     isaacsim_dir = args.isaac_path
-    # check if the isaac-sim directory is provided
     if not os.path.exists(isaacsim_dir):
         raise FileNotFoundError(
             f"Could not find the isaac-sim directory: {isaacsim_dir}. Please provide the correct path to the Isaac Sim"
             " installation."
         )
 except EOFError:
-    print("Unable to trigger EULA acceptance. This is likely due to the script being run in a non-interactive shell.")
+    print(
+        "Unable to trigger EULA acceptance. This is likely due to the script being run in a non-interactive shell."
+    )
     print("Please run the script in an interactive shell to accept the EULA.")
     print("Skipping the setup of the VSCode settings...")
     sys.exit(0)
 
-# check if the isaac-sim directory exists
+# Fail early when neither package discovery nor the explicit path succeeded.
 if not os.path.exists(isaacsim_dir):
     raise FileNotFoundError(
         f"Could not find the isaac-sim directory: {isaacsim_dir}. There are two possible reasons for this:\n\t1. The"
@@ -57,49 +75,152 @@ if not os.path.exists(isaacsim_dir):
     )
 
 ISAACSIM_DIR = isaacsim_dir
-"""Path to the isaac-sim directory."""
+"""Path to the resolved Isaac Sim installation."""
 
 
-def overwrite_python_analysis_extra_paths(isaaclab_settings: str) -> str:
-    """Overwrite the python.analysis.extraPaths in the Isaac Lab settings file.
+def main() -> None:
+    """Generate the project settings and an optional launch configuration."""
 
-    The extraPaths are replaced with the path names from the isaac-sim settings file that exists in the
-    "{ISAACSIM_DIR}/.vscode/settings.json" file.
+    # Locate the project-owned VS Code settings template.
+    isaaclab_vscode_template_filename = os.path.join(
+        PROJECT_DIR, ".vscode", "tools", "settings.template.json"
+    )
+    if not os.path.exists(isaaclab_vscode_template_filename):
+        raise FileNotFoundError(
+            f"Could not find the Isaac Lab template settings file: {isaaclab_vscode_template_filename}"
+        )
 
-    If the isaac-sim settings file does not exist, the extraPaths are not overwritten.
+    # Read the template before replacing its machine-specific values.
+    with open(isaaclab_vscode_template_filename) as f:
+        isaaclab_template_settings = f.read()
+
+    # Insert import-search paths from Isaac Sim and local project extensions.
+    isaaclab_settings = _overwrite_python_analysis_extra_paths(
+        isaaclab_template_settings
+    )
+
+    # Make VS Code use the interpreter associated with this Isaac Sim setup.
+    isaaclab_settings = _overwrite_default_python_interpreter(isaaclab_settings)
+
+    # Mark the output as generated and record the source template.
+    header_message = (
+        "// This file is a template and is automatically generated by the setup_vscode.py script.\n"
+        "// Do not edit this file directly.\n"
+        "// \n"
+        f"// Generated from: {isaaclab_vscode_template_filename}\n"
+    )
+    isaaclab_settings = header_message + isaaclab_settings
+
+    # Write the fully resolved workspace settings.
+    isaaclab_vscode_filename = os.path.join(PROJECT_DIR, ".vscode", "settings.json")
+    with open(isaaclab_vscode_filename, "w") as f:
+        f.write(isaaclab_settings)
+
+    # Preserve an existing launch configuration; otherwise create the default.
+    isaaclab_vscode_launch_filename = os.path.join(
+        PROJECT_DIR, ".vscode", "launch.json"
+    )
+    isaaclab_vscode_template_launch_filename = os.path.join(
+        PROJECT_DIR, ".vscode", "tools", "launch.template.json"
+    )
+    if not os.path.exists(isaaclab_vscode_launch_filename):
+        # Read the launch template and give it the generated-file header.
+        with open(isaaclab_vscode_template_launch_filename) as f:
+            isaaclab_template_launch_settings = f.read()
+        header_message = header_message.replace(
+            isaaclab_vscode_template_filename, isaaclab_vscode_template_launch_filename
+        )
+        isaaclab_launch_settings = header_message + isaaclab_template_launch_settings
+
+        # Write the launch configuration only on its initial creation.
+        with open(isaaclab_vscode_launch_filename, "w") as f:
+            f.write(isaaclab_launch_settings)
+
+
+def _overwrite_default_python_interpreter(isaaclab_settings: str) -> str:
+    """Set the default Python interpreter in the generated VS Code settings.
+
+    The interpreter is derived from the Python executable running this script.
+    When that executable belongs to Kit, the path is converted to Isaac Sim's
+    platform-specific Python launcher.
 
     Args:
-        isaaclab_settings: The settings string to use as template.
+        isaaclab_settings: Settings template whose interpreter will be replaced.
 
     Returns:
-        The settings string with overwritten python analysis extra paths.
+        The settings string containing the resolved interpreter path.
     """
-    # isaac-sim settings
+
+    # Normalize the executable path for comparisons and JSON output.
+    python_exe = os.path.normpath(sys.executable)
+
+    # Prefer Isaac Sim's launcher over Kit's internal Python executable so the
+    # interpreter starts with the required environment and source paths.
+    if f"kit{os.sep}python{os.sep}bin{os.sep}python" in python_exe:
+        # Select the launcher appropriate for the host operating system.
+        if platform.system() == "Windows":
+            python_exe = python_exe.replace(
+                f"kit{os.sep}python{os.sep}bin{os.sep}python3", "python.bat"
+            )
+        else:
+            python_exe = python_exe.replace(
+                f"kit{os.sep}python{os.sep}bin{os.sep}python3", "python.sh"
+            )
+
+    # Replace the template's interpreter while leaving other settings intact.
+    isaaclab_settings = re.sub(
+        r"\"python.defaultInterpreterPath\": \".*?\"",
+        f'"python.defaultInterpreterPath": "{python_exe}"',
+        isaaclab_settings,
+        flags=re.DOTALL,
+    )
+    return isaaclab_settings
+
+
+def _overwrite_python_analysis_extra_paths(isaaclab_settings: str) -> str:
+    """Populate ``python.analysis.extraPaths`` in the generated settings.
+
+    Paths from Isaac Sim's VS Code settings are made relative to this workspace
+    and combined with each local extension under ``source``. If the Isaac Sim
+    settings file is unavailable, only local extension paths are included.
+
+    Args:
+        isaaclab_settings: Settings template whose analysis paths will be replaced.
+
+    Returns:
+        The settings string containing the resolved analysis paths.
+    """
+
+    # Locate the settings distributed with the resolved Isaac Sim installation.
     isaacsim_vscode_filename = os.path.join(ISAACSIM_DIR, ".vscode", "settings.json")
 
-    # we use the isaac-sim settings file to get the python.analysis.extraPaths for kit extensions
-    # if this file does not exist, we will not add any extra paths
+    # Import paths for Kit extensions are sourced from Isaac Sim when available.
     if os.path.exists(isaacsim_vscode_filename):
-        # read the path names from the isaac-sim settings file
+        # Read the source settings before extracting its analysis-path array.
         with open(isaacsim_vscode_filename) as f:
             vscode_settings = f.read()
-        # extract the path names
-        # search for the python.analysis.extraPaths section and extract the contents
+
+        # Extract the contents of the ``python.analysis.extraPaths`` array.
         settings = re.search(
-            r"\"python.analysis.extraPaths\": \[.*?\]", vscode_settings, flags=re.MULTILINE | re.DOTALL
+            r"\"python.analysis.extraPaths\": \[.*?\]",
+            vscode_settings,
+            flags=re.MULTILINE | re.DOTALL,
         )
         settings = settings.group(0)
         settings = settings.split('"python.analysis.extraPaths": [')[-1]
         settings = settings.split("]")[0]
 
-        # read the path names from the isaac-sim settings file
+        # Convert the comma-separated JSON entries into clean path strings.
         path_names = settings.split(",")
         path_names = [path_name.strip().strip('"') for path_name in path_names]
         path_names = [path_name for path_name in path_names if len(path_name) > 0]
 
-        # change the path names to be relative to the Isaac Lab directory
+        # Express Isaac Sim paths relative to this workspace for portability.
         rel_path = os.path.relpath(ISAACSIM_DIR, PROJECT_DIR)
-        path_names = ['"${workspaceFolder}/' + rel_path + "/" + path_name + '"' for path_name in path_names]
+        path_names = [
+            '"${workspaceFolder}/' + rel_path + "/" + path_name + '"'
+            for path_name in path_names
+        ]
     else:
         path_names = []
         print(
@@ -110,110 +231,28 @@ def overwrite_python_analysis_extra_paths(isaaclab_settings: str) -> str:
             "\n\tWe are working on a fix for this issue with the Isaac Sim team."
         )
 
-    # add the path names that are in the Isaac Lab extensions directory
+    # Add local extensions so the language server resolves project imports.
     isaaclab_extensions = os.listdir(os.path.join(PROJECT_DIR, "source"))
-    path_names.extend(['"${workspaceFolder}/source/' + ext + '"' for ext in isaaclab_extensions])
+    path_names.extend(
+        ['"${workspaceFolder}/source/' + ext + '"' for ext in isaaclab_extensions]
+    )
 
-    # combine them into a single string
+    # Format the collected entries as an indented JSON array body.
     path_names = ",\n\t\t".expandtabs(4).join(path_names)
-    # deal with the path separator being different on Windows and Unix
+
+    # Use forward slashes consistently in generated VS Code settings.
     path_names = path_names.replace("\\", "/")
 
-    # replace the path names in the Isaac Lab settings file with the path names parsed
+    # Replace only the template's analysis-path array.
     isaaclab_settings = re.sub(
         r"\"python.analysis.extraPaths\": \[.*?\]",
-        '"python.analysis.extraPaths": [\n\t\t'.expandtabs(4) + path_names + "\n\t]".expandtabs(4),
+        '"python.analysis.extraPaths": [\n\t\t'.expandtabs(4)
+        + path_names
+        + "\n\t]".expandtabs(4),
         isaaclab_settings,
         flags=re.DOTALL,
     )
-    # return the Isaac Lab settings string
     return isaaclab_settings
-
-
-def overwrite_default_python_interpreter(isaaclab_settings: str) -> str:
-    """Overwrite the default python interpreter in the Isaac Lab settings file.
-
-    The default python interpreter is replaced with the path to the python interpreter used by the
-    isaac-sim project. This is necessary because the default python interpreter is the one shipped with
-    isaac-sim.
-
-    Args:
-        isaaclab_settings: The settings string to use as template.
-
-    Returns:
-        The settings string with overwritten default python interpreter.
-    """
-    # read executable name
-    python_exe = os.path.normpath(sys.executable)
-
-    # replace with Isaac Sim's python.sh or python.bat scripts to make sure python with correct
-    # source paths is set as default
-    if f"kit{os.sep}python{os.sep}bin{os.sep}python" in python_exe:
-        # Check if the OS is Windows or Linux to use appropriate shell file
-        if platform.system() == "Windows":
-            python_exe = python_exe.replace(f"kit{os.sep}python{os.sep}bin{os.sep}python3", "python.bat")
-        else:
-            python_exe = python_exe.replace(f"kit{os.sep}python{os.sep}bin{os.sep}python3", "python.sh")
-
-    # replace the default python interpreter in the Isaac Lab settings file with the path to the
-    # python interpreter in the Isaac Lab directory
-    isaaclab_settings = re.sub(
-        r"\"python.defaultInterpreterPath\": \".*?\"",
-        f'"python.defaultInterpreterPath": "{python_exe}"',
-        isaaclab_settings,
-        flags=re.DOTALL,
-    )
-    # return the Isaac Lab settings file
-    return isaaclab_settings
-
-
-def main():
-    # Isaac Lab template settings
-    isaaclab_vscode_template_filename = os.path.join(PROJECT_DIR, ".vscode", "tools", "settings.template.json")
-    # make sure the Isaac Lab template settings file exists
-    if not os.path.exists(isaaclab_vscode_template_filename):
-        raise FileNotFoundError(
-            f"Could not find the Isaac Lab template settings file: {isaaclab_vscode_template_filename}"
-        )
-    # read the Isaac Lab template settings file
-    with open(isaaclab_vscode_template_filename) as f:
-        isaaclab_template_settings = f.read()
-
-    # overwrite the python.analysis.extraPaths in the Isaac Lab settings file with the path names
-    isaaclab_settings = overwrite_python_analysis_extra_paths(isaaclab_template_settings)
-    # overwrite the default python interpreter in the Isaac Lab settings file with the path to the
-    # python interpreter used to call this script
-    isaaclab_settings = overwrite_default_python_interpreter(isaaclab_settings)
-
-    # add template notice to the top of the file
-    header_message = (
-        "// This file is a template and is automatically generated by the setup_vscode.py script.\n"
-        "// Do not edit this file directly.\n"
-        "// \n"
-        f"// Generated from: {isaaclab_vscode_template_filename}\n"
-    )
-    isaaclab_settings = header_message + isaaclab_settings
-
-    # write the Isaac Lab settings file
-    isaaclab_vscode_filename = os.path.join(PROJECT_DIR, ".vscode", "settings.json")
-    with open(isaaclab_vscode_filename, "w") as f:
-        f.write(isaaclab_settings)
-
-    # copy the launch.json file if it doesn't exist
-    isaaclab_vscode_launch_filename = os.path.join(PROJECT_DIR, ".vscode", "launch.json")
-    isaaclab_vscode_template_launch_filename = os.path.join(PROJECT_DIR, ".vscode", "tools", "launch.template.json")
-    if not os.path.exists(isaaclab_vscode_launch_filename):
-        # read template launch settings
-        with open(isaaclab_vscode_template_launch_filename) as f:
-            isaaclab_template_launch_settings = f.read()
-        # add header
-        header_message = header_message.replace(
-            isaaclab_vscode_template_filename, isaaclab_vscode_template_launch_filename
-        )
-        isaaclab_launch_settings = header_message + isaaclab_template_launch_settings
-        # write the Isaac Lab launch settings file
-        with open(isaaclab_vscode_launch_filename, "w") as f:
-            f.write(isaaclab_launch_settings)
 
 
 if __name__ == "__main__":
