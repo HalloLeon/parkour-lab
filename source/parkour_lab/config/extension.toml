@@ -5,31 +5,26 @@ version = "0.1.0"
 
 # Description
 category = "isaaclab"
-readme  = "README.md"
+readme = "docs/README.md"
 
-title = "Extension Template"
-author = "Isaac Lab Project Developers"
-maintainer = "Isaac Lab Project Developers"
-description="Extension Template for Isaac Lab"
-repository = "https://github.com/isaac-sim/IsaacLab.git"
-keywords = ["extension", "template", "isaaclab"]
+title = "Parkour Lab"
+author = "Leon Yi Bai"
+maintainer = "Leon Yi Bai"
+description = "Adaptive parkour curriculum and reproducible evaluation for a Unitree A1 in Isaac Lab"
+repository = "https://github.com/HalloLeon/parkour-lab.git"
+keywords = ["isaaclab", "reinforcement-learning", "parkour", "unitree-a1"]
 
 [dependencies]
 "isaaclab" = {}
 "isaaclab_assets" = {}
-"isaaclab_mimic" = {}
 "isaaclab_rl" = {}
 "isaaclab_tasks" = {}
-# NOTE: Add additional dependencies here
 
 [[python.module]]
 name = "parkour_lab"
 
 [isaaclab_settings]
-# TODO: Uncomment and list any apt dependencies here.
-#       If none, leave it commented out.
+# Optional system dependencies can be declared here when needed.
 # apt_deps = ["example_package"]
-# TODO: Uncomment and provide path to a ros_ws
-#       with rosdeps to be installed. If none,
-#       leave it commented out.
+# ros_ws can point to a ROS workspace with rosdep-managed dependencies.
 # ros_ws = "path/from/extension_root/to/ros_ws"
