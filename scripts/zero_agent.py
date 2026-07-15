@@ -5,29 +5,34 @@
 
 """Script to run an environment with zero action agent."""
 
-"""Launch Isaac Sim Simulator first."""
+# Launch Isaac Sim before importing modules that depend on it.
 
 import argparse
 
 from isaaclab.app import AppLauncher
 
-# add argparse arguments
+# Define script-specific command-line arguments.
 parser = argparse.ArgumentParser(description="Zero agent for Isaac Lab environments.")
 parser.add_argument(
-    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
+    "--disable_fabric",
+    action="store_true",
+    default=False,
+    help="Disable fabric and use USD I/O operations.",
 )
-parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
+parser.add_argument(
+    "--num_envs", type=int, default=None, help="Number of environments to simulate."
+)
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
-# append AppLauncher cli args
+# Add Isaac Lab application arguments.
 AppLauncher.add_app_launcher_args(parser)
-# parse the arguments
+# Parse all command-line arguments.
 args_cli = parser.parse_args()
 
-# launch omniverse app
+# Launch the Omniverse application.
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-"""Rest everything follows."""
+# The remaining imports require the running simulation application.
 
 import gymnasium as gym
 import isaaclab_tasks  # noqa: F401
@@ -36,35 +41,38 @@ import torch
 from isaaclab_tasks.utils import parse_env_cfg
 
 
-def main():
+def main() -> None:
     """Zero actions agent with Isaac Lab environment."""
-    # parse configuration
+
+    # Resolve the selected task's environment configuration.
     env_cfg = parse_env_cfg(
-        args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs, use_fabric=not args_cli.disable_fabric
+        args_cli.task,
+        device=args_cli.device,
+        num_envs=args_cli.num_envs,
+        use_fabric=not args_cli.disable_fabric,
     )
-    # create environment
+    # Instantiate the registered Gym environment.
     env = gym.make(args_cli.task, cfg=env_cfg)
 
-    # print info (this is vectorized environment)
+    # Report the vectorized observation and action spaces.
     print(f"[INFO]: Gym observation space: {env.observation_space}")
     print(f"[INFO]: Gym action space: {env.action_space}")
-    # reset environment
+
+    # Initialize every environment before simulation begins.
     env.reset()
-    # simulate environment
+
+    # Step the environments until the simulation application stops.
     while simulation_app.is_running():
-        # run everything in inference mode
+        # Disable gradient tracking because this script does not train a model.
         with torch.inference_mode():
-            # compute zero actions
+            # Hold every normalized action component at zero.
             actions = torch.zeros(env.action_space.shape, device=env.unwrapped.device)
-            # apply actions
             env.step(actions)
 
-    # close the simulator
+    # Release environment resources.
     env.close()
 
 
 if __name__ == "__main__":
-    # run the main function
     main()
-    # close sim app
     simulation_app.close()

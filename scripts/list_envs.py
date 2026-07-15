@@ -9,44 +9,47 @@ Script to print all the available environments in Isaac Lab.
 The script iterates over all registered environments and stores the details in a table.
 It prints the name of the environment, the entry point and the config file.
 
-All the environments are registered in the `parkour_lab` extension. They start
-with `Isaac` in their name.
+All the environments are registered in the ``parkour_lab`` extension. Their task
+IDs start with ``Parkour-``.
 """
 
-"""Launch Isaac Sim Simulator first."""
+# Launch Isaac Sim before importing modules that depend on it.
 
 from isaaclab.app import AppLauncher
 
-# launch omniverse app
+# Launch the Omniverse application in headless mode.
 app_launcher = AppLauncher(headless=True)
 simulation_app = app_launcher.app
 
-
-"""Rest everything follows."""
+# The remaining imports require the running simulation application.
 
 import gymnasium as gym
 import parkour_lab.tasks  # noqa: F401
 from prettytable import PrettyTable
 
 
-def main():
-    """Print all environments registered in `parkour_lab` extension."""
-    # print all the available environments
+def main() -> None:
+    """Print all environments registered in ``parkour_lab`` extension."""
+
+    # Create and configure the table used to display registered tasks.
     table = PrettyTable(["S. No.", "Task Name", "Entry Point", "Config"])
     table.title = "Available Environments in Isaac Lab"
-    # set alignment of table columns
     table.align["Task Name"] = "l"
     table.align["Entry Point"] = "l"
     table.align["Config"] = "l"
 
-    # count of environments
+    # Collect every registered Parkour Lab environment in registry order.
     index = 0
-    # acquire all Isaac environments names
     for task_spec in gym.registry.values():
-        if "Template-" in task_spec.id:
-            # add details to table
-            table.add_row([index + 1, task_spec.id, task_spec.entry_point, task_spec.kwargs["env_cfg_entry_point"]])
-            # increment count
+        if task_spec.id.startswith("Parkour-"):
+            table.add_row(
+                [
+                    index + 1,
+                    task_spec.id,
+                    task_spec.entry_point,
+                    task_spec.kwargs["env_cfg_entry_point"],
+                ]
+            )
             index += 1
 
     print(table)
@@ -54,10 +57,6 @@ def main():
 
 if __name__ == "__main__":
     try:
-        # run the main function
         main()
-    except Exception as e:
-        raise e
     finally:
-        # close the app
         simulation_app.close()
