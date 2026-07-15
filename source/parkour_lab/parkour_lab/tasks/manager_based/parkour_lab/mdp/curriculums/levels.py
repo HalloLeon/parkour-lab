@@ -10,14 +10,19 @@ from typing import Any, cast
 
 @dataclass(frozen=True)
 class ParkourStructureCfg:
-    """A mesh factory invocation and its terrain-local rigid transform.
+    """A mesh factory invocation and its terrain-local rigid transform."""
 
-    ``orientation_rpy`` is expressed as roll, pitch, and yaw in radians.
-    """
-
+    # Callable used to create the structure's ``Trimesh`` object or objects.
+    # It is invoked as ``mesh_factory(**mesh_kwargs)``.
     mesh_factory: Callable[..., object]
+
+    # Keyword arguments forwarded to ``mesh_factory`` when creating the mesh.
     mesh_kwargs: dict[str, Any]
+
+    # XYZ translation in meters relative to the center of the terrain tile.
     position: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+    # Roll, pitch, and yaw rotation in radians about the X, Y, and Z axes.
     orientation_rpy: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
     def __post_init__(self) -> None:

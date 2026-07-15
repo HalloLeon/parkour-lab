@@ -31,6 +31,64 @@ def _goal_direction_xy(
     return goal_vec_xy / goal_dist_xy
 
 
+def _goal_direction_yaw_xy(
+    env: ManagerBasedRLEnv,
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    Unit XY goal direction in the robot's yaw-aligned body frame.
+
+    The first component points forward and the second points left. Roll and
+    pitch do not affect this heading target, so it is equivalent to
+    ``[cos(heading_error), sin(heading_error)]`` without an angle wrap at
+    ``-pi`` or ``+pi``.
+
+    Returns:
+        [num_envs, 2]
+    """
+
+    forward_direction_w = _root_forward_xy_w(env, asset_cfg)
+    forward_norm = torch.linalg.norm(forward_direction_w, dim=-1, keepdim=True)
+    # A vertical body has no projected forward direction. World +X provides a
+    # deterministic yaw convention for this otherwise undefined edge case.
+    fallback_forward_w = torch.zeros_like(forward_direction_w)
+    fallback_forward_w[:, 0] = 1.0
+    forward_direction_w = torch.where(
+        forward_norm > 1.0e-6,
+        forward_direction_w / forward_norm,
+        fallback_forward_w,
+    )
+    goal_vector_w = _goal_vector_xy(env, goal_cfg, asset_cfg)
+    goal_distance = torch.linalg.norm(goal_vector_w, dim=-1, keepdim=True)
+
+    # Heading is undefined exactly at the waypoint. Use body-forward as a
+    # deterministic, unit-length target for that degenerate state.
+    goal_direction_w = torch.where(
+        goal_distance > 1.0e-6,
+        goal_vector_w / goal_distance,
+        forward_direction_w,
+    )
+
+    # Rotate each world-frame forward vector ``[x, y]`` by 90 degrees
+    # counterclockwise to obtain the corresponding unit left vector
+    # ``[-y, x]``. Together they form the robot's yaw-aligned XY basis.
+    left_direction_w = torch.stack(
+        (-forward_direction_w[:, 1], forward_direction_w[:, 0]), dim=-1
+    )
+
+    # Project the world-frame goal direction onto that basis. The first dot
+    # product is the forward component (cosine of the heading error), and the
+    # second is the signed left component (sine of the heading error).
+    return torch.stack(
+        (
+            torch.sum(goal_direction_w * forward_direction_w, dim=-1),
+            torch.sum(goal_direction_w * left_direction_w, dim=-1),
+        ),
+        dim=-1,
+    )
+
+
 def _goal_distance_xy(
     env: ManagerBasedRLEnv,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),

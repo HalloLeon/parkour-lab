@@ -234,16 +234,29 @@ PARKOUR_TERRAIN_GENERATOR_CFG = TerrainGeneratorCfg(
 def _normalize_mesh_result(result: object, factory: object) -> list[trimesh.Trimesh]:
     """Normalize common Trimesh factory outputs into independent meshes."""
 
+    # Wrap a single mesh in a list so all callers can process one consistent
+    # return type. Copy it because the caller subsequently transforms it.
     if isinstance(result, trimesh.Trimesh):
         return [result.copy()]
+
+    # A scene may contain several positioned geometries. ``dump`` resolves its
+    # scene graph and returns the geometries as transformed mesh objects.
     if isinstance(result, trimesh.Scene):
         result = result.dump(concatenate=False)
         if isinstance(result, trimesh.Trimesh):
             return [result.copy()]
+
+    # Factories may also return a sequence or generator of meshes. Strings and
+    # bytes are iterable too, but cannot represent a valid collection of meshes.
     if isinstance(result, Iterable) and not isinstance(result, (str, bytes)):
         meshes = list(result)
         if all(isinstance(mesh, trimesh.Trimesh) for mesh in meshes):
+            # Return independent copies so applying a structure transform does
+            # not mutate meshes retained or reused by the factory.
             return [mesh.copy() for mesh in meshes]
+
+    # Report the factory as well as the accepted return types to make malformed
+    # custom structure factories straightforward to identify.
     raise TypeError(
         f"Mesh factory {factory!r} must return a Trimesh, Scene, or iterable of Trimesh objects."
     )
@@ -254,16 +267,26 @@ def _structure_meshes(
 ) -> list[trimesh.Trimesh]:
     """Create and rigidly transform all meshes produced by one structure."""
 
+    # Call the configured Trimesh-compatible factory with its shape-specific
+    # keyword arguments. Normalize its possible mesh, scene, or iterable output
+    # into independent ``Trimesh`` objects that are safe to transform in place.
     meshes = _normalize_mesh_result(
         structure.mesh_factory(**dict(structure.mesh_kwargs)),
         structure.mesh_factory,
     )
+
+    # Structure positions are expressed relative to the terrain tile center.
+    # Adding the center converts that local offset into tile mesh coordinates.
     translation = terrain_center + np.asarray(structure.position, dtype=np.float64)
+
+    # Build one homogeneous transform containing the structure's XYZ
+    # translation and roll-pitch-yaw rotation.
     transform = trimesh.transformations.compose_matrix(
         translate=translation,
         angles=structure.orientation_rpy,
     )
 
+    # Apply the same rigid pose to every mesh returned for this structure.
     for mesh in meshes:
         mesh.apply_transform(transform)
     return meshes

@@ -10,9 +10,7 @@ from ._shared import contact, navigation, terrain
 from .commands import get_target_speed
 
 
-def base_clearance_obs(
-    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
+def base_clearance_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """
     Base/root clearance above the support surface underneath the robot.
 
@@ -77,9 +75,7 @@ def goal_direction_body_xy(
 
     goal_vec_xy = navigation._goal_vector_xy(env, goal_cfg, asset_cfg)
 
-    goal_vec_w = torch.zeros(
-        (goal_vec_xy.shape[0], 3), device=goal_vec_xy.device, dtype=goal_vec_xy.dtype
-    )
+    goal_vec_w = torch.zeros((goal_vec_xy.shape[0], 3), device=goal_vec_xy.device, dtype=goal_vec_xy.dtype)
     goal_vec_w[:, :2] = goal_vec_xy
 
     # Rotate the world-frame goal vector into the robot body frame.
@@ -99,9 +95,26 @@ def goal_direction_body_xy(
     goal_vec_b = quat_apply_inverse(asset.data.root_quat_w, goal_vec_w)
     goal_dir_b_xy = goal_vec_b[:, :2]
 
-    return goal_dir_b_xy / torch.linalg.norm(
-        goal_dir_b_xy, dim=-1, keepdim=True
-    ).clamp_min(1.0e-6)
+    return goal_dir_b_xy / torch.linalg.norm(goal_dir_b_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
+
+
+def goal_direction_yaw_xy(
+    env: ManagerBasedRLEnv,
+    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    Wrap-safe oracle heading target in the robot's yaw-aligned body frame.
+
+    The unit vector is ``[forward, left]``. It is training-only supervision
+    for the student's heading head and must never be concatenated into the
+    student policy input.
+
+    Returns:
+        [num_envs, 2]
+    """
+
+    return navigation._goal_direction_yaw_xy(env, goal_cfg, asset_cfg)
 
 
 def goal_distance_xy_w(
@@ -117,6 +130,25 @@ def goal_distance_xy_w(
     """
 
     return navigation._goal_distance_xy(env, goal_cfg, asset_cfg).unsqueeze(-1)
+
+
+def student_exteroception_stub(env: ManagerBasedRLEnv, feature_dim: int = 64) -> torch.Tensor:
+    """
+    Return an information-free placeholder for a future depth embedding.
+
+    This configurable-width zero tensor establishes the student exteroception
+    API without exposing ray hits or other simulator geometry. It is suitable
+    only for testing the pipeline. The future depth encoder may deliberately
+    choose a different feature width, which will create a new student model
+    interface while leaving the action contract unchanged.
+
+    Returns:
+        [num_envs, feature_dim]
+    """
+
+    if feature_dim <= 0:
+        raise ValueError("feature_dim must be positive.")
+    return torch.zeros((env.num_envs, feature_dim), device=env.device)
 
 
 def terrain_height_scan(
@@ -189,9 +221,7 @@ def _terrain_height_scan_components(
     asset: Articulation = env.scene[asset_cfg.name]
 
     if not isinstance(sensor, RayCaster):
-        raise TypeError(
-            f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}."
-        )
+        raise TypeError(f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}.")
 
     return terrain._terrain_height_components(
         asset.data.root_pos_w[:, 2],
