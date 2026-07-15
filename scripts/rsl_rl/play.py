@@ -5,31 +5,22 @@
 
 """Evaluate a checkpoint of an RL agent trained with RSL-RL."""
 
-"""Launch Isaac Sim Simulator first."""
+# Launch Isaac Sim before importing modules that depend on it.
 
 import argparse
 import sys
 
 from isaaclab.app import AppLauncher
 
-# local imports
-import cli_args  # isort: skip
+import cli_args
 
 
-def positive_int(value: str) -> int:
-    """Parse a strictly positive integer argument."""
-    parsed_value = int(value)
-    if parsed_value <= 0:
-        raise argparse.ArgumentTypeError(f"Expected a positive integer, received: {value}")
-    return parsed_value
-
-
-# add argparse arguments
+# Define evaluation arguments.
 parser = argparse.ArgumentParser(description="Evaluate an RSL-RL checkpoint.")
 parser.add_argument("--video", action="store_true", default=False, help="Record an evaluation video.")
 parser.add_argument(
     "--video_length",
-    type=positive_int,
+    type=int,
     default=None,
     help="Length of the recorded video in policy steps. Defaults to one full environment episode.",
 )
@@ -47,59 +38,58 @@ parser.add_argument(
 )
 parser.add_argument(
     "--eval_episodes",
-    type=positive_int,
+    type=int,
     default=10,
     help="Number of completed episodes to evaluate.",
-)
-parser.add_argument(
-    "--export_policy",
-    action="store_true",
-    default=False,
-    help="Export the loaded policy to JIT and ONNX.",
-)
-parser.add_argument(
-    "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
-    "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
+    "--agent",
+    type=str,
+    default="rsl_rl_cfg_entry_point",
+    help="Name of the RL agent configuration entry point.",
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment.")
 parser.add_argument(
-    "--use_pretrained_checkpoint",
+    "--real-time",
     action="store_true",
-    help="Use the pre-trained checkpoint from Nucleus.",
+    default=False,
+    help="Run in real-time, if possible.",
 )
-parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
-# append RSL-RL cli arguments
-cli_args.add_rsl_rl_args(parser)
-# append AppLauncher cli args
+# Playback needs checkpoint selection, not training-only RSL-RL options such as
+# resume state, run naming, or logger configuration.
+cli_args.add_rsl_rl_checkpoint_args(parser)
+# Add Isaac Lab application arguments.
 AppLauncher.add_app_launcher_args(parser)
-# parse the arguments
+# Split recognized CLI options from the remaining Hydra configuration overrides.
 args_cli, hydra_args = parser.parse_known_args()
-# always enable cameras to record video
+for argument_name in ("video_length", "eval_episodes"):
+    argument_value = getattr(args_cli, argument_name)
+    if argument_value is not None and argument_value <= 0:
+        parser.error(f"--{argument_name} must be a positive integer.")
+# Enable cameras when recording video.
 if args_cli.video:
     args_cli.enable_cameras = True
 
-# clear out sys.argv for Hydra
+# ``hydra_task_config`` reads the global ``sys.argv`` when the decorated
+# ``main`` is called later. Leave it only the script name and unparsed Hydra
+# overrides, excluding options already consumed by argparse and AppLauncher.
 sys.argv = [sys.argv[0]] + hydra_args
 
-# launch omniverse app
+# Launch the Omniverse application.
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-"""Rest everything follows."""
+# The remaining imports require the running simulation application.
 
-import hashlib
-import importlib.metadata as metadata
 import json
 import os
-import subprocess
 import time
-from dataclasses import asdict, is_dataclass
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import TypedDict
 
 import gymnasium as gym
 import isaaclab_tasks  # noqa: F401
@@ -108,32 +98,253 @@ import torch
 from isaaclab.envs import (
     DirectMARLEnv,
     DirectMARLEnvCfg,
+    DirectRLEnv,
     DirectRLEnvCfg,
+    ManagerBasedRLEnv,
     ManagerBasedRLEnvCfg,
     multi_agent_to_single_agent,
 )
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
-from isaaclab.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
-from isaaclab_rl.rsl_rl import (
-    RslRlBaseRunnerCfg,
-    RslRlVecEnvWrapper,
-    export_policy_as_jit,
-    export_policy_as_onnx,
-)
+from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
-from packaging import version
-from rsl_rl.runners import DistillationRunner, OnPolicyRunner
+from parkour_lab.tasks.manager_based.parkour_lab.distillation.contracts import (
+    TEACHER_OBSERVATION_GROUPS,
+    assert_teacher_interface_matches,
+    build_teacher_interface,
+    interface_sha256,
+    sha256_file,
+)
+from rsl_rl.runners import OnPolicyRunner
+from tensordict import TensorDict
 
-installed_version = metadata.version("rsl-rl-lib")
+
+class _EvaluationSummary(TypedDict):
+    """Aggregate metrics calculated from completed episodes."""
+
+    success_rate: float | None
+    trunk_contact_rate: float | None
+    timeout_rate: float | None
+    mean_return: float | None
+    mean_episode_length_steps: float | None
+    mean_episode_length_seconds: float | None
 
 
-def configure_evaluation_difficulty(
+class _EvaluationReport(TypedDict):
+    """Complete evaluation report written to ``metrics.json``."""
+
+    # Registered Gym task used to create the evaluation environment.
+    task: str | None
+
+    # Absolute checkpoint path consumed by teacher selection and distillation.
+    checkpoint: str
+
+    # Complete SHA-256 hash identifying the exact checkpoint file contents.
+    checkpoint_sha256: str
+
+    # Reconstructed teacher observation, action, terrain, and timing interface.
+    teacher_interface: dict[str, object] | None
+
+    # SHA-256 identity of the reconstructed teacher-interface description.
+    teacher_interface_sha256: str | None
+
+    # Random seed used by the evaluated environment.
+    seed: int | None
+
+    # Fixed curriculum level selected for this evaluation, when supported.
+    difficulty_level: int | None
+
+    # Task-specific description of the selected difficulty level.
+    difficulty_metadata: dict[str, object]
+
+    # Number of parallel simulation environments used during evaluation.
+    num_envs: int
+
+    # Target number of completed episodes requested on the command line.
+    requested_episodes: int
+
+    # Number of completed episodes actually included in the aggregate metrics.
+    completed_episodes: int
+
+    # Aggregate returns, episode lengths, and termination rates.
+    summary: _EvaluationSummary
+
+
+@dataclass(frozen=True)
+class _ArtifactInfo:
+    """Paths and names shared by evaluation outputs."""
+
+    # Directory receiving ``metrics.json`` and any recorded video.
+    directory: str
+
+    # Descriptive filename prefix containing the checkpoint, level, and seed.
+    video_name_prefix: str
+
+
+@dataclass(frozen=True)
+class _CheckpointInfo:
+    """Resolved identity of the evaluated checkpoint."""
+
+    # Absolute path of the checkpoint loaded by RSL-RL.
+    path: str
+
+    # SHA-256 hash of the checkpoint contents, used to distinguish files that
+    # share a name but contain different model weights.
+    sha256: str
+
+    # Filesystem-safe checkpoint filename without its extension.
+    stem: str
+
+    # Directory containing the checkpoint and its training artifacts.
+    log_dir: str
+
+
+@dataclass(frozen=True)
+class _InterfaceInfo:
+    """Teacher interface reconstructed for fixed evaluation."""
+
+    # Runtime description of teacher observations, preprocessing, actions, and
+    # control timing; ``None`` for a policy without the privileged-teacher route.
+    teacher_interface: dict[str, object] | None
+
+    # Hash of ``teacher_interface`` used to identify its exact contents.
+    teacher_interface_sha256: str | None
+
+
+@dataclass
+class _RolloutResult:
+    """Aggregate statistics collected from completed evaluation episodes."""
+
+    completed_episodes: int = 0
+    return_sum: float = 0.0
+    length_steps_sum: int = 0
+    success_count: int = 0
+    trunk_contact_count: int = 0
+    timeout_count: int = 0
+
+    def record_completed(
+        self,
+        requested_episodes: int,
+        done_mask: torch.Tensor,
+        episode_returns: torch.Tensor,
+        episode_lengths: torch.Tensor,
+        outcomes: dict[str, torch.Tensor],
+    ) -> None:
+        """Add completed episodes without exceeding the requested total."""
+
+        remaining = requested_episodes - self.completed_episodes
+        completed_indices = torch.nonzero(done_mask, as_tuple=False).flatten()[:remaining]
+        if completed_indices.numel() == 0:
+            return
+
+        self.completed_episodes += int(completed_indices.numel())
+        self.return_sum += float(episode_returns[completed_indices].sum().item())
+        self.length_steps_sum += int(episode_lengths[completed_indices].sum().item())
+        self.success_count += int(outcomes["success"][completed_indices].sum().item())
+        self.trunk_contact_count += int(outcomes["trunk_contact"][completed_indices].sum().item())
+        self.timeout_count += int(outcomes["timeout"][completed_indices].sum().item())
+
+    def summary(self, step_dt: float) -> _EvaluationSummary:
+        """Calculate means and rates from the accumulated totals."""
+
+        if self.completed_episodes == 0:
+            return {
+                "success_rate": None,
+                "trunk_contact_rate": None,
+                "timeout_rate": None,
+                "mean_return": None,
+                "mean_episode_length_steps": None,
+                "mean_episode_length_seconds": None,
+            }
+
+        count = self.completed_episodes
+        mean_length_steps = self.length_steps_sum / count
+        return {
+            "success_rate": self.success_count / count,
+            "trunk_contact_rate": self.trunk_contact_count / count,
+            "timeout_rate": self.timeout_count / count,
+            "mean_return": self.return_sum / count,
+            "mean_episode_length_steps": mean_length_steps,
+            "mean_episode_length_seconds": mean_length_steps * step_dt,
+        }
+
+
+# Capture the task ID and agent entry-point name now. The returned wrapper later
+# loads their registered configuration defaults, lets Hydra consume the retained
+# ``sys.argv`` overrides, and calls this function as ``main(env_cfg, agent_cfg)``.
+@hydra_task_config(args_cli.task, args_cli.agent)
+def main(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    agent_cfg: RslRlBaseRunnerCfg,
+) -> None:
+    """Evaluate an RSL-RL agent."""
+    agent_cfg = _configure_runtime(env_cfg, agent_cfg)
+    evaluation_level, level_metadata = _configure_evaluation_difficulty(env_cfg, args_cli.difficulty_level)
+    checkpoint = _resolve_checkpoint(agent_cfg)
+    artifacts = _create_artifacts(checkpoint, evaluation_level, env_cfg.seed)
+    env = _create_environment(env_cfg, agent_cfg, artifacts)
+    num_envs = env.num_envs
+    step_dt = env.unwrapped.step_dt
+
+    try:
+        observations = env.get_observations()
+        interface = _validate_teacher_interface(env.unwrapped, observations, agent_cfg, checkpoint.path)
+        policy = _load_policy(env, agent_cfg, checkpoint.path)
+        rollout = _run_evaluation(env, observations, policy)
+    finally:
+        # Closing also finalizes a partial or completed RecordVideo recording.
+        env.close()
+
+    metrics = _build_metrics(
+        env_cfg=env_cfg,
+        checkpoint=checkpoint,
+        interface=interface,
+        evaluation_level=evaluation_level,
+        level_metadata=level_metadata,
+        num_envs=num_envs,
+        step_dt=step_dt,
+        rollout=rollout,
+    )
+    metrics_path = _write_metrics(artifacts.directory, metrics)
+    _print_summary(metrics, metrics_path)
+
+
+def _build_metrics(
+    *,
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    checkpoint: _CheckpointInfo,
+    interface: _InterfaceInfo,
+    evaluation_level: int | None,
+    level_metadata: dict[str, object],
+    num_envs: int,
+    step_dt: float,
+    rollout: _RolloutResult,
+) -> _EvaluationReport:
+    """Assemble the complete JSON-compatible evaluation report."""
+
+    return {
+        "task": args_cli.task,
+        "checkpoint": checkpoint.path,
+        "checkpoint_sha256": checkpoint.sha256,
+        "teacher_interface": interface.teacher_interface,
+        "teacher_interface_sha256": interface.teacher_interface_sha256,
+        "seed": env_cfg.seed,
+        "difficulty_level": evaluation_level,
+        "difficulty_metadata": level_metadata,
+        "num_envs": num_envs,
+        "requested_episodes": args_cli.eval_episodes,
+        "completed_episodes": rollout.completed_episodes,
+        "summary": rollout.summary(step_dt),
+    }
+
+
+def _configure_evaluation_difficulty(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     requested_level: int | None,
-) -> tuple[int | None, Any]:
+) -> tuple[int | None, dict[str, object]]:
     """Apply a task-specific fixed evaluation difficulty when the config supports it."""
+
     set_difficulty = getattr(env_cfg, "set_evaluation_difficulty", None)
     if not callable(set_difficulty):
         if requested_level is not None:
@@ -143,7 +354,7 @@ def configure_evaluation_difficulty(
             )
         return None, {}
 
-    # None lets the task select its own maximum/default after Hydra overrides
+    # None lets the task select its own maximum or default after Hydra overrides
     # have been synchronized.
     result = set_difficulty(requested_level, seed=env_cfg.seed)
     effective_level = getattr(env_cfg, "evaluation_level", requested_level)
@@ -155,387 +366,128 @@ def configure_evaluation_difficulty(
     return effective_level, metadata
 
 
-def path_component(value: Any, default: str) -> str:
-    """Convert a value to a filesystem-safe path component."""
-    text = default if value is None else str(value)
-    return "".join(character if character.isalnum() or character in {"-", "_", "."} else "_" for character in text)
-
-
-def sha256_file(path: str) -> str:
-    """Return a stable identity for the checkpoint contents."""
-
-    digest = hashlib.sha256()
-    with open(path, "rb") as checkpoint_file:
-        for chunk in iter(lambda: checkpoint_file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def git_state() -> dict[str, Any]:
-    """Return repository identity without making Git a runtime requirement."""
-
-    repository_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    try:
-        commit = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=repository_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-        dirty = bool(
-            subprocess.run(
-                ["git", "status", "--porcelain"],
-                cwd=repository_root,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-        )
-        return {"commit": commit, "dirty": dirty}
-    except (OSError, subprocess.CalledProcessError):
-        return {"commit": None, "dirty": None}
-
-
-def manager_term_mask(
-    base_env: Any, names: tuple[str, ...], reference: torch.Tensor
-) -> tuple[torch.Tensor, str | None]:
-    """Read the first available termination-manager term without recomputing it."""
-    termination_manager = getattr(base_env, "termination_manager", None)
-    if termination_manager is None:
-        return torch.zeros_like(reference, dtype=torch.bool), None
-
-    active_terms = set(getattr(termination_manager, "active_terms", ()))
-    for name in names:
-        if name in active_terms:
-            return termination_manager.get_term(name).to(device=reference.device, dtype=torch.bool), name
-    return torch.zeros_like(reference, dtype=torch.bool), None
-
-
-def timeout_mask(base_env: Any, reference: torch.Tensor) -> tuple[torch.Tensor, str | None]:
-    """Read the current timeout mask, preferring the named manager term."""
-    mask, source = manager_term_mask(base_env, ("time_out", "timeout"), reference)
-    if source is not None:
-        return mask, source
-
-    termination_manager = getattr(base_env, "termination_manager", None)
-    manager_timeouts = getattr(termination_manager, "time_outs", None)
-    if manager_timeouts is not None:
-        return manager_timeouts.to(device=reference.device, dtype=torch.bool), "time_outs"
-
-    reset_timeouts = getattr(base_env, "reset_time_outs", None)
-    if reset_timeouts is not None:
-        return reset_timeouts.to(device=reference.device, dtype=torch.bool), "reset_time_outs"
-
-    return torch.zeros_like(reference, dtype=torch.bool), None
-
-
-def reset_recurrent_policy_state(policy: Any, policy_nn: Any, dones: torch.Tensor) -> None:
-    """Reset recurrent inference state when the loaded policy exposes a reset hook."""
-    if not torch.any(dones):
-        return
-    for candidate in (policy, policy_nn):
-        reset_fn = getattr(candidate, "reset", None)
-        if callable(reset_fn):
-            reset_fn(dones)
-            return
-
-
-def to_jsonable(value: Any) -> Any:
-    """Recursively convert tensors and config objects to JSON-compatible values."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, torch.Tensor):
-        return value.detach().cpu().tolist()
-    if is_dataclass(value) and not isinstance(value, type):
-        return to_jsonable(asdict(value))
-    if isinstance(value, dict):
-        return {str(key): to_jsonable(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [to_jsonable(item) for item in value]
-    to_dict = getattr(value, "to_dict", None)
-    if callable(to_dict):
-        return to_jsonable(to_dict())
-    item = getattr(value, "item", None)
-    if callable(item):
-        try:
-            return item()
-        except (TypeError, ValueError):
-            pass
-    return str(value)
-
-
-@hydra_task_config(args_cli.task, args_cli.agent)
-def main(
+def _configure_runtime(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     agent_cfg: RslRlBaseRunnerCfg,
-) -> None:
-    """Evaluate an RSL-RL agent."""
-    # grab task name for checkpoint path
-    task_name = args_cli.task.split(":")[-1]
-    train_task_name = task_name.replace("-Play", "")
+) -> RslRlBaseRunnerCfg:
+    """Apply CLI overrides needed before constructing the environment."""
 
-    # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
-    env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
-
-    # set the environment seed
-    # note: certain randomizations occur in the environment initialization so we set the seed here
+    if args_cli.num_envs is not None:
+        env_cfg.scene.num_envs = args_cli.num_envs
     env_cfg.seed = agent_cfg.seed
-    env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    if args_cli.device is not None:
+        env_cfg.sim.device = args_cli.device
+    return agent_cfg
 
-    # freeze task difficulty before constructing the simulator scene
-    evaluation_level, evaluation_level_metadata = configure_evaluation_difficulty(env_cfg, args_cli.difficulty_level)
 
-    # specify directory for logging experiments
-    log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
-    log_root_path = os.path.abspath(log_root_path)
-    print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    if args_cli.use_pretrained_checkpoint:
-        resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
-        if not resume_path:
-            print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
-            return
-    elif args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
-    else:
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+def _create_artifacts(
+    checkpoint: _CheckpointInfo,
+    evaluation_level: int | None,
+    seed: int | None,
+) -> _ArtifactInfo:
+    """Create one collision-free artifact directory for this evaluation."""
 
-    checkpoint_path = os.path.abspath(resume_path)
-    checkpoint_sha256 = sha256_file(checkpoint_path)
-    log_dir = os.path.dirname(checkpoint_path)
-
-    # keep each checkpoint/level/seed evaluation in a self-describing folder
-    checkpoint_stem = path_component(os.path.splitext(os.path.basename(checkpoint_path))[0], "checkpoint")
-    checkpoint_id = f"{checkpoint_stem}-{checkpoint_sha256[:8]}"
-    level_component = path_component(evaluation_level, "default")
-    seed_component = path_component(env_cfg.seed, "default")
+    level_component = _path_component(evaluation_level, "default")
+    seed_component = _path_component(seed, "default")
     evaluation_kind = "video" if args_cli.video else "metrics"
     evaluation_settings = f"episodes_{args_cli.eval_episodes}"
     if args_cli.video:
         evaluation_settings += f"-steps_{args_cli.video_length or 'full'}"
-    evaluation_run_id = datetime.now(timezone.utc).strftime("run_%Y%m%dT%H%M%S_%fZ")
+    # Build a readable UTC identifier as ``run_YYYYMMDD_HHMMSS``: ``%Y`` is
+    # the year, ``%m`` the month, ``%d`` the day, ``%H`` the hour, ``%M`` the
+    # minute, and ``%S`` the second.
+    run_id = datetime.now(timezone.utc).strftime("run_%Y%m%d_%H%M%S")
     artifact_root = (
         os.path.abspath(os.path.expanduser(args_cli.video_output_dir))
         if args_cli.video_output_dir is not None
-        else os.path.join(log_dir, "evaluation")
+        else os.path.join(checkpoint.log_dir, "evaluation")
     )
-    artifact_dir = os.path.join(
+    directory = os.path.join(
         artifact_root,
-        checkpoint_id,
+        f"{checkpoint.stem}-{checkpoint.sha256[:8]}",
         f"level_{level_component}",
         f"seed_{seed_component}",
         evaluation_kind,
         evaluation_settings,
-        evaluation_run_id,
+        run_id,
     )
-    os.makedirs(artifact_dir, exist_ok=True)
+    os.makedirs(directory, exist_ok=True)
+    return _ArtifactInfo(
+        directory=directory,
+        video_name_prefix=f"{checkpoint.stem}-level_{level_component}-seed_{seed_component}",
+    )
 
-    # set the log directory for the environment (works for all environment types)
-    env_cfg.log_dir = artifact_dir
 
-    # create isaac environment
+def _create_environment(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    agent_cfg: RslRlBaseRunnerCfg,
+    artifacts: _ArtifactInfo,
+) -> RslRlVecEnvWrapper:
+    """Create, optionally record, and adapt the evaluation environment."""
+
+    env_cfg.log_dir = artifacts.directory
+    # Instantiate the registered Gym task with the resolved Isaac Lab
+    # configuration, requesting rendered RGB frames only when recording video.
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-
-    # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
-    video_length = args_cli.video_length if args_cli.video_length is not None else int(env.unwrapped.max_episode_length)
-    video_name_prefix = f"{checkpoint_stem}-level_{level_component}-seed_{seed_component}"
-
-    # wrap for video recording
+    video_length = args_cli.video_length or int(env.unwrapped.max_episode_length)
     if args_cli.video:
         video_kwargs = {
-            "video_folder": artifact_dir,
+            "video_folder": artifacts.directory,
             "step_trigger": lambda step: step == 0,
             "video_length": video_length,
-            "name_prefix": video_name_prefix,
+            "name_prefix": artifacts.video_name_prefix,
             "disable_logger": True,
         }
         print("[INFO] Recording an evaluation video.")
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
-    # wrap around environment for rsl-rl
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    return RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+
+
+def _load_policy(
+    env: RslRlVecEnvWrapper,
+    agent_cfg: RslRlBaseRunnerCfg,
+    checkpoint_path: str,
+) -> Callable[[TensorDict], torch.Tensor]:
+    """Load the feed-forward PPO teacher and return its inference callable."""
 
     print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
-    # load previously trained model
-    if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    else:
-        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+    if agent_cfg.class_name != "OnPolicyRunner":
+        raise ValueError(
+            "play.py supports only OnPolicyRunner teacher checkpoints; "
+            "stock DistillationRunner checkpoints are not part of this project."
+        )
+    device = env.unwrapped.device
+    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=device)
     runner.load(checkpoint_path)
+    return runner.get_inference_policy(device=device)
 
-    # obtain the trained policy for inference
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
 
-    policy_nn = None
-    if version.parse(installed_version) < version.parse("4.0.0"):
-        # RSL-RL before 4.0 exports and resets through the policy module.
-        if version.parse(installed_version) >= version.parse("2.3.0"):
-            policy_nn = runner.alg.policy
-        else:
-            policy_nn = runner.alg.actor_critic
+def _path_component(value: str | int | None, default: str) -> str:
+    """Convert a value to a filesystem-safe path component."""
 
-    if args_cli.export_policy:
-        export_model_dir = os.path.join(os.path.dirname(checkpoint_path), "exported")
-        if version.parse(installed_version) >= version.parse("4.0.0"):
-            runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
-            runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
-        else:
-            if policy_nn is None:
-                raise RuntimeError("RSL-RL policy module is unavailable for export.")
+    text = default if value is None else str(value)
+    return "".join(character if character.isalnum() or character in {"-", "_", "."} else "_" for character in text)
 
-            # extract the normalizer used by older RSL-RL policy modules
-            if hasattr(policy_nn, "actor_obs_normalizer"):
-                normalizer = policy_nn.actor_obs_normalizer
-            elif hasattr(policy_nn, "student_obs_normalizer"):
-                normalizer = policy_nn.student_obs_normalizer
-            else:
-                normalizer = None
 
-            export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-            export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
-        print(f"[INFO] Exported policy to: {export_model_dir}")
-
-    dt = env.unwrapped.step_dt
-
-    num_envs = env.num_envs
-
-    # the RSL-RL wrapper reset the environment during construction
-    obs = env.get_observations()
-    episode_returns = torch.zeros(num_envs, device=env.unwrapped.device, dtype=torch.float32)
-    episode_lengths = torch.zeros(num_envs, device=env.unwrapped.device, dtype=torch.long)
-    episode_results: list[dict[str, Any]] = []
-    termination_sources: dict[str, str | None] = {
-        "success": None,
-        "trunk_contact": None,
-        "timeout": None,
-    }
-
-    try:
-        while simulation_app.is_running() and len(episode_results) < args_cli.eval_episodes:
-            start_time = time.time()
-            # run everything in inference mode
-            with torch.inference_mode():
-                actions = policy(obs)
-                obs, rewards, dones, _ = env.step(actions)
-
-            rewards = rewards.reshape(-1).to(device=episode_returns.device)
-            dones = dones.reshape(-1).to(device=episode_returns.device)
-            done_mask = dones.to(dtype=torch.bool)
-            episode_returns += rewards
-            episode_lengths += 1
-
-            # Read the masks produced by this step before the next manager compute.
-            success_mask, success_source = manager_term_mask(env.unwrapped, ("success",), done_mask)
-            trunk_contact_mask, trunk_contact_source = manager_term_mask(
-                env.unwrapped, ("trunk_contact", "base_contact"), done_mask
-            )
-            current_timeout_mask, current_timeout_source = timeout_mask(env.unwrapped, done_mask)
-            if success_source is not None:
-                termination_sources["success"] = success_source
-            if trunk_contact_source is not None:
-                termination_sources["trunk_contact"] = trunk_contact_source
-            if current_timeout_source is not None:
-                termination_sources["timeout"] = current_timeout_source
-
-            reset_recurrent_policy_state(policy, policy_nn, dones)
-
-            done_indices = torch.nonzero(done_mask, as_tuple=False).flatten().tolist()
-            for env_index in done_indices:
-                if len(episode_results) >= args_cli.eval_episodes:
-                    break
-                episode_results.append(
-                    {
-                        "episode": len(episode_results) + 1,
-                        "environment_index": env_index,
-                        "return": float(episode_returns[env_index].item()),
-                        "length_steps": int(episode_lengths[env_index].item()),
-                        "length_seconds": float(episode_lengths[env_index].item() * dt),
-                        "success": (bool(success_mask[env_index].item()) if success_source is not None else None),
-                        "trunk_contact": (
-                            bool(trunk_contact_mask[env_index].item()) if trunk_contact_source is not None else None
-                        ),
-                        "timeout": (
-                            bool(current_timeout_mask[env_index].item()) if current_timeout_source is not None else None
-                        ),
-                    }
-                )
-
-            # Isaac Lab already reset completed environments; reset only our accumulators.
-            episode_returns[done_mask] = 0.0
-            episode_lengths[done_mask] = 0
-
-            # time delay for real-time evaluation
-            sleep_time = dt - (time.time() - start_time)
-            if args_cli.real_time and sleep_time > 0:
-                time.sleep(sleep_time)
-    finally:
-        # Closing also finalizes a partial or completed RecordVideo recording.
-        env.close()
-
-    def mean_metric(name: str) -> float | None:
-        values = [float(result[name]) for result in episode_results if result[name] is not None]
-        return sum(values) / len(values) if values else None
-
-    def rate_metric(name: str) -> float | None:
-        values = [bool(result[name]) for result in episode_results if result[name] is not None]
-        return sum(values) / len(values) if values else None
-
-    summary = {
-        "success_rate": rate_metric("success"),
-        "trunk_contact_rate": rate_metric("trunk_contact"),
-        "timeout_rate": rate_metric("timeout"),
-        "mean_return": mean_metric("return"),
-        "mean_episode_length_steps": mean_metric("length_steps"),
-        "mean_episode_length_seconds": mean_metric("length_seconds"),
-    }
-    metrics = {
-        "task": args_cli.task,
-        "checkpoint": checkpoint_path,
-        "loaded_checkpoint": checkpoint_path,
-        "checkpoint_stem": checkpoint_stem,
-        "checkpoint_id": checkpoint_id,
-        "checkpoint_sha256": checkpoint_sha256,
-        "rsl_rl_version": installed_version,
-        "git": git_state(),
-        "evaluation_kind": evaluation_kind,
-        "evaluation_run_id": evaluation_run_id,
-        "seed": env_cfg.seed,
-        "difficulty_level": evaluation_level,
-        "difficulty_metadata": evaluation_level_metadata,
-        "num_envs": num_envs,
-        "requested_episodes": args_cli.eval_episodes,
-        "completed_episodes": len(episode_results),
-        "complete": len(episode_results) == args_cli.eval_episodes,
-        "step_dt_seconds": dt,
-        "video": {
-            "enabled": args_cli.video,
-            "length_steps": video_length if args_cli.video else None,
-            "name_prefix": video_name_prefix if args_cli.video else None,
-            "artifact_directory": artifact_dir,
-        },
-        "termination_term_sources": termination_sources,
-        "summary": summary,
-        "episodes": episode_results,
-    }
-    metrics_path = os.path.join(artifact_dir, "metrics.json")
-    with open(metrics_path, "w", encoding="utf-8") as metrics_file:
-        json.dump(to_jsonable(metrics), metrics_file, indent=2, sort_keys=True)
-        metrics_file.write("\n")
+def _print_summary(metrics: _EvaluationReport, metrics_path: str) -> None:
+    """Print the concise human-readable evaluation summary."""
 
     def format_metric(value: float | None, *, rate: bool = False) -> str:
+        """Format one optional scalar for terminal output."""
+
         if value is None:
             return "n/a"
         return f"{100.0 * value:.1f}%" if rate else f"{value:.4f}"
 
+    summary = metrics["summary"]
     print("[RESULT] Evaluation summary")
-    print(f"  Episodes: {len(episode_results)}/{args_cli.eval_episodes}")
+    print(f"  Episodes: {metrics['completed_episodes']}/{metrics['requested_episodes']}")
     print(f"  Success rate: {format_metric(summary['success_rate'], rate=True)}")
     print(f"  Trunk-contact rate: {format_metric(summary['trunk_contact_rate'], rate=True)}")
     print(f"  Timeout rate: {format_metric(summary['timeout_rate'], rate=True)}")
@@ -543,6 +495,160 @@ def main(
     print(f"  Mean episode length (steps): {format_metric(summary['mean_episode_length_steps'])}")
     print(f"  Mean episode length (seconds): {format_metric(summary['mean_episode_length_seconds'])}")
     print(f"  Metrics: {metrics_path}")
+
+
+def _resolve_checkpoint(agent_cfg: RslRlBaseRunnerCfg) -> _CheckpointInfo:
+    """Resolve the requested checkpoint and calculate its stable identity."""
+
+    log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
+    print(f"[INFO] Loading experiment from directory: {log_root_path}")
+    # Match Isaac Lab's official playback behavior: an explicit checkpoint is
+    # a complete path and takes precedence over run-based automatic lookup.
+    resume_path = (
+        retrieve_file_path(args_cli.checkpoint)
+        if args_cli.checkpoint
+        else get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+    )
+    path = os.path.abspath(resume_path)
+    checkpoint_sha256 = sha256_file(path)
+    stem = _path_component(os.path.splitext(os.path.basename(path))[0], "checkpoint")
+    return _CheckpointInfo(
+        path=path,
+        sha256=checkpoint_sha256,
+        stem=stem,
+        log_dir=os.path.dirname(path),
+    )
+
+
+def _run_evaluation(
+    env: RslRlVecEnvWrapper,
+    observations: TensorDict,
+    policy: Callable[[TensorDict], torch.Tensor],
+) -> _RolloutResult:
+    """Collect fixed-evaluation episodes using deterministic policy actions."""
+
+    step_dt = env.unwrapped.step_dt
+    episode_returns = torch.zeros(env.num_envs, device=env.unwrapped.device, dtype=torch.float32)
+    episode_lengths = torch.zeros(env.num_envs, device=env.unwrapped.device, dtype=torch.long)
+    rollout = _RolloutResult()
+
+    while simulation_app.is_running() and rollout.completed_episodes < args_cli.eval_episodes:
+        start_time = time.time()
+        with torch.inference_mode():
+            actions = policy(observations)
+            observations, rewards, dones, _ = env.step(actions)
+
+        rewards = rewards.reshape(-1).to(device=episode_returns.device)
+        dones = dones.reshape(-1).to(device=episode_returns.device)
+        done_mask = dones.to(dtype=torch.bool)
+        episode_returns += rewards
+        episode_lengths += 1
+        outcomes = _termination_outcomes(env.unwrapped, done_mask)
+        rollout.record_completed(
+            args_cli.eval_episodes,
+            done_mask,
+            episode_returns,
+            episode_lengths,
+            outcomes,
+        )
+        episode_returns[done_mask] = 0.0
+        episode_lengths[done_mask] = 0
+
+        sleep_time = step_dt - (time.time() - start_time)
+        if args_cli.real_time and sleep_time > 0:
+            time.sleep(sleep_time)
+
+    return rollout
+
+
+def _termination_outcomes(
+    base_env: ManagerBasedRLEnv | DirectRLEnv,
+    done_mask: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Read outcome masks produced by the current environment step."""
+
+    if not isinstance(base_env, ManagerBasedRLEnv):
+        raise TypeError("Parkour evaluation outcomes require a ManagerBasedRLEnv.")
+
+    termination_manager = base_env.termination_manager
+    return {
+        "success": termination_manager.get_term("success").to(device=done_mask.device, dtype=torch.bool),
+        "trunk_contact": termination_manager.get_term("trunk_contact").to(device=done_mask.device, dtype=torch.bool),
+        "timeout": termination_manager.get_term("time_out").to(device=done_mask.device, dtype=torch.bool),
+    }
+
+
+def _to_jsonable(value: object) -> object:
+    """Recursively convert tensors and config objects to JSON-compatible values."""
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if is_dataclass(value) and not isinstance(value, type):
+        return _to_jsonable(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_jsonable(item) for item in value]
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _to_jsonable(to_dict())
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _to_jsonable(item())
+        except (TypeError, ValueError):
+            pass
+    return str(value)
+
+
+def _validate_teacher_interface(
+    base_env: ManagerBasedRLEnv | DirectRLEnv,
+    observations: TensorDict,
+    agent_cfg: RslRlBaseRunnerCfg,
+    checkpoint_path: str,
+) -> _InterfaceInfo:
+    """Verify that the checkpoint receives its recorded teacher interface."""
+
+    if tuple(agent_cfg.obs_groups.get("policy", ())) != TEACHER_OBSERVATION_GROUPS:
+        return _InterfaceInfo(None, None)
+
+    training_interface_path = os.path.join(
+        os.path.dirname(checkpoint_path),
+        "params",
+        "teacher_interface.json",
+    )
+    if not os.path.isfile(training_interface_path):
+        raise FileNotFoundError(
+            "The selected privileged-teacher checkpoint has no training interface manifest. "
+            f"Expected: {training_interface_path}."
+        )
+    with open(training_interface_path, encoding="utf-8") as interface_file:
+        training_payload = json.load(interface_file)
+    training_interface = training_payload["teacher_interface"]
+    recorded_interface_hash = training_payload["teacher_interface_sha256"]
+    if interface_sha256(training_interface) != recorded_interface_hash:
+        raise RuntimeError(f"Invalid teacher-interface hash: {training_interface_path}")
+
+    teacher_interface = build_teacher_interface(base_env, observations, agent_cfg)
+    teacher_interface_hash = interface_sha256(teacher_interface)
+    assert_teacher_interface_matches(
+        training_interface,
+        teacher_interface,
+        context="Fixed-evaluation runtime",
+    )
+    return _InterfaceInfo(teacher_interface, teacher_interface_hash)
+
+
+def _write_metrics(artifact_dir: str, metrics: _EvaluationReport) -> str:
+    """Write the evaluation report and return its path."""
+
+    metrics_path = os.path.join(artifact_dir, "metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as metrics_file:
+        json.dump(_to_jsonable(metrics), metrics_file, indent=2, sort_keys=True)
+        metrics_file.write("\n")
+    return metrics_path
 
 
 if __name__ == "__main__":
