@@ -54,9 +54,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
             static_friction=1.0,
             dynamic_friction=1.0,
         ),
-        visual_material=sim_utils.PreviewSurfaceCfg(
-            diffuse_color=(0.55, 0.48, 0.35), roughness=0.8
-        ),
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.55, 0.48, 0.35), roughness=0.8),
     )
 
     goal: RigidObjectCfg = RigidObjectCfg(
@@ -82,9 +80,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         history_length=3,
     )
 
-    base_contact: ContactSensorCfg = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/trunk", history_length=3
-    )
+    base_contact: ContactSensorCfg = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/trunk", history_length=3)
 
     # One downward terrain ray at the trunk origin provides geometry-agnostic
     # base clearance for flat ground, slopes, and arbitrary terrain meshes.
@@ -162,24 +158,22 @@ class ActionsCfg:
     #
     # target_joint_pos = default_joint_pos + scale * policy_action
 
-    joint_pos = mdp.JointPositionActionCfg(
-        asset_name="robot", joint_names=[".*"], scale=0.25, use_default_offset=True
-    )
+    joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], scale=0.25, use_default_offset=True)
 
 
 @configclass
 class ObservationsCfg:
-    """Additive Phase 1 teacher-actor and asymmetric critic observations."""
+    """Teacher, critic, restricted-student, and supervision observations."""
 
     @configclass
-    class DeployableCoreCfg(ObsGroup):
-        """Proprioceptive and task observations reusable by a future student."""
+    class TeacherPolicyCfg(ObsGroup):
+        """Checkpoint-compatible teacher state and oracle task observations."""
 
         # Body orientation and angular motion.
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
         projected_gravity = ObsTerm(func=mdp.projected_gravity)
 
-        # Goal-relative task information.
+        # Exact goal-relative task information available to the teacher.
         goal_direction_body_xy = ObsTerm(
             func=mdp.goal_direction_body_xy,
             params={
@@ -227,9 +221,7 @@ class ObservationsCfg:
         height_scan = ObsTerm(
             func=mdp.terrain_height_scan,
             params={
-                "obs_cfg": mdp.config.HeightScanObservationCfg(
-                    num_rays=132, vertical_offset=0.30, clip=0.50
-                ),
+                "obs_cfg": mdp.config.HeightScanObservationCfg(num_rays=132, vertical_offset=0.30, clip=0.50),
                 "sensor_cfg": SceneEntityCfg("height_scanner"),
                 "asset_cfg": SceneEntityCfg("robot"),
             },
@@ -240,9 +232,7 @@ class ObservationsCfg:
         height_scan_validity = ObsTerm(
             func=mdp.terrain_height_scan_validity,
             params={
-                "obs_cfg": mdp.config.HeightScanObservationCfg(
-                    num_rays=132, vertical_offset=0.30, clip=0.50
-                ),
+                "obs_cfg": mdp.config.HeightScanObservationCfg(num_rays=132, vertical_offset=0.30, clip=0.50),
                 "sensor_cfg": SceneEntityCfg("height_scanner"),
                 "asset_cfg": SceneEntityCfg("robot"),
             },
@@ -260,19 +250,88 @@ class ObservationsCfg:
         # estimation and is absent from both policy and terrain groups.
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
 
-        base_clearance = ObsTerm(
-            func=mdp.base_clearance_obs, params={"asset_cfg": SceneEntityCfg("robot")}
+        base_clearance = ObsTerm(func=mdp.base_clearance_obs, params={"asset_cfg": SceneEntityCfg("robot")})
+
+        def __post_init__(self) -> None:
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
+    class StudentPolicyCfg(ObsGroup):
+        """Restricted state available to the student policy at deployment."""
+
+        # Proprioception.
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+        projected_gravity = ObsTerm(func=mdp.projected_gravity)
+
+        # Task speed, without an oracle goal direction or goal distance.
+        desired_speed = ObsTerm(func=mdp.desired_speed_obs)
+
+        # Joint state.
+        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+
+        # Because student actions advance the environment, this is always the
+        # previously executed student action during online distillation.
+        last_action = ObsTerm(func=mdp.last_action)
+
+        # Contact state.
+        foot_contacts = ObsTerm(
+            func=mdp.foot_contact_state,
+            params={
+                "threshold": 1.0,
+                "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+            },
         )
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
             self.concatenate_terms = True
 
-    # ``policy`` remains the reusable deployable core for Isaac Lab tooling. RSL-
-    # RL routing is explicit and never relies on this conventional name.
-    policy: DeployableCoreCfg = DeployableCoreCfg()
+    @configclass
+    class StudentExteroceptionCfg(ObsGroup):
+        """Temporary replaceable boundary for a future depth-derived feature."""
+
+        # The current tutorial intentionally supplies no geometry. The
+        # placeholder width is configurable and is recorded in every student
+        # checkpoint; choose the real width together with the future depth
+        # encoder instead of treating this provisional value as permanent.
+        features = ObsTerm(
+            func=mdp.student_exteroception_stub,
+            params={"feature_dim": 64},
+        )
+
+        def __post_init__(self) -> None:
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
+    class OracleHeadingTargetCfg(ObsGroup):
+        """Training-only, wrap-safe heading-direction supervision."""
+
+        direction_yaw_xy = ObsTerm(
+            func=mdp.goal_direction_yaw_xy,
+            params={
+                "goal_cfg": SceneEntityCfg("goal"),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+
+        def __post_init__(self) -> None:
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    # Keep ``policy`` as the teacher-training group name for checkpoint
+    # compatibility. RSL-RL routing explicitly appends privileged terrain.
+    policy: TeacherPolicyCfg = TeacherPolicyCfg()
     terrain: PrivilegedTerrainCfg = PrivilegedTerrainCfg()
     critic_privileged: CriticPrivilegedCfg = CriticPrivilegedCfg()
+    student_policy: StudentPolicyCfg = StudentPolicyCfg()
+    student_exteroception: StudentExteroceptionCfg = StudentExteroceptionCfg()
+
+    # Expose the oracle yaw heading as a separate distillation label. It is not
+    # concatenated into either the teacher or restricted student policy input.
+    heading_target: OracleHeadingTargetCfg = OracleHeadingTargetCfg()
 
 
 @configclass
@@ -431,9 +490,7 @@ class RewardsCfg:
         func=mdp.feet_stumble,
         weight=-0.5,
         params={
-            "stumble_cfg": mdp.config.FeetStumbleCfg(
-                lateral_to_vertical_force_ratio=4.0, min_vertical_force=1.0
-            ),
+            "stumble_cfg": mdp.config.FeetStumbleCfg(lateral_to_vertical_force_ratio=4.0, min_vertical_force=1.0),
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
         },
     )
@@ -550,19 +607,19 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
             "min_clearance": level.min_clearance,
         }
 
-    def set_evaluation_difficulty(
-        self, level: int | None = None, seed: int | None = None
-    ) -> None:
+    def set_evaluation_difficulty(self, level: int | None = None, seed: int | None = None) -> None:
         """Freeze the environment at one reproducible logical difficulty."""
 
+        # ``__post_init__`` ran when this config object was first constructed,
+        # before Hydra applied its command-line overrides. Hydra does not call
+        # ``__post_init__`` again, so propagate any overridden curriculum values
+        # to terrain, events, rewards, and terminations before fixing the level.
         self.synchronize_curriculum_config()
         curriculum_cfg = self.parkour_curriculum
         if level is None:
             level = curriculum_cfg.max_level
         if not 0 <= level <= curriculum_cfg.max_level:
-            raise ValueError(
-                f"difficulty level must be in [0, {curriculum_cfg.max_level}], got {level}."
-            )
+            raise ValueError(f"difficulty level must be in [0, {curriculum_cfg.max_level}], got {level}.")
 
         self.evaluation_level = level
         self.curriculum = None
@@ -572,9 +629,9 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         terrain_generator = self.scene.ground.terrain_generator
         if terrain_generator is not None:
             terrain_generator.num_rows = len(curriculum_cfg.levels)
-            terrain_generator.num_cols = max(
-                1, min(terrain_generator.num_cols, self.scene.num_envs)
-            )
+            # Generate at least one column, but never more columns than there
+            # are environments available to occupy the generated terrain.
+            terrain_generator.num_cols = max(1, min(terrain_generator.num_cols, self.scene.num_envs))
             terrain_generator.curriculum = True
             if seed is not None:
                 terrain_generator.seed = seed
@@ -590,39 +647,47 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         terrain_generator = self.scene.ground.terrain_generator
         if terrain_generator is None:
             raise ValueError("ParkourLabEnvCfg requires a generated terrain.")
-        if not terrain_generator.curriculum or tuple(
-            terrain_generator.difficulty_range
-        ) != (0.0, 1.0):
+        if not terrain_generator.curriculum or tuple(terrain_generator.difficulty_range) != (0.0, 1.0):
             raise ValueError(
                 "The discrete parkour row mapping requires terrain curriculum mode and difficulty_range=(0.0, 1.0)."
             )
         if "parkour_course" not in terrain_generator.sub_terrains:
-            raise ValueError(
-                "ParkourLabEnvCfg requires the 'parkour_course' sub-terrain."
-            )
+            raise ValueError("ParkourLabEnvCfg requires the 'parkour_course' sub-terrain.")
 
+        # Generate one terrain row per logical level so the row index and
+        # curriculum-level index have the same meaning.
         terrain_generator.num_rows = len(curriculum_cfg.levels)
-        terrain_generator.sub_terrains["parkour_course"].levels = curriculum_cfg.levels
-        self.scene.ground.max_init_terrain_level = curriculum_cfg.initial_level
-        self.scene.goal.init_state.pos = curriculum_cfg.levels[
-            curriculum_cfg.initial_level
-        ].goal_pos
 
+        # Give the terrain generator the same authoritative level definitions
+        # used by reset events, commands, rewards, and curriculum updates.
+        terrain_generator.sub_terrains["parkour_course"].levels = curriculum_cfg.levels
+
+        # Restrict initial terrain assignment to the configured starting range.
+        self.scene.ground.max_init_terrain_level = curriculum_cfg.initial_level
+
+        # Give the goal a valid startup pose for the initial level. Reset events
+        # subsequently assign each environment its level-specific goal pose.
+        self.scene.goal.init_state.pos = curriculum_cfg.levels[curriculum_cfg.initial_level].goal_pos
+
+        # Pass the same curriculum object to reset events so initial terrain
+        # assignment, goals, and commands use the authoritative level table.
         self.events.initialize_terrain_levels.params["curriculum_cfg"] = curriculum_cfg
         self.events.reset_goal_and_commands.params["curriculum_cfg"] = curriculum_cfg
+
+        # The fixed evaluation configuration disables adaptive curriculum
+        # updates, so synchronize this term only when it is present.
         if self.curriculum is not None:
             self.curriculum.terrain_levels.params["curriculum_cfg"] = curriculum_cfg
 
-        self.rewards.reached_goal_xy.params["threshold"] = (
-            curriculum_cfg.success_threshold
-        )
-        self.rewards.illegal_contact.params["threshold"] = (
-            curriculum_cfg.base_contact_threshold
-        )
+        # Use one success threshold for both the terminal bonus and successful
+        # episode termination so they cannot disagree about reaching the goal.
+        self.rewards.reached_goal_xy.params["threshold"] = curriculum_cfg.success_threshold
         self.terminations.success.params["threshold"] = curriculum_cfg.success_threshold
-        self.terminations.trunk_contact.params["threshold"] = (
-            curriculum_cfg.base_contact_threshold
-        )
+
+        # Likewise, use one contact threshold for both the safety penalty and
+        # trunk-contact termination.
+        self.rewards.illegal_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
+        self.terminations.trunk_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
 
 
 @configclass
