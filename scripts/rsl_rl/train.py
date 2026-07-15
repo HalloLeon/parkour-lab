@@ -5,75 +5,77 @@
 
 """Script to train RL agent with RSL-RL."""
 
-"""Launch Isaac Sim Simulator first."""
+# Launch Isaac Sim before importing modules that depend on it.
 
 import argparse
 import sys
 
 from isaaclab.app import AppLauncher
 
-# local imports
-import cli_args  # isort: skip
+import cli_args
 
-# add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
-parser.add_argument("--video_length", type=int, default=200, help="Length of the recorded video (in steps).")
-parser.add_argument("--video_interval", type=int, default=2000, help="Interval between video recordings (in steps).")
+parser.add_argument(
+    "--video_length",
+    type=int,
+    default=200,
+    help="Length of the recorded video (in steps).",
+)
+parser.add_argument(
+    "--video_interval",
+    type=int,
+    default=2000,
+    help="Interval between video recordings (in steps).",
+)
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
-    "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
+    "--agent",
+    type=str,
+    default="rsl_rl_cfg_entry_point",
+    help="Name of the RL agent configuration entry point.",
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
-    "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
+    "--distributed",
+    action="store_true",
+    default=False,
+    help="Run training with multiple GPUs or nodes.",
 )
-parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
-# append RSL-RL cli arguments
+parser.add_argument(
+    "--export_io_descriptors",
+    action="store_true",
+    default=False,
+    help="Export IO descriptors.",
+)
+# Add RSL-RL command-line arguments.
 cli_args.add_rsl_rl_args(parser)
-# append AppLauncher cli args
+# Add Isaac Lab application arguments.
 AppLauncher.add_app_launcher_args(parser)
+# Parse this script's known options into ``args_cli`` and retain unrecognized
+# configuration overrides, such as ``env.decimation=8``, in ``hydra_args``.
 args_cli, hydra_args = parser.parse_known_args()
 
-# always enable cameras to record video
+# Enable cameras when recording video.
 if args_cli.video:
     args_cli.enable_cameras = True
 
-# clear out sys.argv for Hydra
+# Replace the process-wide argument list with only the script name and Hydra
+# overrides. When the decorated ``main()`` is called later, Isaac Lab's wrapper
+# invokes ``hydra.main()``, which reads these overrides from ``sys.argv`` and
+# applies them to the environment and agent configurations.
 sys.argv = [sys.argv[0]] + hydra_args
 
-# launch omniverse app
+# Launch the Omniverse application.
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
-"""Check for minimum supported RSL-RL version."""
-
-import importlib.metadata as metadata
-import platform
-
-from packaging import version
-
-# check minimum supported rsl-rl version
-RSL_RL_VERSION = "3.0.1"
-installed_version = metadata.version("rsl-rl-lib")
-if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
-    if platform.system() == "Windows":
-        cmd = [r".\isaaclab.bat", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
-    else:
-        cmd = ["./isaaclab.sh", "-p", "-m", "pip", "install", f"rsl-rl-lib=={RSL_RL_VERSION}"]
-    print(
-        f"Please install the correct version of RSL-RL.\nExisting version is: '{installed_version}'"
-        f" and required version is: '{RSL_RL_VERSION}'.\nTo install the correct version, run:"
-        f"\n\n\t{' '.join(cmd)}\n"
-    )
-    sys.exit(1)
-
-"""Rest everything follows."""
+# The remaining imports require the running simulation application.
 
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 
 import gymnasium as gym
 import isaaclab_tasks  # noqa: F401
@@ -92,21 +94,40 @@ from isaaclab.utils.io import dump_yaml
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
-from rsl_rl.runners import DistillationRunner, OnPolicyRunner
+from parkour_lab.tasks.manager_based.parkour_lab.distillation.contracts import (
+    TEACHER_OBSERVATION_GROUPS,
+    build_teacher_interface,
+    interface_sha256,
+    write_json,
+)
+from rsl_rl.runners import OnPolicyRunner
 
+# Use faster TF32 arithmetic for float32 matrix multiplications on supported
+# NVIDIA GPUs, at the cost of some numerical precision.
 torch.backends.cuda.matmul.allow_tf32 = True
+
+# Likewise, permit cuDNN operations such as convolutions to use TF32.
 torch.backends.cudnn.allow_tf32 = True
+
+# Allow cuDNN to use faster algorithms that may not reproduce bit-identical
+# results between otherwise identical runs.
 torch.backends.cudnn.deterministic = False
+
+# Do not benchmark several cuDNN algorithms at runtime to select the fastest
+# one for each input shape.
 torch.backends.cudnn.benchmark = False
 
 
+# Capture the task ID and agent entry-point name now. The returned wrapper later
+# loads their registered configuration defaults, lets Hydra consume the retained
+# ``sys.argv`` overrides, and calls this function as ``main(env_cfg, agent_cfg)``.
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     agent_cfg: RslRlBaseRunnerCfg,
 ) -> None:
     """Train with RSL-RL agent."""
-    # override configurations with non-hydra CLI arguments
+    # Apply command-line overrides that are not handled by Hydra.
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     agent_cfg.max_iterations = (
@@ -116,40 +137,45 @@ def main(
     if callable(synchronize_curriculum):
         synchronize_curriculum()
 
-    # set the environment seed
-    # note: certain randomizations occur in the environment initialization so we set the seed here
+    # Set the seed before constructing the environment because initialization
+    # may randomize state.
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
-    # check for invalid combination of CPU device with distributed training
+    # Reject distributed CPU training, which RSL-RL does not support.
     if args_cli.distributed and args_cli.device is not None and "cpu" in args_cli.device:
         raise ValueError(
             "Distributed training is not supported when using CPU device. "
             "Please use GPU device (e.g., --device cuda) for distributed training."
         )
 
-    # multi-gpu training configuration
+    # ``local_rank`` is the zero-based index of this process among the
+    # distributed processes on the current machine. Use that index to assign
+    # each process to its corresponding local GPU and a distinct seed.
     if args_cli.distributed:
         env_cfg.sim.device = f"cuda:{app_launcher.local_rank}"
         agent_cfg.device = f"cuda:{app_launcher.local_rank}"
 
-        # set seed to have diversity in different threads
+        # Offset the base seed by the process rank so different GPU workers do
+        # not generate identical environment randomization and rollouts.
         seed = agent_cfg.seed + app_launcher.local_rank
         env_cfg.seed = seed
         agent_cfg.seed = seed
 
-    # specify directory for logging experiments
+    # Build the experiment and run directories.
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
     print(f"[INFO] Logging experiment in directory: {log_root_path}")
-    # specify directory for logging runs: {time-stamp}_{run_name}
-    log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    # The Ray Tune workflow extracts experiment name using the logging line below, hence, do not change it (see PR #2346, comment-2819298849)
+    # Build a readable UTC identifier as ``run_YYYYMMDD_HHMMSS``: ``%Y`` is
+    # the year, ``%m`` the month, ``%d`` the day, ``%H`` the hour, ``%M`` the
+    # minute, and ``%S`` the second.
+    log_dir = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+    # Ray Tune extracts the experiment name from this exact logging line.
     print(f"Exact experiment name requested from command line: {log_dir}")
     if agent_cfg.run_name:
         log_dir += f"_{agent_cfg.run_name}"
     log_dir = os.path.join(log_root_path, log_dir)
 
-    # set the IO descriptors output directory if requested
+    # Configure optional environment-interface export.
     if isinstance(env_cfg, ManagerBasedRLEnvCfg):
         env_cfg.export_io_descriptors = args_cli.export_io_descriptors
         env_cfg.io_descriptors_output_dir = log_dir
@@ -158,21 +184,24 @@ def main(
             "IO descriptors are only supported for manager based RL environments. No IO descriptors will be exported."
         )
 
-    # set the log directory for the environment (works for all environment types)
+    # Make the run directory available to the environment.
     env_cfg.log_dir = log_dir
 
-    # create isaac environment
+    # Create the Isaac Lab environment.
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
-    # convert to single-agent instance if required by the RL algorithm
+    # Convert multi-agent environments to the single-agent RSL-RL interface.
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
 
-    # save resume path before creating a new log_dir
-    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+    # Resolve the checkpoint selected for resuming PPO training. Student
+    # distillation has its own explicit entry point in ``distill.py``.
+    if agent_cfg.resume:
+        # Match Isaac Lab's official resume behavior: ``load_run`` selects the
+        # run folder and ``load_checkpoint`` selects a file inside that folder.
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
-    # wrap for video recording
+    # Add video recording before the final RSL-RL wrapper.
     if args_cli.video:
         video_kwargs = {
             "video_folder": os.path.join(log_dir, "videos", "train"),
@@ -184,33 +213,49 @@ def main(
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
-    # wrap around environment for rsl-rl
+    # Adapt the Isaac Lab environment to the RSL-RL vector interface.
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-    # create runner from rsl-rl
-    if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
-    else:
-        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    # write git state to logs
+    # Record the compact actor interface needed to load future teacher
+    # checkpoints safely. Unused environment details remain intentionally
+    # outside this manifest so the codebase can evolve independently.
+    if tuple(agent_cfg.obs_groups.get("policy", ())) == TEACHER_OBSERVATION_GROUPS:
+        teacher_interface = build_teacher_interface(env.unwrapped, env.get_observations(), agent_cfg)
+        write_json(
+            os.path.join(log_dir, "params", "teacher_interface.json"),
+            {
+                "teacher_interface": teacher_interface,
+                "teacher_interface_sha256": interface_sha256(teacher_interface),
+            },
+        )
+
+    # This script trains PPO teachers. The task-specific student uses
+    # ``scripts/rsl_rl/distill.py`` because it has separate heading and motor
+    # supervision that the stock RSL-RL distillation runner does not express.
+    if agent_cfg.class_name != "OnPolicyRunner":
+        raise ValueError("train.py supports only OnPolicyRunner; use distill.py for student distillation.")
+    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    # Record the Git commit and local code changes that produced this run so the
+    # training result can be traced back to its exact repository state.
     runner.add_git_repo_to_log(__file__)
-    # load the checkpoint
-    if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
+    # Load the selected checkpoint when continuing an existing run.
+    if agent_cfg.resume:
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
         runner.load(resume_path)
 
-    # dump the configuration into log-directory
+    # Save the resolved configurations with the checkpoints.
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
 
-    # run training
-    # Curriculum decisions use complete episode outcomes. Randomizing the first
-    # episode length would turn artificial partial timeouts into failures.
     try:
-        runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=False)
+        runner.learn(
+            num_learning_iterations=agent_cfg.max_iterations,
+            # Keep every environment's initial episode counter at zero. If this option
+            # were ``True``, RSL-RL would randomize those counters so the first batch of
+            # environments timed out at different, artificially shortened lengths.
+            # Full first episodes keep those early timeouts meaningful to the curriculum.
+            init_at_random_ep_len=False,
+        )
     finally:
         env.close()
 
