@@ -3,19 +3,18 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Teacher-selection and inference-interface contracts for distillation.
+"""Teacher-checkpoint identity and inference-interface contracts.
 
-This module connects teacher training, fixed evaluation, and online
-distillation. It builds a compact JSON-compatible description of the inputs
-and outputs that determine teacher inference: actor observation groups and
-term order, terrain preprocessing, network settings, action interpretation,
-and control timing. Training writes that description, fixed evaluation carries
-it together with the selected checkpoint, and distillation reconstructs and
-compares it before loading the frozen teacher.
+This module builds a compact JSON-compatible description of the inputs and
+outputs that determine teacher inference: actor observation groups and term
+order, terrain preprocessing, network settings, action interpretation, and
+control timing. Training writes that description next to its checkpoints.
+Evaluation and distillation load the same manifest and compare it with their
+runtime environment before loading the teacher.
 
-Checkpoint and interface SHA-256 hashes identify the exact evaluated model and
-detect files or metadata that changed afterwards. ``TeacherSelection`` retains
-the evaluation evidence for the accepted checkpoint, while readable recursive
+Checkpoint and interface SHA-256 hashes identify the exact model and detect
+files or metadata that changed afterwards. ``TeacherCheckpoint`` keeps the
+exact checkpoint and interface identity together, while readable recursive
 comparisons explain interface mismatches instead of reporting only a failed
 hash comparison.
 
@@ -31,7 +30,7 @@ import hashlib
 import json
 import math
 import os
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -52,11 +51,11 @@ __all__ = [
     "InterfaceMismatchError",
     "TEACHER_INTERFACE_VERSION",
     "TEACHER_OBSERVATION_GROUPS",
-    "TeacherSelection",
+    "TeacherCheckpoint",
     "assert_teacher_interface_matches",
     "build_teacher_interface",
     "interface_sha256",
-    "load_teacher_selection",
+    "load_teacher_checkpoint",
     "sha256_file",
     "write_json",
 ]
@@ -67,49 +66,35 @@ class InterfaceMismatchError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class TeacherSelection:
-    """Immutable handoff from fixed teacher evaluation to distillation.
+class TeacherCheckpoint:
+    """Verified teacher checkpoint and its checkpoint-facing interface.
 
-    ``load_teacher_selection`` creates this record only after confirming that
-    every evaluation completed, selected the same checkpoint contents, and
-    used the same checkpoint-facing inference interface. Distillation then uses
-    the record to load that exact teacher and retain the evidence explaining
-    why it was selected.
+    ``load_teacher_checkpoint`` creates this record after hashing the requested
+    checkpoint and validating the interface manifest written during training.
+    Evaluation and distillation can then compare that interface with their
+    current runtime before loading the model.
 
     ``frozen=True`` prevents reassignment of the record's fields after
     validation. It does not recursively freeze nested dictionaries.
     """
 
-    # Absolute path resolved from the evaluation report and used to load the
-    # exact teacher checkpoint for distillation.
+    # Absolute path used to load the exact teacher checkpoint.
     checkpoint_path: str
 
     # SHA-256 of the checkpoint bytes. Unlike the path alone, this detects a
-    # checkpoint file that was replaced or modified after evaluation.
+    # checkpoint file that is later replaced or modified.
     checkpoint_sha256: str
-
-    # Absolute paths to all completed fixed-evaluation reports used as the
-    # evidence for selecting this checkpoint.
-    evaluation_metrics_paths: tuple[str, ...]
-
-    # Curriculum level evaluated by each corresponding metrics report, kept in
-    # the same order as ``evaluation_metrics_paths``.
-    evaluated_levels: tuple[int, ...]
-
-    # Aggregate results copied from each corresponding evaluation report, such
-    # as success and failure rates, for provenance and later reporting.
-    evaluation_summaries: tuple[dict[str, object], ...]
 
     # Compact description of the teacher actor's observation order and
     # preprocessing, terrain scan, action mapping, and control timing.
     teacher_interface: dict[str, object]
 
     # SHA-256 of the stable JSON representation of ``teacher_interface``, used
-    # to verify that evaluation and distillation use the same interface.
+    # to verify that later runtimes use the training interface unchanged.
     teacher_interface_sha256: str
 
     def to_dict(self) -> dict[str, object]:
-        """Return all selection evidence as a JSON-compatible dictionary."""
+        """Return the checkpoint identity as a JSON-compatible dictionary."""
 
         # ``asdict`` recursively copies the dataclass fields so callers can
         # serialize the result without modifying this record's attributes.
@@ -310,84 +295,47 @@ def interface_sha256(interface: dict[str, object]) -> str:
     return hashlib.sha256(_stable_json(interface).encode("utf-8")).hexdigest()
 
 
-def load_teacher_selection(
-    evaluation_metrics_paths: Iterable[str], *, training_task: str
-) -> TeacherSelection:
-    """Load one evaluated teacher and verify its checkpoint identity."""
+def load_teacher_checkpoint(
+    checkpoint_path: str | os.PathLike[str],
+) -> TeacherCheckpoint:
+    """Load one teacher checkpoint identity and its training interface."""
 
-    metrics_paths = tuple(
-        os.path.abspath(os.path.expanduser(path)) for path in evaluation_metrics_paths
+    resolved_checkpoint_path = os.path.abspath(
+        os.path.expanduser(checkpoint_path)
     )
-    if not metrics_paths:
-        raise ValueError("At least one fixed-evaluation metrics path is required.")
-
-    records: list[dict[str, object]] = []
-    for metrics_path in metrics_paths:
-        with open(metrics_path, encoding="utf-8") as metrics_file:
-            record = json.load(metrics_file)
-        if record.get("difficulty_level") is None:
-            raise ValueError(
-                f"Evaluation did not freeze a difficulty level: {metrics_path}"
-            )
-        if record.get("completed_episodes") != record.get("requested_episodes"):
-            raise ValueError(
-                f"Evaluation did not complete its requested episodes: {metrics_path}"
-            )
-        if _training_task_name(record.get("task")) != _training_task_name(
-            training_task
-        ):
-            raise ValueError(
-                f"Evaluation task {record.get('task')!r} is incompatible with training task {training_task!r}."
-            )
-
-        interface = record.get("teacher_interface")
-        if not isinstance(interface, dict):
-            raise ValueError(
-                f"Evaluation lacks a teacher interface: {metrics_path}. Rerun fixed evaluation with this code."
-            )
-        if record.get("teacher_interface_sha256") != interface_sha256(interface):
-            raise ValueError(f"Teacher interface hash is invalid in {metrics_path}.")
-        records.append(record)
-
-    first = records[0]
-    checkpoint_path = os.path.abspath(cast(str, first["checkpoint"]))
-    checkpoint_hash = cast(str, first["checkpoint_sha256"])
-    teacher_interface = cast(dict[str, object], first["teacher_interface"])
-    teacher_interface_hash = cast(str, first["teacher_interface_sha256"])
-
-    for metrics_path, record in zip(metrics_paths[1:], records[1:]):
-        if os.path.abspath(cast(str, record["checkpoint"])) != checkpoint_path:
-            raise ValueError(
-                f"Evaluation selects a different checkpoint path: {metrics_path}"
-            )
-        if record["checkpoint_sha256"] != checkpoint_hash:
-            raise ValueError(
-                f"Evaluation selects different checkpoint contents: {metrics_path}"
-            )
-        if record["teacher_interface_sha256"] != teacher_interface_hash:
-            raise ValueError(
-                f"Evaluation uses a different teacher interface: {metrics_path}"
-            )
-
-    if not os.path.isfile(checkpoint_path):
+    if not os.path.isfile(resolved_checkpoint_path):
         raise FileNotFoundError(
-            f"Selected teacher checkpoint does not exist: {checkpoint_path}"
-        )
-    actual_checkpoint_hash = sha256_file(checkpoint_path)
-    if actual_checkpoint_hash != checkpoint_hash:
-        raise ValueError(
-            "Selected teacher checkpoint contents changed after evaluation: "
-            f"expected {checkpoint_hash}, got {actual_checkpoint_hash}."
+            f"Teacher checkpoint does not exist: {resolved_checkpoint_path}"
         )
 
-    return TeacherSelection(
-        checkpoint_path=checkpoint_path,
-        checkpoint_sha256=checkpoint_hash,
-        evaluation_metrics_paths=metrics_paths,
-        evaluated_levels=tuple(cast(int, record["difficulty_level"]) for record in records),
-        evaluation_summaries=tuple(
-            cast(dict[str, object], record.get("summary", {})) for record in records
-        ),
+    interface_path = os.path.join(
+        os.path.dirname(resolved_checkpoint_path),
+        "params",
+        "teacher_interface.json",
+    )
+    if not os.path.isfile(interface_path):
+        raise FileNotFoundError(
+            "The teacher checkpoint has no training interface manifest. "
+            f"Expected: {interface_path}."
+        )
+
+    with open(interface_path, encoding="utf-8") as interface_file:
+        loaded_payload = json.load(interface_file)
+    if not isinstance(loaded_payload, dict):
+        raise ValueError(f"Teacher interface manifest is invalid: {interface_path}")
+    payload = cast(dict[str, object], loaded_payload)
+
+    interface = payload.get("teacher_interface")
+    if not isinstance(interface, dict):
+        raise ValueError(f"Teacher interface is missing or invalid: {interface_path}")
+    teacher_interface = cast(dict[str, object], interface)
+    teacher_interface_hash = interface_sha256(teacher_interface)
+    if payload.get("teacher_interface_sha256") != teacher_interface_hash:
+        raise ValueError(f"Teacher interface hash is invalid: {interface_path}")
+
+    return TeacherCheckpoint(
+        checkpoint_path=resolved_checkpoint_path,
+        checkpoint_sha256=sha256_file(resolved_checkpoint_path),
         teacher_interface=teacher_interface,
         teacher_interface_sha256=teacher_interface_hash,
     )
@@ -565,11 +513,3 @@ def _stable_json(value: object) -> str:
     """Serialize an already compact manifest deterministically."""
 
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-
-
-def _training_task_name(task_name: str | None) -> str | None:
-    """Normalize a fixed-play task ID to its corresponding training ID."""
-
-    if task_name is None:
-        return None
-    return task_name.split(":")[-1].replace("-Play", "")

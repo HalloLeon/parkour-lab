@@ -158,28 +158,24 @@ overwritten. Use `--video_output_dir` to choose another artifact root. Omit
 
 ## Online student-driven distillation
 
-The distillation pipeline accepts a teacher only through one or more completed
-fixed-evaluation `metrics.json` files. Teacher training writes the compact
-`params/teacher_interface.json` manifest; fixed evaluation verifies it and
-records the checkpoint's absolute path and SHA-256. Distillation rechecks the
-checkpoint bytes and interface before loading the policy. The manifest covers
-only checkpoint-facing semantics: actor observation order and dimensions,
-normalization, terrain preprocessing, action order and scaling, and control
-timing. It deliberately excludes critic details, unused observation groups,
-framework versions, and source-code hashes so unrelated extensions and
-behavior-preserving refactors do not invalidate a teacher.
+The distillation pipeline accepts the exact teacher checkpoint directly.
+Teacher training writes the compact `params/teacher_interface.json` manifest
+beside its checkpoints. Distillation hashes the requested checkpoint, validates
+that manifest, and reconstructs the runtime interface before loading the
+policy. The manifest covers only checkpoint-facing semantics: actor observation
+order and dimensions, normalization, terrain preprocessing, action order and
+scaling, and control timing. It deliberately excludes critic details, unused
+observation groups, framework versions, and source-code hashes so unrelated
+extensions and behavior-preserving refactors do not invalidate a teacher.
 
-After evaluating the selected teacher on fixed levels, start online
-distillation with the resulting metric files:
+Use `play.py` independently to compare promising checkpoints under identical
+fixed evaluation conditions. After choosing one from those results, pass its
+checkpoint path directly to distillation:
 
 ```bash
 python scripts/rsl_rl/distill.py \
   --task=Parkour-Lab-v0 \
-  --teacher_evaluation_metrics \
-    /absolute/path/to/level_0/metrics.json \
-    /absolute/path/to/level_1/metrics.json \
-    /absolute/path/to/level_2/metrics.json \
-    /absolute/path/to/level_3/metrics.json \
+  --teacher_checkpoint=/absolute/path/to/model_150.pt \
   --allow_zero_exteroception \
   --max_iterations=2 \
   --steps_per_iteration=2 \
@@ -233,13 +229,14 @@ and student still emit the same 12 action values, which use the same scale,
 default-position offset, controller, and 50 Hz rate.
 
 Runs are stored beneath `logs/distillation/parkour_lab/`. Each run records the
-teacher selection, runtime group dimensions and student group order, resolved
-environment and teacher configuration, JSONL losses, pre-update teacher/student
-action L2 disagreement, and student-only checkpoints. The run configuration
-labels the current mode as `zero_exteroception_pipeline_smoke_test`. A resumed
-student is accepted when its serialization version, model configuration, and
-exact teacher checkpoint match. The runtime teacher interface is validated
-separately before the checkpoint is loaded.
+teacher checkpoint identity, runtime group dimensions and student group order,
+resolved environment and teacher configuration, JSONL losses, pre-update
+teacher/student action L2 disagreement, and student-only checkpoints. The run
+configuration labels the current mode as
+`zero_exteroception_pipeline_smoke_test`. A resumed student is accepted when
+its serialization version, model configuration, exact teacher checkpoint, and
+teacher interface match. The runtime teacher interface is validated separately
+before the checkpoint is loaded.
 
 ## Evaluation best practice
 
@@ -247,7 +244,7 @@ Treat success rate and failure outcomes over multiple episodes as the primary
 comparison; use video to understand *why* behavior changed. For fair before/after
 comparisons:
 
-- evaluate every checkpoint on all four fixed levels;
+- evaluate each promising checkpoint on all four fixed levels;
 - keep the seed, number of episodes, and environment count unchanged;
 - do not enable the adaptive training curriculum during evaluation;
 - compare the same metrics before selecting representative clips;

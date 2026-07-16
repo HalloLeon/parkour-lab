@@ -114,6 +114,7 @@ from parkour_lab.tasks.manager_based.parkour_lab.distillation.contracts import (
     assert_teacher_interface_matches,
     build_teacher_interface,
     interface_sha256,
+    load_teacher_checkpoint,
     sha256_file,
 )
 from rsl_rl.runners import OnPolicyRunner
@@ -137,7 +138,7 @@ class _EvaluationReport(TypedDict):
     # Registered Gym task used to create the evaluation environment.
     task: str | None
 
-    # Absolute checkpoint path consumed by teacher selection and distillation.
+    # Absolute path identifying the checkpoint evaluated in this report.
     checkpoint: str
 
     # Complete SHA-256 hash identifying the exact checkpoint file contents.
@@ -614,27 +615,11 @@ def _validate_teacher_interface(
     if tuple(agent_cfg.obs_groups.get("policy", ())) != TEACHER_OBSERVATION_GROUPS:
         return _InterfaceInfo(None, None)
 
-    training_interface_path = os.path.join(
-        os.path.dirname(checkpoint_path),
-        "params",
-        "teacher_interface.json",
-    )
-    if not os.path.isfile(training_interface_path):
-        raise FileNotFoundError(
-            "The selected privileged-teacher checkpoint has no training interface manifest. "
-            f"Expected: {training_interface_path}."
-        )
-    with open(training_interface_path, encoding="utf-8") as interface_file:
-        training_payload = json.load(interface_file)
-    training_interface = training_payload["teacher_interface"]
-    recorded_interface_hash = training_payload["teacher_interface_sha256"]
-    if interface_sha256(training_interface) != recorded_interface_hash:
-        raise RuntimeError(f"Invalid teacher-interface hash: {training_interface_path}")
-
+    teacher_checkpoint = load_teacher_checkpoint(checkpoint_path)
     teacher_interface = build_teacher_interface(base_env, observations, agent_cfg)
     teacher_interface_hash = interface_sha256(teacher_interface)
     assert_teacher_interface_matches(
-        training_interface,
+        teacher_checkpoint.teacher_interface,
         teacher_interface,
         context="Fixed-evaluation runtime",
     )

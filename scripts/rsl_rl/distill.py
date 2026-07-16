@@ -17,11 +17,10 @@ parser = argparse.ArgumentParser(
     description="Run student-driven online action distillation."
 )
 parser.add_argument(
-    "--teacher_evaluation_metrics",
+    "--teacher_checkpoint",
     type=str,
-    nargs="+",
     required=True,
-    help="One or more completed fixed-evaluation metrics.json files selecting the same teacher checkpoint.",
+    help="Path to the exact privileged-teacher checkpoint used for labels.",
 )
 parser.add_argument(
     "--student_checkpoint",
@@ -150,11 +149,11 @@ from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils.hydra import hydra_task_config
 from parkour_lab.tasks.manager_based.parkour_lab.distillation.contracts import (
     TEACHER_OBSERVATION_GROUPS,
-    TeacherSelection,
+    TeacherCheckpoint,
     assert_teacher_interface_matches,
     build_teacher_interface,
     interface_sha256,
-    load_teacher_selection,
+    load_teacher_checkpoint,
     write_json,
 )
 from parkour_lab.tasks.manager_based.parkour_lab.distillation.student import (
@@ -169,7 +168,7 @@ from parkour_lab.tasks.manager_based.parkour_lab.mdp.observations import (
 from rsl_rl.runners import OnPolicyRunner
 from tensordict import TensorDict
 
-STUDENT_CHECKPOINT_VERSION = 1
+STUDENT_CHECKPOINT_VERSION = 2
 """Serialization version of student checkpoints written by this script."""
 
 
@@ -178,12 +177,9 @@ STUDENT_CHECKPOINT_VERSION = 1
 # ``sys.argv`` overrides, and calls this function as ``main(env_cfg, agent_cfg)``.
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
-    """Run student-driven online distillation from one exact evaluated teacher."""
+    """Run student-driven online distillation from one exact teacher checkpoint."""
 
-    teacher_selection = load_teacher_selection(
-        args_cli.teacher_evaluation_metrics,
-        training_task=args_cli.task,
-    )
+    teacher_checkpoint = load_teacher_checkpoint(args_cli.teacher_checkpoint)
 
     if args_cli.num_envs is not None:
         env_cfg.scene.num_envs = args_cli.num_envs
@@ -226,7 +222,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
             env.unwrapped, observations, agent_cfg
         )
         assert_teacher_interface_matches(
-            teacher_selection.teacher_interface,
+            teacher_checkpoint.teacher_interface,
             runtime_teacher_interface,
             context="Online-distillation runtime",
         )
@@ -268,7 +264,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
 
         print(
             "[DISTILL] Frozen teacher: "
-            f"{teacher_selection.checkpoint_path} ({teacher_selection.checkpoint_sha256[:12]})"
+            f"{teacher_checkpoint.checkpoint_path} "
+            f"({teacher_checkpoint.checkpoint_sha256[:12]})"
         )
         print(
             "[DISTILL] Teacher actor groups: policy -> terrain "
@@ -292,7 +289,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
         teacher_policy = _load_teacher_policy(
             env,
             agent_cfg,
-            checkpoint_path=teacher_selection.checkpoint_path,
+            checkpoint_path=teacher_checkpoint.checkpoint_path,
         )
 
         student_cfg = StudentModelCfg(
@@ -318,7 +315,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
                 args_cli.student_checkpoint,
                 student=student,
                 optimizer=optimizer,
-                teacher_checkpoint_sha256=teacher_selection.checkpoint_sha256,
+                teacher_checkpoint=teacher_checkpoint,
             )
             if start_iteration >= args_cli.max_iterations:
                 raise ValueError(
@@ -327,7 +324,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
                 )
 
         write_json(
-            os.path.join(log_dir, "teacher_selection.json"), teacher_selection.to_dict()
+            os.path.join(log_dir, "teacher_checkpoint.json"),
+            teacher_checkpoint.to_dict(),
         )
         write_json(
             os.path.join(log_dir, "distillation_config.json"),
@@ -366,7 +364,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
             optimizer=optimizer,
             start_iteration=start_iteration,
             log_dir=log_dir,
-            teacher_selection=teacher_selection,
+            teacher_checkpoint=teacher_checkpoint,
             training_scope=training_scope,
         )
     finally:
@@ -460,9 +458,9 @@ def _load_student_checkpoint(
     *,
     student: StudentPolicy,
     optimizer: torch.optim.Optimizer,
-    teacher_checkpoint_sha256: str,
+    teacher_checkpoint: TeacherCheckpoint,
 ) -> int:
-    """Resume when model dimensions and exact teacher weights match."""
+    """Resume when model dimensions and the exact teacher contract match."""
 
     # Expand paths beginning with ``~`` and make the result independent of the
     # process's working directory before opening the checkpoint.
@@ -497,11 +495,17 @@ def _load_student_checkpoint(
         )
 
     # Continuing with labels from different teacher weights would silently
-    # change the supervised target midway through student training.
-    selection = checkpoint["teacher_selection"]
-    if selection["checkpoint_sha256"] != teacher_checkpoint_sha256:
+    # change the supervised target midway through student training. The
+    # interface hash also prevents reinterpreting the same weights with changed
+    # observation, action, terrain, or timing semantics.
+    saved_teacher = checkpoint["teacher_checkpoint"]
+    if (
+        saved_teacher["checkpoint_sha256"] != teacher_checkpoint.checkpoint_sha256
+        or saved_teacher["teacher_interface_sha256"]
+        != teacher_checkpoint.teacher_interface_sha256
+    ):
         raise ValueError(
-            "Student checkpoint was trained against different teacher weights."
+            "Student checkpoint was trained against different teacher weights or interface."
         )
 
     # Restore both the learned student weights and Adam's running state, then
@@ -543,13 +547,13 @@ def _run_training(
     optimizer: torch.optim.Optimizer,
     start_iteration: int,
     log_dir: str,
-    teacher_selection: TeacherSelection,
+    teacher_checkpoint: TeacherCheckpoint,
     training_scope: str,
 ) -> None:
     """Alternate student-driven collection with supervised updates."""
 
     metrics_path = os.path.join(log_dir, "metrics.jsonl")
-    selection_manifest = teacher_selection.to_dict()
+    checkpoint_manifest = teacher_checkpoint.to_dict()
     for iteration in range(start_iteration, args_cli.max_iterations):
         observations, batches, rollout_metrics = _collect_rollout(
             env,
@@ -588,7 +592,7 @@ def _run_training(
                 student=student,
                 optimizer=optimizer,
                 iteration=iteration + 1,
-                teacher_selection=selection_manifest,
+                teacher_checkpoint=checkpoint_manifest,
                 training_scope=training_scope,
             )
 
@@ -597,7 +601,7 @@ def _run_training(
         student=student,
         optimizer=optimizer,
         iteration=args_cli.max_iterations,
-        teacher_selection=selection_manifest,
+        teacher_checkpoint=checkpoint_manifest,
         training_scope=training_scope,
     )
 
@@ -608,7 +612,7 @@ def _save_student_checkpoint(
     student: StudentPolicy,
     optimizer: torch.optim.Optimizer,
     iteration: int,
-    teacher_selection: dict[str, object],
+    teacher_checkpoint: dict[str, object],
     training_scope: str,
 ) -> None:
     """Save student weights without duplicating the frozen teacher weights."""
@@ -620,7 +624,7 @@ def _save_student_checkpoint(
             "student_config": student.cfg.to_dict(),
             "student_state_dict": student.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
-            "teacher_selection": teacher_selection,
+            "teacher_checkpoint": teacher_checkpoint,
             "training_scope": training_scope,
         },
         path,
