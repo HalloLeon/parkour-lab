@@ -147,7 +147,7 @@ from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.utils.io import dump_yaml
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils.hydra import hydra_task_config
-from parkour_lab.tasks.manager_based.parkour_lab.distillation.contracts import (
+from parkour_lab.learning.distillation.contracts import (
     TEACHER_OBSERVATION_GROUPS,
     TeacherCheckpoint,
     assert_teacher_interface_matches,
@@ -156,7 +156,7 @@ from parkour_lab.tasks.manager_based.parkour_lab.distillation.contracts import (
     load_teacher_checkpoint,
     write_json,
 )
-from parkour_lab.tasks.manager_based.parkour_lab.distillation.student import (
+from parkour_lab.learning.distillation.student import (
     STUDENT_OBSERVATION_GROUPS,
     StudentModelCfg,
     StudentPolicy,

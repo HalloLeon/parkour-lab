@@ -109,7 +109,7 @@ from isaaclab.utils.dict import print_dict
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
-from parkour_lab.tasks.manager_based.parkour_lab.distillation.contracts import (
+from parkour_lab.learning.distillation.contracts import (
     TEACHER_OBSERVATION_GROUPS,
     assert_teacher_interface_matches,
     build_teacher_interface,
