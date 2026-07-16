@@ -166,30 +166,16 @@ class ObservationsCfg:
     """Teacher, critic, restricted-student, and supervision observations."""
 
     @configclass
-    class TeacherPolicyCfg(ObsGroup):
-        """Checkpoint-compatible teacher state and oracle task observations."""
+    class DeployablePolicyCfg(ObsGroup):
+        """Deployable proprioception and command state shared by both actors."""
 
         # Body orientation and angular motion.
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
         projected_gravity = ObsTerm(func=mdp.projected_gravity)
 
-        # Exact goal-relative task information available to the teacher.
-        goal_direction_body_xy = ObsTerm(
-            func=mdp.goal_direction_body_xy,
-            params={
-                "goal_cfg": SceneEntityCfg("goal"),
-                "asset_cfg": SceneEntityCfg("robot"),
-            },
-        )
-
-        goal_distance_xy = ObsTerm(
-            func=mdp.goal_distance_xy_w,
-            params={
-                "goal_cfg": SceneEntityCfg("goal"),
-                "asset_cfg": SceneEntityCfg("robot"),
-            },
-        )
-
+        # The operator-supplied speed is deployable; the oracle waypoint
+        # direction is kept in its own group so the future student can replace
+        # it with a depth-derived prediction without changing this state order.
         desired_speed = ObsTerm(func=mdp.desired_speed_obs)
 
         # Joint state.
@@ -198,15 +184,6 @@ class ObservationsCfg:
 
         # Previous action.
         last_action = ObsTerm(func=mdp.last_action)
-
-        # Contact state.
-        foot_contacts = ObsTerm(
-            func=mdp.foot_contact_state,
-            params={
-                "threshold": 1.0,
-                "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
-            },
-        )
 
         def __post_init__(self) -> None:
             self.enable_corruption = False
@@ -252,30 +229,18 @@ class ObservationsCfg:
 
         base_clearance = ObsTerm(func=mdp.base_clearance_obs, params={"asset_cfg": SceneEntityCfg("robot")})
 
-        def __post_init__(self) -> None:
-            self.enable_corruption = False
-            self.concatenate_terms = True
+        # Exact distance to the simulator waypoint can improve value
+        # estimation but is not available to the deployed motor policy.
+        goal_distance_xy = ObsTerm(
+            func=mdp.goal_distance_xy_w,
+            params={
+                "goal_cfg": SceneEntityCfg("goal"),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
 
-    @configclass
-    class StudentPolicyCfg(ObsGroup):
-        """Restricted state available to the student policy at deployment."""
-
-        # Proprioception.
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
-        projected_gravity = ObsTerm(func=mdp.projected_gravity)
-
-        # Task speed, without an oracle goal direction or goal distance.
-        desired_speed = ObsTerm(func=mdp.desired_speed_obs)
-
-        # Joint state.
-        joint_pos = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
-
-        # Because student actions advance the environment, this is always the
-        # previously executed student action during online distillation.
-        last_action = ObsTerm(func=mdp.last_action)
-
-        # Contact state.
+        # Isaac Lab derives these contacts from its physics contact sensor.
+        # Keep them critic-only until equivalent hardware sensing is defined.
         foot_contacts = ObsTerm(
             func=mdp.foot_contact_state,
             params={
@@ -290,15 +255,13 @@ class ObservationsCfg:
 
     @configclass
     class StudentExteroceptionCfg(ObsGroup):
-        """Temporary replaceable boundary for a future depth-derived feature."""
+        """Temporary terrain-latent boundary for a future depth encoder."""
 
-        # The current tutorial intentionally supplies no geometry. The
-        # placeholder width is configurable and is recorded in every student
-        # checkpoint; choose the real width together with the future depth
-        # encoder instead of treating this provisional value as permanent.
+        # This zero placeholder remains only for pipeline smoke tests; a later
+        # stage will replace it with the output of a trainable depth encoder.
         features = ObsTerm(
             func=mdp.student_exteroception_stub,
-            params={"feature_dim": 64},
+            params={"feature_dim": 32},
         )
 
         def __post_init__(self) -> None:
@@ -307,7 +270,7 @@ class ObservationsCfg:
 
     @configclass
     class OracleHeadingTargetCfg(ObsGroup):
-        """Training-only, wrap-safe heading-direction supervision."""
+        """Wrap-safe oracle heading used by the teacher and student loss."""
 
         direction_yaw_xy = ObsTerm(
             func=mdp.goal_direction_yaw_xy,
@@ -321,16 +284,17 @@ class ObservationsCfg:
             self.enable_corruption = False
             self.concatenate_terms = True
 
-    # Keep ``policy`` as the teacher-training group name for checkpoint
-    # compatibility. RSL-RL routing explicitly appends privileged terrain.
-    policy: TeacherPolicyCfg = TeacherPolicyCfg()
+    # Both teacher and student consume this one deployable state definition.
+    # Their terrain and heading sources differ, but the state term order cannot
+    # drift because there is no duplicated student-state observation group.
+    policy: DeployablePolicyCfg = DeployablePolicyCfg()
     terrain: PrivilegedTerrainCfg = PrivilegedTerrainCfg()
     critic_privileged: CriticPrivilegedCfg = CriticPrivilegedCfg()
-    student_policy: StudentPolicyCfg = StudentPolicyCfg()
     student_exteroception: StudentExteroceptionCfg = StudentExteroceptionCfg()
 
-    # Expose the oracle yaw heading as a separate distillation label. It is not
-    # concatenated into either the teacher or restricted student policy input.
+    # RSL-RL appends this oracle group to the Phase-1 teacher. Distillation also
+    # uses it as the heading label, but the student motor receives only its own
+    # predicted heading.
     heading_target: OracleHeadingTargetCfg = OracleHeadingTargetCfg()
 
 

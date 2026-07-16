@@ -156,6 +156,11 @@ from parkour_lab.learning.distillation.contracts import (
     load_teacher_checkpoint,
     write_json,
 )
+from parkour_lab.learning.distillation.architecture import (
+    DEFAULT_TERRAIN_LATENT_DIM,
+    HEADING_DIM,
+    MotorInterfaceCfg,
+)
 from parkour_lab.learning.distillation.student import (
     STUDENT_OBSERVATION_GROUPS,
     StudentModelCfg,
@@ -168,7 +173,7 @@ from parkour_lab.tasks.manager_based.parkour_lab.mdp.observations import (
 from rsl_rl.runners import OnPolicyRunner
 from tensordict import TensorDict
 
-STUDENT_CHECKPOINT_VERSION = 2
+STUDENT_CHECKPOINT_VERSION = 3
 """Serialization version of student checkpoints written by this script."""
 
 
@@ -226,10 +231,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
             runtime_teacher_interface,
             context="Online-distillation runtime",
         )
-        required_groups = (
-            *TEACHER_OBSERVATION_GROUPS,
-            *STUDENT_OBSERVATION_GROUPS,
-            "heading_target",
+        required_groups = tuple(
+            dict.fromkeys(
+                (*TEACHER_OBSERVATION_GROUPS, *STUDENT_OBSERVATION_GROUPS)
+            )
         )
         information_dimensions = {
             group_name: int(observations[group_name].shape[-1])
@@ -261,6 +266,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
         student_dim = sum(
             information_dimensions[name] for name in STUDENT_OBSERVATION_GROUPS
         )
+        terrain_latent_dim = information_dimensions["student_exteroception"]
+        if terrain_latent_dim != DEFAULT_TERRAIN_LATENT_DIM:
+            raise RuntimeError(
+                "Student terrain-latent width does not match the frozen transfer "
+                f"contract: expected {DEFAULT_TERRAIN_LATENT_DIM}, got "
+                f"{terrain_latent_dim}."
+            )
+
+        # Define the motor interface once so diagnostics and model creation use
+        # the same complete input width, including any future adaptation latent.
+        motor_cfg = MotorInterfaceCfg(
+            state_dim=information_dimensions["policy"],
+            terrain_latent_dim=terrain_latent_dim,
+            action_dim=action_dim,
+        )
 
         print(
             "[DISTILL] Frozen teacher: "
@@ -268,17 +288,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
             f"({teacher_checkpoint.checkpoint_sha256[:12]})"
         )
         print(
-            "[DISTILL] Teacher actor groups: policy -> terrain "
-            f"({information_dimensions['policy']} + {information_dimensions['terrain']} = "
+            "[DISTILL] Teacher actor groups: policy -> heading_target -> terrain "
+            f"({information_dimensions['policy']} + "
+            f"{information_dimensions['heading_target']} + "
+            f"{information_dimensions['terrain']} = "
             f"{teacher_dim})"
         )
         print(
-            "[DISTILL] Student input groups: student_policy -> student_exteroception "
-            f"({information_dimensions['student_policy']} + "
-            f"{information_dimensions['student_exteroception']} = {student_dim})"
+            "[DISTILL] Student inputs: policy -> predicted heading -> terrain latent "
+            "-> adaptation latent "
+            f"({information_dimensions['policy']} + {HEADING_DIM} + "
+            f"{information_dimensions['student_exteroception']} + "
+            f"{motor_cfg.adaptation_latent_dim} = "
+            f"{motor_cfg.input_dim})"
         )
         print(
-            "[DISTILL] Oracle heading is supervision only; physics is driven only by the student."
+            "[DISTILL] Oracle heading feeds the teacher and student loss, not the student motor; "
+            "physics is driven only by the student."
         )
         if uses_exteroception_stub:
             print(
@@ -292,11 +318,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
             checkpoint_path=teacher_checkpoint.checkpoint_path,
         )
 
-        student_cfg = StudentModelCfg(
-            state_dim=observations["student_policy"].shape[-1],
-            exteroception_dim=observations["student_exteroception"].shape[-1],
-            action_dim=action_dim,
-        )
+        student_cfg = StudentModelCfg(motor=motor_cfg)
 
         # Create the student neural network from the resolved input and action
         # dimensions, then place its parameters on the simulation device.
@@ -334,6 +356,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
                 "runtime_group_dimensions": information_dimensions,
                 "student_observation_group_order": list(STUDENT_OBSERVATION_GROUPS),
                 "student_observation_dimension": student_dim,
+                "motor_input_dimension": student_cfg.motor.input_dim,
                 "student_model": student_cfg.to_dict(),
                 "optimizer": {
                     "name": "Adam",
@@ -386,7 +409,7 @@ def _collect_rollout(
 
     student.eval()
     rollout_state: list[torch.Tensor] = []
-    rollout_exteroception: list[torch.Tensor] = []
+    rollout_terrain_latent: list[torch.Tensor] = []
     rollout_heading_target: list[torch.Tensor] = []
     rollout_teacher_action: list[torch.Tensor] = []
     reward_sum = 0.0
@@ -399,23 +422,26 @@ def _collect_rollout(
     # student-visited state. Only the student action advances physics.
     for _ in range(steps):
         with torch.inference_mode():
-            student_state = observations["student_policy"]
-            exteroception = observations["student_exteroception"]
+            deployable_state = observations["policy"]
+            terrain_latent = observations["student_exteroception"]
             heading_target = observations["heading_target"]
             teacher_action = teacher_policy(observations)
 
-            # Produce the deterministic motor command from only the student's
-            # restricted state and exteroception. This action, rather than the
-            # teacher label, is used to advance the environment below.
-            student_action = student.act_inference(student_state, exteroception)
+            # Produce the deterministic motor command from only the shared
+            # deployable state and temporary terrain latent. This action,
+            # rather than the teacher label, advances the environment below.
+            student_action = student.act_inference(
+                deployable_state,
+                terrain_latent,
+            )
             if not torch.isfinite(student_action).all():
                 raise RuntimeError("The student produced a non-finite action.")
             action_l2 = torch.linalg.norm(student_action - teacher_action, dim=-1)
 
         # Clone observation-backed tensors because the simulator may reuse its
         # buffers when the environment advances to the next state.
-        rollout_state.append(student_state.clone())
-        rollout_exteroception.append(exteroception.clone())
+        rollout_state.append(deployable_state.clone())
+        rollout_terrain_latent.append(terrain_latent.clone())
         rollout_heading_target.append(heading_target.clone())
         rollout_teacher_action.append(teacher_action.clone())
         action_l2_sum += float(action_l2.sum().item())
@@ -428,12 +454,12 @@ def _collect_rollout(
 
     batches = (
         torch.cat(rollout_state, dim=0),
-        torch.cat(rollout_exteroception, dim=0),
+        torch.cat(rollout_terrain_latent, dim=0),
         torch.cat(rollout_heading_target, dim=0),
         torch.cat(rollout_teacher_action, dim=0),
     )
     for batch_name, batch in zip(
-        ("student state", "student exteroception", "heading target", "teacher action"),
+        ("deployable state", "terrain latent", "heading target", "teacher action"),
         batches,
     ):
         if not torch.isfinite(batch).all():

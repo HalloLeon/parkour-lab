@@ -41,14 +41,30 @@ if TYPE_CHECKING:
     from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
     from tensordict import TensorDict
 
-TEACHER_INTERFACE_VERSION = 1
+TEACHER_INTERFACE_VERSION = 2
 """Serialization version of the compact teacher interface manifest."""
 
-TEACHER_OBSERVATION_GROUPS = ("policy", "terrain")
+DEPLOYABLE_STATE_GROUP = "policy"
+"""Observation group shared unchanged by teacher and student motor policies."""
+
+ORACLE_HEADING_GROUP = "heading_target"
+"""Yaw-aligned oracle heading used by the Phase-1 teacher and student loss."""
+
+PRIVILEGED_TERRAIN_GROUP = "terrain"
+"""Simulator ray-scan group available only to the privileged teacher path."""
+
+TEACHER_OBSERVATION_GROUPS = (
+    DEPLOYABLE_STATE_GROUP,
+    ORACLE_HEADING_GROUP,
+    PRIVILEGED_TERRAIN_GROUP,
+)
 """Observation-group order consumed by the privileged teacher actor."""
 
 __all__ = [
     "InterfaceMismatchError",
+    "DEPLOYABLE_STATE_GROUP",
+    "ORACLE_HEADING_GROUP",
+    "PRIVILEGED_TERRAIN_GROUP",
     "TEACHER_INTERFACE_VERSION",
     "TEACHER_OBSERVATION_GROUPS",
     "TeacherCheckpoint",
@@ -232,6 +248,24 @@ def build_teacher_interface(
 
     return {
         "interface_version": TEACHER_INTERFACE_VERSION,
+        # Name each actor-input role explicitly. This distinguishes the shared
+        # deployable state from the oracle and simulator-only inputs even when
+        # all three are concatenated by the current PPO implementation.
+        "information_contract": {
+            "deployable_state_group": DEPLOYABLE_STATE_GROUP,
+            "deployable_state_dimension": _flat_dimension(
+                observations[DEPLOYABLE_STATE_GROUP]
+            ),
+            "oracle_heading_group": ORACLE_HEADING_GROUP,
+            "oracle_heading_dimension": _flat_dimension(
+                observations[ORACLE_HEADING_GROUP]
+            ),
+            "heading_representation": "yaw_aligned_unit_xy",
+            "privileged_terrain_group": PRIVILEGED_TERRAIN_GROUP,
+            "privileged_terrain_dimension": _flat_dimension(
+                observations[PRIVILEGED_TERRAIN_GROUP]
+            ),
+        },
         # Record the actor input layout and preprocessing performed by RSL-RL.
         "actor": {
             "observation_groups": groups,
@@ -329,6 +363,11 @@ def load_teacher_checkpoint(
     if not isinstance(interface, dict):
         raise ValueError(f"Teacher interface is missing or invalid: {interface_path}")
     teacher_interface = cast(dict[str, object], interface)
+    if teacher_interface.get("interface_version") != TEACHER_INTERFACE_VERSION:
+        raise ValueError(
+            "Teacher interface uses an unsupported serialization version: "
+            f"{interface_path}"
+        )
     teacher_interface_hash = interface_sha256(teacher_interface)
     if payload.get("teacher_interface_sha256") != teacher_interface_hash:
         raise ValueError(f"Teacher interface hash is invalid: {interface_path}")

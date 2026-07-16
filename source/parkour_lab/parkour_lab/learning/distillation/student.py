@@ -3,47 +3,65 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Restricted student model and initial supervised distillation losses."""
+"""Restricted student model built around the transferable motor contract."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from typing import Any
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 
-STUDENT_OBSERVATION_GROUPS = ("student_policy", "student_exteroception")
-"""Ordered environment groups concatenated for the restricted student."""
+from .architecture import MotorActor, MotorInterfaceCfg, _build_mlp, _validate_input
+
+STUDENT_OBSERVATION_GROUPS = ("policy", "student_exteroception")
+"""Deployable state and temporary terrain-latent groups used by the student."""
 
 
 @dataclass(frozen=True)
 class StudentModelCfg:
-    """Architecture and loss configuration for the first restricted student."""
+    """Heading-prediction and loss settings around one shared motor actor."""
 
-    state_dim: int
-    exteroception_dim: int
-    action_dim: int
+    # Shared teacher/student motor contract. It fixes the deployable-state,
+    # heading, terrain-latent, optional adaptation-latent, and action widths as
+    # well as the motor MLP hidden layers and tensor concatenation order.
+    motor: MotorInterfaceCfg
+
+    # Hidden-layer widths of the MLP that predicts the two-component heading
+    # from deployable state and the terrain latent.
     heading_hidden_dims: tuple[int, ...] = (256, 128)
-    motor_hidden_dims: tuple[int, ...] = (512, 256, 128)
+
+    # Multiplier for the Smooth L1 loss between student and teacher actions.
     motor_loss_weight: float = 1.0
+
+    # Multiplier for the cosine-direction loss that aligns the predicted
+    # heading with the oracle heading, independently of vector magnitude.
     heading_direction_loss_weight: float = 0.2
+
+    # Multiplier for the auxiliary penalty that keeps the raw heading vector's
+    # length close to one before it is explicitly normalized.
     heading_norm_loss_weight: float = 0.01
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         """Return a JSON-compatible model configuration."""
 
-        return asdict(self)
+        return {
+            "motor": self.motor.to_dict(),
+            "heading_hidden_dims": list(self.heading_hidden_dims),
+            "motor_loss_weight": self.motor_loss_weight,
+            "heading_direction_loss_weight": self.heading_direction_loss_weight,
+            "heading_norm_loss_weight": self.heading_norm_loss_weight,
+        }
 
     def validate(self) -> None:
         """Validate dimensions and non-negative loss weights."""
 
-        for name in ("state_dim", "exteroception_dim", "action_dim"):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be positive.")
-        if not self.heading_hidden_dims or not self.motor_hidden_dims:
-            raise ValueError("Heading and motor networks must each have hidden layers.")
+        self.motor.validate()
+        if not self.heading_hidden_dims or any(
+            width <= 0 for width in self.heading_hidden_dims
+        ):
+            raise ValueError("Heading hidden dimensions must be positive.")
         for name in (
             "motor_loss_weight",
             "heading_direction_loss_weight",
@@ -53,6 +71,49 @@ class StudentModelCfg:
                 raise ValueError(f"{name} must be non-negative.")
 
 
+class HeadingPredictor(nn.Module):
+    """Predict a wrap-safe two-component heading from deployable inputs."""
+
+    def __init__(self, cfg: StudentModelCfg) -> None:
+        super().__init__()
+        input_dim = cfg.motor.state_dim + cfg.motor.terrain_latent_dim
+        self.network = _build_mlp(
+            input_dim,
+            cfg.motor.heading_dim,
+            cfg.heading_hidden_dims,
+        )
+
+        # Begin with a defined forward heading instead of normalizing a random
+        # near-zero vector. Later supervised updates learn obstacle-dependent
+        # directions from the oracle heading target.
+        output = _last_linear(self.network)
+        nn.init.zeros_(output.weight)
+        nn.init.zeros_(output.bias)
+        output.bias.data[0] = 1.0
+
+    def forward(
+        self,
+        deployable_state: torch.Tensor,
+        terrain_latent: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the normalized heading and its unnormalized network output."""
+
+        observations = torch.cat((deployable_state, terrain_latent), dim=-1)
+        raw_heading = self.network(observations)
+
+        # Convert the unconstrained network output into a unit XY direction.
+        # This prevents its arbitrary magnitude from changing the motor input:
+        # only the predicted direction should influence the action. Keep the
+        # raw vector as well so the auxiliary loss can teach it a stable norm.
+        heading = functional.normalize(
+            raw_heading,
+            p=2.0,
+            dim=-1,
+            eps=1.0e-6,
+        )
+        return heading, raw_heading
+
+
 class StudentPolicy(nn.Module):
     """Heading predictor and motor policy using only restricted information."""
 
@@ -60,77 +121,89 @@ class StudentPolicy(nn.Module):
         super().__init__()
         cfg.validate()
         self.cfg = cfg
-        observation_dim = cfg.state_dim + cfg.exteroception_dim
+        self.heading = HeadingPredictor(cfg)
+        self.motor = MotorActor(cfg.motor)
 
-        # Consume the complete restricted student observation and predict two
-        # components representing the desired heading direction in the XY
-        # plane. ``forward`` later normalizes this raw vector to unit length.
-        self.heading = _build_mlp(observation_dim, 2, cfg.heading_hidden_dims)
-
-        # Give the motor network the same student observation followed by the
-        # two-component heading command. It produces one value for every
-        # action dimension expected by the robot's low-level controller.
-        self.motor = _build_mlp(
-            observation_dim + 2, cfg.action_dim, cfg.motor_hidden_dims
-        )
-
-        # Zero the final projection so random hidden features cannot affect the
-        # initial heading. Setting its first bias component to one immediately
-        # afterwards makes every initial raw heading equal to ``(1, 0)``.
-        heading_output = _last_linear(self.heading)
-        nn.init.zeros_(heading_output.weight)
-        nn.init.zeros_(heading_output.bias)
-        heading_output.bias.data[0] = 1.0
-
-        # Begin the motor policy with a zero joint offset.
-        motor_output = _last_linear(self.motor)
+        # Preserve the current smoke-test behavior until a later stage copies
+        # the trained teacher motor weights into this exact shared module.
+        motor_output = self.motor.output_layer
         nn.init.zeros_(motor_output.weight)
         nn.init.zeros_(motor_output.bias)
 
     def act_inference(
-        self, student_state: torch.Tensor, exteroception: torch.Tensor
+        self,
+        deployable_state: torch.Tensor,
+        terrain_latent: torch.Tensor,
+        adaptation_latent: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return deterministic motor actions executed during online rollout."""
 
-        actions, _, _ = self.forward(student_state, exteroception)
+        actions, _, _ = self.forward(
+            deployable_state,
+            terrain_latent,
+            adaptation_latent,
+        )
         return actions
 
     def forward(
-        self, student_state: torch.Tensor, exteroception: torch.Tensor
+        self,
+        deployable_state: torch.Tensor,
+        terrain_latent: torch.Tensor,
+        adaptation_latent: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return motor actions, unit heading commands, and raw heading vectors."""
 
-        _validate_input(student_state, self.cfg.state_dim, "student_state")
-        _validate_input(exteroception, self.cfg.exteroception_dim, "exteroception")
-        if student_state.shape[0] != exteroception.shape[0]:
+        _validate_input(
+            deployable_state,
+            self.cfg.motor.state_dim,
+            "deployable_state",
+        )
+        _validate_input(
+            terrain_latent,
+            self.cfg.motor.terrain_latent_dim,
+            "terrain_latent",
+        )
+        if deployable_state.shape[0] != terrain_latent.shape[0]:
             raise ValueError(
-                "Student state and exteroception batch dimensions must match."
+                "Deployable state and terrain-latent batch dimensions must match."
             )
 
-        observations = torch.cat((student_state, exteroception), dim=-1)
-        raw_heading = self.heading(observations)
-
-        # Normalize each final-dimension XY pair with its L2 norm so the motor
-        # network receives a unit direction rather than an arbitrary magnitude.
-        # ``eps`` prevents division by zero for a near-zero prediction.
-        heading_command = functional.normalize(raw_heading, p=2.0, dim=-1, eps=1.0e-6)
-        motor_input = torch.cat((observations, heading_command), dim=-1)
-        actions = self.motor(motor_input)
+        heading_command, raw_heading = self.heading(
+            deployable_state,
+            terrain_latent,
+        )
+        actions = self.motor(
+            deployable_state,
+            heading_command,
+            terrain_latent,
+            adaptation_latent,
+        )
         return actions, heading_command, raw_heading
 
 
 def compute_distillation_losses(
     student: StudentPolicy,
-    student_state: torch.Tensor,
-    exteroception: torch.Tensor,
+    deployable_state: torch.Tensor,
+    terrain_latent: torch.Tensor,
     oracle_heading: torch.Tensor,
     teacher_action: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
     """Compute robust action imitation and wrap-safe heading supervision."""
 
-    _validate_input(oracle_heading, 2, "oracle_heading")
-    _validate_input(teacher_action, student.cfg.action_dim, "teacher_action")
-    actions, heading_command, raw_heading = student(student_state, exteroception)
+    _validate_input(
+        oracle_heading,
+        student.cfg.motor.heading_dim,
+        "oracle_heading",
+    )
+    _validate_input(
+        teacher_action,
+        student.cfg.motor.action_dim,
+        "teacher_action",
+    )
+    actions, heading_command, raw_heading = student(
+        deployable_state,
+        terrain_latent,
+    )
     # Normalize each final-dimension XY pair with its L2 norm so the motor
     # network receives a unit direction rather than an arbitrary magnitude.
     # ``eps`` prevents division by zero for a near-zero prediction.
@@ -174,37 +247,6 @@ def compute_distillation_losses(
     }
 
 
-def _build_mlp(
-    input_dim: int, output_dim: int, hidden_dims: tuple[int, ...]
-) -> nn.Sequential:
-    """Build an ELU MLP with a linear output layer."""
-
-    # Accumulate the modules in execution order before combining them into one
-    # feed-forward network.
-    layers: list[nn.Module] = []
-
-    # The first hidden layer consumes the complete input vector. After each
-    # iteration, this tracks the width produced for the following layer.
-    previous_dim = input_dim
-    for hidden_dim in hidden_dims:
-        if hidden_dim <= 0:
-            raise ValueError("Hidden dimensions must be positive.")
-
-        # Transform from the preceding width to this hidden width, then apply
-        # the nonlinear ELU activation before feeding the next layer.
-        layers.extend((nn.Linear(previous_dim, hidden_dim), nn.ELU()))
-        previous_dim = hidden_dim
-
-    # Map the final hidden representation to the requested output dimension.
-    # No activation is applied so callers can interpret or normalize the raw
-    # heading and motor outputs as appropriate.
-    layers.append(nn.Linear(previous_dim, output_dim))
-
-    # ``*layers`` passes the collected modules as individual positional
-    # arguments, and ``Sequential`` executes them in the listed order.
-    return nn.Sequential(*layers)
-
-
 def _last_linear(module: nn.Sequential) -> nn.Linear:
     """Return the final linear layer of an MLP."""
 
@@ -212,12 +254,3 @@ def _last_linear(module: nn.Sequential) -> nn.Linear:
     if not isinstance(output, nn.Linear):
         raise TypeError("Student MLP must end in a linear layer.")
     return output
-
-
-def _validate_input(tensor: torch.Tensor, expected_dim: int, name: str) -> None:
-    """Validate one two-dimensional batched tensor's static feature width."""
-
-    if tensor.ndim != 2 or tensor.shape[-1] != expected_dim:
-        raise ValueError(
-            f"{name} must have shape [num_envs, {expected_dim}], got {tuple(tensor.shape)}."
-        )

@@ -66,19 +66,19 @@ Phase 1 trains an asymmetric, privileged parkour teacher. The runtime roles are:
 
 | Role | RSL-RL observation mapping | Inputs |
 |---|---|---|
-| Teacher actor | `policy + terrain` | 50-D teacher state/task group plus 132 normalized terrain heights and their 132-D validity mask (314 total) |
-| Privileged critic | `policy + terrain + critic_privileged` | Everything seen by the teacher, plus exact base linear velocity and base clearance (318 total) |
-| Restricted student | `student_policy + student_exteroception` | 47-D restricted proprioceptive/task state plus a temporary 64-D zero exteroception boundary (111 total) |
+| Teacher actor | `policy + heading_target + terrain` | 43-D deployable state, 2-D oracle heading, and 264-D privileged scan (309 total) |
+| Privileged critic | `policy + heading_target + terrain + critic_privileged` | Everything seen by the teacher, plus 9-D simulator-only value information (318 total) |
+| Restricted student | `policy + student_exteroception` | The same 43-D deployable state plus a temporary 32-D terrain latent (75 observed values; its motor also receives the predicted 2-D heading) |
 
-The teacher's `policy` group is base angular velocity, projected gravity, exact
-body-frame goal direction and distance, desired speed, relative joint position
-and velocity, previous action, and foot-contact state. The teacher appends the
-simulator ray-cast height scan, clipped to ±0.50 m and normalized to `[-1, 1]`,
-followed by a binary hit-validity mask. Missing hits use normalized height `+1`
-and mask `0`, so a future gap cannot be confused with a valid surface. The
-critic appends only exact base linear velocity and clearance to the complete
-teacher input. The restricted student reuses the deployable proprioceptive,
-speed-command, action-history, and contact subset, but not the exact goal terms.
+The shared `policy` group is base angular velocity, projected gravity, desired
+speed, relative joint position and velocity, and the previous action. The
+teacher then receives the yaw-aligned oracle heading and the simulator ray-cast
+height scan, clipped to ±0.50 m and normalized to `[-1, 1]`, followed by a
+binary hit-validity mask. Missing hits use normalized height `+1` and mask `0`,
+so a future gap cannot be confused with a valid surface. Exact goal distance,
+base linear velocity, base clearance, and simulator-derived foot contacts are
+critic-only. In particular, foot contacts are not classified as deployable
+until equivalent hardware sensing is defined.
 
 The ray grid uses explicit `xy` flattening: longitudinal X changes fastest,
 then lateral Y. It has 12 longitudinal samples from -0.45 m behind the trunk to
@@ -96,25 +96,34 @@ must not keep using this static target. Either bake the obstacles into generated
 terrain or upgrade to an Isaac Lab release that provides transform-aware
 multi-mesh ray casting.
 
-The restricted student groups are independent of the RSL-RL PPO routes, so
-adding them does not change the teacher checkpoint input. The student excludes
-the exact goal direction and distance, simulator ray hits, exact base clearance,
-curriculum-level and obstacle-family identifiers, and configured obstacle
-dimensions. Its 64-D exteroception group is all zeros in this tutorial; it is a
-replaceable interface for a later depth encoder, not a visual representation.
+The teacher and student deliberately reuse one `policy` group, preventing two
+copies of the deployable state order from drifting apart. The student excludes
+the oracle heading, exact goal distance, simulator ray hits, contacts and
+clearance, curriculum-level and obstacle-family identifiers, and configured
+obstacle dimensions. Its 32-D exteroception group is all zeros in this tutorial;
+it represents the fixed-width output contract of a later depth encoder, not a
+visual representation.
 
 Teacher and future student share one action contract: 12 Unitree A1 joint-position
 offsets, scale `0.25`, interpreted relative to default joint positions at the
 same 50 Hz control rate. Observation asymmetry therefore does not alter the
 low-level controller or action interface.
 
+`learning/distillation/architecture.py` fixes the transferable motor input order
+as deployable state, two-component heading, 32-D terrain latent, and an optional
+adaptation latent. It provides a privileged scan encoder and reference teacher
+whose `MotorActor` has exactly the same configuration and state-dictionary
+layout as the student's motor. The current stock PPO teacher is not yet wired to
+that modular actor; doing so is a later teacher-architecture stage and must
+precede final teacher training.
+
 Three controlled RSL-RL entry points support observation ablations without
 changing PPO settings, hidden layers, rewards, curricula, or actions:
 
 ```text
-rsl_rl_baseline_cfg_entry_point              actor: policy
-rsl_rl_privileged_critic_cfg_entry_point     actor: policy; critic also sees terrain
-rsl_rl_cfg_entry_point                       actor and critic both see terrain
+rsl_rl_baseline_cfg_entry_point              actor: policy + oracle heading
+rsl_rl_privileged_critic_cfg_entry_point     actor: policy + oracle heading; critic also sees terrain
+rsl_rl_cfg_entry_point                       actor and critic see policy + oracle heading + terrain
 ```
 
 Select one with `--agent=<entry-point>` and use that same entry point for
@@ -192,9 +201,9 @@ The four distinct information sets are:
 
 | Information set | Shape | Contents and status |
 |---|---:|---|
-| Teacher observations | Runtime-derived; currently `[N, 314]` | `policy` followed by privileged `terrain`; label generation only |
-| Student policy observations | Runtime-derived; currently `[N, 111]` | `student_policy` followed by the temporary zero-valued exteroceptive feature; student input |
-| Oracle heading target | `[N, 2]` | Yaw-aligned body-frame `[forward, left] = [cos(Δψ), sin(Δψ)]`; supervision only, never a student input |
+| Teacher observations | Runtime-derived; currently `[N, 309]` | Shared `policy`, oracle `heading_target`, then privileged `terrain`; label generation only during distillation |
+| Student observations | Runtime-derived; currently `[N, 75]` | Shared 43-D `policy` followed by the temporary 32-D zero terrain latent |
+| Oracle heading target | `[N, 2]` | Yaw-aligned `[forward, left] = [cos(Δψ), sin(Δψ)]`; teacher input and student supervision, never a student motor input |
 | Teacher motor-action target | `[N, 12]` | Frozen teacher's deterministic action-distribution mean in resolved A1 joint order; supervision only |
 
 The instantiated group dimensions and exact student group order are stored in
@@ -219,10 +228,9 @@ parameters enter the optimizer.
 
 This stage does not render cameras, encode depth, or claim that the zero feature
 is deployable perception. It establishes and tests the information barrier and
-student-driven training semantics. The current placeholder is 64-D only as a
-provisional configuration value; its actual width is derived at runtime and
-stored with the student model, so the future depth architecture can choose a
-different width deliberately. Before fully student-driven perceptive training,
+student-driven training semantics. The terrain-latent contract is fixed at 32
+values and stored with the student model; both the privileged scan encoder and
+future depth encoder must produce that width. Before fully student-driven perceptive training,
 the next stage should warm-start the otherwise zero-output motor student from
 teacher-labeled data and then switch to student-visited online rollouts. Teacher
 and student still emit the same 12 action values, which use the same scale,

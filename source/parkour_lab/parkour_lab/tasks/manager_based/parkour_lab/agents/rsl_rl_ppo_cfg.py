@@ -28,11 +28,17 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # Logging backend used for training metrics.
     logger = "tensorboard"
 
-    # The policy receives deployable state and terrain geometry. The critic
-    # receives the same input followed by its simulator-only state.
+    # The teacher receives the same deployable state reserved for the future
+    # student, followed by its oracle heading and privileged terrain scan. The
+    # critic additionally receives simulator-only state.
     obs_groups = {
-        "policy": ["policy", "terrain"],
-        "critic": ["policy", "terrain", "critic_privileged"],
+        "policy": ["policy", "heading_target", "terrain"],
+        "critic": [
+            "policy",
+            "heading_target",
+            "terrain",
+            "critic_privileged",
+        ],
     }
 
     # RSL-RL 3 configures both networks through one actor-critic policy object.
@@ -89,11 +95,16 @@ class PPOPrivilegedCriticRunnerCfg(PPORunnerCfg):
     # Identify this routing variant in its run-directory name.
     run_name = "privileged_critic"
 
-    # Keep terrain privileged to the value function so the actor must act from
-    # the deployable observation core alone.
+    # Keep terrain privileged to the value function. The actor still receives
+    # the oracle heading required by every Phase-1 teacher variant.
     obs_groups = {
-        "policy": ["policy"],
-        "critic": ["policy", "terrain", "critic_privileged"],
+        "policy": ["policy", "heading_target"],
+        "critic": [
+            "policy",
+            "heading_target",
+            "terrain",
+            "critic_privileged",
+        ],
     }
 
 
@@ -106,6 +117,6 @@ class PPOBaselineRunnerCfg(PPORunnerCfg):
 
     # Remove terrain from both networks while retaining the critic-only state.
     obs_groups = {
-        "policy": ["policy"],
-        "critic": ["policy", "critic_privileged"],
+        "policy": ["policy", "heading_target"],
+        "critic": ["policy", "heading_target", "critic_privileged"],
     }
