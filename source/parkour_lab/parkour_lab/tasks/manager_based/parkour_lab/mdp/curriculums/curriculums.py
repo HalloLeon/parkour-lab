@@ -203,6 +203,8 @@ def reset_goal_and_commands_from_terrain_level(
         curriculum_cfg=curriculum_cfg,
     )
 
+    # ``goal_pos`` is derived from each course's final waypoint. This compatibility
+    # lookup will be replaced with a per-environment active-waypoint state.
     goal_pos_by_level = _level_tensor("goal_pos", dtype=dtype)
     target_speed_by_level = _level_tensor("target_speed")
     min_clearance_by_level = _level_tensor("min_clearance")

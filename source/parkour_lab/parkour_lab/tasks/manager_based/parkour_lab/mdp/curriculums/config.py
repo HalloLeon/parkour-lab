@@ -9,7 +9,33 @@ from isaaclab.terrains.terrain_generator_cfg import TerrainGeneratorCfg
 from isaaclab.utils import configclass
 
 from .difficulty import difficulty_to_level
-from .levels import ParkourLevelCfg, ParkourStructureCfg, coerce_level_cfg
+from .levels import (
+    ParkourDifficultyCfg,
+    ParkourLevelCfg,
+    ParkourStructureCfg,
+    ParkourSupportRegionCfg,
+    ParkourWaypointCfg,
+    coerce_and_validate_levels,
+    coerce_level_cfg,
+)
+
+_OBSTACLE_LENGTH_M = 0.5
+_OBSTACLE_WIDTH_M = 1.8
+_OBSTACLE_CENTER_X_M = 2.0
+_OBSTACLE_X_RANGE_M = (
+    _OBSTACLE_CENTER_X_M - 0.5 * _OBSTACLE_LENGTH_M,
+    _OBSTACLE_CENTER_X_M + 0.5 * _OBSTACLE_LENGTH_M,
+)
+_OBSTACLE_Y_RANGE_M = (-0.5 * _OBSTACLE_WIDTH_M, 0.5 * _OBSTACLE_WIDTH_M)
+
+# Name, obstacle family, difficulty rank, obstacle height, target speed, and
+# minimum clearance for the shared default course layout below.
+_DEFAULT_LEVEL_PARAMETERS = (
+    ("level_0_flat_marker", "flat_marker", 0.0, 0.02, 0.60, 0.24),
+    ("level_1_low_step", "step", 1.0, 0.05, 0.70, 0.25),
+    ("level_2_medium_step", "step", 2.0, 0.08, 0.75, 0.26),
+    ("level_3_higher_step", "step", 3.0, 0.12, 0.80, 0.27),
+)
 
 
 @configclass
@@ -20,59 +46,72 @@ class ParkourCurriculumCfg:
     Levels should go from easiest to hardest.
     """
 
-    levels: tuple[ParkourLevelCfg, ...] = (
+    levels: tuple[ParkourLevelCfg, ...] = tuple(
         ParkourLevelCfg(
-            name="level_0_flat_marker",
+            name=name,
+            obstacle_family=obstacle_family,
+            waypoints=(
+                ParkourWaypointCfg(position=(1.0, 0.0, 0.01)),
+                ParkourWaypointCfg(
+                    position=(
+                        _OBSTACLE_CENTER_X_M,
+                        0.0,
+                        obstacle_height + 0.01,
+                    )
+                ),
+                ParkourWaypointCfg(position=(3.8, 0.0, 0.01)),
+            ),
             structures=(
                 ParkourStructureCfg(
+                    name="center_obstacle",
                     mesh_factory=trimesh.creation.box,
-                    mesh_kwargs={"extents": (0.5, 1.8, 0.02)},
-                    position=(2.0, 0.0, 0.01),
+                    mesh_kwargs={
+                        "extents": (
+                            _OBSTACLE_LENGTH_M,
+                            _OBSTACLE_WIDTH_M,
+                            obstacle_height,
+                        )
+                    },
+                    position=(
+                        _OBSTACLE_CENTER_X_M,
+                        0.0,
+                        0.5 * obstacle_height,
+                    ),
                 ),
             ),
-            goal_pos=(4.0, 0.0, 0.01),
-            target_speed=0.60,
-            min_clearance=0.24,
-        ),
-        ParkourLevelCfg(
-            name="level_1_low_step",
-            structures=(
-                ParkourStructureCfg(
-                    mesh_factory=trimesh.creation.box,
-                    mesh_kwargs={"extents": (0.5, 1.8, 0.05)},
-                    position=(2.0, 0.0, 0.025),
+            # This annotation describes the traversable top of the box;
+            # generic terrain code does not inspect the mesh's shape.
+            support_regions=(
+                ParkourSupportRegionCfg(
+                    name="ground",
+                    structure_name=None,
+                    x_range=(-4.0, 4.0),
+                    y_range=(-2.0, 2.0),
+                    surface_z=0.0,
+                ),
+                ParkourSupportRegionCfg(
+                    name="center_obstacle_top",
+                    structure_name="center_obstacle",
+                    x_range=_OBSTACLE_X_RANGE_M,
+                    y_range=_OBSTACLE_Y_RANGE_M,
+                    surface_z=obstacle_height,
                 ),
             ),
-            goal_pos=(4.0, 0.0, 0.01),
-            target_speed=0.70,
-            min_clearance=0.25,
-        ),
-        ParkourLevelCfg(
-            name="level_2_medium_step",
-            structures=(
-                ParkourStructureCfg(
-                    mesh_factory=trimesh.creation.box,
-                    mesh_kwargs={"extents": (0.5, 1.8, 0.08)},
-                    position=(2.0, 0.0, 0.04),
-                ),
+            target_speed=target_speed,
+            min_clearance=min_clearance,
+            difficulty=ParkourDifficultyCfg(
+                order=difficulty_order,
+                parameters={"obstacle_height_m": obstacle_height},
             ),
-            goal_pos=(4.0, 0.0, 0.01),
-            target_speed=0.75,
-            min_clearance=0.26,
-        ),
-        ParkourLevelCfg(
-            name="level_3_higher_step",
-            structures=(
-                ParkourStructureCfg(
-                    mesh_factory=trimesh.creation.box,
-                    mesh_kwargs={"extents": (0.5, 1.8, 0.12)},
-                    position=(2.0, 0.0, 0.06),
-                ),
-            ),
-            goal_pos=(4.2, 0.0, 0.01),
-            target_speed=0.80,
-            min_clearance=0.27,
-        ),
+        )
+        for (
+            name,
+            obstacle_family,
+            difficulty_order,
+            obstacle_height,
+            target_speed,
+            min_clearance,
+        ) in _DEFAULT_LEVEL_PARAMETERS
     )
 
     initial_level: int = 1
@@ -99,30 +138,10 @@ class ParkourCurriculumCfg:
     def validate_configuration(self) -> None:
         """Validate ordering, bounds, and curriculum transition settings."""
 
-        if len(self.levels) == 0:
-            raise ValueError("ParkourCurriculumCfg.levels must not be empty.")
-
         # Hydra can turn nested dataclasses into dictionaries. Convert them
-        # back once so all downstream consumers receive one representation.
-        self.levels = tuple(coerce_level_cfg(level) for level in self.levels)
-
-        names = [level.name for level in self.levels]
-        if len(names) != len(set(names)):
-            raise ValueError("Parkour curriculum level names must be unique.")
-
-        target_speeds = [level.target_speed for level in self.levels]
-        min_clearances = [level.min_clearance for level in self.levels]
-
-        for field_name, values in (
-            ("target speed", target_speeds),
-            ("minimum clearance", min_clearances),
-        ):
-            if any(
-                current > following for current, following in zip(values, values[1:])
-            ):
-                raise ValueError(
-                    f"Parkour curriculum {field_name} must be non-decreasing."
-                )
+        # back once and validate explicit easiest-to-hardest ordering so all
+        # downstream consumers receive one representation.
+        self.levels = coerce_and_validate_levels(self.levels)
 
         if self.initial_level < 0 or self.initial_level >= len(self.levels):
             raise ValueError("initial_level is out of range.")
@@ -156,6 +175,7 @@ def parkour_terrain(
     )
     terrain_center = _terrain_local_center(cfg)
     ground = ParkourStructureCfg(
+        name="ground",
         mesh_factory=trimesh.creation.box,
         mesh_kwargs={"extents": (*cfg.size, cfg.ground_thickness)},
         position=(0.0, 0.0, -0.5 * cfg.ground_thickness),
@@ -267,11 +287,11 @@ def _structure_meshes(
 ) -> list[trimesh.Trimesh]:
     """Create and rigidly transform all meshes produced by one structure."""
 
-    # Call the configured Trimesh-compatible factory with its shape-specific
-    # keyword arguments. Normalize its possible mesh, scene, or iterable output
-    # into independent ``Trimesh`` objects that are safe to transform in place.
+    # Call the configured factory with its declarative keyword arguments.
+    # Normalize its possible mesh, scene, or iterable output into independent
+    # meshes that are safe to transform.
     meshes = _normalize_mesh_result(
-        structure.mesh_factory(**dict(structure.mesh_kwargs)),
+        structure.mesh_factory(**structure.mesh_kwargs),
         structure.mesh_factory,
     )
 

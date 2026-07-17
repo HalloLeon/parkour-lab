@@ -562,14 +562,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         if self.evaluation_level is None:
             return {}
         level = self.parkour_curriculum.levels[self.evaluation_level]
-        return {
-            "index": self.evaluation_level,
-            "name": level.name,
-            "structures": [structure.metadata() for structure in level.structures],
-            "goal_pos": list(level.goal_pos),
-            "target_speed": level.target_speed,
-            "min_clearance": level.min_clearance,
-        }
+        return {"index": self.evaluation_level, **level.metadata()}
 
     def set_evaluation_difficulty(self, level: int | None = None, seed: int | None = None) -> None:
         """Freeze the environment at one reproducible logical difficulty."""
@@ -618,6 +611,12 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         if "parkour_course" not in terrain_generator.sub_terrains:
             raise ValueError("ParkourLabEnvCfg requires the 'parkour_course' sub-terrain.")
 
+        # Ground support regions use course-local coordinates. Validate them
+        # once here, after the scene's actual tile size is known and before
+        # the terrain generator invokes the same level configuration per tile.
+        for level in curriculum_cfg.levels:
+            level.validate_terrain_size(terrain_generator.size)
+
         # Generate one terrain row per logical level so the row index and
         # curriculum-level index have the same meaning.
         terrain_generator.num_rows = len(curriculum_cfg.levels)
@@ -629,8 +628,9 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         # Restrict initial terrain assignment to the configured starting range.
         self.scene.ground.max_init_terrain_level = curriculum_cfg.initial_level
 
-        # Give the goal a valid startup pose for the initial level. Reset events
-        # subsequently assign each environment its level-specific goal pose.
+        # Until active-waypoint progression is introduced, the final
+        # configured waypoint remains the compatibility goal used by reset
+        # events, observations, rewards, and termination terms.
         self.scene.goal.init_state.pos = curriculum_cfg.levels[curriculum_cfg.initial_level].goal_pos
 
         # Pass the same curriculum object to reset events so initial terrain

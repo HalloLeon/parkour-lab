@@ -60,6 +60,29 @@ Runs are written beneath `logs/rsl_rl/parkour_lab/<run>/`. This includes policy
 checkpoints (`model_*.pt`), the resolved environment and agent configurations in
 `params/`, TensorBoard data, and optional clips in `videos/train/`.
 
+## Declarative course configuration
+
+Each curriculum level is a reusable course description rather than a special
+case in the runtime. It records an obstacle-family label, ordered terrain-local
+waypoints, named mesh structures and their factory arguments, rectangular
+supporting ground/platform regions, target speed and clearance, and explicit
+difficulty metadata. Factory arguments are passed directly to each structure
+factory. A support region either refers to the generated base ground or names
+the structure whose surface it describes. The annotation is authoritative, so
+structure generation does not assume a box or zero rotation. Support annotations
+currently remain horizontal, axis-aligned rectangles even when the referenced
+mesh is more general. Terrain generation still iterates the configured structures
+generically; it does not branch on a level number or obstacle family.
+
+Support regions currently validate the final waypoint but do not alter the
+generated mesh. Physical gap segmentation and edge-contact penalties belong to
+later stages; an edge representation should be introduced with those consumers
+rather than stored speculatively. Likewise, the runtime continues to use the
+final configured waypoint as its single goal until per-environment waypoint
+progression is added. This compatibility rule lets a flat course already contain
+several ordered waypoints without changing reset, observation, reward, or
+termination code.
+
 ## Phase 1 observation architecture
 
 Phase 1 trains an asymmetric, privileged parkour teacher. The runtime roles are:
