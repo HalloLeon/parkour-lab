@@ -222,8 +222,8 @@ class ParkourLevelCfg:
     obstacle_family: str
 
     # Route through the course in traversal order. Positions are XYZ offsets
-    # in the terrain-local coordinate system; the final entry is the current
-    # compatibility goal until waypoint progression is implemented.
+    # in the terrain-local coordinate system. Intermediate entries may be
+    # directional guides; only the final entry must lie on a support region.
     waypoints: tuple[ParkourWaypointCfg, ...]
 
     # Mesh-producing obstacles and platforms placed relative to the terrain
@@ -361,7 +361,7 @@ class ParkourLevelCfg:
 
     @property
     def goal_pos(self) -> tuple[float, float, float]:
-        """Return the final waypoint for the single-goal runtime."""
+        """Return the final course waypoint for metadata compatibility."""
 
         return self.waypoints[-1].position
 
@@ -377,8 +377,8 @@ class ParkourLevelCfg:
             "target_speed": self.target_speed,
             "min_clearance": self.min_clearance,
             "difficulty": self.difficulty.metadata(),
-            # Preserve the old evaluation-report field until the introduction of
-            # an active waypoint. It is derived, not independently configured.
+            # Keep the derived endpoint convenient for reports and external
+            # tooling; runtime navigation uses the ordered ``waypoints`` above.
             "goal_pos": list(self.goal_pos),
         }
 

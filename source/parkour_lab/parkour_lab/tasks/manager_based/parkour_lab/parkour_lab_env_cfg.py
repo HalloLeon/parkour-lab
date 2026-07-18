@@ -31,7 +31,7 @@ PARKOUR_CURRICULUM = mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM
 
 DEFAULT_LEVEL = PARKOUR_CURRICULUM.levels[PARKOUR_CURRICULUM.initial_level]
 
-GOAL_POS = DEFAULT_LEVEL.goal_pos
+INITIAL_WAYPOINT_POS = DEFAULT_LEVEL.waypoints[0].position
 
 ##
 # Scene definition
@@ -60,13 +60,13 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     goal: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Goal",
         spawn=sim_utils.CylinderCfg(
-            radius=0.25,
+            radius=PARKOUR_CURRICULUM.waypoint_reach_threshold,
             height=0.02,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
             collision_props=sim_utils.CollisionPropertiesCfg(collision_enabled=False),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.8, 0.1)),
         ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=GOAL_POS),
+        init_state=RigidObjectCfg.InitialStateCfg(pos=INITIAL_WAYPOINT_POS),
     )
 
     robot: ArticulationCfg = UNITREE_A1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
@@ -311,8 +311,8 @@ class EventCfg:
         },
     )
 
-    reset_goal_and_commands = EventTerm(
-        func=mdp.reset_goal_and_commands_from_terrain_level,
+    reset_waypoints_and_commands = EventTerm(
+        func=mdp.reset_waypoints_and_commands_from_terrain_level,
         mode="reset",
         params={
             "curriculum_cfg": PARKOUR_CURRICULUM,
@@ -396,14 +396,9 @@ class RewardsCfg:
         },
     )
 
-    reached_goal_xy = RewTerm(
-        func=mdp.reached_goal_xy_reward,
+    completed_course = RewTerm(
+        func=mdp.completed_course_reward,
         weight=100.0,
-        params={
-            "threshold": PARKOUR_CURRICULUM.success_threshold,
-            "goal_cfg": SceneEntityCfg("goal"),
-            "asset_cfg": SceneEntityCfg("robot"),
-        },
     )
 
     # Safety.
@@ -467,9 +462,10 @@ class TerminationsCfg:
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
     success = DoneTerm(
-        func=mdp.reached_goal_xy_done,
+        func=mdp.completed_course_done,
         params={
-            "threshold": PARKOUR_CURRICULUM.success_threshold,
+            "reach_threshold": PARKOUR_CURRICULUM.waypoint_reach_threshold,
+            "reach_hold_s": PARKOUR_CURRICULUM.waypoint_reach_hold_s,
             "goal_cfg": SceneEntityCfg("goal"),
             "asset_cfg": SceneEntityCfg("robot"),
         },
@@ -628,25 +624,34 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         # Restrict initial terrain assignment to the configured starting range.
         self.scene.ground.max_init_terrain_level = curriculum_cfg.initial_level
 
-        # Until active-waypoint progression is introduced, the final
-        # configured waypoint remains the compatibility goal used by reset
-        # events, observations, rewards, and termination terms.
-        self.scene.goal.init_state.pos = curriculum_cfg.levels[curriculum_cfg.initial_level].goal_pos
+        # The marker starts at waypoint zero. Reset events select the matching
+        # route independently for every environment after terrain assignment.
+        self.scene.goal.init_state.pos = curriculum_cfg.levels[
+            curriculum_cfg.initial_level
+        ].waypoints[0].position
+        # Keep the visible marker footprint consistent with the configured XY
+        # radius used by the waypoint transition condition.
+        self.scene.goal.spawn.radius = curriculum_cfg.waypoint_reach_threshold
 
         # Pass the same curriculum object to reset events so initial terrain
-        # assignment, goals, and commands use the authoritative level table.
+        # assignment, active routes, and commands use the authoritative table.
         self.events.initialize_terrain_levels.params["curriculum_cfg"] = curriculum_cfg
-        self.events.reset_goal_and_commands.params["curriculum_cfg"] = curriculum_cfg
+        self.events.reset_waypoints_and_commands.params["curriculum_cfg"] = curriculum_cfg
 
         # The fixed evaluation configuration disables adaptive curriculum
         # updates, so synchronize this term only when it is present.
         if self.curriculum is not None:
             self.curriculum.terrain_levels.params["curriculum_cfg"] = curriculum_cfg
 
-        # Use one success threshold for both the terminal bonus and successful
-        # episode termination so they cannot disagree about reaching the goal.
-        self.rewards.reached_goal_xy.params["threshold"] = curriculum_cfg.success_threshold
-        self.terminations.success.params["threshold"] = curriculum_cfg.success_threshold
+        # The success term owns route advancement before reward computation.
+        # Synchronize its proximity and dwell contract with the authoritative
+        # curriculum so only a safely reached final waypoint ends an episode.
+        self.terminations.success.params[
+            "reach_threshold"
+        ] = curriculum_cfg.waypoint_reach_threshold
+        self.terminations.success.params[
+            "reach_hold_s"
+        ] = curriculum_cfg.waypoint_reach_hold_s
 
         # Likewise, use one contact threshold for both the safety penalty and
         # trunk-contact termination.

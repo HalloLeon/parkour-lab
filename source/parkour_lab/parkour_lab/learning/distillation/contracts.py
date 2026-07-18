@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
     from tensordict import TensorDict
 
-TEACHER_INTERFACE_VERSION = 2
+TEACHER_INTERFACE_VERSION = 3
 """Serialization version of the compact teacher interface manifest."""
 
 DEPLOYABLE_STATE_GROUP = "policy"
@@ -244,6 +244,7 @@ def build_teacher_interface(
     action_descriptor = action_manager.get_term("joint_pos").IO_descriptor
     height_obs_cfg = base_env.cfg.observations.terrain.height_scan.params["obs_cfg"]
     scanner_cfg = base_env.cfg.scene.height_scanner
+    curriculum_cfg = base_env.cfg.parkour_curriculum
     policy_cfg = agent_cfg.policy
 
     return {
@@ -261,6 +262,21 @@ def build_teacher_interface(
                 observations[ORACLE_HEADING_GROUP]
             ),
             "heading_representation": "yaw_aligned_unit_xy",
+            # The target now changes along each ordered route. Record both the
+            # routes and switching rule so a final-goal checkpoint cannot be
+            # loaded as though it had trained with active-waypoint headings.
+            "oracle_heading_source": {
+                "kind": "active_course_waypoint",
+                "waypoint_routes_m": [
+                    [list(waypoint.position) for waypoint in level.waypoints]
+                    for level in curriculum_cfg.levels
+                ],
+                "reach_threshold_m": float(
+                    curriculum_cfg.waypoint_reach_threshold
+                ),
+                "reach_hold_s": float(curriculum_cfg.waypoint_reach_hold_s),
+                "final_requires_min_clearance": True,
+            },
             "privileged_terrain_group": PRIVILEGED_TERRAIN_GROUP,
             "privileged_terrain_dimension": _flat_dimension(
                 observations[PRIVILEGED_TERRAIN_GROUP]

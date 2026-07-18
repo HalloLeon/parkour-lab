@@ -12,7 +12,7 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCaster
 
-from .state import _root_height_env
+from .robot import _root_height_env
 
 
 def _base_clearance(

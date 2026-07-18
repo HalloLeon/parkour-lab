@@ -6,8 +6,9 @@ from isaaclab.sensors import RayCaster
 from isaaclab.utils.math import quat_apply_inverse
 
 from . import config
-from ._shared import contact, navigation, terrain
+from ._shared import contact, terrain
 from .commands import get_target_speed
+from .navigation import geometry
 
 
 def base_clearance_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
@@ -73,7 +74,7 @@ def goal_direction_body_xy(
 
     asset: Articulation = env.scene[asset_cfg.name]
 
-    goal_vec_xy = navigation._goal_vector_xy(env, goal_cfg, asset_cfg)
+    goal_vec_xy = geometry._goal_vector_xy(env, goal_cfg, asset_cfg)
 
     goal_vec_w = torch.zeros((goal_vec_xy.shape[0], 3), device=goal_vec_xy.device, dtype=goal_vec_xy.dtype)
     goal_vec_w[:, :2] = goal_vec_xy
@@ -114,7 +115,7 @@ def goal_direction_yaw_xy(
         [num_envs, 2]
     """
 
-    return navigation._goal_direction_yaw_xy(env, goal_cfg, asset_cfg)
+    return geometry._goal_direction_yaw_xy(env, goal_cfg, asset_cfg)
 
 
 def goal_distance_xy_w(
@@ -129,7 +130,7 @@ def goal_distance_xy_w(
         [num_envs, 1]
     """
 
-    return navigation._goal_distance_xy(env, goal_cfg, asset_cfg).unsqueeze(-1)
+    return geometry._goal_distance_xy(env, goal_cfg, asset_cfg).unsqueeze(-1)
 
 
 def student_exteroception_stub(env: ManagerBasedRLEnv, feature_dim: int = 64) -> torch.Tensor:

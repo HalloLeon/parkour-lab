@@ -12,9 +12,9 @@ to work.
 """
 
 from .reward_terms.goal import (
+    completed_course_reward,
     goal_heading_misalignment_l2,
     goal_progress_xy_stable,
-    reached_goal_xy_reward,
     velocity_along_goal_xy_capped,
     velocity_along_goal_xy_clearance_capped,
 )
@@ -33,7 +33,7 @@ __all__ = [
     "velocity_along_goal_xy_clearance_capped",
     "goal_progress_xy_stable",
     "goal_heading_misalignment_l2",
-    "reached_goal_xy_reward",
+    "completed_course_reward",
     # Safety and clearance penalties.
     "base_contact",
     "base_clearance_below_l2",

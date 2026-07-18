@@ -2,9 +2,9 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
-from ._shared import contact, navigation, terrain
-from .commands import get_min_clearance
+from ._shared import contact
 from .curriculums import episode_outcomes
+from .navigation.route import advance_active_waypoints
 
 
 def base_contact_done(
@@ -28,29 +28,25 @@ def base_contact_done(
     return base_contact
 
 
-def reached_goal_xy_done(
+def completed_course_done(
     env: ManagerBasedRLEnv,
-    threshold: float,
+    reach_threshold: float,
+    reach_hold_s: float,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """
-    Success termination based on XY distance to goal,
-    while requiring the robot not to be collapsed.
+    """Advance active waypoints and terminate only after the safe final one.
 
     Returns:
         [num_envs]
     """
 
-    dist_to_goal = navigation._goal_distance_xy(env, goal_cfg, asset_cfg)
-    clearance = terrain._base_clearance(env, asset_cfg)
-
-    min_clearance = get_min_clearance(env).to(
-        device=clearance.device, dtype=clearance.dtype
+    success = advance_active_waypoints(
+        env,
+        reach_threshold=reach_threshold,
+        reach_hold_s=reach_hold_s,
+        goal_cfg=goal_cfg,
+        asset_cfg=asset_cfg,
     )
-
-    success = torch.logical_and(dist_to_goal < threshold, clearance > min_clearance)
-
     episode_outcomes.mark_success(env, success)
-
     return success

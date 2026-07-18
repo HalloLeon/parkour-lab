@@ -74,14 +74,24 @@ currently remain horizontal, axis-aligned rectangles even when the referenced
 mesh is more general. Terrain generation still iterates the configured structures
 generically; it does not branch on a level number or obstacle family.
 
-Support regions currently validate the final waypoint but do not alter the
-generated mesh. Physical gap segmentation and edge-contact penalties belong to
-later stages; an edge representation should be introduced with those consumers
-rather than stored speculatively. Likewise, the runtime continues to use the
-final configured waypoint as its single goal until per-environment waypoint
-progression is added. This compatibility rule lets a flat course already contain
-several ordered waypoints without changing reset, observation, reward, or
-termination code.
+Support regions validate the final landing waypoint but do not alter the
+generated mesh. Intermediate waypoints are allowed to be directional guides
+rather than occupiable surfaces. Physical gap segmentation and edge-contact
+penalties belong to later stages; an edge representation should be introduced
+with those consumers rather than stored speculatively.
+
+Each environment owns an active waypoint index, proximity dwell timer, and
+course-completion state. A reset selects waypoint zero from the route belonging
+to that environment's current terrain level. Remaining within 0.20 m in XY for
+0.10 s advances only that environment to its next waypoint and immediately
+retargets its marker, oracle heading, critic distance, and world-frame velocity
+reward. Intermediate waypoints do not end an episode or count as curriculum
+success. The final waypoint completes the course only when the existing minimum
+base-clearance condition is also satisfied. Routes may contain different
+numbers of waypoints without cursor overrun or cross-environment state changes.
+Because this changes the teacher's heading input from one fixed endpoint to an
+active route target, the teacher-interface manifest is version 3; older
+final-goal teacher manifests intentionally fail compatibility validation.
 
 ## Phase 1 observation architecture
 
@@ -98,10 +108,10 @@ speed, relative joint position and velocity, and the previous action. The
 teacher then receives the yaw-aligned oracle heading and the simulator ray-cast
 height scan, clipped to ±0.50 m and normalized to `[-1, 1]`, followed by a
 binary hit-validity mask. Missing hits use normalized height `+1` and mask `0`,
-so a future gap cannot be confused with a valid surface. Exact goal distance,
-base linear velocity, base clearance, and simulator-derived foot contacts are
-critic-only. In particular, foot contacts are not classified as deployable
-until equivalent hardware sensing is defined.
+so a future gap cannot be confused with a valid surface. Exact active-waypoint
+distance, base linear velocity, base clearance, and simulator-derived foot
+contacts are critic-only. In particular, foot contacts are not classified as
+deployable until equivalent hardware sensing is defined.
 
 The ray grid uses explicit `xy` flattening: longitudinal X changes fastest,
 then lateral Y. It has 12 longitudinal samples from -0.45 m behind the trunk to
@@ -226,7 +236,7 @@ The four distinct information sets are:
 |---|---:|---|
 | Teacher observations | Runtime-derived; currently `[N, 309]` | Shared `policy`, oracle `heading_target`, then privileged `terrain`; label generation only during distillation |
 | Student observations | Runtime-derived; currently `[N, 75]` | Shared 43-D `policy` followed by the temporary 32-D zero terrain latent |
-| Oracle heading target | `[N, 2]` | Yaw-aligned `[forward, left] = [cos(Δψ), sin(Δψ)]`; teacher input and student supervision, never a student motor input |
+| Oracle heading target | `[N, 2]` | Yaw-aligned direction to the active course waypoint, `[forward, left] = [cos(Δψ), sin(Δψ)]`; teacher input and student supervision, never a student motor input |
 | Teacher motor-action target | `[N, 12]` | Frozen teacher's deterministic action-distribution mean in resolved A1 joint order; supervision only |
 
 The instantiated group dimensions and exact student group order are stored in
@@ -236,8 +246,9 @@ avoiding a second hard-coded runtime description. The heading head predicts a
 two-vector from restricted student information, normalizes it to a unit
 direction, and appends that predicted direction—not the oracle target—to the
 motor MLP. This is continuous across the `-pi/+pi` boundary. At an exactly
-reached waypoint, where direction is undefined, the target deterministically
-falls back to body-forward.
+reached active waypoint, where direction is undefined, the target
+deterministically falls back to body-forward until the waypoint transition is
+applied.
 
 Every online transition follows one ownership rule: construct teacher and
 student inputs from the same current state, obtain the frozen teacher mean as a

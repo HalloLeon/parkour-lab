@@ -124,7 +124,10 @@ class ParkourCurriculumCfg:
     promote_on_success: bool = True
     demote_on_failure: bool = True
 
-    success_threshold: float = 0.30
+    # A waypoint changes only after the root remains within this XY radius for
+    # ``waypoint_reach_hold_s``.
+    waypoint_reach_threshold: float = 0.20
+    waypoint_reach_hold_s: float = 0.10
     successes_to_promote: int = 2  # Avoids promotion from one lucky success
     failures_to_demote: int = (
         2  # Hysteresis prevents oscillating after one poor episode
@@ -149,8 +152,17 @@ class ParkourCurriculumCfg:
         if self.max_level < self.initial_level or self.max_level >= len(self.levels):
             raise ValueError("max_level is out of range.")
 
-        if self.success_threshold <= 0.0:
-            raise ValueError("success_threshold must be positive.")
+        if (
+            not np.isfinite(self.waypoint_reach_threshold)
+            or self.waypoint_reach_threshold <= 0.0
+        ):
+            raise ValueError("waypoint_reach_threshold must be positive.")
+
+        if (
+            not np.isfinite(self.waypoint_reach_hold_s)
+            or self.waypoint_reach_hold_s < 0.0
+        ):
+            raise ValueError("waypoint_reach_hold_s must be non-negative.")
 
         if self.successes_to_promote <= 0:
             raise ValueError("successes_to_promote must be positive.")

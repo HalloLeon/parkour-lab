@@ -6,12 +6,14 @@
 """Goal-directed task rewards."""
 
 import torch
+from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
 from .. import config
-from .._shared import navigation, runtime, stability, state, terrain
+from .._shared import robot, runtime, terrain
 from ..commands import get_min_clearance, get_target_speed
+from ..navigation import geometry, route
 
 
 def goal_heading_misalignment_l2(
@@ -36,11 +38,11 @@ def goal_heading_misalignment_l2(
         [num_envs]
     """
 
-    heading_error = navigation._heading_error_to_goal_xy(
+    heading_error = geometry._heading_error_to_goal_xy(
         env, goal_cfg=goal_cfg, asset_cfg=asset_cfg
     )
 
-    velocity_along_goal = navigation._velocity_along_goal_xy(
+    velocity_along_goal = geometry._velocity_along_goal_xy(
         env, goal_cfg=goal_cfg, asset_cfg=asset_cfg
     )
 
@@ -84,7 +86,7 @@ def goal_progress_xy_stable(
         [num_envs]
     """
 
-    current_distance = navigation._goal_distance_xy(
+    current_distance = geometry._goal_distance_xy(
         env, goal_cfg=goal_cfg, asset_cfg=asset_cfg
     )
 
@@ -100,18 +102,26 @@ def goal_progress_xy_stable(
         env, reference=current_distance, grace_steps=progress_cfg.reset_grace_steps
     )
 
+    # Switching from a reached waypoint to the next one makes the measured
+    # distance jump discontinuously. Suppress that single transition sample so
+    # route retargeting is not mistaken for motion away from the goal.
+    distance_reference_changed = torch.logical_or(
+        just_reset,
+        route.active_waypoint_changed_this_step(env),
+    )
+
     progress = runtime._difference_from_previous_env_buffer(
         env,
         buffer_name=distance_buffer_name,
         current_value=current_distance,
-        reset_mask=just_reset,
+        reset_mask=distance_reference_changed,
     )
 
-    root_delta_xy = state._root_xy_delta_from_previous(
+    root_delta_xy = robot._root_xy_delta_from_previous(
         env, buffer_name=root_xy_buffer_name, reset_mask=just_reset, asset_cfg=asset_cfg
     )
 
-    stable = stability._root_stability_mask(
+    stable = _root_stability_mask(
         env, stability_cfg=progress_cfg.stability, asset_cfg=asset_cfg
     )
 
@@ -130,7 +140,7 @@ def goal_progress_xy_stable(
         max=progress_cfg.max_negative_penalty,
     )
 
-    lateral_drift = navigation._lateral_drift_to_goal_xy(
+    lateral_drift = geometry._lateral_drift_to_goal_xy(
         env, root_delta_xy=root_delta_xy, goal_cfg=goal_cfg, asset_cfg=asset_cfg
     )
 
@@ -154,28 +164,16 @@ def goal_progress_xy_stable(
     )
 
 
-def reached_goal_xy_reward(
-    env: ManagerBasedRLEnv,
-    threshold: float = 0.25,
-    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """
-    Sparse success reward based on XY goal distance.
+def completed_course_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return a sparse bonus only for safely reaching the final waypoint.
 
     Returns:
         [num_envs]
     """
 
-    dist_to_goal = navigation._goal_distance_xy(env, goal_cfg, asset_cfg)
-    clearance = terrain._base_clearance(env, asset_cfg)
-
-    reached = dist_to_goal < threshold
-    clear_enough = clearance > get_min_clearance(env).to(
-        device=clearance.device, dtype=clearance.dtype
-    )
-
-    return torch.logical_and(reached, clear_enough).float()
+    # ManagerBasedRLEnv computes terminations before rewards. The success term
+    # advances intermediate waypoints and records this one-step completion event.
+    return route.course_completed_this_step(env).float()
 
 
 def velocity_along_goal_xy_capped(
@@ -206,7 +204,7 @@ def velocity_along_goal_xy_capped(
         [num_envs]
     """
 
-    velocity_along_goal = navigation._velocity_along_goal_xy(
+    velocity_along_goal = geometry._velocity_along_goal_xy(
         env, goal_cfg=goal_cfg, asset_cfg=asset_cfg
     )
 
@@ -250,3 +248,25 @@ def velocity_along_goal_xy_clearance_capped(
     )
 
     return reward * has_enough_clearance.to(dtype=reward.dtype)
+
+
+def _root_stability_mask(
+    env: ManagerBasedRLEnv,
+    stability_cfg: config.RootStabilityCfg,
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Gate positive progress on attitude, angular speed, and clearance."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    roll_pitch_speed = torch.linalg.norm(asset.data.root_ang_vel_b[:, :2], dim=-1)
+    tilt = torch.linalg.norm(asset.data.projected_gravity_b[:, :2], dim=-1)
+    clearance = terrain._base_clearance(env, asset_cfg)
+    min_clearance = get_min_clearance(env).to(
+        device=clearance.device,
+        dtype=clearance.dtype,
+    )
+    return (
+        (roll_pitch_speed < stability_cfg.max_roll_pitch_ang_speed)
+        & (tilt < stability_cfg.max_projected_gravity_xy_norm)
+        & (clearance > min_clearance)
+    )

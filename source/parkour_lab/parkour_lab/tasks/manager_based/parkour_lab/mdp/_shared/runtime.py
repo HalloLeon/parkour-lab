@@ -1,5 +1,4 @@
 import torch
-from isaaclab.assets import AssetBase
 from isaaclab.envs import ManagerBasedRLEnv
 
 
@@ -102,20 +101,6 @@ def _get_or_init_env_buffer(
         setattr(env, name, value.detach().clone())
 
     return getattr(env, name)
-
-
-def _get_scene_entity_or_none(env: ManagerBasedRLEnv, name: str) -> AssetBase | None:
-    """
-    Return a scene entity if it exists, otherwise None.
-
-    This keeps optional scene objects, such as an obstacle, from making
-    reward functions crash in simpler environments.
-    """
-
-    try:
-        return env.scene[name]
-    except KeyError:
-        return None
 
 
 def _linear_ramp(value: torch.Tensor, lower: float, upper: float) -> torch.Tensor:

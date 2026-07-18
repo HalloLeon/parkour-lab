@@ -1,9 +1,9 @@
 import torch
-from isaaclab.assets import AssetBase
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
-from .state import _root_forward_xy_w, _root_lin_vel_xy, _root_pos_env
+from .._shared.robot import _root_forward_xy_w, _root_lin_vel_xy, _root_pos_env
+from .route import active_waypoint_positions
 
 
 def _goal_direction_xy(
@@ -116,8 +116,7 @@ def _goal_pos_env(
         [num_envs, 3]
     """
 
-    goal: AssetBase = env.scene[goal_cfg.name]
-    return goal.data.root_pos_w - env.scene.env_origins
+    return active_waypoint_positions(env, goal_cfg)
 
 
 def _goal_vector_xy(

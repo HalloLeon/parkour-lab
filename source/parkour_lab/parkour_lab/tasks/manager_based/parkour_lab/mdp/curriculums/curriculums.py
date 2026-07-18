@@ -1,13 +1,13 @@
 from typing import Sequence
 
 import torch
-from isaaclab.assets import RigidObject
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.terrains import TerrainImporter
 
 from .._shared.runtime import _all_env_ids, _env_torch_device
 from ..commands import set_commands
+from ..navigation.route import reset_active_waypoints
 from . import config, episode_outcomes
 
 
@@ -159,14 +159,13 @@ def parkour_terrain_levels(
     )
 
 
-def reset_goal_and_commands_from_terrain_level(
+def reset_waypoints_and_commands_from_terrain_level(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor | None,
     curriculum_cfg: config.ParkourCurriculumCfg = config.DEFAULT_PARKOUR_CURRICULUM,
     goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
 ) -> None:
-    """
-    Reset goal pose and per-env command buffers based on the current terrain level.
+    """Reset the route cursor, goal marker, and commands for selected environments.
 
     The terrain level has already been updated by the CurriculumManager before
     reset events are applied.
@@ -184,52 +183,26 @@ def reset_goal_and_commands_from_terrain_level(
 
     env_ids = _all_env_ids(env, env_ids)
 
-    terrain = env.scene.terrain
-    if terrain is None or terrain.terrain_origins is None:
-        raise RuntimeError(
-            "reset_goal_and_commands_from_terrain_level requires generated terrain."
-        )
+    terrain: TerrainImporter = env.scene.terrain
+    _validate_terrain_layout(terrain, curriculum_cfg)
 
-    goal: RigidObject = env.scene[goal_cfg.name]
+    # Terrain row N is generated directly from curriculum level N, so the
+    # importer's row indices are already the logical course-level indices.
+    levels = terrain.terrain_levels[env_ids]
 
-    dtype = goal.data.default_root_state.dtype
-    num_reset_envs = env_ids.numel()
-
-    terrain_levels = terrain.terrain_levels[env_ids]
-
-    levels = _logical_level_from_terrain_level(
-        env=env,
-        terrain_level=terrain_levels,
-        curriculum_cfg=curriculum_cfg,
-    )
-
-    # ``goal_pos`` is derived from each course's final waypoint. This compatibility
-    # lookup will be replaced with a per-environment active-waypoint state.
-    goal_pos_by_level = _level_tensor("goal_pos", dtype=dtype)
     target_speed_by_level = _level_tensor("target_speed")
     min_clearance_by_level = _level_tensor("min_clearance")
 
-    level_goal_pos = goal_pos_by_level[levels]
-
-    goal_pos_w = level_goal_pos + env.scene.env_origins[env_ids]
-
-    # Root velocity has six values per environment:
-    #   [linear_x, linear_y, linear_z, angular_x, angular_y, angular_z].
-    # Therefore the batched tensor has shape [num_reset_envs, 6]. The goal is
-    # kinematic and stationary, so all linear and angular velocities are zero.
-    zero_velocity = torch.zeros((num_reset_envs, 6), device=env.device, dtype=dtype)
-
-    # Root pose has seven values per environment:
-    #   [position_x, position_y, position_z, quaternion_w, quaternion_x,
-    #    quaternion_y, quaternion_z].
-    # Select only the reset environments and clone to obtain a writable tensor
-    # with shape [num_reset_envs, 7]. Keep the configured orientation in columns
-    # 3:7 and replace only the XYZ position in columns 0:3.
-    goal_pose = goal.data.default_root_state[env_ids, :7].clone()
-    goal_pose[:, :3] = goal_pos_w
-
-    goal.write_root_pose_to_sim(goal_pose, env_ids=env_ids)
-    goal.write_root_velocity_to_sim(zero_velocity, env_ids=env_ids)
+    # Curriculum updates run before reset events, so ``levels`` already contains
+    # any promotion or demotion selected for this new episode. Reset only these
+    # environments to waypoint zero of that newly selected route.
+    reset_active_waypoints(
+        env,
+        env_ids,
+        levels,
+        curriculum_cfg,
+        goal_cfg,
+    )
 
     set_commands(
         env=env,
@@ -302,42 +275,6 @@ def _ensure_curriculum_stat_buffers(env: ManagerBasedRLEnv) -> None:
         env._parkour_last_level_change = torch.zeros(
             env.num_envs, device=env.device, dtype=torch.long
         )
-
-
-def _logical_level_from_terrain_level(
-    env: ManagerBasedRLEnv,
-    terrain_level: torch.Tensor,
-    curriculum_cfg: config.ParkourCurriculumCfg,
-) -> torch.Tensor:
-    """Map terrain rows one-to-one to the authoritative logical levels.
-
-    ``terrain_level`` contains integer row indices maintained by
-    ``TerrainImporter``; it is not the normalized floating-point difficulty
-    passed to the terrain-generation function. The parkour configuration
-    enforces exactly one terrain row per logical level, so the mapping is:
-
-        terrain row 0 -> logical level 0
-        terrain row 1 -> logical level 1
-        ...
-
-    Consequently, no division or proportional scaling is required. If the
-    number of terrain rows and logical levels ever differs, the layout
-    validation below raises instead of silently applying an ambiguous mapping.
-    """
-
-    terrain = env.scene.terrain
-
-    if terrain is None or terrain.terrain_origins is None:
-        raise RuntimeError("Generated terrain is required.")
-
-    _validate_terrain_layout(terrain, curriculum_cfg)
-
-    # This is already the logical level because physical row N is generated
-    # directly from curriculum level N. Only normalize its device and dtype.
-    logical_level = terrain_level.to(device=env.device, dtype=torch.long)
-
-    # max_level may intentionally expose only a prefix of the defined levels.
-    return torch.clamp(logical_level, min=0, max=curriculum_cfg.max_level)
 
 
 def _validate_terrain_layout(

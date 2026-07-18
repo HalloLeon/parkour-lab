@@ -11,7 +11,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
 from .. import config
-from .._shared import contact, runtime, state
+from .._shared import contact, robot, runtime
 
 
 def feet_stumble(
@@ -56,7 +56,7 @@ def joint_deviation_l2(
         [num_envs]
     """
 
-    joint_error = state._selected_joint_pos_error(env, asset_cfg)
+    joint_error = robot._selected_joint_pos_error(env, asset_cfg)
 
     return torch.sum(joint_error.square(), dim=-1)
 
@@ -124,7 +124,7 @@ def rapid_feet_motion_l2(
         [num_envs]
     """
 
-    foot_speed = state._selected_body_speed_w(env, asset_cfg)
+    foot_speed = robot._selected_body_speed_w(env, asset_cfg)
 
     force_norm = contact._force_norm_mask(env, sensor_cfg=sensor_cfg)
 

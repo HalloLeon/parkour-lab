@@ -12,7 +12,7 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
 from .. import config
-from .._shared import runtime, state
+from .._shared import robot, runtime
 
 
 @dataclass(frozen=True)
@@ -36,10 +36,10 @@ class _RootChatterState:
         """Read current root/core signals from the environment."""
 
         return cls(
-            root_z=state._root_height_env(env, asset_cfg),
-            root_z_vel=state._root_lin_vel_z(env, asset_cfg),
-            projected_gravity_xy=state._root_projected_gravity_xy(env, asset_cfg),
-            roll_pitch_rate=state._root_roll_pitch_rate(env, asset_cfg),
+            root_z=robot._root_height_env(env, asset_cfg),
+            root_z_vel=robot._root_lin_vel_z(env, asset_cfg),
+            projected_gravity_xy=robot._root_projected_gravity_xy(env, asset_cfg),
+            roll_pitch_rate=robot._root_roll_pitch_rate(env, asset_cfg),
         )
 
     @classmethod
