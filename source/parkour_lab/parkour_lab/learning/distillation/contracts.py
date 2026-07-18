@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
     from tensordict import TensorDict
 
-TEACHER_INTERFACE_VERSION = 3
+TEACHER_INTERFACE_VERSION = 4
 """Serialization version of the compact teacher interface manifest."""
 
 DEPLOYABLE_STATE_GROUP = "policy"
@@ -117,9 +117,7 @@ class TeacherCheckpoint:
         return cast(dict[str, object], asdict(self))
 
 
-def assert_teacher_interface_matches(
-    expected: dict[str, object], actual: dict[str, object], *, context: str
-) -> None:
+def assert_teacher_interface_matches(expected: dict[str, object], actual: dict[str, object], *, context: str) -> None:
     """Raise a readable error when a checkpoint-facing interface changed."""
 
     # Compare every nested dictionary value and list element while retaining
@@ -141,9 +139,7 @@ def assert_teacher_interface_matches(
 
     # ``context`` identifies the operation performing the check, for example
     # teacher playback or distillation, in the final error message.
-    raise InterfaceMismatchError(
-        f"{context} changed the frozen teacher interface:\n{detail}"
-    )
+    raise InterfaceMismatchError(f"{context} changed the frozen teacher interface:\n{detail}")
 
 
 def build_teacher_interface(
@@ -178,9 +174,7 @@ def build_teacher_interface(
         # A configured route is unusable if the environment did not compute a
         # corresponding observation tensor.
         if group_name not in observations:
-            raise InterfaceMismatchError(
-                f"The teacher routes missing observation group {group_name!r}."
-            )
+            raise InterfaceMismatchError(f"The teacher routes missing observation group {group_name!r}.")
 
         # ``base_env.cfg`` is the resolved ``ParkourLabEnvCfg`` retained by the
         # running environment. It contains the declarative observation terms
@@ -223,9 +217,7 @@ def build_teacher_interface(
             {
                 "name": group_name,
                 "dimension": _flat_dimension(observations[group_name]),
-                "concatenate_terms": bool(
-                    observation_manager.group_obs_concatenate[group_name]
-                ),
+                "concatenate_terms": bool(observation_manager.group_obs_concatenate[group_name]),
                 "enable_corruption": bool(group_cfg.enable_corruption),
                 "terms": terms,
             }
@@ -245,6 +237,8 @@ def build_teacher_interface(
     height_obs_cfg = base_env.cfg.observations.terrain.height_scan.params["obs_cfg"]
     scanner_cfg = base_env.cfg.scene.height_scanner
     curriculum_cfg = base_env.cfg.parkour_curriculum
+    terrain_generator_cfg = base_env.cfg.scene.ground.terrain_generator
+    course_terrain_cfg = terrain_generator_cfg.sub_terrains["parkour_course"]
     policy_cfg = agent_cfg.policy
 
     return {
@@ -254,13 +248,9 @@ def build_teacher_interface(
         # all three are concatenated by the current PPO implementation.
         "information_contract": {
             "deployable_state_group": DEPLOYABLE_STATE_GROUP,
-            "deployable_state_dimension": _flat_dimension(
-                observations[DEPLOYABLE_STATE_GROUP]
-            ),
+            "deployable_state_dimension": _flat_dimension(observations[DEPLOYABLE_STATE_GROUP]),
             "oracle_heading_group": ORACLE_HEADING_GROUP,
-            "oracle_heading_dimension": _flat_dimension(
-                observations[ORACLE_HEADING_GROUP]
-            ),
+            "oracle_heading_dimension": _flat_dimension(observations[ORACLE_HEADING_GROUP]),
             "heading_representation": "yaw_aligned_unit_xy",
             # The target now changes along each ordered route. Record both the
             # routes and switching rule so a final-goal checkpoint cannot be
@@ -268,30 +258,21 @@ def build_teacher_interface(
             "oracle_heading_source": {
                 "kind": "active_course_waypoint",
                 "waypoint_routes_m": [
-                    [list(waypoint.position) for waypoint in level.waypoints]
-                    for level in curriculum_cfg.levels
+                    [list(waypoint.position) for waypoint in level.waypoints] for level in curriculum_cfg.levels
                 ],
-                "reach_threshold_m": float(
-                    curriculum_cfg.waypoint_reach_threshold
-                ),
+                "reach_threshold_m": float(curriculum_cfg.waypoint_reach_threshold),
                 "reach_hold_s": float(curriculum_cfg.waypoint_reach_hold_s),
                 "final_requires_min_clearance": True,
             },
             "privileged_terrain_group": PRIVILEGED_TERRAIN_GROUP,
-            "privileged_terrain_dimension": _flat_dimension(
-                observations[PRIVILEGED_TERRAIN_GROUP]
-            ),
+            "privileged_terrain_dimension": _flat_dimension(observations[PRIVILEGED_TERRAIN_GROUP]),
         },
         # Record the actor input layout and preprocessing performed by RSL-RL.
         "actor": {
             "observation_groups": groups,
-            "input_dimension": sum(
-                _flat_dimension(observations[name]) for name in actor_groups
-            ),
+            "input_dimension": sum(_flat_dimension(observations[name]) for name in actor_groups),
             "network": {
-                "class_name": getattr(
-                    policy_cfg, "class_name", type(policy_cfg).__name__
-                ),
+                "class_name": getattr(policy_cfg, "class_name", type(policy_cfg).__name__),
                 "hidden_dimensions": list(policy_cfg.actor_hidden_dims),
                 "activation": policy_cfg.activation,
                 "observation_normalization": bool(policy_cfg.actor_obs_normalization),
@@ -315,6 +296,15 @@ def build_teacher_interface(
             "mesh_prim_paths": list(scanner_cfg.mesh_prim_paths),
             "max_distance_m": float(scanner_cfg.max_distance),
             "update_period_s": float(scanner_cfg.update_period),
+        },
+        # Terrain support patches determine both the physical collision mesh
+        # and the privileged ray values seen by the teacher. Freeze the full
+        # declarative courses so a continuous-ground checkpoint cannot be
+        # mistaken for one trained on the physically segmented gap course.
+        "terrain_course": {
+            "tile_size_m": _simple_value(terrain_generator_cfg.size),
+            "ground_thickness_m": float(course_terrain_cfg.ground_thickness),
+            "levels": [level.metadata() for level in curriculum_cfg.levels],
         },
         # Record how network outputs map to ordered low-level joint commands.
         "action": {
@@ -350,13 +340,9 @@ def load_teacher_checkpoint(
 ) -> TeacherCheckpoint:
     """Load one teacher checkpoint identity and its training interface."""
 
-    resolved_checkpoint_path = os.path.abspath(
-        os.path.expanduser(checkpoint_path)
-    )
+    resolved_checkpoint_path = os.path.abspath(os.path.expanduser(checkpoint_path))
     if not os.path.isfile(resolved_checkpoint_path):
-        raise FileNotFoundError(
-            f"Teacher checkpoint does not exist: {resolved_checkpoint_path}"
-        )
+        raise FileNotFoundError(f"Teacher checkpoint does not exist: {resolved_checkpoint_path}")
 
     interface_path = os.path.join(
         os.path.dirname(resolved_checkpoint_path),
@@ -365,8 +351,7 @@ def load_teacher_checkpoint(
     )
     if not os.path.isfile(interface_path):
         raise FileNotFoundError(
-            "The teacher checkpoint has no training interface manifest. "
-            f"Expected: {interface_path}."
+            "The teacher checkpoint has no training interface manifest. " f"Expected: {interface_path}."
         )
 
     with open(interface_path, encoding="utf-8") as interface_file:
@@ -380,10 +365,7 @@ def load_teacher_checkpoint(
         raise ValueError(f"Teacher interface is missing or invalid: {interface_path}")
     teacher_interface = cast(dict[str, object], interface)
     if teacher_interface.get("interface_version") != TEACHER_INTERFACE_VERSION:
-        raise ValueError(
-            "Teacher interface uses an unsupported serialization version: "
-            f"{interface_path}"
-        )
+        raise ValueError("Teacher interface uses an unsupported serialization version: " f"{interface_path}")
     teacher_interface_hash = interface_sha256(teacher_interface)
     if payload.get("teacher_interface_sha256") != teacher_interface_hash:
         raise ValueError(f"Teacher interface hash is invalid: {interface_path}")
@@ -428,9 +410,7 @@ def _differences(expected: object, actual: object, path: str = "interface") -> l
     """Return readable differences between nested JSON values."""
 
     if type(expected) is not type(actual):
-        return [
-            f"{path}: expected type {type(expected).__name__}, got {type(actual).__name__}"
-        ]
+        return [f"{path}: expected type {type(expected).__name__}, got {type(actual).__name__}"]
     if isinstance(expected, dict):
         expected_mapping = cast(dict[str, object], expected)
         actual_mapping = cast(dict[str, object], actual)
@@ -438,38 +418,22 @@ def _differences(expected: object, actual: object, path: str = "interface") -> l
         for key in sorted(set(expected_mapping) | set(actual_mapping)):
             child_path = f"{path}.{key}"
             if key not in expected_mapping:
-                differences.append(
-                    f"{child_path}: unexpected value {actual_mapping[key]!r}"
-                )
+                differences.append(f"{child_path}: unexpected value {actual_mapping[key]!r}")
             elif key not in actual_mapping:
-                differences.append(
-                    f"{child_path}: missing; expected {expected_mapping[key]!r}"
-                )
+                differences.append(f"{child_path}: missing; expected {expected_mapping[key]!r}")
             else:
-                differences.extend(
-                    _differences(
-                        expected_mapping[key], actual_mapping[key], child_path
-                    )
-                )
+                differences.extend(_differences(expected_mapping[key], actual_mapping[key], child_path))
         return differences
     if isinstance(expected, list):
         expected_list = cast(list[object], expected)
         actual_list = cast(list[object], actual)
         if len(expected_list) != len(actual_list):
-            return [
-                f"{path}: expected length {len(expected_list)}, got {len(actual_list)}"
-            ]
+            return [f"{path}: expected length {len(expected_list)}, got {len(actual_list)}"]
         differences = []
-        for index, (expected_item, actual_item) in enumerate(
-            zip(expected_list, actual_list)
-        ):
-            differences.extend(
-                _differences(expected_item, actual_item, f"{path}[{index}]")
-            )
+        for index, (expected_item, actual_item) in enumerate(zip(expected_list, actual_list)):
+            differences.extend(_differences(expected_item, actual_item, f"{path}[{index}]"))
         return differences
-    return (
-        [] if expected == actual else [f"{path}: expected {expected!r}, got {actual!r}"]
-    )
+    return [] if expected == actual else [f"{path}: expected {expected!r}, got {actual!r}"]
 
 
 def _flat_dimension(tensor: torch.Tensor) -> int:
@@ -532,10 +496,7 @@ def _simple_value(value: object) -> object:
         converted_items = [_simple_value(item) for item in value]
         return (
             converted_items
-            if all(
-                item is not None or source is None
-                for item, source in zip(converted_items, value)
-            )
+            if all(item is not None or source is None for item, source in zip(converted_items, value))
             else None
         )
     if isinstance(value, dict):

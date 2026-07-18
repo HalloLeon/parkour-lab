@@ -19,6 +19,7 @@ from .reward_terms.goal import (
     velocity_along_goal_xy_clearance_capped,
 )
 from .reward_terms.limb import (
+    feet_edge,
     feet_stumble,
     joint_deviation_l2,
     no_feet_contact,
@@ -39,6 +40,7 @@ __all__ = [
     "base_clearance_below_l2",
     # Limb regularizers.
     "joint_deviation_l2",
+    "feet_edge",
     "feet_stumble",
     "no_feet_contact",
     "rapid_feet_motion_l2",

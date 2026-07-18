@@ -15,6 +15,7 @@ from .levels import (
     ParkourStructureCfg,
     ParkourSupportRegionCfg,
     ParkourWaypointCfg,
+    base_ground_structures,
     coerce_and_validate_levels,
     coerce_level_cfg,
 )
@@ -27,15 +28,128 @@ _OBSTACLE_X_RANGE_M = (
     _OBSTACLE_CENTER_X_M + 0.5 * _OBSTACLE_LENGTH_M,
 )
 _OBSTACLE_Y_RANGE_M = (-0.5 * _OBSTACLE_WIDTH_M, 0.5 * _OBSTACLE_WIDTH_M)
+_TERRAIN_X_RANGE_M = (-4.0, 4.0)
+_TERRAIN_Y_RANGE_M = (-2.0, 2.0)
+_GAP_CENTER_X_M = 2.0
+_GAP_WIDTH_M = 0.4
+_GAP_X_RANGE_M = (
+    _GAP_CENTER_X_M - 0.5 * _GAP_WIDTH_M,
+    _GAP_CENTER_X_M + 0.5 * _GAP_WIDTH_M,
+)
 
 # Name, obstacle family, difficulty rank, obstacle height, target speed, and
 # minimum clearance for the shared default course layout below.
-_DEFAULT_LEVEL_PARAMETERS = (
+_DEFAULT_STEP_LEVEL_PARAMETERS = (
     ("level_0_flat_marker", "flat_marker", 0.0, 0.02, 0.60, 0.24),
     ("level_1_low_step", "step", 1.0, 0.05, 0.70, 0.25),
     ("level_2_medium_step", "step", 2.0, 0.08, 0.75, 0.26),
-    ("level_3_higher_step", "step", 3.0, 0.12, 0.80, 0.27),
 )
+
+
+def _gap_level() -> ParkourLevelCfg:
+    """Create the first course whose base supports leave a physical gap."""
+
+    return ParkourLevelCfg(
+        name="level_3_gap",
+        obstacle_family="gap",
+        waypoints=(
+            ParkourWaypointCfg(position=(1.5, 0.0, 0.01)),
+            ParkourWaypointCfg(position=(2.5, 0.0, 0.01)),
+            ParkourWaypointCfg(position=(3.8, 0.0, 0.01)),
+        ),
+        structures=(),
+        support_regions=(
+            ParkourSupportRegionCfg(
+                name="approach_ground",
+                structure_name=None,
+                x_range=(_TERRAIN_X_RANGE_M[0], _GAP_X_RANGE_M[0]),
+                y_range=_TERRAIN_Y_RANGE_M,
+                surface_z=0.0,
+            ),
+            ParkourSupportRegionCfg(
+                name="landing_ground",
+                structure_name=None,
+                x_range=(_GAP_X_RANGE_M[1], _TERRAIN_X_RANGE_M[1]),
+                y_range=_TERRAIN_Y_RANGE_M,
+                surface_z=0.0,
+            ),
+        ),
+        target_speed=0.80,
+        min_clearance=0.27,
+        difficulty=ParkourDifficultyCfg(
+            order=3.0,
+            parameters={"gap_width_m": _GAP_WIDTH_M},
+        ),
+    )
+
+
+def _step_level(
+    name: str,
+    obstacle_family: str,
+    difficulty_order: float,
+    obstacle_height: float,
+    target_speed: float,
+    min_clearance: float,
+) -> ParkourLevelCfg:
+    """Create one box-step course using the shared default layout."""
+
+    return ParkourLevelCfg(
+        name=name,
+        obstacle_family=obstacle_family,
+        waypoints=(
+            ParkourWaypointCfg(position=(1.0, 0.0, 0.01)),
+            ParkourWaypointCfg(
+                position=(
+                    _OBSTACLE_CENTER_X_M,
+                    0.0,
+                    obstacle_height + 0.01,
+                )
+            ),
+            ParkourWaypointCfg(position=(3.8, 0.0, 0.01)),
+        ),
+        structures=(
+            ParkourStructureCfg(
+                name="center_obstacle",
+                mesh_factory=trimesh.creation.box,
+                mesh_kwargs={
+                    "extents": (
+                        _OBSTACLE_LENGTH_M,
+                        _OBSTACLE_WIDTH_M,
+                        obstacle_height,
+                    )
+                },
+                position=(
+                    _OBSTACLE_CENTER_X_M,
+                    0.0,
+                    0.5 * obstacle_height,
+                ),
+            ),
+        ),
+        support_regions=(
+            ParkourSupportRegionCfg(
+                name="ground",
+                structure_name=None,
+                x_range=_TERRAIN_X_RANGE_M,
+                y_range=_TERRAIN_Y_RANGE_M,
+                surface_z=0.0,
+            ),
+            # The named support only annotates the traversable box top; the
+            # structure above remains its sole source of collision geometry.
+            ParkourSupportRegionCfg(
+                name="center_obstacle_top",
+                structure_name="center_obstacle",
+                x_range=_OBSTACLE_X_RANGE_M,
+                y_range=_OBSTACLE_Y_RANGE_M,
+                surface_z=obstacle_height,
+            ),
+        ),
+        target_speed=target_speed,
+        min_clearance=min_clearance,
+        difficulty=ParkourDifficultyCfg(
+            order=difficulty_order,
+            parameters={"obstacle_height_m": obstacle_height},
+        ),
+    )
 
 
 @configclass
@@ -47,62 +161,13 @@ class ParkourCurriculumCfg:
     """
 
     levels: tuple[ParkourLevelCfg, ...] = tuple(
-        ParkourLevelCfg(
-            name=name,
-            obstacle_family=obstacle_family,
-            waypoints=(
-                ParkourWaypointCfg(position=(1.0, 0.0, 0.01)),
-                ParkourWaypointCfg(
-                    position=(
-                        _OBSTACLE_CENTER_X_M,
-                        0.0,
-                        obstacle_height + 0.01,
-                    )
-                ),
-                ParkourWaypointCfg(position=(3.8, 0.0, 0.01)),
-            ),
-            structures=(
-                ParkourStructureCfg(
-                    name="center_obstacle",
-                    mesh_factory=trimesh.creation.box,
-                    mesh_kwargs={
-                        "extents": (
-                            _OBSTACLE_LENGTH_M,
-                            _OBSTACLE_WIDTH_M,
-                            obstacle_height,
-                        )
-                    },
-                    position=(
-                        _OBSTACLE_CENTER_X_M,
-                        0.0,
-                        0.5 * obstacle_height,
-                    ),
-                ),
-            ),
-            # This annotation describes the traversable top of the box;
-            # generic terrain code does not inspect the mesh's shape.
-            support_regions=(
-                ParkourSupportRegionCfg(
-                    name="ground",
-                    structure_name=None,
-                    x_range=(-4.0, 4.0),
-                    y_range=(-2.0, 2.0),
-                    surface_z=0.0,
-                ),
-                ParkourSupportRegionCfg(
-                    name="center_obstacle_top",
-                    structure_name="center_obstacle",
-                    x_range=_OBSTACLE_X_RANGE_M,
-                    y_range=_OBSTACLE_Y_RANGE_M,
-                    surface_z=obstacle_height,
-                ),
-            ),
-            target_speed=target_speed,
-            min_clearance=min_clearance,
-            difficulty=ParkourDifficultyCfg(
-                order=difficulty_order,
-                parameters={"obstacle_height_m": obstacle_height},
-            ),
+        _step_level(
+            name,
+            obstacle_family,
+            difficulty_order,
+            obstacle_height,
+            target_speed,
+            min_clearance,
         )
         for (
             name,
@@ -111,8 +176,8 @@ class ParkourCurriculumCfg:
             obstacle_height,
             target_speed,
             min_clearance,
-        ) in _DEFAULT_LEVEL_PARAMETERS
-    )
+        ) in _DEFAULT_STEP_LEVEL_PARAMETERS
+    ) + (_gap_level(),)
 
     initial_level: int = 1
     # Balance the initial population over levels 0..initial_level. This gives
@@ -134,6 +199,11 @@ class ParkourCurriculumCfg:
     )
 
     base_contact_threshold: float = 1.0
+
+    # A contacted foot within this metric distance of a support boundary is
+    # counted by the edge penalty.
+    edge_width_threshold: float = 0.03
+    foot_edge_contact_threshold: float = 1.0
 
     def __post_init__(self) -> None:
         self.validate_configuration()
@@ -173,6 +243,18 @@ class ParkourCurriculumCfg:
         if self.base_contact_threshold < 0.0:
             raise ValueError("base_contact_threshold must be non-negative.")
 
+        if (
+            not np.isfinite(self.edge_width_threshold)
+            or self.edge_width_threshold <= 0.0
+        ):
+            raise ValueError("edge_width_threshold must be positive.")
+
+        if (
+            not np.isfinite(self.foot_edge_contact_threshold)
+            or self.foot_edge_contact_threshold < 0.0
+        ):
+            raise ValueError("foot_edge_contact_threshold must be non-negative.")
+
 
 DEFAULT_PARKOUR_CURRICULUM = ParkourCurriculumCfg()
 
@@ -180,21 +262,21 @@ DEFAULT_PARKOUR_CURRICULUM = ParkourCurriculumCfg()
 def parkour_terrain(
     difficulty: float, cfg: ParkourTerrainCfg
 ) -> tuple[list[trimesh.Trimesh], np.ndarray]:
-    """Generate a terrain tile by composing configured mesh factories."""
+    """Generate a terrain tile from base-support patches and structures."""
 
     level = coerce_level_cfg(
         cfg.levels[difficulty_to_level(difficulty, len(cfg.levels))]
     )
+    level.validate_terrain_size(cfg.size)
     terrain_center = _terrain_local_center(cfg)
-    ground = ParkourStructureCfg(
-        name="ground",
+    ground_structures = base_ground_structures(
+        level,
         mesh_factory=trimesh.creation.box,
-        mesh_kwargs={"extents": (*cfg.size, cfg.ground_thickness)},
-        position=(0.0, 0.0, -0.5 * cfg.ground_thickness),
+        ground_thickness=cfg.ground_thickness,
     )
 
     meshes: list[trimesh.Trimesh] = []
-    for structure in (ground, *level.structures):
+    for structure in (*ground_structures, *level.structures):
         meshes.extend(_structure_meshes(structure, terrain_center))
 
     return meshes, terrain_center.copy()

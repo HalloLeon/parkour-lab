@@ -2,14 +2,45 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from importlib import import_module
-import math
 from typing import Any, cast
 
 WAYPOINT_SURFACE_TOLERANCE_M = 0.05
 """Maximum marker-height offset accepted above a supporting surface."""
+
+
+@dataclass(frozen=True)
+class ParkourDifficultyCfg:
+    """Explicit curriculum rank and family-specific numeric parameters."""
+
+    # Sortable curriculum rank used to arrange levels from easiest to hardest.
+    # Larger values represent harder levels; equal values represent the same
+    # rank and are allowed when two courses have comparable difficulty.
+    # This is not Isaac Lab's normalized terrain difficulty in ``[0.0, 1.0]``;
+    # values such as 0.0, 1.0, 2.0, and intermediate ranks are therefore valid.
+    order: float
+
+    # Obstacle-family-specific values that describe what makes this level hard.
+    parameters: dict[str, float]
+
+    def __post_init__(self) -> None:
+        order = _float_value(self.order, field_name="curriculum difficulty rank")
+        if order < 0.0:
+            raise ValueError("Curriculum difficulty rank must be non-negative.")
+        object.__setattr__(self, "order", order)
+        object.__setattr__(
+            self,
+            "parameters",
+            _float_mapping(self.parameters, field_name="difficulty parameters"),
+        )
+
+    def metadata(self) -> dict[str, object]:
+        """Return a JSON-compatible difficulty description."""
+
+        return {"order": self.order, "parameters": dict(self.parameters)}
 
 
 @dataclass(frozen=True)
@@ -83,25 +114,6 @@ class ParkourStructureCfg:
 
 
 @dataclass(frozen=True)
-class ParkourWaypointCfg:
-    """One ordered course waypoint in terrain-local XYZ coordinates."""
-
-    position: tuple[float, float, float]
-
-    def __post_init__(self) -> None:
-        object.__setattr__(
-            self,
-            "position",
-            _float_triplet(self.position, field_name="waypoint position"),
-        )
-
-    def metadata(self) -> dict[str, object]:
-        """Return a JSON-compatible waypoint description."""
-
-        return {"position": list(self.position)}
-
-
-@dataclass(frozen=True)
 class ParkourSupportRegionCfg:
     """Explicit horizontal surface on which a course waypoint may be placed.
 
@@ -111,19 +123,21 @@ class ParkourSupportRegionCfg:
     configuration validation to individual shapes and mesh-inspection rules.
     A support region therefore records the intended traversable rectangle
     explicitly. The level uses it to reject a final waypoint that is outside a
-    configured surface, and terrain validation uses the ground region to check
-    that its footprint agrees with the generated tile.
+    configured surface. Base-ground regions also define the rectangular ground
+    patches emitted by the terrain generator, so leaving space between two of
+    them creates a physical gap rather than metadata over a continuous slab.
 
-    ``structure_name`` associates an elevated region with its physical mesh;
-    ``None`` denotes the base ground created by the terrain generator. The
-    annotation creates no geometry and is currently limited to horizontal,
+    ``structure_name`` associates an elevated region with its separately
+    configured physical mesh; ``None`` denotes one generated base-ground
+    patch. Named regions remain annotations and do not duplicate their
+    structure geometry. Regions are currently limited to horizontal,
     axis-aligned rectangles.
     """
 
     name: str
 
     # Name of the physical structure whose top surface this annotation
-    # describes. ``None`` refers to the generated base ground instead.
+    # describes. ``None`` makes this region a generated base-ground patch.
     structure_name: str | None
 
     x_range: tuple[float, float]
@@ -151,19 +165,36 @@ class ParkourSupportRegionCfg:
             _float_value(self.surface_z, field_name=f"{self.name} surface_z"),
         )
 
+    def boundary_segments_xy(
+        self,
+    ) -> tuple[
+        tuple[tuple[float, float], tuple[float, float]],
+        tuple[tuple[float, float], tuple[float, float]],
+        tuple[tuple[float, float], tuple[float, float]],
+        tuple[tuple[float, float], tuple[float, float]],
+    ]:
+        """Return the four ordered XY boundary segments of this support.
+
+        The runtime edge penalty consumes these segments directly. Keeping the
+        representation in metric course coordinates avoids a resolution-bound
+        height-field mask and gives every environment the same exact geometry.
+        """
+
+        x_min, x_max = self.x_range
+        y_min, y_max = self.y_range
+        return (
+            ((x_min, y_min), (x_max, y_min)),
+            ((x_max, y_min), (x_max, y_max)),
+            ((x_max, y_max), (x_min, y_max)),
+            ((x_min, y_max), (x_min, y_min)),
+        )
+
     def contains_xy(self, point: tuple[float, ...]) -> bool:
         """Return whether a point lies over this support's closed XY footprint."""
 
         return (
             self.x_range[0] <= point[0] <= self.x_range[1]
             and self.y_range[0] <= point[1] <= self.y_range[1]
-        )
-
-    def supports_waypoint(self, position: tuple[float, float, float]) -> bool:
-        """Return whether a waypoint lies on this support within marker tolerance."""
-
-        return self.contains_xy(position) and (
-            abs(position[2] - self.surface_z) <= WAYPOINT_SURFACE_TOLERANCE_M
         )
 
     def metadata(self) -> dict[str, object]:
@@ -177,36 +208,31 @@ class ParkourSupportRegionCfg:
             "surface_z": self.surface_z,
         }
 
+    def supports_waypoint(self, position: tuple[float, float, float]) -> bool:
+        """Return whether a waypoint lies on this support within marker tolerance."""
+
+        return self.contains_xy(position) and (
+            abs(position[2] - self.surface_z) <= WAYPOINT_SURFACE_TOLERANCE_M
+        )
+
 
 @dataclass(frozen=True)
-class ParkourDifficultyCfg:
-    """Explicit curriculum rank and family-specific numeric parameters."""
+class ParkourWaypointCfg:
+    """One ordered course waypoint in terrain-local XYZ coordinates."""
 
-    # Sortable curriculum rank used to arrange levels from easiest to hardest.
-    # Larger values represent harder levels; equal values represent the same
-    # rank and are allowed when two courses have comparable difficulty.
-    # This is not Isaac Lab's normalized terrain difficulty in ``[0.0, 1.0]``;
-    # values such as 0.0, 1.0, 2.0, and intermediate ranks are therefore valid.
-    order: float
-
-    # Obstacle-family-specific values that describe what makes this level hard.
-    parameters: dict[str, float]
+    position: tuple[float, float, float]
 
     def __post_init__(self) -> None:
-        order = _float_value(self.order, field_name="curriculum difficulty rank")
-        if order < 0.0:
-            raise ValueError("Curriculum difficulty rank must be non-negative.")
-        object.__setattr__(self, "order", order)
         object.__setattr__(
             self,
-            "parameters",
-            _float_mapping(self.parameters, field_name="difficulty parameters"),
+            "position",
+            _float_triplet(self.position, field_name="waypoint position"),
         )
 
     def metadata(self) -> dict[str, object]:
-        """Return a JSON-compatible difficulty description."""
+        """Return a JSON-compatible waypoint description."""
 
-        return {"order": self.order, "parameters": dict(self.parameters)}
+        return {"position": list(self.position)}
 
 
 @dataclass(frozen=True)
@@ -230,9 +256,9 @@ class ParkourLevelCfg:
     # tile center. A flat course may leave this tuple empty.
     structures: tuple[ParkourStructureCfg, ...]
 
-    # Traversable horizontal surfaces supporting waypoints. Each region
-    # describes either the base ground or a surface associated with a named
-    # structure, without assuming a particular mesh shape.
+    # Traversable horizontal surfaces supporting waypoints. A base-ground
+    # region (``structure_name=None``) also produces one collision patch;
+    # named regions annotate a surface of existing structure geometry.
     support_regions: tuple[ParkourSupportRegionCfg, ...]
 
     # Desired velocity toward the active goal in meters per second. It is
@@ -284,81 +310,6 @@ class ParkourLevelCfg:
         self._validate_final_waypoint()
         self._validate_training_targets()
 
-    def _validate_support_references(
-        self,
-        structure_by_name: dict[str, ParkourStructureCfg],
-    ) -> None:
-        """Require every elevated support to reference physical course geometry."""
-
-        for region in self.support_regions:
-            # ``None`` represents the separately generated base ground, whose
-            # footprint is checked later by ``validate_terrain_size``.
-            if region.structure_name is None:
-                continue
-
-            # The support annotation is authoritative for arbitrary meshes, but
-            # it must still identify physical geometry belonging to this level.
-            if region.structure_name not in structure_by_name:
-                raise ValueError(
-                    f"{self.name}: support region {region.name!r} refers to unknown "
-                    f"structure {region.structure_name!r}."
-                )
-
-    def _validate_final_waypoint(self) -> None:
-        """Require the final waypoint to lie on a configured support region."""
-
-        final_position = self.waypoints[-1].position
-        if not any(
-            region.supports_waypoint(final_position) for region in self.support_regions
-        ):
-            raise ValueError(
-                f"{self.name}: final waypoint must lie on a valid support region."
-            )
-
-    def _validate_training_targets(self) -> None:
-        """Validate scalar training targets and store them as finite floats."""
-
-        target_speed = _float_value(self.target_speed, field_name="target_speed")
-        if target_speed <= 0.0:
-            raise ValueError(f"{self.name}: target_speed must be positive.")
-        object.__setattr__(self, "target_speed", target_speed)
-
-        min_clearance = _float_value(
-            self.min_clearance,
-            field_name="min_clearance",
-        )
-        if min_clearance < 0.0:
-            raise ValueError(f"{self.name}: min_clearance must be non-negative.")
-        object.__setattr__(self, "min_clearance", min_clearance)
-
-    def validate_terrain_size(self, size: tuple[float, float]) -> None:
-        """Validate base-ground annotations against the generated terrain tile."""
-
-        size_x, size_y = _float_pair(size, field_name="terrain size")
-        if size_x <= 0.0 or size_y <= 0.0:
-            raise ValueError("terrain size must be positive.")
-
-        ground_x_range = (-0.5 * size_x, 0.5 * size_x)
-        ground_y_range = (-0.5 * size_y, 0.5 * size_y)
-        base_regions = [
-            region for region in self.support_regions if region.structure_name is None
-        ]
-        if len(base_regions) > 1:
-            raise ValueError(
-                f"{self.name}: the generated base ground may have at most one "
-                "support-region annotation."
-            )
-        for region in base_regions:
-            if not (
-                _pairs_close(region.x_range, ground_x_range)
-                and _pairs_close(region.y_range, ground_y_range)
-                and math.isclose(region.surface_z, 0.0, abs_tol=1.0e-9)
-            ):
-                raise ValueError(
-                    f"{self.name}: base-ground support region {region.name!r} "
-                    "must match the generated terrain tile at z=0."
-                )
-
     @property
     def goal_pos(self) -> tuple[float, float, float]:
         """Return the final course waypoint for metadata compatibility."""
@@ -381,6 +332,179 @@ class ParkourLevelCfg:
             # tooling; runtime navigation uses the ordered ``waypoints`` above.
             "goal_pos": list(self.goal_pos),
         }
+
+    def validate_terrain_size(self, size: tuple[float, float]) -> None:
+        """Validate base-ground patches against the generated terrain tile."""
+
+        size_x, size_y = _float_pair(size, field_name="terrain size")
+        if size_x <= 0.0 or size_y <= 0.0:
+            raise ValueError("terrain size must be positive.")
+
+        ground_x_range = (-0.5 * size_x, 0.5 * size_x)
+        ground_y_range = (-0.5 * size_y, 0.5 * size_y)
+        base_regions = [
+            region for region in self.support_regions if region.structure_name is None
+        ]
+        if not base_regions:
+            raise ValueError(
+                f"{self.name}: at least one base-ground support region is required."
+            )
+
+        for region in base_regions:
+            if not (
+                _pair_within(region.x_range, ground_x_range)
+                and _pair_within(region.y_range, ground_y_range)
+                and math.isclose(region.surface_z, 0.0, abs_tol=1.0e-9)
+            ):
+                raise ValueError(
+                    f"{self.name}: base-ground support region {region.name!r} "
+                    "must lie inside the generated terrain tile at z=0."
+                )
+
+        # Positive-area overlap would create duplicate coplanar collision
+        # meshes and ambiguous internal edges. Touching boundaries are allowed
+        # because adjacent patches can meet without overlapping volume.
+        for index, region in enumerate(base_regions):
+            for other in base_regions[index + 1 :]:
+                if _rectangles_overlap(region, other):
+                    raise ValueError(
+                        f"{self.name}: base-ground support regions {region.name!r} and {other.name!r} overlap."
+                    )
+
+    def _validate_final_waypoint(self) -> None:
+        """Require the final waypoint to lie on a configured support region."""
+
+        final_position = self.waypoints[-1].position
+        if not any(
+            region.supports_waypoint(final_position) for region in self.support_regions
+        ):
+            raise ValueError(
+                f"{self.name}: final waypoint must lie on a valid support region."
+            )
+
+    def _validate_support_references(
+        self,
+        structure_by_name: dict[str, ParkourStructureCfg],
+    ) -> None:
+        """Require every elevated support to reference physical course geometry."""
+
+        for region in self.support_regions:
+            # ``None`` represents one generated base-ground patch, whose
+            # footprint is checked later by ``validate_terrain_size``.
+            if region.structure_name is None:
+                continue
+
+            # The support annotation is authoritative for arbitrary meshes, but
+            # it must still identify physical geometry belonging to this level.
+            if region.structure_name not in structure_by_name:
+                raise ValueError(
+                    f"{self.name}: support region {region.name!r} refers to unknown "
+                    f"structure {region.structure_name!r}."
+                )
+
+    def _validate_training_targets(self) -> None:
+        """Validate scalar training targets and store them as finite floats."""
+
+        target_speed = _float_value(self.target_speed, field_name="target_speed")
+        if target_speed <= 0.0:
+            raise ValueError(f"{self.name}: target_speed must be positive.")
+        object.__setattr__(self, "target_speed", target_speed)
+
+        min_clearance = _float_value(
+            self.min_clearance,
+            field_name="min_clearance",
+        )
+        if min_clearance < 0.0:
+            raise ValueError(f"{self.name}: min_clearance must be non-negative.")
+        object.__setattr__(self, "min_clearance", min_clearance)
+
+
+def base_ground_structures(
+    level: ParkourLevelCfg,
+    *,
+    mesh_factory: Callable[..., object],
+    ground_thickness: float,
+) -> tuple[ParkourStructureCfg, ...]:
+    """Convert a level's base supports into physical box structures.
+
+    This is the single bridge between the declarative support layout and
+    terrain collision geometry. A level with two separated base supports
+    therefore produces two boxes with empty space between them.
+    """
+
+    thickness = _float_value(ground_thickness, field_name="ground_thickness")
+    if thickness <= 0.0:
+        raise ValueError("ground_thickness must be positive.")
+
+    base_regions = tuple(
+        region for region in level.support_regions if region.structure_name is None
+    )
+    if not base_regions:
+        raise ValueError(
+            f"{level.name}: at least one base-ground support region is required."
+        )
+
+    return tuple(
+        ParkourStructureCfg(
+            name=f"base_ground_{region.name}",
+            mesh_factory=mesh_factory,
+            mesh_kwargs={
+                "extents": (
+                    region.x_range[1] - region.x_range[0],
+                    region.y_range[1] - region.y_range[0],
+                    thickness,
+                )
+            },
+            position=(
+                0.5 * (region.x_range[0] + region.x_range[1]),
+                0.5 * (region.y_range[0] + region.y_range[1]),
+                -0.5 * thickness,
+            ),
+        )
+        for region in base_regions
+    )
+
+
+def coerce_and_validate_levels(
+    levels: Iterable[ParkourLevelCfg | Mapping[str, object]],
+) -> tuple[ParkourLevelCfg, ...]:
+    """Normalize a curriculum and require an easiest-to-hardest ordering."""
+
+    normalized = tuple(coerce_level_cfg(level) for level in levels)
+    if not normalized:
+        raise ValueError("Parkour curriculum levels must not be empty.")
+
+    names = [level.name for level in normalized]
+    if len(names) != len(set(names)):
+        raise ValueError("Parkour curriculum level names must be unique.")
+
+    for field_name, values in (
+        ("difficulty", [level.difficulty.order for level in normalized]),
+        ("target speed", [level.target_speed for level in normalized]),
+        ("minimum clearance", [level.min_clearance for level in normalized]),
+    ):
+        if any(current > following for current, following in zip(values, values[1:])):
+            raise ValueError(f"Parkour curriculum {field_name} must be non-decreasing.")
+
+    return normalized
+
+
+def coerce_difficulty_cfg(difficulty: object) -> ParkourDifficultyCfg:
+    """Reconstruct a difficulty config from typed or Hydra data."""
+
+    if isinstance(difficulty, ParkourDifficultyCfg):
+        return difficulty
+    if not isinstance(difficulty, Mapping):
+        raise TypeError("difficulty must be a ParkourDifficultyCfg or mapping.")
+    missing_fields = {"order", "parameters"}.difference(difficulty)
+    if missing_fields:
+        raise ValueError(
+            f"Difficulty is missing fields: {', '.join(sorted(missing_fields))}."
+        )
+    return ParkourDifficultyCfg(
+        order=cast(float, difficulty["order"]),
+        parameters=cast(dict[str, float], difficulty["parameters"]),
+    )
 
 
 def coerce_level_cfg(level: ParkourLevelCfg | Mapping[str, object]) -> ParkourLevelCfg:
@@ -484,6 +608,29 @@ def coerce_structure_cfg(
     )
 
 
+def coerce_support_region_cfg(
+    region: ParkourSupportRegionCfg | Mapping[str, object],
+) -> ParkourSupportRegionCfg:
+    """Reconstruct one support-region annotation from Python or Hydra data."""
+
+    if isinstance(region, ParkourSupportRegionCfg):
+        return region
+    if not isinstance(region, Mapping):
+        raise TypeError("Support region must be a configuration or mapping.")
+    missing_fields = {"name", "structure_name", "x_range", "y_range"}.difference(region)
+    if missing_fields:
+        raise ValueError(
+            f"Support region is missing fields: {', '.join(sorted(missing_fields))}."
+        )
+    return ParkourSupportRegionCfg(
+        name=cast(str, region["name"]),
+        structure_name=cast(str | None, region["structure_name"]),
+        x_range=cast(tuple[float, float], region["x_range"]),
+        y_range=cast(tuple[float, float], region["y_range"]),
+        surface_z=cast(float, region.get("surface_z", 0.0)),
+    )
+
+
 def coerce_waypoint_cfg(
     waypoint: ParkourWaypointCfg | Mapping[str, object],
 ) -> ParkourWaypointCfg:
@@ -498,87 +645,29 @@ def coerce_waypoint_cfg(
     )
 
 
-def coerce_support_region_cfg(
-    region: ParkourSupportRegionCfg | Mapping[str, object],
-) -> ParkourSupportRegionCfg:
-    """Reconstruct one support-region annotation from Python or Hydra data."""
+def _float_mapping(value: object, *, field_name: str) -> dict[str, float]:
+    """Convert a string-keyed Hydra mapping into finite float values."""
 
-    if isinstance(region, ParkourSupportRegionCfg):
-        return region
-    if not isinstance(region, Mapping):
-        raise TypeError("Support region must be a configuration or mapping.")
-    missing_fields = {"name", "structure_name", "x_range", "y_range"}.difference(region)
-    if missing_fields:
-        raise ValueError(
-            "Support region is missing fields: " f"{', '.join(sorted(missing_fields))}."
-        )
-    return ParkourSupportRegionCfg(
-        name=cast(str, region["name"]),
-        structure_name=cast(str | None, region["structure_name"]),
-        x_range=cast(tuple[float, float], region["x_range"]),
-        y_range=cast(tuple[float, float], region["y_range"]),
-        surface_z=cast(float, region.get("surface_z", 0.0)),
-    )
-
-
-def coerce_difficulty_cfg(difficulty: object) -> ParkourDifficultyCfg:
-    """Reconstruct a difficulty config from typed or Hydra data."""
-
-    if isinstance(difficulty, ParkourDifficultyCfg):
-        return difficulty
-    if not isinstance(difficulty, Mapping):
-        raise TypeError("difficulty must be a ParkourDifficultyCfg or mapping.")
-    missing_fields = {"order", "parameters"}.difference(difficulty)
-    if missing_fields:
-        raise ValueError(
-            f"Difficulty is missing fields: {', '.join(sorted(missing_fields))}."
-        )
-    return ParkourDifficultyCfg(
-        order=cast(float, difficulty["order"]),
-        parameters=cast(dict[str, float], difficulty["parameters"]),
-    )
-
-
-def coerce_and_validate_levels(
-    levels: Iterable[ParkourLevelCfg | Mapping[str, object]],
-) -> tuple[ParkourLevelCfg, ...]:
-    """Normalize a curriculum and require an easiest-to-hardest ordering."""
-
-    normalized = tuple(coerce_level_cfg(level) for level in levels)
-    if not normalized:
-        raise ValueError("Parkour curriculum levels must not be empty.")
-
-    names = [level.name for level in normalized]
-    if len(names) != len(set(names)):
-        raise ValueError("Parkour curriculum level names must be unique.")
-
-    for field_name, values in (
-        ("difficulty", [level.difficulty.order for level in normalized]),
-        ("target speed", [level.target_speed for level in normalized]),
-        ("minimum clearance", [level.min_clearance for level in normalized]),
+    if not isinstance(value, Mapping) or not all(
+        isinstance(name, str) and name.strip() for name in value
     ):
-        if any(current > following for current, following in zip(values, values[1:])):
-            raise ValueError(f"Parkour curriculum {field_name} must be non-decreasing.")
+        raise TypeError(f"{field_name} must be a mapping with non-empty string keys.")
+    return {
+        name: _float_value(component, field_name=f"{field_name}.{name}")
+        for name, component in value.items()
+    }
 
-    return normalized
 
+def _float_pair(value: object, *, field_name: str) -> tuple[float, float]:
+    """Convert a Hydra/Python sequence into a fixed two-float tuple."""
 
-def _validate_typed_sequence(
-    values: tuple[object, ...],
-    expected_type: type[object],
-    *,
-    owner: str,
-    item_name: str,
-    required: bool = False,
-) -> None:
-    """Validate the contents and optional non-emptiness of a config tuple."""
-
-    if required and not values:
-        raise ValueError(f"{owner}: at least one {item_name} is required.")
-    if not all(isinstance(value, expected_type) for value in values):
-        raise TypeError(
-            f"{owner}: {item_name}s must contain {expected_type.__name__} values."
-        )
+    values = tuple(
+        _float_value(component, field_name=field_name)
+        for component in _sequence_value(value, field_name=field_name)
+    )
+    if len(values) != 2:
+        raise ValueError(f"{field_name} must have length 2, got {len(values)}.")
+    return values[0], values[1]
 
 
 def _float_triplet(value: object, *, field_name: str) -> tuple[float, float, float]:
@@ -594,18 +683,6 @@ def _float_triplet(value: object, *, field_name: str) -> tuple[float, float, flo
     return values[0], values[1], values[2]
 
 
-def _float_pair(value: object, *, field_name: str) -> tuple[float, float]:
-    """Convert a Hydra/Python sequence into a fixed two-float tuple."""
-
-    values = tuple(
-        _float_value(component, field_name=field_name)
-        for component in _sequence_value(value, field_name=field_name)
-    )
-    if len(values) != 2:
-        raise ValueError(f"{field_name} must have length 2, got {len(values)}.")
-    return values[0], values[1]
-
-
 def _float_value(value: object, *, field_name: str) -> float:
     """Convert a numeric Hydra value to float with a field-specific error."""
 
@@ -619,19 +696,6 @@ def _float_value(value: object, *, field_name: str) -> float:
     if not math.isfinite(converted):
         raise ValueError(f"{field_name} must contain finite numeric values.")
     return converted
-
-
-def _float_mapping(value: object, *, field_name: str) -> dict[str, float]:
-    """Convert a string-keyed Hydra mapping into finite float values."""
-
-    if not isinstance(value, Mapping) or not all(
-        isinstance(name, str) and name.strip() for name in value
-    ):
-        raise TypeError(f"{field_name} must be a mapping with non-empty string keys.")
-    return {
-        name: _float_value(component, field_name=f"{field_name}.{name}")
-        for name, component in value.items()
-    }
 
 
 def _json_mapping(value: object, *, field_name: str) -> dict[str, object]:
@@ -673,36 +737,30 @@ def _json_value(value: object, *, field_name: str) -> object:
     raise TypeError(f"{field_name} is not Hydra/JSON-compatible.")
 
 
-def _pairs_close(
-    actual: tuple[float, float],
-    expected: tuple[float, float],
+def _pair_within(
+    inner: tuple[float, float],
+    outer: tuple[float, float],
 ) -> bool:
-    """Return whether two coordinate ranges agree within numeric tolerance."""
+    """Return whether one closed coordinate range lies inside another."""
 
-    return all(
-        math.isclose(actual_value, expected_value, abs_tol=1.0e-9)
-        for actual_value, expected_value in zip(actual, expected)
+    tolerance = 1.0e-9
+    return inner[0] >= outer[0] - tolerance and inner[1] <= outer[1] + tolerance
+
+
+def _rectangles_overlap(
+    first: ParkourSupportRegionCfg,
+    second: ParkourSupportRegionCfg,
+) -> bool:
+    """Return whether two support rectangles overlap with positive area."""
+
+    tolerance = 1.0e-9
+    overlap_x = min(first.x_range[1], second.x_range[1]) - max(
+        first.x_range[0], second.x_range[0]
     )
-
-
-def _sequence_value(value: object, *, field_name: str) -> tuple[object, ...]:
-    """Return a non-string Hydra/Python iterable as a tuple."""
-
-    if isinstance(value, (str, bytes, Mapping)):
-        raise TypeError(f"{field_name} must be a sequence.")
-    try:
-        return tuple(cast(Iterable[object], value))
-    except TypeError as error:
-        raise TypeError(f"{field_name} must be a sequence.") from error
-
-
-def _validate_name(value: str, *, field_name: str) -> None:
-    """Require a non-empty identifier-like metadata string."""
-
-    if not isinstance(value, str):
-        raise TypeError(f"{field_name} must be a string.")
-    if not value.strip():
-        raise ValueError(f"{field_name} must not be empty.")
+    overlap_y = min(first.y_range[1], second.y_range[1]) - max(
+        first.y_range[0], second.y_range[0]
+    )
+    return overlap_x > tolerance and overlap_y > tolerance
 
 
 def _resolve_mesh_factory(value: object) -> Callable[..., object]:
@@ -728,3 +786,41 @@ def _resolve_mesh_factory(value: object) -> Callable[..., object]:
     if not callable(factory):
         raise TypeError(f"Resolved mesh_factory '{value}' is not callable.")
     return cast(Callable[..., object], factory)
+
+
+def _sequence_value(value: object, *, field_name: str) -> tuple[object, ...]:
+    """Return a non-string Hydra/Python iterable as a tuple."""
+
+    if isinstance(value, (str, bytes, Mapping)):
+        raise TypeError(f"{field_name} must be a sequence.")
+    try:
+        return tuple(cast(Iterable[object], value))
+    except TypeError as error:
+        raise TypeError(f"{field_name} must be a sequence.") from error
+
+
+def _validate_name(value: str, *, field_name: str) -> None:
+    """Require a non-empty identifier-like metadata string."""
+
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a string.")
+    if not value.strip():
+        raise ValueError(f"{field_name} must not be empty.")
+
+
+def _validate_typed_sequence(
+    values: tuple[object, ...],
+    expected_type: type[object],
+    *,
+    owner: str,
+    item_name: str,
+    required: bool = False,
+) -> None:
+    """Validate the contents and optional non-emptiness of a config tuple."""
+
+    if required and not values:
+        raise ValueError(f"{owner}: at least one {item_name} is required.")
+    if not all(isinstance(value, expected_type) for value in values):
+        raise TypeError(
+            f"{owner}: {item_name}s must contain {expected_type.__name__} values."
+        )

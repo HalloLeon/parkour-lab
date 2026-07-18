@@ -76,8 +76,9 @@ def advance_active_waypoints(
 
     import torch
 
-    from .._shared import robot, terrain
+    from .._shared import robot
     from ..commands import get_min_clearance
+    from ..terrain import queries
 
     if reach_threshold <= 0.0:
         raise ValueError("reach_threshold must be positive.")
@@ -108,7 +109,7 @@ def advance_active_waypoints(
 
     # Intermediate waypoints only select a new direction. The final waypoint
     # retains the existing safety rule that a collapsed robot is not successful.
-    clearance = terrain._base_clearance(env, asset_cfg)
+    clearance = queries._base_clearance(env, asset_cfg)
     min_clearance = get_min_clearance(env).to(
         device=clearance.device,
         dtype=clearance.dtype,
@@ -251,9 +252,7 @@ def _advance_route_state(
 
     # Account for float32 accumulation (for example, 0.08 + 0.02 may be stored
     # just below 0.10) without shortening the dwell by a meaningful duration.
-    dwell_satisfied = within_radius & (
-        next_hold_times_s >= reach_hold_s - step_dt_s * 1.0e-6
-    )
+    dwell_satisfied = within_radius & (next_hold_times_s >= reach_hold_s - step_dt_s * 1.0e-6)
 
     # Each environment can follow a route of a different length, so determine
     # its final index from its own waypoint count rather than a shared constant.
@@ -296,10 +295,7 @@ def _ensure_waypoint_state(
 
     from .._shared.runtime import _get_or_init_env_buffer
 
-    route_signature = tuple(
-        tuple(waypoint.position for waypoint in level.waypoints)
-        for level in curriculum_cfg.levels
-    )
+    route_signature = tuple(tuple(waypoint.position for waypoint in level.waypoints) for level in curriculum_cfg.levels)
     expected_device = torch.device(env.device)
 
     # ``_parkour_waypoint_table`` stores every level's terrain-local XYZ

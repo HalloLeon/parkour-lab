@@ -10,8 +10,8 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
-from .._shared import terrain
 from ..commands import get_min_clearance
+from ..terrain import queries
 
 
 def base_clearance_below_l2(
@@ -40,11 +40,9 @@ def base_clearance_below_l2(
         [num_envs]
     """
 
-    clearance = terrain._base_clearance(env, asset_cfg)
+    clearance = queries._base_clearance(env, asset_cfg)
 
-    min_clearance = get_min_clearance(env).to(
-        device=clearance.device, dtype=clearance.dtype
-    )
+    min_clearance = get_min_clearance(env).to(device=clearance.device, dtype=clearance.dtype)
 
     clearance_error = torch.clamp(min_clearance - clearance, min=0.0)
 

@@ -11,9 +11,10 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
 from .. import config
-from .._shared import robot, runtime, terrain
+from .._shared import robot, runtime
 from ..commands import get_min_clearance, get_target_speed
 from ..navigation import geometry, route
+from ..terrain import queries
 
 
 def goal_heading_misalignment_l2(
@@ -38,13 +39,9 @@ def goal_heading_misalignment_l2(
         [num_envs]
     """
 
-    heading_error = geometry._heading_error_to_goal_xy(
-        env, goal_cfg=goal_cfg, asset_cfg=asset_cfg
-    )
+    heading_error = geometry._heading_error_to_goal_xy(env, goal_cfg=goal_cfg, asset_cfg=asset_cfg)
 
-    velocity_along_goal = geometry._velocity_along_goal_xy(
-        env, goal_cfg=goal_cfg, asset_cfg=asset_cfg
-    )
+    velocity_along_goal = geometry._velocity_along_goal_xy(env, goal_cfg=goal_cfg, asset_cfg=asset_cfg)
 
     advancing_gate = runtime._linear_ramp(
         value=velocity_along_goal,
@@ -52,9 +49,7 @@ def goal_heading_misalignment_l2(
         upper=heading_cfg.full_forward_speed,
     )
 
-    normalized_heading_error = torch.clamp(
-        heading_error / heading_cfg.max_heading_error, min=0.0, max=1.0
-    )
+    normalized_heading_error = torch.clamp(heading_error / heading_cfg.max_heading_error, min=0.0, max=1.0)
 
     return advancing_gate * normalized_heading_error.square()
 
@@ -86,13 +81,9 @@ def goal_progress_xy_stable(
         [num_envs]
     """
 
-    current_distance = geometry._goal_distance_xy(
-        env, goal_cfg=goal_cfg, asset_cfg=asset_cfg
-    )
+    current_distance = geometry._goal_distance_xy(env, goal_cfg=goal_cfg, asset_cfg=asset_cfg)
 
-    distance_buffer_name = runtime._private_buffer_name(
-        "parkour_prev_goal_distance_xy", goal_cfg.name, asset_cfg.name
-    )
+    distance_buffer_name = runtime._private_buffer_name("parkour_prev_goal_distance_xy", goal_cfg.name, asset_cfg.name)
 
     root_xy_buffer_name = runtime._private_buffer_name(
         "parkour_prev_root_xy_for_goal_progress", goal_cfg.name, asset_cfg.name
@@ -121,9 +112,7 @@ def goal_progress_xy_stable(
         env, buffer_name=root_xy_buffer_name, reset_mask=just_reset, asset_cfg=asset_cfg
     )
 
-    stable = _root_stability_mask(
-        env, stability_cfg=progress_cfg.stability, asset_cfg=asset_cfg
-    )
+    stable = _root_stability_mask(env, stability_cfg=progress_cfg.stability, asset_cfg=asset_cfg)
 
     progress = runtime._gate_positive_values(values=progress, gate=stable)
 
@@ -157,11 +146,7 @@ def goal_progress_xy_stable(
         torch.zeros_like(lateral_penalty),
     )
 
-    return (
-        positive_reward
-        - negative_penalty
-        - progress_cfg.lateral_drift_weight * lateral_penalty
-    )
+    return positive_reward - negative_penalty - progress_cfg.lateral_drift_weight * lateral_penalty
 
 
 def completed_course_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -204,13 +189,9 @@ def velocity_along_goal_xy_capped(
         [num_envs]
     """
 
-    velocity_along_goal = geometry._velocity_along_goal_xy(
-        env, goal_cfg=goal_cfg, asset_cfg=asset_cfg
-    )
+    velocity_along_goal = geometry._velocity_along_goal_xy(env, goal_cfg=goal_cfg, asset_cfg=asset_cfg)
 
-    target_speed = get_target_speed(env).to(
-        device=velocity_along_goal.device, dtype=velocity_along_goal.dtype
-    )
+    target_speed = get_target_speed(env).to(device=velocity_along_goal.device, dtype=velocity_along_goal.dtype)
     normalization_speed = target_speed.clamp_min(torch.finfo(target_speed.dtype).eps)
 
     return torch.minimum(velocity_along_goal, target_speed) / normalization_speed
@@ -241,11 +222,9 @@ def velocity_along_goal_xy_clearance_capped(
 
     reward = velocity_along_goal_xy_capped(env, goal_cfg=goal_cfg, asset_cfg=asset_cfg)
 
-    clearance = terrain._base_clearance(env, asset_cfg=asset_cfg)
+    clearance = queries._base_clearance(env, asset_cfg=asset_cfg)
 
-    has_enough_clearance = clearance > get_min_clearance(env).to(
-        device=clearance.device, dtype=clearance.dtype
-    )
+    has_enough_clearance = clearance > get_min_clearance(env).to(device=clearance.device, dtype=clearance.dtype)
 
     return reward * has_enough_clearance.to(dtype=reward.dtype)
 
@@ -260,7 +239,7 @@ def _root_stability_mask(
     asset: Articulation = env.scene[asset_cfg.name]
     roll_pitch_speed = torch.linalg.norm(asset.data.root_ang_vel_b[:, :2], dim=-1)
     tilt = torch.linalg.norm(asset.data.projected_gravity_b[:, :2], dim=-1)
-    clearance = terrain._base_clearance(env, asset_cfg)
+    clearance = queries._base_clearance(env, asset_cfg)
     min_clearance = get_min_clearance(env).to(
         device=clearance.device,
         dtype=clearance.dtype,

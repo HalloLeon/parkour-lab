@@ -299,7 +299,7 @@ class ObservationsCfg:
 
 
 @configclass
-class EventCfg:
+class EventsCfg:
     """Configuration for events."""
 
     initialize_terrain_levels = EventTerm(
@@ -454,6 +454,16 @@ class RewardsCfg:
         },
     )
 
+    feet_edge = RewTerm(
+        func=mdp.feet_edge,
+        weight=-1.0,
+        params={
+            "curriculum_cfg": PARKOUR_CURRICULUM,
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+        },
+    )
+
 
 @configclass
 class TerminationsCfg:
@@ -505,7 +515,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
     # Basic settings.
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
-    events: EventCfg = EventCfg()
+    events: EventsCfg = EventsCfg()
     curriculum: CurriculumCfg | None = CurriculumCfg()
 
     # MDP settings.
@@ -626,9 +636,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
 
         # The marker starts at waypoint zero. Reset events select the matching
         # route independently for every environment after terrain assignment.
-        self.scene.goal.init_state.pos = curriculum_cfg.levels[
-            curriculum_cfg.initial_level
-        ].waypoints[0].position
+        self.scene.goal.init_state.pos = curriculum_cfg.levels[curriculum_cfg.initial_level].waypoints[0].position
         # Keep the visible marker footprint consistent with the configured XY
         # radius used by the waypoint transition condition.
         self.scene.goal.spawn.radius = curriculum_cfg.waypoint_reach_threshold
@@ -646,17 +654,17 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         # The success term owns route advancement before reward computation.
         # Synchronize its proximity and dwell contract with the authoritative
         # curriculum so only a safely reached final waypoint ends an episode.
-        self.terminations.success.params[
-            "reach_threshold"
-        ] = curriculum_cfg.waypoint_reach_threshold
-        self.terminations.success.params[
-            "reach_hold_s"
-        ] = curriculum_cfg.waypoint_reach_hold_s
+        self.terminations.success.params["reach_threshold"] = curriculum_cfg.waypoint_reach_threshold
+        self.terminations.success.params["reach_hold_s"] = curriculum_cfg.waypoint_reach_hold_s
 
         # Likewise, use one contact threshold for both the safety penalty and
         # trunk-contact termination.
         self.rewards.illegal_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
         self.terminations.trunk_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
+
+        # Keep the contact-gated edge penalty tied to the same authoritative
+        # level geometry and metric thresholds as terrain generation.
+        self.rewards.feet_edge.params["curriculum_cfg"] = curriculum_cfg
 
 
 @configclass

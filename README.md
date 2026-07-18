@@ -68,17 +68,26 @@ waypoints, named mesh structures and their factory arguments, rectangular
 supporting ground/platform regions, target speed and clearance, and explicit
 difficulty metadata. Factory arguments are passed directly to each structure
 factory. A support region either refers to the generated base ground or names
-the structure whose surface it describes. The annotation is authoritative, so
-structure generation does not assume a box or zero rotation. Support annotations
-currently remain horizontal, axis-aligned rectangles even when the referenced
-mesh is more general. Terrain generation still iterates the configured structures
-generically; it does not branch on a level number or obstacle family.
+the structure whose surface it describes. Base-ground regions are authoritative
+physical patches: the terrain generator emits one collision box for each such
+rectangle, so an uncovered interval is a real hole in both collision and raycast
+geometry. Named regions annotate separately generated structures without
+duplicating them. Regions currently remain horizontal, axis-aligned rectangles
+even when a referenced mesh is more general. Terrain generation still iterates
+configured structures generically; it does not branch on a level number or
+obstacle family.
 
-Support regions validate the final landing waypoint but do not alter the
-generated mesh. Intermediate waypoints are allowed to be directional guides
-rather than occupiable surfaces. Physical gap segmentation and edge-contact
-penalties belong to later stages; an edge representation should be introduced
-with those consumers rather than stored speculatively.
+Level 3 replaces the former higher step with a 0.40 m physical gap. Its approach
+and landing supports stop at opposite gap lips, and the ordered route directs the
+robot onto the landing side before the final goal. Intermediate waypoints remain
+directional guides rather than mandatory support annotations.
+
+Every support rectangle also provides four exact metric XY edge segments. The
+edge penalty selects the segment table for each environment's current level and
+counts only feet that are both within 0.05 m of an edge and in recent contact.
+Swing feet passing over a lip are therefore not penalized, and different terrain
+levels can be evaluated in one vectorized batch without a rasterized height-field
+mask.
 
 Each environment owns an active waypoint index, proximity dwell timer, and
 course-completion state. A reset selects waypoint zero from the route belonging
@@ -89,9 +98,11 @@ reward. Intermediate waypoints do not end an episode or count as curriculum
 success. The final waypoint completes the course only when the existing minimum
 base-clearance condition is also satisfied. Routes may contain different
 numbers of waypoints without cursor overrun or cross-environment state changes.
-Because this changes the teacher's heading input from one fixed endpoint to an
-active route target, the teacher-interface manifest is version 3; older
-final-goal teacher manifests intentionally fail compatibility validation.
+The teacher-interface manifest is version 4. In addition to the active-route
+semantics introduced with version 3, it now freezes the complete declarative
+terrain courses because physical support segmentation changes the privileged ray
+values seen by the teacher. Pre-gap manifests intentionally fail compatibility
+validation.
 
 ## Phase 1 observation architecture
 

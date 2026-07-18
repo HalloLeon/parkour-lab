@@ -6,9 +6,10 @@ from isaaclab.sensors import RayCaster
 from isaaclab.utils.math import quat_apply_inverse
 
 from . import config
-from ._shared import contact, terrain
+from ._shared import contact
 from .commands import get_target_speed
 from .navigation import geometry
+from .terrain import queries
 
 
 def base_clearance_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
@@ -19,7 +20,7 @@ def base_clearance_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = Scene
         [num_envs, 1]
     """
 
-    return terrain._base_clearance(env, asset_cfg).unsqueeze(-1)
+    return queries._base_clearance(env, asset_cfg).unsqueeze(-1)
 
 
 def desired_speed_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -224,7 +225,7 @@ def _terrain_height_scan_components(
     if not isinstance(sensor, RayCaster):
         raise TypeError(f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}.")
 
-    return terrain._terrain_height_components(
+    return queries._terrain_height_components(
         asset.data.root_pos_w[:, 2],
         sensor.data.ray_hits_w,
         num_rays=obs_cfg.num_rays,
