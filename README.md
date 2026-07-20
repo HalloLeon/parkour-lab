@@ -2,7 +2,7 @@
 
 Parkour Lab is an Isaac Lab reinforcement-learning environment for training a
 Unitree A1 to reach a goal across progressively harder obstacles. Training uses
-an adaptive four-level terrain curriculum; evaluation freezes one level so that
+an adaptive five-level terrain curriculum; evaluation freezes one level so that
 policy changes can be compared under the same conditions and recorded on video.
 
 ## Setup
@@ -77,8 +77,8 @@ even when a referenced mesh is more general. Terrain generation still iterates
 configured structures generically; it does not branch on a level number or
 obstacle family.
 
-The default four-level curriculum now contains one representative of each
-implemented behavior: flat ground, a high step, a hurdle, and a physical gap.
+The default five-level curriculum now contains flat ground, a high step, a
+hurdle, a physical gap, and a two-ramp redirected course.
 The 0.16 m high step is a 1.6 m deep elevated platform with a vertical,
 ground-mounted front face. Its final waypoint lies inside the annotated top
 surface, so completing the course means climbing and landing on that platform.
@@ -93,6 +93,16 @@ Level 3 replaces the former higher step with a 0.40 m physical gap. Its approach
 and landing supports stop at opposite gap lips, and the ordered route directs the
 robot onto the landing side before the final goal. Intermediate waypoints remain
 directional guides rather than mandatory support annotations.
+
+Level 4 places two thin collision slabs over an unsupported corridor. Each
+slab's local X axis is its travel direction; a signed roll banks the surface
+across its width and yaw rotates that direction in terrain-local XY. The default
+ramps use opposite 12-degree banks and yaws of 10 and 32 degrees, with a
+configurable longitudinal gap, lateral offset, slab width, and final landing
+area. Five ordered waypoints align the first approach, cross the inter-ramp
+transition, then switch the oracle heading along ramp two before targeting the
+final ground landing. This mirrors the paper's use of terrain waypoints to make
+the robot change direction immediately on tilted ramps.
 
 Every support rectangle also provides four exact metric XY edge segments. The
 edge penalty selects the segment table for each environment's current level and
@@ -113,10 +123,10 @@ numbers of waypoints without cursor overrun or cross-environment state changes.
 The teacher-interface manifest is version 4. In addition to the active-route
 semantics introduced with version 3, it now freezes the complete declarative
 terrain courses because physical support segmentation changes the privileged ray
-values seen by the teacher. The schema remains version 4 for the high-step and
-hurdle addition because its shape did not change; the serialized course content
-still makes checkpoints trained with the earlier default geometry fail
-compatibility validation.
+values seen by the teacher. The schema remains version 4 for the high-step,
+hurdle, and tilted-ramp additions because its shape did not change; the
+serialized course content still makes checkpoints trained with earlier default
+geometry fail compatibility validation.
 
 ## Phase 1 observation architecture
 
@@ -214,7 +224,7 @@ python scripts/rsl_rl/play.py \
   --video
 ```
 
-Repeat the command with `--difficulty_level=1`, `2`, and `3` for a complete
+Repeat the command with `--difficulty_level=1`, `2`, `3`, and `4` for a complete
 comparison. Evaluation reports episode outcomes for the selected level and
 writes `metrics.json` plus the optional MP4 beneath
 `<run>/evaluation/<checkpoint>-<hash>/level_<n>/seed_<seed>/`, separated
@@ -311,7 +321,7 @@ Treat success rate and failure outcomes over multiple episodes as the primary
 comparison; use video to understand *why* behavior changed. For fair before/after
 comparisons:
 
-- evaluate each promising checkpoint on all four fixed levels;
+- evaluate each promising checkpoint on all five fixed levels;
 - keep the seed, number of episodes, and environment count unchanged;
 - do not enable the adaptive training curriculum during evaluation;
 - compare the same metrics before selecting representative clips;
