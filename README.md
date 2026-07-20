@@ -77,6 +77,18 @@ even when a referenced mesh is more general. Terrain generation still iterates
 configured structures generically; it does not branch on a level number or
 obstacle family.
 
+The default four-level curriculum now contains one representative of each
+implemented behavior: flat ground, a high step, a hurdle, and a physical gap.
+The 0.16 m high step is a 1.6 m deep elevated platform with a vertical,
+ground-mounted front face. Its final waypoint lies inside the annotated top
+surface, so completing the course means climbing and landing on that platform.
+The 0.12 m hurdle is only 0.18 m deep; the base-ground support remains continuous
+beneath and beyond it, its top is not declared traversable, and its sole
+waypoint is on ground after the rear face. Both builders accept obstacle height,
+width, depth, and XY position independently and record those exact values in
+the level difficulty metadata. These conservative initial heights are well
+below the paper's 0.5 m maximum.
+
 Level 3 replaces the former higher step with a 0.40 m physical gap. Its approach
 and landing supports stop at opposite gap lips, and the ordered route directs the
 robot onto the landing side before the final goal. Intermediate waypoints remain
@@ -101,8 +113,10 @@ numbers of waypoints without cursor overrun or cross-environment state changes.
 The teacher-interface manifest is version 4. In addition to the active-route
 semantics introduced with version 3, it now freezes the complete declarative
 terrain courses because physical support segmentation changes the privileged ray
-values seen by the teacher. Pre-gap manifests intentionally fail compatibility
-validation.
+values seen by the teacher. The schema remains version 4 for the high-step and
+hurdle addition because its shape did not change; the serialized course content
+still makes checkpoints trained with the earlier default geometry fail
+compatibility validation.
 
 ## Phase 1 observation architecture
 

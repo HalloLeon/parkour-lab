@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
 
 import numpy as np
@@ -20,30 +21,38 @@ from .levels import (
     coerce_level_cfg,
 )
 
-_OBSTACLE_LENGTH_M = 0.5
-_OBSTACLE_WIDTH_M = 1.8
-_OBSTACLE_CENTER_X_M = 2.0
-_OBSTACLE_X_RANGE_M = (
-    _OBSTACLE_CENTER_X_M - 0.5 * _OBSTACLE_LENGTH_M,
-    _OBSTACLE_CENTER_X_M + 0.5 * _OBSTACLE_LENGTH_M,
-)
-_OBSTACLE_Y_RANGE_M = (-0.5 * _OBSTACLE_WIDTH_M, 0.5 * _OBSTACLE_WIDTH_M)
 _TERRAIN_X_RANGE_M = (-4.0, 4.0)
 _TERRAIN_Y_RANGE_M = (-2.0, 2.0)
 _GAP_CENTER_X_M = 2.0
 _GAP_WIDTH_M = 0.4
+_HURDLE_LANDING_MARGIN_M = 0.8
 _GAP_X_RANGE_M = (
     _GAP_CENTER_X_M - 0.5 * _GAP_WIDTH_M,
     _GAP_CENTER_X_M + 0.5 * _GAP_WIDTH_M,
 )
 
-# Name, obstacle family, difficulty rank, obstacle height, target speed, and
-# minimum clearance for the shared default course layout below.
-_DEFAULT_STEP_LEVEL_PARAMETERS = (
-    ("level_0_flat_marker", "flat_marker", 0.0, 0.02, 0.60, 0.24),
-    ("level_1_low_step", "step", 1.0, 0.05, 0.70, 0.25),
-    ("level_2_medium_step", "step", 2.0, 0.08, 0.75, 0.26),
-)
+
+def _flat_level() -> ParkourLevelCfg:
+    """Create the obstacle-free entry level of the default curriculum."""
+
+    return ParkourLevelCfg(
+        name="level_0_flat",
+        obstacle_family="flat",
+        waypoints=(ParkourWaypointCfg(position=(3.8, 0.0, 0.01)),),
+        structures=(),
+        support_regions=(
+            ParkourSupportRegionCfg(
+                name="ground",
+                structure_name=None,
+                x_range=_TERRAIN_X_RANGE_M,
+                y_range=_TERRAIN_Y_RANGE_M,
+                surface_z=0.0,
+            ),
+        ),
+        target_speed=0.60,
+        min_clearance=0.24,
+        difficulty=ParkourDifficultyCfg(order=0.0, parameters={}),
+    )
 
 
 def _gap_level() -> ParkourLevelCfg:
@@ -83,48 +92,114 @@ def _gap_level() -> ParkourLevelCfg:
     )
 
 
-def _step_level(
+def _box_obstacle(
+    *,
     name: str,
-    obstacle_family: str,
+    obstacle_height: float,
+    obstacle_width: float,
+    obstacle_depth: float,
+    obstacle_position_xy: tuple[float, float],
+) -> tuple[
+    ParkourStructureCfg,
+    tuple[float, float],
+    tuple[float, float],
+]:
+    """Create one ground-mounted box and return its exact XY footprint."""
+
+    dimensions = (obstacle_depth, obstacle_width, obstacle_height)
+    if any(not math.isfinite(value) or value <= 0.0 for value in dimensions):
+        raise ValueError("Box-obstacle height, width, and depth must be positive.")
+    if len(obstacle_position_xy) != 2 or any(
+        not math.isfinite(value) for value in obstacle_position_xy
+    ):
+        raise ValueError("Box-obstacle XY position must contain two finite values.")
+
+    center_x, center_y = obstacle_position_xy
+    x_range = (
+        center_x - 0.5 * obstacle_depth,
+        center_x + 0.5 * obstacle_depth,
+    )
+    y_range = (
+        center_y - 0.5 * obstacle_width,
+        center_y + 0.5 * obstacle_width,
+    )
+    if not (
+        _TERRAIN_X_RANGE_M[0] <= x_range[0] < x_range[1] <= _TERRAIN_X_RANGE_M[1]
+        and _TERRAIN_Y_RANGE_M[0] <= y_range[0] < y_range[1] <= _TERRAIN_Y_RANGE_M[1]
+    ):
+        raise ValueError("Box-obstacle footprint must lie inside the terrain tile.")
+
+    return (
+        ParkourStructureCfg(
+            name=name,
+            mesh_factory=trimesh.creation.box,
+            # Trimesh box extents are ordered X (depth), Y (width), Z (height).
+            mesh_kwargs={"extents": dimensions},
+            # Center the box vertically so its base is exactly on ground z=0.
+            position=(center_x, center_y, 0.5 * obstacle_height),
+        ),
+        x_range,
+        y_range,
+    )
+
+
+def _box_difficulty_parameters(
+    *,
+    obstacle_height: float,
+    obstacle_width: float,
+    obstacle_depth: float,
+    obstacle_position_xy: tuple[float, float],
+) -> dict[str, float]:
+    """Record the box geometry varied by one curriculum level."""
+
+    return {
+        "obstacle_height_m": obstacle_height,
+        "obstacle_width_m": obstacle_width,
+        "obstacle_depth_m": obstacle_depth,
+        "obstacle_position_x_m": obstacle_position_xy[0],
+        "obstacle_position_y_m": obstacle_position_xy[1],
+    }
+
+
+def _high_step_level(
+    *,
+    name: str,
     difficulty_order: float,
     obstacle_height: float,
+    obstacle_width: float,
+    obstacle_depth: float,
+    obstacle_position_xy: tuple[float, float],
     target_speed: float,
     min_clearance: float,
 ) -> ParkourLevelCfg:
-    """Create one box-step course using the shared default layout."""
+    """Create a climbable face followed by an elevated landing platform."""
+
+    platform, platform_x_range, platform_y_range = _box_obstacle(
+        name="elevated_platform",
+        obstacle_height=obstacle_height,
+        obstacle_width=obstacle_width,
+        obstacle_depth=obstacle_depth,
+        obstacle_position_xy=obstacle_position_xy,
+    )
+    platform_center_x, platform_center_y = obstacle_position_xy
+    approach_x = platform_x_range[0] - 0.5
 
     return ParkourLevelCfg(
         name=name,
-        obstacle_family=obstacle_family,
+        obstacle_family="high_step",
         waypoints=(
-            ParkourWaypointCfg(position=(1.0, 0.0, 0.01)),
+            ParkourWaypointCfg(position=(approach_x, platform_center_y, 0.01)),
+            # The final target lies well inside the top footprint. Reaching it
+            # requires climbing the front face and landing on the platform.
             ParkourWaypointCfg(
                 position=(
-                    _OBSTACLE_CENTER_X_M,
-                    0.0,
+                    platform_center_x,
+                    platform_center_y,
                     obstacle_height + 0.01,
                 )
             ),
-            ParkourWaypointCfg(position=(3.8, 0.0, 0.01)),
         ),
-        structures=(
-            ParkourStructureCfg(
-                name="center_obstacle",
-                mesh_factory=trimesh.creation.box,
-                mesh_kwargs={
-                    "extents": (
-                        _OBSTACLE_LENGTH_M,
-                        _OBSTACLE_WIDTH_M,
-                        obstacle_height,
-                    )
-                },
-                position=(
-                    _OBSTACLE_CENTER_X_M,
-                    0.0,
-                    0.5 * obstacle_height,
-                ),
-            ),
-        ),
+        structures=(platform,),
         support_regions=(
             ParkourSupportRegionCfg(
                 name="ground",
@@ -133,13 +208,11 @@ def _step_level(
                 y_range=_TERRAIN_Y_RANGE_M,
                 surface_z=0.0,
             ),
-            # The named support only annotates the traversable box top; the
-            # structure above remains its sole source of collision geometry.
             ParkourSupportRegionCfg(
-                name="center_obstacle_top",
-                structure_name="center_obstacle",
-                x_range=_OBSTACLE_X_RANGE_M,
-                y_range=_OBSTACLE_Y_RANGE_M,
+                name="platform_top",
+                structure_name=platform.name,
+                x_range=platform_x_range,
+                y_range=platform_y_range,
                 surface_z=obstacle_height,
             ),
         ),
@@ -147,9 +220,93 @@ def _step_level(
         min_clearance=min_clearance,
         difficulty=ParkourDifficultyCfg(
             order=difficulty_order,
-            parameters={"obstacle_height_m": obstacle_height},
+            parameters=_box_difficulty_parameters(
+                obstacle_height=obstacle_height,
+                obstacle_width=obstacle_width,
+                obstacle_depth=obstacle_depth,
+                obstacle_position_xy=obstacle_position_xy,
+            ),
         ),
     )
+
+
+def _hurdle_level(
+    *,
+    name: str,
+    difficulty_order: float,
+    obstacle_height: float,
+    obstacle_width: float,
+    obstacle_depth: float,
+    obstacle_position_xy: tuple[float, float],
+    target_speed: float,
+    min_clearance: float,
+) -> ParkourLevelCfg:
+    """Create a narrow obstacle cleared onto continuous ground beyond it."""
+
+    hurdle, hurdle_x_range, _ = _box_obstacle(
+        name="hurdle",
+        obstacle_height=obstacle_height,
+        obstacle_width=obstacle_width,
+        obstacle_depth=obstacle_depth,
+        obstacle_position_xy=obstacle_position_xy,
+    )
+    landing_x = hurdle_x_range[1] + _HURDLE_LANDING_MARGIN_M
+    landing_y = obstacle_position_xy[1]
+
+    return ParkourLevelCfg(
+        name=name,
+        obstacle_family="hurdle",
+        # The only target is on ground beyond the rear face. Unlike the high
+        # step, the hurdle top is never declared as a traversable support.
+        waypoints=(ParkourWaypointCfg(position=(landing_x, landing_y, 0.01)),),
+        structures=(hurdle,),
+        support_regions=(
+            ParkourSupportRegionCfg(
+                name="ground",
+                structure_name=None,
+                x_range=_TERRAIN_X_RANGE_M,
+                y_range=_TERRAIN_Y_RANGE_M,
+                surface_z=0.0,
+            ),
+        ),
+        target_speed=target_speed,
+        min_clearance=min_clearance,
+        difficulty=ParkourDifficultyCfg(
+            order=difficulty_order,
+            parameters=_box_difficulty_parameters(
+                obstacle_height=obstacle_height,
+                obstacle_width=obstacle_width,
+                obstacle_depth=obstacle_depth,
+                obstacle_position_xy=obstacle_position_xy,
+            ),
+        ),
+    )
+
+
+_DEFAULT_PARKOUR_LEVELS = (
+    _flat_level(),
+    _high_step_level(
+        name="level_1_high_step",
+        difficulty_order=1.0,
+        obstacle_height=0.16,
+        obstacle_width=1.8,
+        obstacle_depth=1.6,
+        obstacle_position_xy=(2.8, 0.0),
+        target_speed=0.70,
+        min_clearance=0.25,
+    ),
+    _hurdle_level(
+        name="level_2_hurdle",
+        difficulty_order=2.0,
+        obstacle_height=0.12,
+        obstacle_width=1.8,
+        obstacle_depth=0.18,
+        obstacle_position_xy=(2.0, 0.0),
+        target_speed=0.75,
+        min_clearance=0.26,
+    ),
+    _gap_level(),
+)
 
 
 @configclass
@@ -160,24 +317,7 @@ class ParkourCurriculumCfg:
     Levels should go from easiest to hardest.
     """
 
-    levels: tuple[ParkourLevelCfg, ...] = tuple(
-        _step_level(
-            name,
-            obstacle_family,
-            difficulty_order,
-            obstacle_height,
-            target_speed,
-            min_clearance,
-        )
-        for (
-            name,
-            obstacle_family,
-            difficulty_order,
-            obstacle_height,
-            target_speed,
-            min_clearance,
-        ) in _DEFAULT_STEP_LEVEL_PARAMETERS
-    ) + (_gap_level(),)
+    levels: tuple[ParkourLevelCfg, ...] = _DEFAULT_PARKOUR_LEVELS
 
     initial_level: int = 1
     # Balance the initial population over levels 0..initial_level. This gives
