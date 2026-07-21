@@ -11,6 +11,8 @@ from typing import Any, cast
 WAYPOINT_SURFACE_TOLERANCE_M = 0.05
 """Maximum marker-height offset accepted above a supporting surface."""
 
+_GEOMETRY_TOLERANCE = 1.0e-9
+
 
 @dataclass(frozen=True)
 class ParkourDifficultyCfg:
@@ -115,23 +117,22 @@ class ParkourStructureCfg:
 
 @dataclass(frozen=True)
 class ParkourSupportRegionCfg:
-    """Explicit horizontal surface on which a course waypoint may be placed.
+    """Ordered convex planar surface on which a waypoint may be placed.
 
     A :class:`ParkourStructureCfg` describes how to create physical mesh
     geometry, but an arbitrary mesh factory does not say which faces are safe
     course surfaces. Inferring that meaning from Trimesh geometry would couple
     configuration validation to individual shapes and mesh-inspection rules.
-    A support region therefore records the intended traversable rectangle
-    explicitly. The level uses it to reject a final waypoint that is outside a
-    configured surface. Base-ground regions also define the rectangular ground
-    patches emitted by the terrain generator, so leaving space between two of
-    them creates a physical gap rather than metadata over a continuous slab.
+    A support region therefore records the intended traversable polygon
+    explicitly. Vertices use terrain-local XYZ coordinates and must be ordered
+    counter-clockwise when viewed from the upward-facing side of the plane.
 
     ``structure_name`` associates an elevated region with its separately
     configured physical mesh; ``None`` denotes one generated base-ground
     patch. Named regions remain annotations and do not duplicate their
-    structure geometry. Regions are currently limited to horizontal,
-    axis-aligned rectangles.
+    structure geometry. Base-ground regions are deliberately restricted to
+    horizontal, axis-aligned rectangles because they are converted to boxes by
+    :func:`base_ground_structures`.
     """
 
     name: str
@@ -140,9 +141,10 @@ class ParkourSupportRegionCfg:
     # describes. ``None`` makes this region a generated base-ground patch.
     structure_name: str | None
 
-    x_range: tuple[float, float]
-    y_range: tuple[float, float]
-    surface_z: float = 0.0
+    # Polygon boundary in terrain-local XYZ coordinates. This is the single
+    # canonical support representation; ranges and the plane normal are
+    # derived from it rather than stored independently.
+    vertices: tuple[tuple[float, float, float], ...]
 
     def __post_init__(self) -> None:
         _validate_name(self.name, field_name="support-region name")
@@ -151,50 +153,78 @@ class ParkourSupportRegionCfg:
                 self.structure_name,
                 field_name=f"{self.name} structure_name",
             )
-        x_range = _float_pair(self.x_range, field_name=f"{self.name} x_range")
-        y_range = _float_pair(self.y_range, field_name=f"{self.name} y_range")
-        if x_range[0] >= x_range[1] or y_range[0] >= y_range[1]:
-            raise ValueError(
-                f"{self.name}: support-region ranges must have positive width."
+        vertices = tuple(
+            _float_triplet(vertex, field_name=f"{self.name} vertices[{index}]")
+            for index, vertex in enumerate(
+                _sequence_value(self.vertices, field_name=f"{self.name} vertices")
             )
-        object.__setattr__(self, "x_range", x_range)
-        object.__setattr__(self, "y_range", y_range)
-        object.__setattr__(
-            self,
-            "surface_z",
-            _float_value(self.surface_z, field_name=f"{self.name} surface_z"),
+        )
+        _validate_support_polygon(self.name, vertices)
+        object.__setattr__(self, "vertices", vertices)
+
+    @classmethod
+    def horizontal_rectangle(
+        cls,
+        *,
+        name: str,
+        structure_name: str | None,
+        x_range: tuple[float, float],
+        y_range: tuple[float, float],
+        surface_z: float = 0.0,
+    ) -> ParkourSupportRegionCfg:
+        """Create a horizontal axis-aligned support with CCW vertex winding."""
+
+        normalized_x = _float_pair(x_range, field_name=f"{name} x_range")
+        normalized_y = _float_pair(y_range, field_name=f"{name} y_range")
+        normalized_z = _float_value(surface_z, field_name=f"{name} surface_z")
+        if normalized_x[0] >= normalized_x[1] or normalized_y[0] >= normalized_y[1]:
+            raise ValueError(f"{name}: support-region ranges must have positive width.")
+        x_min, x_max = normalized_x
+        y_min, y_max = normalized_y
+        return cls(
+            name=name,
+            structure_name=structure_name,
+            vertices=(
+                (x_min, y_min, normalized_z),
+                (x_max, y_min, normalized_z),
+                (x_max, y_max, normalized_z),
+                (x_min, y_max, normalized_z),
+            ),
         )
 
-    def boundary_segments_xy(
+    @property
+    def normal(self) -> tuple[float, float, float]:
+        """Return the polygon's upward-facing unit plane normal."""
+
+        return _unit_polygon_normal(self.vertices)
+
+    @property
+    def x_range(self) -> tuple[float, float]:
+        """Return the polygon's derived closed X extent."""
+
+        coordinates = tuple(vertex[0] for vertex in self.vertices)
+        return min(coordinates), max(coordinates)
+
+    @property
+    def y_range(self) -> tuple[float, float]:
+        """Return the polygon's derived closed Y extent."""
+
+        coordinates = tuple(vertex[1] for vertex in self.vertices)
+        return min(coordinates), max(coordinates)
+
+    def boundary_segments_xyz(
         self,
-    ) -> tuple[
-        tuple[tuple[float, float], tuple[float, float]],
-        tuple[tuple[float, float], tuple[float, float]],
-        tuple[tuple[float, float], tuple[float, float]],
-        tuple[tuple[float, float], tuple[float, float]],
-    ]:
-        """Return the four ordered XY boundary segments of this support.
+    ) -> tuple[tuple[tuple[float, float, float], tuple[float, float, float]], ...]:
+        """Return the ordered XYZ boundary segments of this support.
 
         The runtime edge penalty consumes these segments directly. Keeping the
         representation in metric course coordinates avoids a resolution-bound
         height-field mask and gives every environment the same exact geometry.
         """
 
-        x_min, x_max = self.x_range
-        y_min, y_max = self.y_range
-        return (
-            ((x_min, y_min), (x_max, y_min)),
-            ((x_max, y_min), (x_max, y_max)),
-            ((x_max, y_max), (x_min, y_max)),
-            ((x_min, y_max), (x_min, y_min)),
-        )
-
-    def contains_xy(self, point: tuple[float, ...]) -> bool:
-        """Return whether a point lies over this support's closed XY footprint."""
-
-        return (
-            self.x_range[0] <= point[0] <= self.x_range[1]
-            and self.y_range[0] <= point[1] <= self.y_range[1]
+        return tuple(
+            (vertex, self.vertices[(index + 1) % len(self.vertices)])
+            for index, vertex in enumerate(self.vertices)
         )
 
     def metadata(self) -> dict[str, object]:
@@ -203,16 +233,72 @@ class ParkourSupportRegionCfg:
         return {
             "name": self.name,
             "structure_name": self.structure_name,
-            "x_range": list(self.x_range),
-            "y_range": list(self.y_range),
-            "surface_z": self.surface_z,
+            "vertices": [list(vertex) for vertex in self.vertices],
         }
 
     def supports_waypoint(self, position: tuple[float, float, float]) -> bool:
         """Return whether a waypoint lies on this support within marker tolerance."""
 
-        return self.contains_xy(position) and (
-            abs(position[2] - self.surface_z) <= WAYPOINT_SURFACE_TOLERANCE_M
+        point = _float_triplet(position, field_name="waypoint position")
+        normal = self.normal
+        relative = _subtract_xyz(point, self.vertices[0])
+        plane_distance = _dot_xyz(relative, normal)
+        if abs(plane_distance) > WAYPOINT_SURFACE_TOLERANCE_M:
+            return False
+
+        # Let ``plane_origin`` be the first polygon vertex and let
+        # ``relative = point - plane_origin``. Any such displacement can be
+        # split uniquely into a component parallel to the support plane and a
+        # component perpendicular to it:
+        #
+        # ``relative = parallel_component + perpendicular_component``.
+        #
+        # The plane normal is perpendicular to every in-plane direction, so
+        # the parallel component contributes zero to a dot product with the
+        # normal. Because the normal has unit length,
+        #
+        # ``plane_distance = relative dot normal``
+        #
+        # is both the coefficient and signed length of the perpendicular
+        # component. The full perpendicular vector is consequently
+        #
+        # ``perpendicular_component = plane_distance * normal``.
+        #
+        # Removing that component leaves the in-plane part of the displacement
+        # and gives the orthogonal projection of the marker onto the plane:
+        #
+        # ``projected = point - plane_distance * normal``
+        # ``          = plane_origin + parallel_component``.
+        projected = (
+            point[0] - plane_distance * normal[0],
+            point[1] - plane_distance * normal[1],
+            point[2] - plane_distance * normal[2],
+        )
+
+        # Each CCW boundary segment is a directed edge from ``start`` to
+        # ``end``. For that edge, ``end - start`` follows the boundary and
+        # ``projected - start`` points from the same origin toward the marker.
+        # Their cross product is perpendicular to the polygon plane. Dotting
+        # it with the upward polygon normal turns its direction into a signed
+        # scalar: positive means the marker is on the edge's left/inward side,
+        # zero means it lies on the edge line, and negative means it is on the
+        # right/outward side.
+        #
+        # A convex polygon is the intersection of the inward half-planes of
+        # all its directed boundary edges. The projected marker is therefore
+        # inside or on the polygon exactly when every signed value is
+        # non-negative. Comparing against the small negative geometry
+        # tolerance keeps boundary points valid despite floating-point error.
+        return all(
+            _dot_xyz(
+                _cross_xyz(
+                    _subtract_xyz(end, start),
+                    _subtract_xyz(projected, start),
+                ),
+                normal,
+            )
+            >= -_GEOMETRY_TOLERANCE
+            for start, end in self.boundary_segments_xyz()
         )
 
 
@@ -256,9 +342,10 @@ class ParkourLevelCfg:
     # tile center. A flat course may leave this tuple empty.
     structures: tuple[ParkourStructureCfg, ...]
 
-    # Traversable horizontal surfaces supporting waypoints. A base-ground
-    # region (``structure_name=None``) also produces one collision patch;
-    # named regions annotate a surface of existing structure geometry.
+    # Traversable planar surfaces supporting waypoints. A base-ground region
+    # (``structure_name=None``) must be a horizontal axis-aligned rectangle
+    # and also produces one collision patch; named regions annotate a surface
+    # of existing structure geometry and may be inclined convex polygons.
     support_regions: tuple[ParkourSupportRegionCfg, ...]
 
     # Desired velocity toward the active goal in meters per second. It is
@@ -351,10 +438,17 @@ class ParkourLevelCfg:
             )
 
         for region in base_regions:
+            try:
+                x_range, y_range, surface_z = _horizontal_rectangle_geometry(region)
+            except ValueError as error:
+                raise ValueError(
+                    f"{self.name}: base-ground support region {region.name!r} "
+                    "must be a horizontal axis-aligned rectangle."
+                ) from error
             if not (
-                _pair_within(region.x_range, ground_x_range)
-                and _pair_within(region.y_range, ground_y_range)
-                and math.isclose(region.surface_z, 0.0, abs_tol=1.0e-9)
+                _pair_within(x_range, ground_x_range)
+                and _pair_within(y_range, ground_y_range)
+                and math.isclose(surface_z, 0.0, abs_tol=_GEOMETRY_TOLERANCE)
             ):
                 raise ValueError(
                     f"{self.name}: base-ground support region {region.name!r} "
@@ -419,6 +513,9 @@ class ParkourLevelCfg:
         object.__setattr__(self, "min_clearance", min_clearance)
 
 
+# Terrain-construction API.
+
+
 def base_ground_structures(
     level: ParkourLevelCfg,
     *,
@@ -444,25 +541,41 @@ def base_ground_structures(
             f"{level.name}: at least one base-ground support region is required."
         )
 
-    return tuple(
-        ParkourStructureCfg(
-            name=f"base_ground_{region.name}",
-            mesh_factory=mesh_factory,
-            mesh_kwargs={
-                "extents": (
-                    region.x_range[1] - region.x_range[0],
-                    region.y_range[1] - region.y_range[0],
-                    thickness,
-                )
-            },
-            position=(
-                0.5 * (region.x_range[0] + region.x_range[1]),
-                0.5 * (region.y_range[0] + region.y_range[1]),
-                -0.5 * thickness,
-            ),
+    structures: list[ParkourStructureCfg] = []
+    for region in base_regions:
+        try:
+            x_range, y_range, surface_z = _horizontal_rectangle_geometry(region)
+        except ValueError as error:
+            raise ValueError(
+                f"{level.name}: base-ground support region {region.name!r} "
+                "must be a horizontal axis-aligned rectangle."
+            ) from error
+        if not math.isclose(surface_z, 0.0, abs_tol=_GEOMETRY_TOLERANCE):
+            raise ValueError(
+                f"{level.name}: base-ground support region {region.name!r} must lie at z=0."
+            )
+        structures.append(
+            ParkourStructureCfg(
+                name=f"base_ground_{region.name}",
+                mesh_factory=mesh_factory,
+                mesh_kwargs={
+                    "extents": (
+                        x_range[1] - x_range[0],
+                        y_range[1] - y_range[0],
+                        thickness,
+                    )
+                },
+                position=(
+                    0.5 * (x_range[0] + x_range[1]),
+                    0.5 * (y_range[0] + y_range[1]),
+                    -0.5 * thickness,
+                ),
+            )
         )
-        for region in base_regions
-    )
+    return tuple(structures)
+
+
+# Configuration-reconstruction API, ordered lexicographically.
 
 
 def coerce_and_validate_levels(
@@ -617,7 +730,7 @@ def coerce_support_region_cfg(
         return region
     if not isinstance(region, Mapping):
         raise TypeError("Support region must be a configuration or mapping.")
-    missing_fields = {"name", "structure_name", "x_range", "y_range"}.difference(region)
+    missing_fields = {"name", "structure_name", "vertices"}.difference(region)
     if missing_fields:
         raise ValueError(
             f"Support region is missing fields: {', '.join(sorted(missing_fields))}."
@@ -625,9 +738,7 @@ def coerce_support_region_cfg(
     return ParkourSupportRegionCfg(
         name=cast(str, region["name"]),
         structure_name=cast(str | None, region["structure_name"]),
-        x_range=cast(tuple[float, float], region["x_range"]),
-        y_range=cast(tuple[float, float], region["y_range"]),
-        surface_z=cast(float, region.get("surface_z", 0.0)),
+        vertices=cast(tuple[tuple[float, float, float], ...], region["vertices"]),
     )
 
 
@@ -643,6 +754,216 @@ def coerce_waypoint_cfg(
     return ParkourWaypointCfg(
         position=cast(tuple[float, float, float], waypoint["position"])
     )
+
+
+# Polygon-geometry helpers, ordered lexicographically.
+
+
+def _horizontal_rectangle_geometry(
+    region: ParkourSupportRegionCfg,
+) -> tuple[tuple[float, float], tuple[float, float], float]:
+    """Return extents for a horizontal axis-aligned rectangular support."""
+
+    # A rectangle must first be a four-vertex polygon. Its unit normal must be
+    # world up ``(0, 0, 1)``: zero X and Y components mean the plane has no
+    # tilt, while positive unit Z confirms the required upward CCW winding.
+    # These conditions establish a horizontal quadrilateral; the coordinate
+    # checks below additionally prove that its sides form an axis-aligned
+    # rectangle rather than another four-sided shape.
+    if len(region.vertices) != 4 or not (
+        math.isclose(region.normal[0], 0.0, abs_tol=_GEOMETRY_TOLERANCE)
+        and math.isclose(region.normal[1], 0.0, abs_tol=_GEOMETRY_TOLERANCE)
+        and math.isclose(region.normal[2], 1.0, abs_tol=_GEOMETRY_TOLERANCE)
+    ):
+        raise ValueError("Support is not a horizontal rectangle.")
+
+    # Previous support-region validation already guarantees a planar, strictly
+    # convex polygon with unique CCW vertices. For a four-sided polygon, it is
+    # therefore sufficient to require every boundary edge to follow exactly
+    # one world axis. An X-aligned edge has no Y displacement, while a
+    # Y-aligned edge has no X displacement.
+    for start, end in region.boundary_segments_xyz():
+        delta_x = end[0] - start[0]
+        delta_y = end[1] - start[1]
+        runs_along_x = math.isclose(
+            delta_y,
+            0.0,
+            abs_tol=_GEOMETRY_TOLERANCE,
+        )
+        runs_along_y = math.isclose(
+            delta_x,
+            0.0,
+            abs_tol=_GEOMETRY_TOLERANCE,
+        )
+
+        # Exactly one condition must hold. Both false describes a diagonal
+        # edge; both true describes an effectively zero-length edge.
+        if runs_along_x == runs_along_y:
+            raise ValueError("Support is not axis-aligned.")
+
+    return region.x_range, region.y_range, region.vertices[0][2]
+
+
+def _unit_polygon_normal(
+    vertices: tuple[tuple[float, float, float], ...],
+) -> tuple[float, float, float]:
+    """Compute the polygon's oriented unit normal from its first three vertices.
+
+    The first two consecutive boundary vectors are ``v1 - v0`` and
+    ``v2 - v1``. Their cross product is perpendicular to both vectors and
+    therefore to the polygon plane. Its sign follows the right-hand rule, so
+    counter-clockwise vertices viewed from above produce an upward-facing
+    normal while reversed vertex order produces the opposite normal.
+
+    Dividing the cross product by its Euclidean magnitude removes the area
+    scale and leaves a vector of length one. A near-zero magnitude means that
+    the first three vertices are collinear or repeated and cannot establish a
+    plane, in which case the function raises ``ValueError``. The caller
+    separately verifies that all remaining vertices lie in the same plane.
+    """
+
+    first_edge = _subtract_xyz(vertices[1], vertices[0])
+    second_edge = _subtract_xyz(vertices[2], vertices[1])
+    normal = _cross_xyz(first_edge, second_edge)
+    magnitude = math.sqrt(_dot_xyz(normal, normal))
+    if magnitude <= _GEOMETRY_TOLERANCE:
+        raise ValueError("Support-region vertices must define a nondegenerate plane.")
+    return (
+        normal[0] / magnitude,
+        normal[1] / magnitude,
+        normal[2] / magnitude,
+    )
+
+
+def _validate_support_polygon(
+    name: str,
+    vertices: tuple[tuple[float, float, float], ...],
+) -> None:
+    """Require one finite, planar, strictly convex, upward-wound polygon."""
+
+    if len(vertices) < 3:
+        raise ValueError(f"{name}: a support region requires at least three vertices.")
+
+    for index, vertex in enumerate(vertices):
+        for other in vertices[index + 1 :]:
+            separation = _subtract_xyz(vertex, other)
+            if _dot_xyz(separation, separation) <= _GEOMETRY_TOLERANCE**2:
+                raise ValueError(f"{name}: support-region vertices must be unique.")
+
+    normal = _unit_polygon_normal(vertices)
+    if normal[2] <= _GEOMETRY_TOLERANCE:
+        raise ValueError(
+            f"{name}: support-region vertices must have counter-clockwise, upward-facing winding."
+        )
+
+    origin = vertices[0]
+
+    # Subtracting ``origin`` expresses each remaining vertex relative to a
+    # known point on the plane. Projecting that displacement onto the unit
+    # normal gives its signed perpendicular distance from the plane. Every
+    # coplanar vertex must have distance zero within the geometry tolerance.
+    if any(
+        abs(_dot_xyz(_subtract_xyz(vertex, origin), normal)) > _GEOMETRY_TOLERANCE
+        for vertex in vertices[1:]
+    ):
+        raise ValueError(f"{name}: support-region vertices must be coplanar.")
+
+    # A strictly convex CCW polygon places every non-edge vertex strictly to
+    # the left of each directed boundary edge. Unlike checking only adjacent
+    # turns, this also rejects self-intersecting star-shaped vertex orders.
+    for edge_index, start in enumerate(vertices):
+        end_index = (edge_index + 1) % len(vertices)
+        end = vertices[end_index]
+        edge = _subtract_xyz(end, start)
+        for vertex_index, vertex in enumerate(vertices):
+            if vertex_index in (edge_index, end_index):
+                continue
+
+            # Crossing the directed edge with the vector from its start to
+            # this vertex produces a vector perpendicular to the polygon. Its
+            # dot product with the polygon normal is positive when the vertex
+            # lies to the left of the edge, negative when it lies to the
+            # right, and zero when it lies on the edge's line. Every non-edge
+            # vertex of a strictly convex CCW polygon must be strictly left of
+            # every directed boundary edge.
+            signed_side = _dot_xyz(
+                _cross_xyz(edge, _subtract_xyz(vertex, start)),
+                normal,
+            )
+            if signed_side <= _GEOMETRY_TOLERANCE:
+                raise ValueError(
+                    f"{name}: support-region vertices must form a strictly convex CCW polygon."
+                )
+
+
+# XYZ-vector helpers
+
+
+def _cross_xyz(
+    first: tuple[float, float, float],
+    second: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Return the right-handed cross product of two XYZ vectors."""
+
+    return (
+        first[1] * second[2] - first[2] * second[1],
+        first[2] * second[0] - first[0] * second[2],
+        first[0] * second[1] - first[1] * second[0],
+    )
+
+
+def _dot_xyz(
+    first: tuple[float, float, float],
+    second: tuple[float, float, float],
+) -> float:
+    """Return the scalar product of two XYZ vectors."""
+
+    return sum(first[axis] * second[axis] for axis in range(3))
+
+
+def _subtract_xyz(
+    first: tuple[float, float, float],
+    second: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Subtract two XYZ vectors without a numerical dependency."""
+
+    return (
+        first[0] - second[0],
+        first[1] - second[1],
+        first[2] - second[2],
+    )
+
+
+# Range-geometry helpers, ordered lexicographically.
+
+
+def _pair_within(
+    inner: tuple[float, float],
+    outer: tuple[float, float],
+) -> bool:
+    """Return whether one closed coordinate range lies inside another."""
+
+    tolerance = 1.0e-9
+    return inner[0] >= outer[0] - tolerance and inner[1] <= outer[1] + tolerance
+
+
+def _rectangles_overlap(
+    first: ParkourSupportRegionCfg,
+    second: ParkourSupportRegionCfg,
+) -> bool:
+    """Return whether two support rectangles overlap with positive area."""
+
+    tolerance = 1.0e-9
+    overlap_x = min(first.x_range[1], second.x_range[1]) - max(
+        first.x_range[0], second.x_range[0]
+    )
+    overlap_y = min(first.y_range[1], second.y_range[1]) - max(
+        first.y_range[0], second.y_range[0]
+    )
+    return overlap_x > tolerance and overlap_y > tolerance
+
+
+# Configuration-value helpers, ordered lexicographically.
 
 
 def _float_mapping(value: object, *, field_name: str) -> dict[str, float]:
@@ -735,32 +1056,6 @@ def _json_value(value: object, *, field_name: str) -> object:
     if callable(item):
         return _json_value(item(), field_name=field_name)
     raise TypeError(f"{field_name} is not Hydra/JSON-compatible.")
-
-
-def _pair_within(
-    inner: tuple[float, float],
-    outer: tuple[float, float],
-) -> bool:
-    """Return whether one closed coordinate range lies inside another."""
-
-    tolerance = 1.0e-9
-    return inner[0] >= outer[0] - tolerance and inner[1] <= outer[1] + tolerance
-
-
-def _rectangles_overlap(
-    first: ParkourSupportRegionCfg,
-    second: ParkourSupportRegionCfg,
-) -> bool:
-    """Return whether two support rectangles overlap with positive area."""
-
-    tolerance = 1.0e-9
-    overlap_x = min(first.x_range[1], second.x_range[1]) - max(
-        first.x_range[0], second.x_range[0]
-    )
-    overlap_y = min(first.y_range[1], second.y_range[1]) - max(
-        first.y_range[0], second.y_range[0]
-    )
-    return overlap_x > tolerance and overlap_y > tolerance
 
 
 def _resolve_mesh_factory(value: object) -> Callable[..., object]:

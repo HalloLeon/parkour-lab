@@ -89,10 +89,7 @@ class TiltedRampCourseCfg:
         if len(self.landing_size) != 2:
             raise ValueError("Landing size must contain length and width.")
         landing_length, landing_width = self.landing_size
-        if any(
-            not math.isfinite(value) or value <= 0.0
-            for value in (landing_length, landing_width)
-        ):
+        if any(not math.isfinite(value) or value <= 0.0 for value in (landing_length, landing_width)):
             raise ValueError("Landing length and width must be positive finite values.")
         if not math.isfinite(self.landing_center_y):
             raise ValueError("Landing center Y must be finite.")
@@ -118,12 +115,8 @@ class TiltedRampCourseCfg:
     ) -> tuple[TiltedRampGeometry, TiltedRampGeometry]:
         """Construct and validate the two positioned ramp geometries."""
 
-        if len(self.ramps) != 2 or not all(
-            isinstance(ramp, TiltedRampSegmentCfg) for ramp in self.ramps
-        ):
-            raise ValueError(
-                "Tilted-ramp courses require exactly two ramp configurations."
-            )
+        if len(self.ramps) != 2 or not all(isinstance(ramp, TiltedRampSegmentCfg) for ramp in self.ramps):
+            raise ValueError("Tilted-ramp courses require exactly two ramp configurations.")
         if any(ramp.length <= 2.0 * _RAMP_WAYPOINT_INSET_M for ramp in self.ramps):
             raise ValueError("Each ramp must be long enough for inset route waypoints.")
         if not math.isfinite(self.inter_ramp_gap) or self.inter_ramp_gap < 0.0:
@@ -155,18 +148,10 @@ class TiltedRampCourseCfg:
         for ramp in (first_ramp, second_ramp):
             x_bounds, y_bounds = ramp.collision_bounds_xy
             if not (
-                _TERRAIN_X_RANGE_M[0]
-                <= x_bounds[0]
-                < x_bounds[1]
-                <= _TERRAIN_X_RANGE_M[1]
-                and _TERRAIN_Y_RANGE_M[0]
-                <= y_bounds[0]
-                < y_bounds[1]
-                <= _TERRAIN_Y_RANGE_M[1]
+                _TERRAIN_X_RANGE_M[0] <= x_bounds[0] < x_bounds[1] <= _TERRAIN_X_RANGE_M[1]
+                and _TERRAIN_Y_RANGE_M[0] <= y_bounds[0] < y_bounds[1] <= _TERRAIN_Y_RANGE_M[1]
             ):
-                raise ValueError(
-                    "Tilted-ramp collision geometry must lie inside the terrain tile."
-                )
+                raise ValueError("Tilted-ramp collision geometry must lie inside the terrain tile.")
         return first_ramp, second_ramp
 
 
@@ -205,9 +190,7 @@ def _box_obstacle(
     dimensions = (obstacle_depth, obstacle_width, obstacle_height)
     if any(not math.isfinite(value) or value <= 0.0 for value in dimensions):
         raise ValueError("Box-obstacle height, width, and depth must be positive.")
-    if len(obstacle_position_xy) != 2 or any(
-        not math.isfinite(value) for value in obstacle_position_xy
-    ):
+    if len(obstacle_position_xy) != 2 or any(not math.isfinite(value) for value in obstacle_position_xy):
         raise ValueError("Box-obstacle XY position must contain two finite values.")
 
     center_x, center_y = obstacle_position_xy
@@ -248,7 +231,7 @@ def _flat_level() -> ParkourLevelCfg:
         waypoints=(ParkourWaypointCfg(position=(3.8, 0.0, 0.01)),),
         structures=(),
         support_regions=(
-            ParkourSupportRegionCfg(
+            ParkourSupportRegionCfg.horizontal_rectangle(
                 name="ground",
                 structure_name=None,
                 x_range=_TERRAIN_X_RANGE_M,
@@ -275,14 +258,14 @@ def _gap_level() -> ParkourLevelCfg:
         ),
         structures=(),
         support_regions=(
-            ParkourSupportRegionCfg(
+            ParkourSupportRegionCfg.horizontal_rectangle(
                 name="approach_ground",
                 structure_name=None,
                 x_range=(_TERRAIN_X_RANGE_M[0], _GAP_X_RANGE_M[0]),
                 y_range=_TERRAIN_Y_RANGE_M,
                 surface_z=0.0,
             ),
-            ParkourSupportRegionCfg(
+            ParkourSupportRegionCfg.horizontal_rectangle(
                 name="landing_ground",
                 structure_name=None,
                 x_range=(_GAP_X_RANGE_M[1], _TERRAIN_X_RANGE_M[1]),
@@ -339,14 +322,14 @@ def _high_step_level(
         ),
         structures=(platform,),
         support_regions=(
-            ParkourSupportRegionCfg(
+            ParkourSupportRegionCfg.horizontal_rectangle(
                 name="ground",
                 structure_name=None,
                 x_range=_TERRAIN_X_RANGE_M,
                 y_range=_TERRAIN_Y_RANGE_M,
                 surface_z=0.0,
             ),
-            ParkourSupportRegionCfg(
+            ParkourSupportRegionCfg.horizontal_rectangle(
                 name="platform_top",
                 structure_name=platform.name,
                 x_range=platform_x_range,
@@ -399,7 +382,7 @@ def _hurdle_level(
         waypoints=(ParkourWaypointCfg(position=(landing_x, landing_y, 0.01)),),
         structures=(hurdle,),
         support_regions=(
-            ParkourSupportRegionCfg(
+            ParkourSupportRegionCfg.horizontal_rectangle(
                 name="ground",
                 structure_name=None,
                 x_range=_TERRAIN_X_RANGE_M,
@@ -507,7 +490,7 @@ def _tilted_ramp_level(
             )
         ),
     )
-    approach_region = ParkourSupportRegionCfg(
+    approach_region = ParkourSupportRegionCfg.horizontal_rectangle(
         name="approach_ground",
         structure_name=None,
         x_range=(_TERRAIN_X_RANGE_M[0], _RAMP_APPROACH_END_X_M),
@@ -517,20 +500,38 @@ def _tilted_ramp_level(
     if not approach_region.supports_waypoint(waypoints[0].position):
         raise ValueError("The first tilted-ramp waypoint must lie on approach ground.")
 
+    first_ramp_structure = _ramp_structure("tilted_ramp_1", first_ramp)
+    second_ramp_structure = _ramp_structure("tilted_ramp_2", second_ramp)
+    first_ramp_support = ParkourSupportRegionCfg(
+        name="tilted_ramp_1_top",
+        structure_name=first_ramp_structure.name,
+        vertices=first_ramp.top_corners,
+    )
+    second_ramp_support = ParkourSupportRegionCfg(
+        name="tilted_ramp_2_top",
+        structure_name=second_ramp_structure.name,
+        vertices=second_ramp.top_corners,
+    )
+    if not first_ramp_support.supports_waypoint(waypoints[1].position):
+        raise ValueError("The first ramp waypoint must lie on its top surface.")
+    if not all(second_ramp_support.supports_waypoint(waypoints[index].position) for index in (2, 3)):
+        raise ValueError("The second ramp waypoints must lie on its top surface.")
+
     return ParkourLevelCfg(
         name=name,
         obstacle_family="tilted_ramps",
         waypoints=waypoints,
         structures=(
-            _ramp_structure("tilted_ramp_1", first_ramp),
-            _ramp_structure("tilted_ramp_2", second_ramp),
+            first_ramp_structure,
+            second_ramp_structure,
         ),
-        # Only horizontal ground is annotated as support in EP-06. The banked
-        # slabs are physical collision meshes; inclined edge semantics remain
-        # outside this stage.
+        # Annotate the exact top faces so the same terrain-independent edge
+        # reward covers horizontal ground and both banked ramp surfaces.
         support_regions=(
             approach_region,
-            ParkourSupportRegionCfg(
+            first_ramp_support,
+            second_ramp_support,
+            ParkourSupportRegionCfg.horizontal_rectangle(
                 name="final_landing",
                 structure_name=None,
                 x_range=landing_x_range,
@@ -625,15 +626,13 @@ class ParkourCurriculumCfg:
     waypoint_reach_threshold: float = 0.20
     waypoint_reach_hold_s: float = 0.10
     successes_to_promote: int = 2  # Avoids promotion from one lucky success
-    failures_to_demote: int = (
-        2  # Hysteresis prevents oscillating after one poor episode
-    )
+    failures_to_demote: int = 2  # Hysteresis prevents oscillating after one poor episode
 
     base_contact_threshold: float = 1.0
 
     # A contacted foot within this metric distance of a support boundary is
     # counted by the edge penalty.
-    edge_width_threshold: float = 0.03
+    edge_width_threshold: float = 0.05
     foot_edge_contact_threshold: float = 1.0
 
     def __post_init__(self) -> None:
@@ -653,16 +652,10 @@ class ParkourCurriculumCfg:
         if self.max_level < self.initial_level or self.max_level >= len(self.levels):
             raise ValueError("max_level is out of range.")
 
-        if (
-            not np.isfinite(self.waypoint_reach_threshold)
-            or self.waypoint_reach_threshold <= 0.0
-        ):
+        if not np.isfinite(self.waypoint_reach_threshold) or self.waypoint_reach_threshold <= 0.0:
             raise ValueError("waypoint_reach_threshold must be positive.")
 
-        if (
-            not np.isfinite(self.waypoint_reach_hold_s)
-            or self.waypoint_reach_hold_s < 0.0
-        ):
+        if not np.isfinite(self.waypoint_reach_hold_s) or self.waypoint_reach_hold_s < 0.0:
             raise ValueError("waypoint_reach_hold_s must be non-negative.")
 
         if self.successes_to_promote <= 0:
@@ -674,30 +667,20 @@ class ParkourCurriculumCfg:
         if self.base_contact_threshold < 0.0:
             raise ValueError("base_contact_threshold must be non-negative.")
 
-        if (
-            not np.isfinite(self.edge_width_threshold)
-            or self.edge_width_threshold <= 0.0
-        ):
+        if not np.isfinite(self.edge_width_threshold) or self.edge_width_threshold <= 0.0:
             raise ValueError("edge_width_threshold must be positive.")
 
-        if (
-            not np.isfinite(self.foot_edge_contact_threshold)
-            or self.foot_edge_contact_threshold < 0.0
-        ):
+        if not np.isfinite(self.foot_edge_contact_threshold) or self.foot_edge_contact_threshold < 0.0:
             raise ValueError("foot_edge_contact_threshold must be non-negative.")
 
 
 DEFAULT_PARKOUR_CURRICULUM = ParkourCurriculumCfg()
 
 
-def parkour_terrain(
-    difficulty: float, cfg: ParkourTerrainCfg
-) -> tuple[list[trimesh.Trimesh], np.ndarray]:
+def parkour_terrain(difficulty: float, cfg: ParkourTerrainCfg) -> tuple[list[trimesh.Trimesh], np.ndarray]:
     """Generate a terrain tile from base-support patches and structures."""
 
-    level = coerce_level_cfg(
-        cfg.levels[difficulty_to_level(difficulty, len(cfg.levels))]
-    )
+    level = coerce_level_cfg(cfg.levels[difficulty_to_level(difficulty, len(cfg.levels))])
     level.validate_terrain_size(cfg.size)
     terrain_center = _terrain_local_center(cfg)
     ground_structures = base_ground_structures(
@@ -802,14 +785,10 @@ def _normalize_mesh_result(result: object, factory: object) -> list[trimesh.Trim
 
     # Report the factory as well as the accepted return types to make malformed
     # custom structure factories straightforward to identify.
-    raise TypeError(
-        f"Mesh factory {factory!r} must return a Trimesh, Scene, or iterable of Trimesh objects."
-    )
+    raise TypeError(f"Mesh factory {factory!r} must return a Trimesh, Scene, or iterable of Trimesh objects.")
 
 
-def _structure_meshes(
-    structure: ParkourStructureCfg, terrain_center: np.ndarray
-) -> list[trimesh.Trimesh]:
+def _structure_meshes(structure: ParkourStructureCfg, terrain_center: np.ndarray) -> list[trimesh.Trimesh]:
     """Create and rigidly transform all meshes produced by one structure."""
 
     # Call the configured factory with its declarative keyword arguments.

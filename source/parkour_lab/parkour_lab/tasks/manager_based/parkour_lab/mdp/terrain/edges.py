@@ -3,7 +3,14 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Metric support-edge geometry and contact-gated runtime queries."""
+"""Derive exposed support edges and query contact near them at runtime.
+
+Support polygons contribute directed XYZ boundary segments. Shared,
+oppositely wound portions are removed as internal seams, and the remaining
+edges are packed into padded tensors by curriculum level. Runtime queries then
+combine exact 3D point-to-segment distance with recent foot-contact history so
+a swing foot passing over an edge is not treated as an edge contact.
+"""
 
 from __future__ import annotations
 
@@ -24,7 +31,14 @@ _GEOMETRY_TOLERANCE = 1.0e-9
 
 @dataclass(frozen=True)
 class _SupportEdgeCache:
-    """Device-side edge geometry derived from one curriculum configuration."""
+    """Padded device-side edge geometry for one curriculum configuration.
+
+    ``segment_table`` has shape ``(num_levels, max_segments, 2, 3)`` and stores
+    two XYZ endpoints for each exposed edge. ``valid_segment_mask`` has shape
+    ``(num_levels, max_segments)`` and distinguishes real edges from zero-filled
+    padding. Retaining ``curriculum_cfg`` by identity prevents geometry derived
+    from one configuration object from being reused for another.
+    """
 
     curriculum_cfg: ParkourCurriculumCfg
     segment_table: torch.Tensor
@@ -37,7 +51,12 @@ class _SupportEdgeCache:
         device: torch.device,
         dtype: torch.dtype,
     ) -> bool:
-        """Return whether this cache can serve the requested runtime tensors."""
+        """Return whether the cache matches the configuration and tensor layout.
+
+        Reuse requires the identical curriculum object, the requested tensor
+        device, and the requested floating-point dtype. The Boolean validity
+        mask is device-sensitive but has a fixed Boolean dtype.
+        """
 
         return (
             self.curriculum_cfg is curriculum_cfg
@@ -54,10 +73,31 @@ def foot_edge_contact_mask(
     asset_cfg: SceneEntityCfg,
     sensor_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
-    """Return contacted feet near exposed edges of their current support.
+    """Identify recently contacted feet near exposed edges of their level.
+
+    Each environment selects the edge table for its active curriculum level.
+    A foot is marked only when its recent contact-force history exceeds
+    ``foot_edge_contact_threshold`` and its current XYZ position lies within
+    ``edge_width_threshold`` of an exposed finite segment. Internal seams and
+    padded table rows are excluded before this query.
+
+    Args:
+        env: Vectorized manager-based environment containing route state,
+            robot bodies, and the configured contact sensor.
+        curriculum_cfg: Course levels and metric contact/edge thresholds.
+        asset_cfg: Robot entity and body selection identifying the queried
+            feet.
+        sensor_cfg: Contact sensor entity and body selection matching those
+            feet.
 
     Returns:
-        Boolean tensor with shape ``(num_envs, num_feet)``.
+        Boolean tensor of shape ``(num_envs, num_feet)``. ``True`` means that
+        the corresponding foot is both recently contacting terrain and close
+        to an exposed edge.
+
+    Raises:
+        RuntimeError: If active per-environment curriculum levels have not
+            been initialized.
     """
 
     import torch
@@ -66,16 +106,13 @@ def foot_edge_contact_mask(
 
     levels = getattr(env, "_parkour_waypoint_level", None)
     if levels is None or levels.shape != (env.num_envs,):
-        raise RuntimeError(
-            "Active course levels must be initialized before evaluating edges."
-        )
+        raise RuntimeError("Active course levels must be initialized before evaluating edges.")
 
     foot_positions = robot._selected_body_pos_env(env, asset_cfg)
 
     # Reduce the history axis, retaining one recent-contact flag per foot.
     recent_contact = torch.any(
-        contact._force_norm_mask(env, sensor_cfg=sensor_cfg)
-        > curriculum_cfg.foot_edge_contact_threshold,
+        contact._force_norm_mask(env, sensor_cfg=sensor_cfg) > curriculum_cfg.foot_edge_contact_threshold,
         dim=1,
     )
     runtime._validate_matching_shape(
@@ -103,52 +140,52 @@ def foot_edge_contact_mask(
 def _exposed_segment_fragments(
     start: tuple[float, float, float],
     end: tuple[float, float, float],
-    all_segments: tuple[
-        tuple[tuple[float, float, float], tuple[float, float, float]], ...
-    ],
+    all_segments: tuple[tuple[tuple[float, float, float], tuple[float, float, float]], ...],
 ) -> tuple[tuple[tuple[float, float, float], tuple[float, float, float]], ...]:
-    """Remove internal seams from one segment and return its exposed pieces."""
+    """Return the exposed pieces of one directed 3D support boundary.
 
-    # Axis-aligned horizontal segments have equal start and end Y coordinates.
-    # Use an absolute tolerance because course geometry is represented by
-    # floating-point values.
-    horizontal = math.isclose(
-        start[1],
-        end[1],
-        rel_tol=0.0,
-        abs_tol=_GEOMETRY_TOLERANCE,
-    )
+    The candidate is parameterized by signed metric distance from ``start``
+    along its unit direction, making its complete interval ``(0, length)``.
+    Every oppositely directed segment that overlaps the same infinite 3D line
+    removes its shared interval. This suppresses both coplanar seams and exact
+    folds between adjacent support polygons while retaining partially exposed
+    prefixes and suffixes. The remaining scalar intervals are finally mapped
+    back to directed XYZ endpoint pairs.
 
-    # Coordinate index 0 is X and index 1 is Y. X varies along a horizontal
-    # segment, whereas Y varies along a vertical segment.
-    varying_axis = 0 if horizontal else 1
+    Args:
+        start: First XYZ endpoint of the candidate boundary.
+        end: Second XYZ endpoint, establishing its direction.
+        all_segments: All directed support boundaries in the level, including
+            the candidate itself.
 
-    # Record whether the directed boundary travels in the positive or negative
-    # direction so reconstructed fragments preserve the original orientation.
-    direction = 1 if end[varying_axis] > start[varying_axis] else -1
+    Returns:
+        Exposed directed XYZ fragments in candidate order. The result is empty
+        for a degenerate candidate or one covered completely by internal
+        seams.
+    """
 
-    # Begin with the segment's complete one-dimensional interval in ascending
-    # order. The outer tuple holds the remaining pieces because removing
-    # internal seams may split this interval into multiple fragments.
-    fragments = (
-        (
-            min(start[varying_axis], end[varying_axis]),
-            max(start[varying_axis], end[varying_axis]),
-        ),
-    )
+    vector = tuple(end[axis] - start[axis] for axis in range(3))
+    length = math.sqrt(sum(component * component for component in vector))
+    if length <= _GEOMETRY_TOLERANCE:
+        return ()
+    unit_direction = tuple(component / length for component in vector)
 
-    # Compare this boundary with every course boundary. An oppositely directed
-    # segment on the same line and support height belongs to the neighboring
-    # side of a coplanar region, so their overlap is an internal seam.
+    # Parameterize the candidate by metric distance from ``start``. This works
+    # for horizontal, rotated, and sloped edges while retaining the simple
+    # interval subtraction used to split partially covered boundaries.
+    fragments = ((0.0, length),)
+
+    # Oppositely directed overlap on the same 3D line is the neighboring side
+    # of either a coplanar seam or a fold between two differently tilted faces.
     for other_start, other_end in all_segments:
-        blocker = _shared_coplanar_interval(
+        blocker = _shared_collinear_interval(
             start,
             end,
             other_start,
             other_end,
         )
-        # Different axes, lines, heights, or directions cannot hide any part
-        # of this boundary and therefore leave its fragments unchanged.
+        # Offset, crossing, same-direction, and endpoint-only boundaries do not
+        # hide a positive-length part of this edge.
         if blocker is None:
             continue
 
@@ -156,34 +193,29 @@ def _exposed_segment_fragments(
         # still exposed. One blocker may shorten a piece, split it in two, or
         # remove it completely; the flattened tuple becomes the input for the
         # next comparison and supports multiple partial neighboring seams.
-        fragments = tuple(
-            remaining
-            for fragment in fragments
-            for remaining in _subtract_interval(fragment, blocker)
+        fragments = tuple(remaining for fragment in fragments for remaining in _subtract_interval(fragment, blocker))
+
+    def point_at(distance: float) -> tuple[float, float, float]:
+        """Map a metric line coordinate back to an XYZ candidate point.
+
+        Exact candidate endpoints are returned unchanged when the coordinate
+        lies within the geometry tolerance. Interior coordinates use
+        ``start + distance * unit_direction``.
+        """
+
+        if math.isclose(distance, 0.0, abs_tol=_GEOMETRY_TOLERANCE):
+            return start
+        if math.isclose(distance, length, abs_tol=_GEOMETRY_TOLERANCE):
+            return end
+        return tuple(start[axis] + distance * unit_direction[axis] for axis in range(3))
+
+    return tuple(
+        (
+            point_at(fragment_start),
+            point_at(fragment_end),
         )
-
-    exposed_segments: list[
-        tuple[tuple[float, float, float], tuple[float, float, float]]
-    ] = []
-    for fragment_start, fragment_end in fragments:
-        first = fragment_start if direction > 0 else fragment_end
-        second = fragment_end if direction > 0 else fragment_start
-        if horizontal:
-            exposed_segments.append(
-                (
-                    (first, start[1], start[2]),
-                    (second, start[1], start[2]),
-                )
-            )
-        else:
-            exposed_segments.append(
-                (
-                    (start[0], first, start[2]),
-                    (start[0], second, start[2]),
-                )
-            )
-
-    return tuple(exposed_segments)
+        for fragment_start, fragment_end in fragments
+    )
 
 
 def _get_support_edge_cache(
@@ -193,7 +225,27 @@ def _get_support_edge_cache(
     device: torch.device,
     dtype: torch.dtype,
 ) -> _SupportEdgeCache:
-    """Return cached, padded edge geometry on the requested device."""
+    """Return padded exposed-edge tensors on the requested device.
+
+    The cache is reused only when :meth:`_SupportEdgeCache.matches` accepts the
+    curriculum identity, device, and dtype. Otherwise, exposed segments are
+    derived independently for every level and packed to the largest level edge
+    count. Zero-filled rows make the tensor rectangular, while a Boolean mask
+    prevents those rows from participating in distance minima. The rebuilt
+    cache is stored on ``env`` for subsequent control steps.
+
+    Args:
+        env: Environment that owns the runtime cache.
+        curriculum_cfg: Ordered course levels from which exposed edges are
+            derived.
+        device: Device on which the edge and validity tensors must reside.
+        dtype: Floating-point dtype used for XYZ edge coordinates.
+
+    Returns:
+        Cache containing a segment tensor of shape
+        ``(num_levels, max_segments, 2, 3)`` and a validity mask of shape
+        ``(num_levels, max_segments)``.
+    """
 
     import torch
 
@@ -207,9 +259,7 @@ def _get_support_edge_cache(
 
     # Each level may contain a different number of exposed edges. Every edge
     # consists of two XYZ endpoints, where Z identifies its support surface.
-    segments_by_level = tuple(
-        _support_edge_segments(level) for level in curriculum_cfg.levels
-    )
+    segments_by_level = tuple(_support_edge_segments(level) for level in curriculum_cfg.levels)
     max_segments = max(len(segments) for segments in segments_by_level)
 
     # Shape: ``(num_levels, max_segments, 2, 3)``. Shorter levels retain
@@ -253,8 +303,12 @@ def _minimum_distance_to_level_edges(
 ) -> torch.Tensor:
     """Measure 3D points against exposed edges for their environment level.
 
-    Including height prevents an edge on one support surface from penalizing a
-    foot contacting another surface at the same XY location.
+    Each environment indexes one curriculum-level segment table. Every query
+    point is compared with every valid finite edge in that table using a
+    clamped line projection, and the segment-axis minimum is returned. Distances
+    include height, preventing an edge on one support surface from penalizing a
+    foot contacting another surface at the same XY location. Padded rows are
+    assigned infinite distance and cannot become minima.
 
     Args:
         points: Query positions with shape ``(num_envs, num_points, 3)``.
@@ -287,9 +341,7 @@ def _minimum_distance_to_level_edges(
 
     # Squared segment lengths have shape ``(num_envs, 1, max_segments)``.
     # Clamping also keeps zero-filled padding from causing division by zero.
-    squared_lengths = torch.sum(vectors.square(), dim=-1).clamp_min(
-        torch.finfo(points.dtype).eps
-    )
+    squared_lengths = torch.sum(vectors.square(), dim=-1).clamp_min(torch.finfo(points.dtype).eps)
 
     # For a point P and segment from A to B, ``vectors`` is v = B - A and
     # ``point_offsets`` is w = P - A. The normalized scalar projection
@@ -326,25 +378,21 @@ def _minimum_distance_to_level_edges(
     return distances.amin(dim=-1)
 
 
-def _shared_coplanar_interval(
+def _shared_collinear_interval(
     start: tuple[float, float, float],
     end: tuple[float, float, float],
     other_start: tuple[float, float, float],
     other_end: tuple[float, float, float],
 ) -> tuple[float, float] | None:
-    """Return the blocking interval of an opposing coplanar boundary.
+    """Return the blocking interval of an opposing collinear 3D boundary.
 
-    Two axis-aligned boundaries can describe the two sides of an internal seam
-    only when they are both horizontal or both vertical, lie on the same XY
-    line, have the same support-surface height, and point in opposite
-    directions. The opposite direction follows from the consistent winding of
-    neighboring support rectangles.
+    This recognizes both a coplanar seam and the exact shared line at a fold
+    between differently oriented support surfaces.
 
-    When those conditions hold, the returned pair contains ``other_start`` and
-    ``other_end`` projected onto the segment's varying axis and sorted in
-    ascending order. It may extend beyond ``start`` and ``end``; the caller's
-    interval-subtraction step computes their actual overlap. ``None`` means the
-    other boundary cannot hide any part of the candidate as an internal seam.
+    The returned values are signed metric distances from ``start`` along the
+    candidate direction. They may lie outside the candidate; interval
+    subtraction determines the positive-length overlap. ``None`` means the
+    other boundary cannot conceal any part of the candidate.
 
     Args:
         start: First XYZ endpoint of the candidate boundary.
@@ -353,66 +401,90 @@ def _shared_coplanar_interval(
         other_end: Second XYZ endpoint of the boundary being compared.
 
     Returns:
-        The other boundary's ascending interval along the varying axis, or
+        The other boundary's ascending interval along the candidate line, or
         ``None`` when the boundaries cannot form an internal seam.
     """
 
-    horizontal = math.isclose(
-        start[1],
-        end[1],
-        rel_tol=0.0,
-        abs_tol=_GEOMETRY_TOLERANCE,
-    )
-    other_horizontal = math.isclose(
-        other_start[1],
-        other_end[1],
-        rel_tol=0.0,
-        abs_tol=_GEOMETRY_TOLERANCE,
-    )
-    if horizontal != other_horizontal:
+    candidate = tuple(end[axis] - start[axis] for axis in range(3))
+    other = tuple(other_end[axis] - other_start[axis] for axis in range(3))
+    candidate_length = math.sqrt(sum(component * component for component in candidate))
+    other_length = math.sqrt(sum(component * component for component in other))
+    if candidate_length <= _GEOMETRY_TOLERANCE or other_length <= _GEOMETRY_TOLERANCE:
         return None
 
-    # Coordinate index 0 is X and index 1 is Y. X varies along a horizontal
-    # segment, whereas Y varies along a vertical segment.
-    varying_axis = 0 if horizontal else 1
-    constant_axis = 1 - varying_axis
-    same_line = math.isclose(
-        start[constant_axis],
-        other_start[constant_axis],
-        rel_tol=0.0,
-        abs_tol=_GEOMETRY_TOLERANCE,
-    )
-    same_height = math.isclose(
-        start[2],
-        other_start[2],
-        rel_tol=0.0,
-        abs_tol=_GEOMETRY_TOLERANCE,
-    )
+    unit_direction = tuple(component / candidate_length for component in candidate)
 
-    if not same_line or not same_height:
+    def projection_and_distance(
+        point: tuple[float, float, float],
+    ) -> tuple[float, float]:
+        """Return one point's signed line coordinate and perpendicular distance.
+
+        The first result is metric distance from candidate ``start`` along
+        ``unit_direction`` and may be negative or exceed the candidate length.
+        The second is the non-negative shortest distance to the corresponding
+        infinite 3D line.
+        """
+
+        # Let ``r = point - start`` and let ``u`` be the candidate line's unit
+        # direction. The dot product ``r dot u`` is the signed scalar
+        # projection of ``r`` onto the line: its magnitude is the distance
+        # along the line from ``start``, and its sign identifies whether the
+        # projected point lies with or against the candidate direction.
+        offset = tuple(point[axis] - start[axis] for axis in range(3))
+        projection = sum(offset[axis] * unit_direction[axis] for axis in range(3))
+
+        # Multiplying the scalar projection by ``u`` reconstructs the parallel
+        # component of ``r``. Removing that component leaves
+        # ``r_perpendicular = r - (r dot u) * u``, the shortest displacement
+        # from the infinite candidate line to ``point``. Its Euclidean norm is
+        # therefore the point-to-line distance. A distance near zero means the
+        # point is collinear with the candidate boundary; ``projection`` may
+        # still fall outside the finite segment and is handled separately.
+        perpendicular = tuple(offset[axis] - projection * unit_direction[axis] for axis in range(3))
+        distance = math.sqrt(sum(component * component for component in perpendicular))
+        return projection, distance
+
+    other_start_projection, other_start_distance = projection_and_distance(other_start)
+    other_end_projection, other_end_distance = projection_and_distance(other_end)
+    if other_start_distance > _GEOMETRY_TOLERANCE or other_end_distance > _GEOMETRY_TOLERANCE:
         return None
 
-    direction = 1 if end[varying_axis] > start[varying_axis] else -1
-    other_direction = 1 if other_end[varying_axis] > other_start[varying_axis] else -1
-    # On a shared boundary, the right edge of the region on the left points
-    # upward while the left edge of the region on the right points downward.
-    # Opposite directions therefore identify the two sides of an internal
-    # seam. Equal directions do not; this also ignores the segment when it is
-    # compared with itself in ``all_segments``.
-    if direction == other_direction:
+    # Each support polygon stores its boundary in CCW order when viewed from
+    # its upward-facing normal. When two such polygons meet along an internal
+    # seam, their interiors lie on opposite sides of that seam, so their CCW
+    # boundary walks traverse the shared line in opposite directions. The dot
+    # product below measures the other edge's signed component along the
+    # candidate direction: a negative value means opposing traversal and can
+    # conceal a seam, whereas a non-negative value is rejected as
+    # equal-direction geometry. This includes the candidate edge itself when
+    # ``all_segments`` is compared against itself. Since the preceding checks
+    # already require a nondegenerate collinear segment, zero is retained only
+    # as a defensive numerical boundary between the two directions.
+    if sum(other[axis] * unit_direction[axis] for axis in range(3)) >= 0.0:
         return None
 
-    return (
-        min(other_start[varying_axis], other_end[varying_axis]),
-        max(other_start[varying_axis], other_end[varying_axis]),
-    )
+    return tuple(sorted((other_start_projection, other_end_projection)))
 
 
 def _subtract_interval(
     interval: tuple[float, float],
     blocker: tuple[float, float],
 ) -> tuple[tuple[float, float], ...]:
-    """Remove the positive-length overlap with ``blocker`` from an interval."""
+    """Subtract one closed scalar blocker from an ascending interval.
+
+    Both pairs belong to the same one-dimensional candidate-line coordinate
+    system, but ``blocker`` may extend outside ``interval``. Touching only at
+    an endpoint, or overlapping by no more than the geometry tolerance, leaves
+    the interval unchanged. Positive-length overlap can shorten the interval,
+    split it into two ordered fragments, or remove it completely.
+
+    Args:
+        interval: Ascending exposed interval to retain where possible.
+        blocker: Ascending interval occupied by an internal seam.
+
+    Returns:
+        Zero, one, or two ascending fragments in their original order.
+    """
 
     start, end = interval
     overlap_start = max(start, blocker[0])
@@ -431,23 +503,27 @@ def _subtract_interval(
 def _support_edge_segments(
     level: ParkourLevelCfg,
 ) -> tuple[tuple[tuple[float, float, float], tuple[float, float, float]], ...]:
-    """Return exposed XYZ support boundaries for one course level.
+    """Derive every exposed directed XYZ boundary for one course level.
 
-    Oppositely directed, collinear boundaries at the same height describe an
-    internal seam between coplanar support regions. Their shared interval is
-    removed because traversing that seam does not risk stepping off a surface.
+    Boundary segments are collected from all ordered support polygons.
+    Oppositely directed, collinear 3D boundaries describe either a coplanar
+    internal seam or the exact fold where traversable surfaces meet. Their
+    shared intervals are removed from both candidates because crossing them
+    does not leave the union of traversable supports. Partial overlap may split
+    one raw boundary into multiple exposed fragments.
+
+    Args:
+        level: Course level containing the support-region polygons.
+
+    Returns:
+        Directed exposed segments, each represented by two XYZ endpoints. The
+        order follows the level's support regions, their CCW boundaries, and
+        the surviving fragment order along each boundary.
     """
 
     raw_segments = tuple(
-        (
-            (start[0], start[1], region.surface_z),
-            (end[0], end[1], region.surface_z),
-        )
-        for region in level.support_regions
-        for start, end in region.boundary_segments_xy()
+        (start, end) for region in level.support_regions for start, end in region.boundary_segments_xyz()
     )
     return tuple(
-        fragment
-        for start, end in raw_segments
-        for fragment in _exposed_segment_fragments(start, end, raw_segments)
+        fragment for start, end in raw_segments for fragment in _exposed_segment_fragments(start, end, raw_segments)
     )

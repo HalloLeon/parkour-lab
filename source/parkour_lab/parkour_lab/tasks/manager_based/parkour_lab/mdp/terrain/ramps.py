@@ -345,65 +345,71 @@ class TiltedRampGeometry:
         cos_incline = math.cos(self.incline_radians)
         sin_incline = math.sin(self.incline_radians)
 
-        # Map local coordinates on the ramp's top face to world coordinates.
+        # Map local top-face coordinates to world coordinates.
         #
-        # Treat the top-face center C as the local origin. The offsets are signed
-        # physical distances in meters:
+        # Let the top-face center C be the local origin, with signed offsets in meters:
         #
-        #   longitudinal_offset > 0 : forward along the ramp
-        #   longitudinal_offset < 0 : backward along the ramp
-        #   lateral_offset      > 0 : left across the top surface
-        #   lateral_offset      < 0 : right across the top surface
+        #   u = longitudinal_offset  # +forward, -backward
+        #   v = lateral_offset       # +left,    -right
         #
-        # Rotation order matters. This construction first sets the ramp's heading
-        # by yawing about the fixed world Z-axis, then rolls the ramp about its
-        # resulting local X-axis, i.e. its travel direction:
+        # The ramp orientation first yaws about fixed world Z, then rolls about the
+        # resulting local X-axis (the travel direction):
         #
-        #   orientation = Rz(yaw) @ Rx(incline)
+        #   R = Rz(yaw) @ Rx(incline)
         #
-        # For column vectors, the rightmost matrix acts in local coordinates. Thus
-        # Rx(incline) represents roll about the ramp's local X-axis, while Rz(yaw)
-        # expresses the resulting directions in world coordinates.
+        # For column vectors, the rightmost matrix acts first. Using
         #
-        # After yaw, the horizontal forward and left unit vectors are
+        #   cy = cos(yaw),  sy = sin(yaw)
+        #   ci = cos(incline),  si = sin(incline)
         #
-        #   travel_w = ( cos(yaw), sin(yaw), 0)
-        #   left_w   = (-sin(yaw), cos(yaw), 0)
+        # the rotation matrices are
         #
-        # Hence, if left_w is stored as
+        #        [ cy -sy  0 ]         [ 1  0   0 ]
+        #   Rz = [ sy  cy  0 ],   Rx = [ 0  ci -si ].
+        #        [  0   0  1 ]         [ 0  si  ci ]
         #
-        #   left_w = (left_x, left_y, 0),
+        # Their product is
         #
-        # then normally
+        #       [ cy -sy*ci   sy*si ]
+        #   R = [ sy  cy*ci  -cy*si ].
+        #       [  0     si      ci ]
         #
-        #   left_x = -sin(yaw)
-        #   left_y =  cos(yaw).
+        # The local top surface is the z = 0 plane, with basis vectors
         #
-        # Rolling about travel_w leaves travel_w unchanged because it is the roll
-        # axis. The left vector rotates toward world up:
+        #   e_x = (1, 0, 0)  # forward
+        #   e_y = (0, 1, 0)  # left
         #
-        #   rolled_left_w
-        #       = cos(incline) * left_w + sin(incline) * up_w
-        #       = (cos(incline) * left_x,
-        #          cos(incline) * left_y,
-        #          sin(incline))
+        # Applying R gives their world-space directions:
         #
-        # or, after substituting the yawed left direction,
+        #   travel_w = R @ e_x
+        #            = (cy, sy, 0)
+        #            = (travel_x, travel_y, 0)
         #
-        #   rolled_left_w
-        #       = (-cos(incline) * sin(yaw),
-        #           cos(incline) * cos(yaw),
-        #           sin(incline)).
+        #   left_w = Rz @ e_y
+        #          = (-sy, cy, 0)
+        #          = (left_x, left_y, 0)
         #
-        # travel_w and rolled_left_w are perpendicular unit vectors spanning the
-        # tilted top surface. Multiplying them by the signed offsets therefore
-        # gives displacements of exactly those distances along the surface.
+        #   rolled_left_w = R @ e_y
+        #                 = (ci*left_x, ci*left_y, si)
         #
-        # The local surface coordinates are mapped to the world point P by
+        # Thus roll leaves travel_w unchanged and tilts left_w toward world up. Since
+        # travel_w and rolled_left_w are perpendicular unit vectors, u and v remain
+        # exact signed distances along the tilted top surface.
         #
-        #   P = C
-        #       + longitudinal_offset * travel_w
-        #       + lateral_offset * rolled_left_w
+        # For q = (u, v, 0), the world point is
+        #
+        #   P = C + R @ q
+        #     = C + u*travel_w + v*rolled_left_w
+        #
+        # With
+        #
+        #   C = (self.center_xy[0], self.center_xy[1], self.top_center_z)
+        #
+        # this expands component-wise to
+        #
+        #   P.x = self.center_xy[0] + u*travel_x + v*ci*left_x
+        #   P.y = self.center_xy[1] + u*travel_y + v*ci*left_y
+        #   P.z = self.top_center_z + v*si
         return (
             self.center_xy[0] + longitudinal_offset * travel_x + lateral_offset * cos_incline * left_x,
             self.center_xy[1] + longitudinal_offset * travel_y + lateral_offset * cos_incline * left_y,

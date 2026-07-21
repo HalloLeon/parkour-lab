@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
     from tensordict import TensorDict
 
-TEACHER_INTERFACE_VERSION = 4
+TEACHER_INTERFACE_VERSION = 5
 """Serialization version of the compact teacher interface manifest."""
 
 DEPLOYABLE_STATE_GROUP = "policy"

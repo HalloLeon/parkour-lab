@@ -104,12 +104,14 @@ transition, then switch the oracle heading along ramp two before targeting the
 final ground landing. This mirrors the paper's use of terrain waypoints to make
 the robot change direction immediately on tilted ramps.
 
-Every support rectangle also provides four exact metric XY edge segments. The
-edge penalty selects the segment table for each environment's current level and
-counts only feet that are both within 0.05 m of an edge and in recent contact.
-Swing feet passing over a lip are therefore not penalized, and different terrain
-levels can be evaluated in one vectorized batch without a rasterized height-field
-mask.
+Every support surface records an ordered planar XYZ polygon. Horizontal
+rectangles still generate the base-ground collision patches, while each banked
+ramp uses the exact corners of its collision slab's top face. The edge penalty
+selects the resulting 3D boundary segments for each environment's current level
+and counts only feet that are both within 0.05 m of an exposed edge and in recent
+contact. Swing feet passing over a lip are therefore not penalized, and different
+terrain levels can be evaluated in one vectorized batch without a rasterized
+height-field mask.
 
 Each environment owns an active waypoint index, proximity dwell timer, and
 course-completion state. A reset selects waypoint zero from the route belonging
@@ -120,13 +122,11 @@ reward. Intermediate waypoints do not end an episode or count as curriculum
 success. The final waypoint completes the course only when the existing minimum
 base-clearance condition is also satisfied. Routes may contain different
 numbers of waypoints without cursor overrun or cross-environment state changes.
-The teacher-interface manifest is version 4. In addition to the active-route
-semantics introduced with version 3, it now freezes the complete declarative
-terrain courses because physical support segmentation changes the privileged ray
-values seen by the teacher. The schema remains version 4 for the high-step,
-hurdle, and tilted-ramp additions because its shape did not change; the
-serialized course content still makes checkpoints trained with earlier default
-geometry fail compatibility validation.
+The teacher-interface manifest is version 5. Version 4 introduced complete
+declarative terrain courses because physical support segmentation changes the
+privileged ray values seen by the teacher. Version 5 replaces horizontal-only
+support metadata with ordered planar XYZ boundaries, making the banked ramp
+surfaces and their safety edges part of the frozen checkpoint interface.
 
 ## Phase 1 observation architecture
 
