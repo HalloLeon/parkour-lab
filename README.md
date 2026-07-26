@@ -2,8 +2,9 @@
 
 Parkour Lab is an Isaac Lab reinforcement-learning environment for training a
 Unitree A1 to reach a goal across progressively harder obstacles. Training uses
-an adaptive five-level terrain curriculum; evaluation freezes one level so that
-policy changes can be compared under the same conditions and recorded on video.
+a balanced obstacle-family by difficulty terrain matrix; evaluation freezes one
+matrix cell so policy changes can be compared and recorded under the same
+conditions.
 
 ## Setup
 
@@ -32,7 +33,7 @@ The two task IDs serve different purposes:
 
 - `Parkour-Lab-v0` is the vectorized training task with the adaptive
   curriculum enabled.
-- `Parkour-Lab-Play-v0` is the smaller, fixed-difficulty task for
+- `Parkour-Lab-Play-v0` is the smaller, fixed-family/fixed-difficulty task for
   evaluation and video.
 
 ## Train
@@ -62,46 +63,43 @@ checkpoints (`model_*.pt`), the resolved environment and agent configurations in
 
 ## Declarative course configuration
 
-Each curriculum level is a reusable course description rather than a special
-case in the runtime. It records an obstacle-family label, ordered terrain-local
-waypoints, named mesh structures and their factory arguments, rectangular
-supporting ground/platform regions, target speed and clearance, and explicit
-difficulty metadata. Factory arguments are passed directly to each structure
+Each curriculum matrix cell is a reusable course description rather than a
+special case in the runtime. Terrain rows are five shared difficulty indices;
+equal column blocks contain gaps, high steps, hurdles, and tilted ramps so no
+easier family dominates PPO samples. Each course records ordered terrain-local
+waypoints, named mesh structures and their factory arguments, planar support
+polygons, target speed and clearance, and explicit difficulty metadata. Factory
+arguments are passed directly to each structure
 factory. A support region either refers to the generated base ground or names
 the structure whose surface it describes. Base-ground regions are authoritative
 physical patches: the terrain generator emits one collision box for each such
 rectangle, so an uncovered interval is a real hole in both collision and raycast
 geometry. Named regions annotate separately generated structures without
-duplicating them. Regions currently remain horizontal, axis-aligned rectangles
-even when a referenced mesh is more general. Terrain generation still iterates
+duplicating them. Terrain generation still iterates
 configured structures generically; it does not branch on a level number or
 obstacle family.
 
-The default five-level curriculum now contains flat ground, a high step, a
-hurdle, a physical gap, and a two-ramp redirected course.
-The 0.16 m high step is a 1.6 m deep elevated platform with a vertical,
-ground-mounted front face. Its final waypoint lies inside the annotated top
-surface, so completing the course means climbing and landing on that platform.
-The 0.12 m hurdle is only 0.18 m deep; the base-ground support remains continuous
-beneath and beyond it, its top is not declared traversable, and its sole
-waypoint is on ground after the rear face. Both builders accept obstacle height,
-width, depth, and XY position independently and record those exact values in
-the level difficulty metadata. These conservative initial heights are well
-below the paper's 0.5 m maximum.
+The high-step family uses 1.6 m deep elevated platforms with vertical,
+ground-mounted front faces. Each final waypoint lies inside the annotated top
+surface, so completing the course means climbing and landing on the platform.
+The hurdle family uses narrow 0.18 m deep barriers; base-ground support remains
+continuous beneath and beyond each one, its top is not declared traversable,
+and its waypoint is on ground after the rear face. Heights increase within each
+family while remaining below the 0.5 m maximum.
 
-Level 3 replaces the former higher step with a 0.40 m physical gap. Its approach
-and landing supports stop at opposite gap lips, and the ordered route directs the
-robot onto the landing side before the final goal. Intermediate waypoints remain
-directional guides rather than mandatory support annotations.
+Gap widths increase from 0.10 m to 0.50 m. Approach and landing supports stop
+at opposite gap lips, and the ordered route directs the robot onto the landing
+side before the final goal. Intermediate waypoints remain directional guides
+rather than mandatory support annotations.
 
-Level 4 places two thin collision slabs over an unsupported corridor. Each
+The tilted-ramp family places two thin collision slabs over an unsupported corridor. Each
 slab's local X axis is its travel direction; a signed roll banks the surface
 across its width and yaw rotates that direction in terrain-local XY. The default
-ramps use opposite 12-degree banks and yaws of 10 and 32 degrees, with a
+hardest course uses opposite 12-degree banks and yaws of 10 and 32 degrees, with a
 configurable longitudinal gap, lateral offset, slab width, and final landing
 area. Five ordered waypoints align the first approach, cross the inter-ramp
 transition, then switch the oracle heading along ramp two before targeting the
-final ground landing. This mirrors the paper's use of terrain waypoints to make
+final ground landing. This utilizes terrain waypoints to make
 the robot change direction immediately on tilted ramps.
 
 Every support surface records an ordered planar XYZ polygon. Horizontal
@@ -115,18 +113,25 @@ height-field mask.
 
 Each environment owns an active waypoint index, proximity dwell timer, and
 course-completion state. A reset selects waypoint zero from the route belonging
-to that environment's current terrain level. Remaining within 0.20 m in XY for
+to that environment's obstacle family and difficulty. Remaining within 0.20 m in XY for
 0.10 s advances only that environment to its next waypoint and immediately
 retargets its marker, oracle heading, critic distance, and world-frame velocity
 reward. Intermediate waypoints do not end an episode or count as curriculum
 success. The final waypoint completes the course only when the existing minimum
 base-clearance condition is also satisfied. Routes may contain different
 numbers of waypoints without cursor overrun or cross-environment state changes.
-The teacher-interface manifest is version 5. Version 4 introduced complete
+Maximum progress is measured along this route, so retreating or following a
+redirected ramp cannot corrupt the episode's best progress. Terminal episodes
+promote after traversing more than half the route and demote after traveling
+less than half the commanded speed times episode duration; promotion wins if
+both strict conditions hold.
+
+The teacher-interface manifest is version 6. Version 4 introduced complete
 declarative terrain courses because physical support segmentation changes the
 privileged ray values seen by the teacher. Version 5 replaces horizontal-only
 support metadata with ordered planar XYZ boundaries, making the banked ramp
 surfaces and their safety edges part of the frozen checkpoint interface.
+Version 6 freezes the complete obstacle-family by difficulty matrix.
 
 ## Phase 1 observation architecture
 
@@ -199,13 +204,26 @@ training and playback.
 
 ## Evaluate and record video
 
-Evaluate a checkpoint on one frozen difficulty at a time. Difficulty levels are
-zero-based: `0` is easiest and `3` is hardest.
+Evaluate a checkpoint across the complete fixed matrix with one command.
+Families are `gap`, `high_step`, `hurdle`, and `tilted_ramps`; difficulty
+levels are zero-based from `0` (easiest) through `4` (hardest).
 
 ```bash
 python scripts/rsl_rl/play.py \
   --task=Parkour-Lab-Play-v0 \
   --checkpoint=/absolute/path/to/model_150.pt \
+  --all_courses \
+  --eval_episodes=20 \
+  --headless
+```
+
+For a shorter diagnostic or video, select one fixed cell instead:
+
+```bash
+python scripts/rsl_rl/play.py \
+  --task=Parkour-Lab-Play-v0 \
+  --checkpoint=/absolute/path/to/model_150.pt \
+  --terrain_family=gap \
   --difficulty_level=0 \
   --eval_episodes=20 \
   --headless
@@ -218,16 +236,19 @@ level, and seed:
 python scripts/rsl_rl/play.py \
   --task=Parkour-Lab-Play-v0 \
   --checkpoint=/absolute/path/to/model_150.pt \
+  --terrain_family=gap \
   --difficulty_level=0 \
   --eval_episodes=1 \
   --headless \
   --video
 ```
 
-Repeat the command with `--difficulty_level=1`, `2`, `3`, and `4` for a complete
-comparison. Evaluation reports episode outcomes for the selected level and
-writes `metrics.json` plus the optional MP4 beneath
-`<run>/evaluation/<checkpoint>-<hash>/level_<n>/seed_<seed>/`, separated
+`--all_courses` creates all 20 independent reports; it cannot be combined with
+the two single-cell selectors. Evaluation reports success, maximum course
+progress, trunk contact, timeout, return, and episode length for each selected
+matrix cell. It writes
+`metrics.json` plus the optional MP4 beneath
+`<run>/evaluation/<checkpoint>-<hash>/family_<family>/level_<n>/seed_<seed>/`, separated
 into `metrics/episodes_<n>/` and `video/episodes_<n>-steps_<length>/`.
 Each invocation gets a timestamped `run_*` leaf so before/after results are not
 overwritten. Use `--video_output_dir` to choose another artifact root. Omit
@@ -321,7 +342,7 @@ Treat success rate and failure outcomes over multiple episodes as the primary
 comparison; use video to understand *why* behavior changed. For fair before/after
 comparisons:
 
-- evaluate each promising checkpoint on all five fixed levels;
+- evaluate each promising checkpoint on all 20 family/difficulty cells;
 - keep the seed, number of episodes, and environment count unchanged;
 - do not enable the adaptive training curriculum during evaluation;
 - compare the same metrics before selecting representative clips;
