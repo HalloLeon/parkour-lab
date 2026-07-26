@@ -28,11 +28,18 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     # Logging backend used for training metrics.
     logger = "tensorboard"
 
-    # The teacher receives the same deployable state reserved for the future
-    # student, followed by its oracle heading and privileged terrain scan. The
-    # critic additionally receives simulator-only state.
+    # Dictionary keys name RSL-RL network inputs; list entries name Isaac Lab
+    # observation groups declared on ObservationsCfg in parkour_lab_env_cfg.py:
+    # policy -> DeployablePolicyCfg, heading_target -> OracleHeadingTargetCfg,
+    # terrain -> PrivilegedTerrainCfg, and
+    # critic_privileged -> CriticPrivilegedCfg.
     obs_groups = {
+        # RSL-RL calls the action-producing actor input "policy". Its counterpart
+        # below is the actor_* configuration on RslRlPpoActorCriticCfg. The
+        # identically named list entry is instead ObservationsCfg.policy.
         "policy": ["policy", "heading_target", "terrain"],
+        # The "critic" input feeds the value-estimating network configured by
+        # critic_* below. It sees every actor group plus simulator-only state.
         "critic": [
             "policy",
             "heading_target",
@@ -46,8 +53,10 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # Initial standard deviation of the Gaussian action distribution. This
         # controls exploration before the standard deviation is learned.
         init_noise_std=1.0,
-        # Observations already use deliberate physical scaling, so additional
-        # running normalization remains disabled for both networks.
+        # Use the environment's fixed observation conventions instead of
+        # learned running mean/variance statistics. Bounded terrain, direction,
+        # and contact terms are already scaled; audit the remaining raw
+        # physical-unit terms before treating this as final normalization tuning.
         actor_obs_normalization=False,
         critic_obs_normalization=False,
         # Hidden-layer widths of the action-producing actor network.

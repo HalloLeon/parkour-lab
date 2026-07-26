@@ -30,6 +30,7 @@ def _base_clearance(
     if not isinstance(sensor, RayCaster):
         raise TypeError(f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}.")
 
+    # Shape: [num_envs, num_rays, 3], with XYZ hit positions in world coordinates.
     ray_hits_w = sensor.data.ray_hits_w
     if ray_hits_w.shape[1] != 1:
         raise RuntimeError(f"'{sensor_cfg.name}' must contain exactly one downward ray.")

@@ -448,6 +448,8 @@ def _collect_rollout(
         action_l2_max = max(action_l2_max, float(action_l2.max().item()))
         action_l2_count += int(action_l2.numel())
 
+        # Advance every parallel environment and return its next observations,
+        # per-environment reward, episode-completion flags, and auxiliary data.
         observations, rewards, dones, _ = env.step(student_action)
         reward_sum += float(rewards.mean().item())
         done_count += int(torch.count_nonzero(dones).item())
