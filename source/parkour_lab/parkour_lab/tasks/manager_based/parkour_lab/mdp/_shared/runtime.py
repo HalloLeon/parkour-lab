@@ -1,12 +1,19 @@
+from collections.abc import Sequence
+
 import torch
 from isaaclab.envs import ManagerBasedRLEnv
 
 
-def _all_env_ids(env: ManagerBasedRLEnv, env_ids: torch.Tensor | None) -> torch.Tensor:
+def _all_env_ids(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int] | torch.Tensor | None,
+) -> torch.Tensor:
+    """Return selected environment indices as a device-local integer tensor."""
+
     if env_ids is None:
         return torch.arange(env.num_envs, device=env.device, dtype=torch.long)
 
-    return env_ids.to(device=env.device, dtype=torch.long)
+    return torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
 
 
 def _difference_from_previous_env_buffer(

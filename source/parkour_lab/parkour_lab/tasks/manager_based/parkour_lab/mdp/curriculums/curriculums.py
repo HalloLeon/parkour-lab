@@ -5,17 +5,18 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.terrains import TerrainImporter
 
-from .._shared.runtime import _all_env_ids, _env_torch_device
-from ..commands import set_commands
-from ..navigation.route import reset_active_waypoints
-from . import config, episode_outcomes
+from .._shared.runtime import _all_env_ids, _get_or_init_env_buffer
+from ..commands import get_target_speed, set_commands
+from ..navigation import route
+from . import config
 
 
 def initialize_parkour_terrain_levels(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int] | None,
+    terrain_layout: config.ParkourTerrainLayout,
     curriculum_cfg: config.ParkourCurriculumCfg = config.DEFAULT_PARKOUR_CURRICULUM,
-    fixed_level: int | None = None,
+    initial_level_override: int | None = None,
 ) -> None:
     """Place environments on exact terrain rows before the first reset.
 
@@ -23,30 +24,44 @@ def initialize_parkour_terrain_levels(
     sampling, not an exact initial level. This startup event makes the training
     distribution explicit and is also what pins deterministic evaluation to a
     single difficulty.
+
+    Args:
+        env: Vectorized manager-based environment whose terrain assignments,
+            origins, family indices, and curriculum statistics are initialized.
+        env_ids: Environment indices to initialize. ``None`` selects every
+            environment; otherwise only the specified environments are changed.
+        terrain_layout: Authoritative relationship between physical terrain
+            rows and difficulty indices, plus the family assigned to every
+            physical column. Training uses balanced family blocks, while fixed
+            evaluation maps every column to its selected family.
+        curriculum_cfg: Ordered parkour families, difficulty levels, initial
+            distribution settings, and curriculum bounds associated with the
+            generated terrain layout.
+        initial_level_override: Optional exact difficulty row assigned to every
+            selected environment during startup. When omitted, levels are
+            either balanced across rows zero through ``initial_level`` or fixed
+            at ``initial_level``, as controlled by
+            ``distribute_initial_levels``.
     """
 
     terrain: TerrainImporter = env.scene.terrain
-    _validate_terrain_layout(terrain, curriculum_cfg)
+    _validate_terrain_layout(terrain, terrain_layout, curriculum_cfg)
 
-    if fixed_level is not None and not 0 <= fixed_level <= curriculum_cfg.max_level:
-        raise ValueError(
-            f"fixed_level must be in [0, {curriculum_cfg.max_level}], got {fixed_level}."
-        )
-
-    if env_ids is None:
-        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
-    else:
-        env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
-    if fixed_level is not None:
-        levels = torch.full_like(env_ids, fixed_level)
-    elif curriculum_cfg.distribute_initial_levels:
-        # Deterministically balanced, which is more reproducible than relying on
-        # TerrainImporter's random 0..max initialization.
-        levels = torch.remainder(env_ids, curriculum_cfg.initial_level + 1)
-    else:
-        levels = torch.full_like(env_ids, curriculum_cfg.initial_level)
+    env_ids = _all_env_ids(env, env_ids)
+    levels = _initial_level_indices(
+        env_ids,
+        curriculum_cfg,
+        initial_level_override,
+    )
+    family_indices = _family_indices_for_terrain_columns(
+        env,
+        terrain,
+        env_ids,
+        terrain_layout,
+    )
 
     terrain.terrain_levels[env_ids] = levels
+    _family_index_buffer(env)[env_ids] = family_indices
     # terrain_origins has shape [num_levels, num_terrain_types, 3] and is the
     # generated-tile lookup table (difficulty row, terrain column/type, XYZ).
     # env_origins has shape [num_envs, 3] and stores the selected tile origin
@@ -55,111 +70,81 @@ def initialize_parkour_terrain_levels(
         levels, terrain.terrain_types[env_ids]
     ]
 
-    _ensure_curriculum_stat_buffers(env)
-    env._parkour_success_streak[env_ids] = 0
-    env._parkour_failure_streak[env_ids] = 0
-    env._parkour_last_level_change[env_ids] = 0
-    episode_outcomes.clear_episode_outcomes(env, env_ids)
-
 
 def parkour_terrain_levels(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
     curriculum_cfg: config.ParkourCurriculumCfg = config.DEFAULT_PARKOUR_CURRICULUM,
 ) -> dict[str, torch.Tensor]:
-    """Update per-environment difficulty from terminal episode outcomes."""
+    """Update selected environments' difficulty from terminal outcomes.
 
-    env_ids_tensor = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+    Args:
+        env: Vectorized environment containing terrain, route, and episode
+            outcome state.
+        env_ids: Environments whose completed episodes are being processed.
+        curriculum_cfg: Course matrix and progress thresholds controlling row
+            promotion and demotion.
+
+    Returns:
+        Scalar population and reset-batch metrics for experiment logging.
+    """
+
+    env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
 
     terrain: TerrainImporter = env.scene.terrain
-    _validate_terrain_layout(terrain, curriculum_cfg)
 
-    if env_ids_tensor.numel() == 0:
+    family_index_buffer = _family_index_buffer(env)
+    if env_ids.numel() == 0:
+        empty_bool = torch.zeros(0, device=env.device, dtype=torch.bool)
         return _curriculum_stats(
             terrain=terrain,
             curriculum_cfg=curriculum_cfg,
-            success_event=torch.zeros(0, device=env.device, dtype=torch.bool),
-            failure_event=torch.zeros(0, device=env.device, dtype=torch.bool),
+            family_indices=family_index_buffer[env_ids],
+            maximum_progress=torch.zeros(0, device=env.device),
+            promotion_ready=empty_bool,
+            demotion_ready=empty_bool,
+            success_event=empty_bool,
+            failure_event=empty_bool,
             actual_change=torch.zeros(0, device=env.device, dtype=torch.long),
         )
 
-    _ensure_curriculum_stat_buffers(env)
-    episode_outcomes.ensure_episode_outcome_buffers(env)
-
-    success_event = episode_outcomes.get_success(env)[env_ids_tensor]
-
-    # CurriculumManager runs only for reset environments. reset_buf therefore
-    # covers trunk contact, timeout, and future failure terminations. Outcome
-    # buffers keep the initial/manual reset neutral. Success wins if multiple
-    # termination terms fire on the same step.
-    if hasattr(env, "reset_buf"):
-        terminal_event = env.reset_buf[env_ids_tensor].to(
-            device=env.device, dtype=torch.bool
-        )
-    else:
-        terminal_event = (
-            episode_outcomes.get_base_contact(env)[env_ids_tensor] | success_event
-        )
-    failure_event = terminal_event & (~success_event)
-
-    success_streak = env._parkour_success_streak[env_ids_tensor]
-    failure_streak = env._parkour_failure_streak[env_ids_tensor]
-
-    success_streak = torch.where(
-        success_event,
-        success_streak + 1,
-        torch.where(failure_event, torch.zeros_like(success_streak), success_streak),
+    success_event, terminal_event, failure_event = _terminal_event_masks(
+        env,
+        env_ids,
+    )
+    maximum_progress, promotion_ready, demotion_ready = _progress_transition_decisions(
+        env,
+        env_ids,
+        terminal_event,
+        curriculum_cfg,
     )
 
-    failure_streak = torch.where(
-        failure_event,
-        failure_streak + 1,
-        torch.where(success_event, torch.zeros_like(failure_streak), failure_streak),
-    )
-
-    promotion_ready = success_streak >= curriculum_cfg.successes_to_promote
-    demotion_ready = failure_streak >= curriculum_cfg.failures_to_demote
-    if not curriculum_cfg.promote_on_success:
-        promotion_ready = torch.zeros_like(promotion_ready)
-    if not curriculum_cfg.demote_on_failure:
-        demotion_ready = torch.zeros_like(demotion_ready)
-
-    old_levels = terrain.terrain_levels[env_ids_tensor].clone()
+    old_levels = terrain.terrain_levels[env_ids].clone()
     move_up = promotion_ready & (old_levels < curriculum_cfg.max_level)
     move_down = demotion_ready & (old_levels > 0) & (~move_up)
 
-    # Important:
-    # Let TerrainImporter own terrain_levels and env_origins.
-    terrain.update_env_origins(
-        env_ids=env_ids_tensor, move_up=move_up, move_down=move_down
-    )
+    # Let TerrainImporter update both its authoritative row indices and the
+    # corresponding per-environment origins so those two pieces of state cannot
+    # diverge after promotion or demotion.
+    terrain.update_env_origins(env_ids=env_ids, move_up=move_up, move_down=move_down)
 
-    new_levels = terrain.terrain_levels[env_ids_tensor]
+    new_levels = terrain.terrain_levels[env_ids]
     actual_change = new_levels - old_levels
-    consumed_streak = promotion_ready | demotion_ready
-
-    env._parkour_success_streak[env_ids_tensor] = torch.where(
-        consumed_streak, torch.zeros_like(success_streak), success_streak
-    )
-
-    env._parkour_failure_streak[env_ids_tensor] = torch.where(
-        consumed_streak, torch.zeros_like(failure_streak), failure_streak
-    )
-
-    env._parkour_last_level_change[env_ids_tensor] = actual_change
-
-    episode_outcomes.clear_episode_outcomes(env, env_ids_tensor)
 
     return _curriculum_stats(
         terrain=terrain,
         curriculum_cfg=curriculum_cfg,
+        family_indices=family_index_buffer[env_ids],
+        maximum_progress=maximum_progress,
+        promotion_ready=promotion_ready,
+        demotion_ready=demotion_ready,
         success_event=success_event,
         failure_event=failure_event,
         actual_change=actual_change,
     )
 
 
-def reset_waypoints_and_commands_from_terrain_level(
+def reset_routes_and_commands(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor | None,
     curriculum_cfg: config.ParkourCurriculumCfg = config.DEFAULT_PARKOUR_CURRICULUM,
@@ -169,129 +154,317 @@ def reset_waypoints_and_commands_from_terrain_level(
 
     The terrain level has already been updated by the CurriculumManager before
     reset events are applied.
-    """
 
-    def _level_tensor(name: str, *, dtype: torch.dtype = torch.float32) -> torch.Tensor:
-        return torch.tensor(
-            [
-                getattr(config.coerce_level_cfg(level), name)
-                for level in curriculum_cfg.levels
-            ],
-            device=env.device,
-            dtype=dtype,
-        )
+    Args:
+        env: Vectorized environment containing terrain, route, goal-marker, and
+            command state.
+        env_ids: Environments beginning a new episode, or ``None`` for all
+            environments.
+        curriculum_cfg: Course matrix used to resolve the selected family and
+            difficulty into route geometry and scalar commands.
+        goal_cfg: Scene-entity selection for the visible waypoint marker.
+    """
 
     env_ids = _all_env_ids(env, env_ids)
 
     terrain: TerrainImporter = env.scene.terrain
-    _validate_terrain_layout(terrain, curriculum_cfg)
 
     # Terrain row N is generated directly from curriculum level N, so the
     # importer's row indices are already the logical course-level indices.
-    levels = terrain.terrain_levels[env_ids]
+    difficulty_indices = terrain.terrain_levels[env_ids]
+    family_indices = _family_index_buffer(env)[env_ids]
 
-    target_speed_by_level = _level_tensor("target_speed")
-    min_clearance_by_level = _level_tensor("min_clearance")
-
-    # Curriculum updates run before reset events, so ``levels`` already contains
-    # any promotion or demotion selected for this new episode. Reset only these
-    # environments to waypoint zero of that newly selected route.
-    reset_active_waypoints(
+    # Curriculum updates run before reset events, so ``difficulty_indices``
+    # already contains any promotion or demotion selected for this new episode.
+    # Reset only these environments to waypoint zero of that newly selected
+    # route. The route helper returns the same flattened course indices it stores
+    # as authoritative per-environment route state.
+    course_indices = route.reset_routes(
         env,
         env_ids,
-        levels,
+        family_indices,
+        difficulty_indices,
         curriculum_cfg,
         goal_cfg,
     )
-
     set_commands(
         env=env,
         env_ids=env_ids,
-        target_speed=target_speed_by_level[levels],
-        min_clearance=min_clearance_by_level[levels],
+        target_speed=env._parkour_target_speed_by_course[course_indices],
+        min_clearance=env._parkour_min_clearance_by_course[course_indices],
     )
 
 
 def _curriculum_stats(
     terrain: TerrainImporter,
     curriculum_cfg: config.ParkourCurriculumCfg,
+    family_indices: torch.Tensor,
+    maximum_progress: torch.Tensor,
+    promotion_ready: torch.Tensor,
+    demotion_ready: torch.Tensor,
     success_event: torch.Tensor,
     failure_event: torch.Tensor,
     actual_change: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """Build scalar curriculum metrics for TensorBoard/W&B logging."""
+    """Build scalar curriculum metrics for TensorBoard/W&B logging.
 
-    levels = terrain.terrain_levels
-    zero = torch.zeros((), device=levels.device, dtype=torch.float32)
+    Level-distribution metrics describe the complete parallel environment
+    population. Event, transition, progress, and per-family metrics describe
+    only the environments in the current reset batch.
+    """
+
+    population_levels = terrain.terrain_levels
+    zero = torch.zeros((), device=population_levels.device, dtype=torch.float32)
 
     def _event_rate(event: torch.Tensor) -> torch.Tensor:
         return event.float().mean() if event.numel() > 0 else zero
 
-    return {
-        "mean_level": levels.float().mean(),
-        "min_level": levels.min().float(),
-        "max_level": levels.max().float(),
-        "top_level_fraction": (levels == curriculum_cfg.max_level).float().mean(),
+    stats = {
+        "mean_level": population_levels.float().mean(),
+        "min_level": population_levels.min().float(),
+        "max_level": population_levels.max().float(),
+        "top_level_fraction": (
+            (population_levels == curriculum_cfg.max_level).float().mean()
+        ),
         "success_rate": _event_rate(success_event),
         "failure_rate": _event_rate(failure_event),
+        "mean_max_course_progress_m": (
+            maximum_progress.float().mean() if maximum_progress.numel() > 0 else zero
+        ),
+        "promotion_ready_rate": _event_rate(promotion_ready),
+        "demotion_ready_rate": _event_rate(demotion_ready),
         "promotion_rate": _event_rate(actual_change > 0),
         "demotion_rate": _event_rate(actual_change < 0),
     }
+    for family_index, family_name in enumerate(curriculum_cfg.family_names):
+        family_mask = family_indices == family_index
+        stats[f"family/{family_name}/reset_fraction"] = _event_rate(family_mask)
+        stats[f"family/{family_name}/mean_max_course_progress_m"] = (
+            maximum_progress[family_mask].float().mean()
+            if torch.any(family_mask)
+            else zero
+        )
+    return stats
 
 
-def _ensure_curriculum_stat_buffers(env: ManagerBasedRLEnv) -> None:
+def _family_index_buffer(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return the authoritative per-environment obstacle-family buffer."""
+
+    return _get_or_init_env_buffer(
+        env,
+        "_parkour_family_index",
+        torch.zeros(env.num_envs, device=env.device, dtype=torch.long),
+    )
+
+
+def _family_indices_for_terrain_columns(
+    env: ManagerBasedRLEnv,
+    terrain: TerrainImporter,
+    env_ids: torch.Tensor,
+    terrain_layout: config.ParkourTerrainLayout,
+) -> torch.Tensor:
+    """Resolve selected environments' terrain columns to obstacle families.
+
+    ``terrain_layout.family_index_by_column`` has one semantic family index for
+    every physical terrain column. ``terrain_types`` selects a column for each
+    environment; indexing the mapping with those column identifiers produces
+    one family index per selected environment. The startup layout validation
+    has already established that the mapping covers every generated column and
+    refers only to configured families.
     """
-    Ensure curriculum statistic buffers exist.
+
+    family_by_column = torch.as_tensor(
+        terrain_layout.family_index_by_column,
+        device=env.device,
+        dtype=torch.long,
+    )
+    return family_by_column[terrain.terrain_types[env_ids]]
+
+
+def _initial_level_indices(
+    env_ids: torch.Tensor,
+    curriculum_cfg: config.ParkourCurriculumCfg,
+    initial_level_override: int | None,
+) -> torch.Tensor:
+    """Select one deterministic startup difficulty for each environment.
+
+    Fixed evaluation fills every selected environment with the explicit
+    override. Training either balances environments over rows zero through the
+    configured initial level or places all environments on that initial level.
     """
 
-    device = _env_torch_device(env)
+    if initial_level_override is not None:
+        if not 0 <= initial_level_override <= curriculum_cfg.max_level:
+            raise ValueError(
+                "initial_level_override must be in "
+                f"[0, {curriculum_cfg.max_level}], got {initial_level_override}."
+            )
+        return torch.full_like(env_ids, initial_level_override)
 
-    if (
-        not hasattr(env, "_parkour_success_streak")
-        or env._parkour_success_streak.shape != (env.num_envs,)
-        or env._parkour_success_streak.device != device
-        or env._parkour_success_streak.dtype != torch.long
-    ):
-        env._parkour_success_streak = torch.zeros(
-            env.num_envs, device=env.device, dtype=torch.long
+    if curriculum_cfg.distribute_initial_levels:
+        # Deterministically balanced, which is more reproducible than relying on
+        # TerrainImporter's random 0..max initialization.
+        return torch.remainder(env_ids, curriculum_cfg.initial_level + 1)
+    return torch.full_like(env_ids, curriculum_cfg.initial_level)
+
+
+def _progress_transition_decisions(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    terminal_event: torch.Tensor,
+    curriculum_cfg: config.ParkourCurriculumCfg,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return progress plus promotion and demotion decisions for a reset batch.
+
+    Initial construction may ask the curriculum manager to process a reset
+    before route state exists. Such resets remain neutral and report zero
+    progress. Once route state is available, decisions use the greatest
+    progress reached during the episode, full route length, configured target
+    speed, and completed episode duration.
+
+    The route subsystem supplies that state through four device-side buffers:
+
+    * ``_parkour_course_index`` has shape ``[num_envs]`` and selects each
+      environment's active course using the flattened family-major curriculum
+      matrix index.
+    * ``_parkour_waypoint_count_by_course`` and
+      ``_parkour_route_cumulative_m`` together provide each course's full XY
+      route length in metres.
+    * ``_parkour_max_course_progress_m`` has shape ``[num_envs]`` and stores the
+      greatest cumulative XY route progress reached in the current episode. It
+      is monotonic within an episode and cleared on reset.
+
+    Target speeds come from the per-environment command buffer selected when
+    each route was reset.
+    """
+
+    route_initialized = all(
+        hasattr(env, name)
+        for name in (
+            "_parkour_course_index",
+            "_parkour_waypoint_count_by_course",
+            "_parkour_route_cumulative_m",
+            "_parkour_max_course_progress_m",
+        )
+    )
+    if not route_initialized:
+        maximum_progress = torch.zeros(
+            env_ids.numel(),
+            device=env.device,
+            dtype=torch.float32,
+        )
+        return (
+            maximum_progress,
+            torch.zeros_like(terminal_event),
+            torch.zeros_like(terminal_event),
         )
 
-    if (
-        not hasattr(env, "_parkour_failure_streak")
-        or env._parkour_failure_streak.shape != (env.num_envs,)
-        or env._parkour_failure_streak.device != device
-        or env._parkour_failure_streak.dtype != torch.long
-    ):
-        env._parkour_failure_streak = torch.zeros(
-            env.num_envs, device=env.device, dtype=torch.long
-        )
+    course_indices = env._parkour_course_index[env_ids]
+    waypoint_counts = env._parkour_waypoint_count_by_course[course_indices]
+    course_lengths = env._parkour_route_cumulative_m[
+        course_indices, waypoint_counts - 1
+    ]
+    maximum_progress = env._parkour_max_course_progress_m[env_ids]
+    target_speeds = get_target_speed(env)[env_ids].to(
+        dtype=maximum_progress.dtype
+    )
+    episode_duration = env.episode_length_buf[env_ids].to(
+        dtype=maximum_progress.dtype
+    ) * float(env.step_dt)
+    promotion_ready, demotion_ready = _progress_transition_masks(
+        maximum_progress,
+        course_lengths,
+        target_speeds * episode_duration,
+        terminal_event,
+        promotion_course_fraction=curriculum_cfg.promotion_course_fraction,
+        demotion_expected_distance_fraction=(
+            curriculum_cfg.demotion_expected_distance_fraction
+        ),
+    )
+    return maximum_progress, promotion_ready, demotion_ready
 
-    if (
-        not hasattr(env, "_parkour_last_level_change")
-        or env._parkour_last_level_change.shape != (env.num_envs,)
-        or env._parkour_last_level_change.device != device
-        or env._parkour_last_level_change.dtype != torch.long
-    ):
-        env._parkour_last_level_change = torch.zeros(
-            env.num_envs, device=env.device, dtype=torch.long
+
+def _progress_transition_masks(
+    maximum_progress: torch.Tensor,
+    course_lengths: torch.Tensor,
+    expected_distances: torch.Tensor,
+    terminal_event: torch.Tensor,
+    *,
+    promotion_course_fraction: float,
+    demotion_expected_distance_fraction: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return progress promotion and demotion decisions.
+
+    Promotion uses strict traversal beyond the configured fraction of the full
+    route. Demotion uses strict under-travel relative to commanded speed times
+    the completed episode duration. Initial or manual resets remain neutral.
+    """
+
+    promotion_ready = terminal_event & (
+        maximum_progress > promotion_course_fraction * course_lengths
+    )
+    demotion_ready = terminal_event & (
+        maximum_progress < demotion_expected_distance_fraction * expected_distances
+    )
+    return promotion_ready, demotion_ready
+
+
+def _terminal_event_masks(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return success, terminal, and failure masks for a reset batch.
+
+    CurriculumManager runs only for reset environments. ``reset_buf`` therefore
+    covers trunk contact, timeout, and future failure terminations. Requiring a
+    positive episode length keeps initial and repeated manual resets neutral.
+    Success wins if several termination terms fire during the same step.
+    """
+
+    has_completed_step = env.episode_length_buf[env_ids] > 0
+    reset_buf = getattr(env, "reset_buf", None)
+    if reset_buf is None:
+        terminal_event = torch.zeros_like(has_completed_step)
+    else:
+        terminal_event = reset_buf[env_ids].to(
+            device=env.device,
+            dtype=torch.bool,
+        ) & has_completed_step
+    success_event = (
+        env.termination_manager.get_term("success")[env_ids].to(
+            device=env.device,
+            dtype=torch.bool,
         )
+        & terminal_event
+    )
+    failure_event = terminal_event & (~success_event)
+    return success_event, terminal_event, failure_event
 
 
 def _validate_terrain_layout(
     terrain: TerrainImporter | None,
+    terrain_layout: config.ParkourTerrainLayout,
     curriculum_cfg: config.ParkourCurriculumCfg,
 ) -> None:
-    """Require an exact physical-row to logical-level mapping."""
+    """Validate the physical terrain grid against its semantic matrix layout.
+
+    Isaac Lab's ``terrain_origins`` table has one physical row for each
+    generated difficulty and one physical column for each terrain sampling
+    slot. ``ParkourTerrainLayout`` supplies the semantic interpretation that
+    Isaac Lab itself does not store: row indices are curriculum difficulty
+    indices, while each column maps to one obstacle-family index. Checking the
+    complete relationship once during startup prevents mesh generation, route
+    lookup, and per-environment family state from silently disagreeing.
+    """
 
     if terrain is None or terrain.terrain_origins is None:
         raise RuntimeError(
             "The parkour curriculum requires TerrainImporterCfg with terrain_type='generator'."
         )
 
-    num_rows = terrain.terrain_origins.shape[0]
-    num_levels = len(curriculum_cfg.levels)
-    if num_rows != num_levels:
-        raise RuntimeError(
-            "Parkour terrain rows and curriculum levels must match one-to-one: "
-            f"got {num_rows} rows and {num_levels} levels."
-        )
+    terrain_layout.validate(
+        curriculum_difficulties=curriculum_cfg.num_difficulties,
+        curriculum_families=len(curriculum_cfg.families),
+        terrain_columns=int(terrain.terrain_origins.shape[1]),
+        terrain_rows=int(terrain.terrain_origins.shape[0]),
+    )

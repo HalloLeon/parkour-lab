@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
     from tensordict import TensorDict
 
-TEACHER_INTERFACE_VERSION = 5
+TEACHER_INTERFACE_VERSION = 6
 """Serialization version of the compact teacher interface manifest."""
 
 DEPLOYABLE_STATE_GROUP = "policy"
@@ -238,7 +238,7 @@ def build_teacher_interface(
     scanner_cfg = base_env.cfg.scene.height_scanner
     curriculum_cfg = base_env.cfg.parkour_curriculum
     terrain_generator_cfg = base_env.cfg.scene.ground.terrain_generator
-    course_terrain_cfg = terrain_generator_cfg.sub_terrains["parkour_course"]
+    course_terrain_cfg = next(iter(terrain_generator_cfg.sub_terrains.values()))
     policy_cfg = agent_cfg.policy
 
     return {
@@ -257,8 +257,14 @@ def build_teacher_interface(
             # loaded as though it had trained with active-waypoint headings.
             "oracle_heading_source": {
                 "kind": "active_course_waypoint",
-                "waypoint_routes_m": [
-                    [list(waypoint.position) for waypoint in level.waypoints] for level in curriculum_cfg.levels
+                "waypoint_routes_by_family_m": [
+                    {
+                        "family": family.name,
+                        "routes": [
+                            [list(waypoint.position) for waypoint in level.waypoints] for level in family.levels
+                        ],
+                    }
+                    for family in curriculum_cfg.families
                 ],
                 "reach_threshold_m": float(curriculum_cfg.waypoint_reach_threshold),
                 "reach_hold_s": float(curriculum_cfg.waypoint_reach_hold_s),
@@ -301,10 +307,10 @@ def build_teacher_interface(
         # and the privileged ray values seen by the teacher. Freeze the full
         # declarative courses so a continuous-ground checkpoint cannot be
         # mistaken for one trained on the physically segmented gap course.
-        "terrain_course": {
+        "terrain_curriculum": {
             "tile_size_m": _simple_value(terrain_generator_cfg.size),
             "ground_thickness_m": float(course_terrain_cfg.ground_thickness),
-            "levels": [level.metadata() for level in curriculum_cfg.levels],
+            "matrix": curriculum_cfg.metadata(),
         },
         # Record how network outputs map to ordered low-level joint commands.
         "action": {

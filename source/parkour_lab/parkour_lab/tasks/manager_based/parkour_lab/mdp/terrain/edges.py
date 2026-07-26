@@ -5,11 +5,14 @@
 
 """Derive exposed support edges and query contact near them at runtime.
 
-Support polygons contribute directed XYZ boundary segments. Shared,
-oppositely wound portions are removed as internal seams, and the remaining
-edges are packed into padded tensors by curriculum level. Runtime queries then
-combine exact 3D point-to-segment distance with recent foot-contact history so
-a swing foot passing over an edge is not treated as an edge contact.
+A course is one family/difficulty cell of the curriculum matrix. Its support
+polygons contribute directed XYZ boundary segments. Shared, oppositely wound
+portions are removed as internal seams, and the remaining edges are packed into
+padded tensors by course.
+
+Runtime queries combine exact 3D point-to-segment distance with recent
+foot-contact history so a swing foot passing over an edge is not treated as an
+edge contact.
 """
 
 from __future__ import annotations
@@ -33,9 +36,9 @@ _GEOMETRY_TOLERANCE = 1.0e-9
 class _SupportEdgeCache:
     """Padded device-side edge geometry for one curriculum configuration.
 
-    ``segment_table`` has shape ``(num_levels, max_segments, 2, 3)`` and stores
+    ``segment_table`` has shape ``(num_courses, max_segments, 2, 3)`` and stores
     two XYZ endpoints for each exposed edge. ``valid_segment_mask`` has shape
-    ``(num_levels, max_segments)`` and distinguishes real edges from zero-filled
+    ``(num_courses, max_segments)`` and distinguishes real edges from zero-filled
     padding. Retaining ``curriculum_cfg`` by identity prevents geometry derived
     from one configuration object from being reused for another.
     """
@@ -73,9 +76,9 @@ def foot_edge_contact_mask(
     asset_cfg: SceneEntityCfg,
     sensor_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
-    """Identify recently contacted feet near exposed edges of their level.
+    """Identify recently contacted feet near exposed edges of their course.
 
-    Each environment selects the edge table for its active curriculum level.
+    Each environment selects the edge table for its active curriculum course.
     A foot is marked only when its recent contact-force history exceeds
     ``foot_edge_contact_threshold`` and its current XYZ position lies within
     ``edge_width_threshold`` of an exposed finite segment. Internal seams and
@@ -84,7 +87,7 @@ def foot_edge_contact_mask(
     Args:
         env: Vectorized manager-based environment containing route state,
             robot bodies, and the configured contact sensor.
-        curriculum_cfg: Course levels and metric contact/edge thresholds.
+        curriculum_cfg: Curriculum courses and metric contact/edge thresholds.
         asset_cfg: Robot entity and body selection identifying the queried
             feet.
         sensor_cfg: Contact sensor entity and body selection matching those
@@ -96,17 +99,17 @@ def foot_edge_contact_mask(
         to an exposed edge.
 
     Raises:
-        RuntimeError: If active per-environment curriculum levels have not
-            been initialized.
+        RuntimeError: If active per-environment course indices are unavailable
+            or malformed.
     """
 
     import torch
 
     from .._shared import contact, robot, runtime
 
-    levels = getattr(env, "_parkour_waypoint_level", None)
-    if levels is None or levels.shape != (env.num_envs,):
-        raise RuntimeError("Active course levels must be initialized before evaluating edges.")
+    course_indices = getattr(env, "_parkour_course_index", None)
+    if course_indices is None or course_indices.shape != (env.num_envs,):
+        raise RuntimeError("Active courses must be initialized before evaluating edges.")
 
     foot_positions = robot._selected_body_pos_env(env, asset_cfg)
 
@@ -128,11 +131,11 @@ def foot_edge_contact_mask(
         device=foot_positions.device,
         dtype=foot_positions.dtype,
     )
-    edge_distance = _minimum_distance_to_level_edges(
+    edge_distance = _minimum_distance_to_course_edges(
         foot_positions,
         edge_cache.segment_table,
         edge_cache.valid_segment_mask,
-        levels,
+        course_indices,
     )
     return recent_contact & (edge_distance <= curriculum_cfg.edge_width_threshold)
 
@@ -145,7 +148,7 @@ def _exposed_segment_fragments(
     """Return the exposed pieces of one directed 3D support boundary.
 
     The candidate is parameterized by signed metric distance from ``start``
-    along its unit direction, making its complete interval ``(0, length)``.
+    along its unit direction, making its complete interval ``[0, length]``.
     Every oppositely directed segment that overlaps the same infinite 3D line
     removes its shared interval. This suppresses both coplanar seams and exact
     folds between adjacent support polygons while retaining partially exposed
@@ -155,7 +158,7 @@ def _exposed_segment_fragments(
     Args:
         start: First XYZ endpoint of the candidate boundary.
         end: Second XYZ endpoint, establishing its direction.
-        all_segments: All directed support boundaries in the level, including
+        all_segments: All directed support boundaries in the course, including
             the candidate itself.
 
     Returns:
@@ -228,23 +231,25 @@ def _get_support_edge_cache(
     """Return padded exposed-edge tensors on the requested device.
 
     The cache is reused only when :meth:`_SupportEdgeCache.matches` accepts the
-    curriculum identity, device, and dtype. Otherwise, exposed segments are
-    derived independently for every level and packed to the largest level edge
-    count. Zero-filled rows make the tensor rectangular, while a Boolean mask
-    prevents those rows from participating in distance minima. The rebuilt
-    cache is stored on ``env`` for subsequent control steps.
+    curriculum identity, device, and dtype.
+
+    On a cache miss, exposed segments are derived independently for every course
+    and padded to the maximum edge count across courses. Zero-filled rows make
+    the tensor rectangular, while a Boolean mask prevents those rows from
+    participating in distance minima. The rebuilt cache is stored on ``env``
+    for subsequent control steps.
 
     Args:
         env: Environment that owns the runtime cache.
-        curriculum_cfg: Ordered course levels from which exposed edges are
-            derived.
+        curriculum_cfg: Curriculum whose ordered courses supply the exposed
+            edges.
         device: Device on which the edge and validity tensors must reside.
         dtype: Floating-point dtype used for XYZ edge coordinates.
 
     Returns:
         Cache containing a segment tensor of shape
-        ``(num_levels, max_segments, 2, 3)`` and a validity mask of shape
-        ``(num_levels, max_segments)``.
+        ``(num_courses, max_segments, 2, 3)`` and a validity mask of shape
+        ``(num_courses, max_segments)``.
     """
 
     import torch
@@ -257,34 +262,35 @@ def _get_support_edge_cache(
     ):
         return cache
 
-    # Each level may contain a different number of exposed edges. Every edge
-    # consists of two XYZ endpoints, where Z identifies its support surface.
-    segments_by_level = tuple(_support_edge_segments(level) for level in curriculum_cfg.levels)
-    max_segments = max(len(segments) for segments in segments_by_level)
+    # Each family/difficulty course may contain a different number of exposed
+    # edges. Every edge consists of two XYZ endpoints, where Z identifies its
+    # support surface.
+    segments_by_course = tuple(_support_edge_segments(course) for course in curriculum_cfg.courses)
+    max_segments = max(len(segments) for segments in segments_by_course)
 
-    # Shape: ``(num_levels, max_segments, 2, 3)``. Shorter levels retain
+    # Shape: ``(num_courses, max_segments, 2, 3)``. Shorter courses retain
     # zero-filled padding in their unused segment rows.
     segment_table = torch.zeros(
-        (len(segments_by_level), max_segments, 2, 3),
+        (len(segments_by_course), max_segments, 2, 3),
         device=device,
         dtype=dtype,
     )
 
-    # Shape: ``(num_levels, max_segments)``. True entries distinguish real
+    # Shape: ``(num_courses, max_segments)``. True entries distinguish real
     # segments from the padded rows that the distance kernel must ignore.
     valid_segment_mask = torch.zeros(
-        (len(segments_by_level), max_segments),
+        (len(segments_by_course), max_segments),
         device=device,
         dtype=torch.bool,
     )
-    for level_index, segments in enumerate(segments_by_level):
+    for course_index, segments in enumerate(segments_by_course):
         segment_count = len(segments)
-        segment_table[level_index, :segment_count] = torch.tensor(
+        segment_table[course_index, :segment_count] = torch.tensor(
             segments,
             device=device,
             dtype=dtype,
         )
-        valid_segment_mask[level_index, :segment_count] = True
+        valid_segment_mask[course_index, :segment_count] = True
 
     cache = _SupportEdgeCache(
         curriculum_cfg=curriculum_cfg,
@@ -295,28 +301,29 @@ def _get_support_edge_cache(
     return cache
 
 
-def _minimum_distance_to_level_edges(
+def _minimum_distance_to_course_edges(
     points: torch.Tensor,
     segment_table: torch.Tensor,
     valid_segment_mask: torch.Tensor,
-    levels: torch.Tensor,
+    course_indices: torch.Tensor,
 ) -> torch.Tensor:
-    """Measure 3D points against exposed edges for their environment level.
+    """Measure 3D points against the exposed edges of their course.
 
-    Each environment indexes one curriculum-level segment table. Every query
-    point is compared with every valid finite edge in that table using a
-    clamped line projection, and the segment-axis minimum is returned. Distances
-    include height, preventing an edge on one support surface from penalizing a
-    foot contacting another surface at the same XY location. Padded rows are
-    assigned infinite distance and cannot become minima.
+    Each environment selects the segment table for its course. Every query point
+    is compared with every valid finite edge in that table using a clamped line
+    projection, and the segment-axis minimum is returned. Distances include
+    height, preventing an edge on one support surface from penalizing a foot
+    contacting another surface at the same XY location. Padded rows are assigned
+    infinite distance and cannot become minima.
 
     Args:
         points: Query positions with shape ``(num_envs, num_points, 3)``.
         segment_table: Padded edge endpoints with shape
-            ``(num_levels, max_segments, 2, 3)``.
+            ``(num_courses, max_segments, 2, 3)``.
         valid_segment_mask: Valid rows of ``segment_table`` with shape
-            ``(num_levels, max_segments)``.
-        levels: Level index for each environment with shape ``(num_envs,)``.
+            ``(num_courses, max_segments)``.
+        course_indices: Flattened family/difficulty index for each environment,
+            with shape ``(num_envs,)``.
 
     Returns:
         Minimum distance for every query point, with shape
@@ -325,33 +332,36 @@ def _minimum_distance_to_level_edges(
 
     import torch
 
-    # Select one level table per environment:
-    # ``(num_envs, max_segments, 2, 3)``.
-    selected_segments = segment_table[levels]
+    # Shape legend: E = environments, P = query points, S = padded segments.
+    #
+    # Geometry roadmap for a point P and segment from A to B:
+    #
+    #     v = B - A
+    #     w = P - A
+    #     t = clamp(dot(w, v) / dot(v, v), 0, 1)
+    #     Q = A + t * v
+    #     distance = ||P - Q||_2
+    #
+    # Select one course table per environment: ``(E, S, 2, 3)``.
+    selected_segments = segment_table[course_indices]
 
     # Insert a singleton point axis so every point can be compared with every
-    # segment. Both tensors have shape ``(num_envs, 1, max_segments, 3)``.
+    # segment. Both tensors have shape ``(E, 1, S, 3)`` and broadcast across P.
     starts = selected_segments[:, None, :, 0, :]
     vectors = selected_segments[:, None, :, 1, :] - starts
 
     # Insert a singleton segment axis into the points. Broadcasting against
-    # ``starts`` produces offsets of shape
-    # ``(num_envs, num_points, max_segments, 3)``.
+    # ``starts`` produces point offsets of shape ``(E, P, S, 3)``.
     point_offsets = points[:, :, None, :] - starts
 
-    # Squared segment lengths have shape ``(num_envs, 1, max_segments)``.
+    # Squared segment lengths have shape ``(E, 1, S)``.
     # Clamping also keeps zero-filled padding from causing division by zero.
     squared_lengths = torch.sum(vectors.square(), dim=-1).clamp_min(torch.finfo(points.dtype).eps)
 
-    # For a point P and segment from A to B, ``vectors`` is v = B - A and
-    # ``point_offsets`` is w = P - A. The normalized scalar projection
-    #
-    #     t = dot(w, v) / dot(v, v)
-    #
-    # says where the perpendicular projection of P falls along the segment's
-    # infinite supporting line: t = 0 is A, t = 1 is B, t < 0 lies before A,
-    # and t > 1 lies beyond B. Summing over the XYZ axis computes each dot
-    # product and produces shape ``(num_envs, num_points, max_segments)``.
+    # The normalized scalar projection t says where the perpendicular projection
+    # of P falls along the segment's infinite supporting line: t = 0 is A, t = 1
+    # is B, t < 0 lies before A, and t > 1 lies beyond B. Summing over the XYZ
+    # axis computes each dot product and produces shape ``(E, P, S)``.
     projection = torch.sum(point_offsets * vectors, dim=-1) / squared_lengths
 
     # Restrict t to the finite segment. A projection before A therefore uses A
@@ -360,21 +370,22 @@ def _minimum_distance_to_level_edges(
 
     # Reconstruct the closest point Q = A + t * v. ``[..., None]`` restores an
     # XYZ axis to t so it broadcasts over the three vector components. The
-    # resulting closest points have shape
-    # ``(num_envs, num_points, max_segments, 3)``.
+    # resulting closest points have shape ``(E, P, S, 3)``.
     closest_points = starts + projection[..., None] * vectors
 
     # Finally, ||P - Q||_2 is the Euclidean distance from each point to each
-    # segment. Reducing the XYZ axis leaves shape
-    # ``(num_envs, num_points, max_segments)``.
+    # segment. Reducing the XYZ axis leaves shape ``(E, P, S)``.
     distances = torch.linalg.norm(
         points[:, :, None, :] - closest_points,
         dim=-1,
     )
 
-    # The selected mask has shape ``(num_envs, 1, max_segments)`` and
-    # broadcasts across points. Infinite padded distances cannot become minima.
-    distances.masked_fill_(~valid_segment_mask[levels, None, :], torch.inf)
+    # The selected mask has shape ``(E, 1, S)`` and broadcasts across P.
+    # Infinite padded distances cannot become minima.
+    distances.masked_fill_(
+        ~valid_segment_mask[course_indices, None, :],
+        torch.inf,
+    )
     return distances.amin(dim=-1)
 
 
@@ -444,11 +455,16 @@ def _shared_collinear_interval(
         distance = math.sqrt(sum(component * component for component in perpendicular))
         return projection, distance
 
+    # 1. Project both endpoints onto the candidate line.
     other_start_projection, other_start_distance = projection_and_distance(other_start)
     other_end_projection, other_end_distance = projection_and_distance(other_end)
+
+    # 2. Reject boundaries whose endpoints are offset from the candidate line.
     if other_start_distance > _GEOMETRY_TOLERANCE or other_end_distance > _GEOMETRY_TOLERANCE:
         return None
 
+    # 3. Require the shared boundary to run in the opposite direction.
+    #
     # Each support polygon stores its boundary in CCW order when viewed from
     # its upward-facing normal. When two such polygons meet along an internal
     # seam, their interiors lie on opposite sides of that seam, so their CCW
@@ -477,6 +493,12 @@ def _subtract_interval(
     an endpoint, or overlapping by no more than the geometry tolerance, leaves
     the interval unchanged. Positive-length overlap can shorten the interval,
     split it into two ordered fragments, or remove it completely.
+
+    A central blocker produces two fragments::
+
+        interval:  [----------------]
+        blocker:         [------]
+        result:    [-----]      [----]
 
     Args:
         interval: Ascending exposed interval to retain where possible.

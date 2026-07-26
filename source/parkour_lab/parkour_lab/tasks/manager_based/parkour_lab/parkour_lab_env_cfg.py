@@ -29,7 +29,16 @@ from . import mdp
 
 PARKOUR_CURRICULUM = mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM
 
-DEFAULT_LEVEL = PARKOUR_CURRICULUM.levels[PARKOUR_CURRICULUM.initial_level]
+DEFAULT_TERRAIN_LAYOUT = PARKOUR_CURRICULUM.terrain_layout(
+    mdp.curriculums_config.PARKOUR_TERRAIN_GENERATOR_CFG.num_cols
+)
+
+DEFAULT_FAMILY_INDEX = 0
+
+DEFAULT_LEVEL = PARKOUR_CURRICULUM.course(
+    DEFAULT_FAMILY_INDEX,
+    PARKOUR_CURRICULUM.initial_level,
+)
 
 INITIAL_WAYPOINT_POS = DEFAULT_LEVEL.waypoints[0].position
 
@@ -54,7 +63,9 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
             static_friction=1.0,
             dynamic_friction=1.0,
         ),
-        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.55, 0.48, 0.35), roughness=0.8),
+        visual_material=sim_utils.PreviewSurfaceCfg(
+            diffuse_color=(0.55, 0.48, 0.35), roughness=0.8
+        ),
     )
 
     goal: RigidObjectCfg = RigidObjectCfg(
@@ -80,7 +91,9 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         history_length=3,
     )
 
-    base_contact: ContactSensorCfg = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/trunk", history_length=3)
+    base_contact: ContactSensorCfg = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/trunk", history_length=3
+    )
 
     # One downward terrain ray at the trunk origin provides geometry-agnostic
     # base clearance for flat ground, slopes, and arbitrary terrain meshes.
@@ -158,7 +171,9 @@ class ActionsCfg:
     #
     # target_joint_pos = default_joint_pos + scale * policy_action
 
-    joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=[".*"], scale=0.25, use_default_offset=True)
+    joint_pos = mdp.JointPositionActionCfg(
+        asset_name="robot", joint_names=[".*"], scale=0.25, use_default_offset=True
+    )
 
 
 @configclass
@@ -198,7 +213,9 @@ class ObservationsCfg:
         height_scan = ObsTerm(
             func=mdp.terrain_height_scan,
             params={
-                "obs_cfg": mdp.config.HeightScanObservationCfg(num_rays=132, vertical_offset=0.30, clip=0.50),
+                "obs_cfg": mdp.config.HeightScanObservationCfg(
+                    num_rays=132, vertical_offset=0.30, clip=0.50
+                ),
                 "sensor_cfg": SceneEntityCfg("height_scanner"),
                 "asset_cfg": SceneEntityCfg("robot"),
             },
@@ -209,7 +226,9 @@ class ObservationsCfg:
         height_scan_validity = ObsTerm(
             func=mdp.terrain_height_scan_validity,
             params={
-                "obs_cfg": mdp.config.HeightScanObservationCfg(num_rays=132, vertical_offset=0.30, clip=0.50),
+                "obs_cfg": mdp.config.HeightScanObservationCfg(
+                    num_rays=132, vertical_offset=0.30, clip=0.50
+                ),
                 "sensor_cfg": SceneEntityCfg("height_scanner"),
                 "asset_cfg": SceneEntityCfg("robot"),
             },
@@ -227,7 +246,9 @@ class ObservationsCfg:
         # estimation and is absent from both policy and terrain groups.
         base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
 
-        base_clearance = ObsTerm(func=mdp.base_clearance_obs, params={"asset_cfg": SceneEntityCfg("robot")})
+        base_clearance = ObsTerm(
+            func=mdp.base_clearance_obs, params={"asset_cfg": SceneEntityCfg("robot")}
+        )
 
         # Exact distance to the simulator waypoint can improve value
         # estimation but is not available to the deployed motor policy.
@@ -272,10 +293,10 @@ class ObservationsCfg:
     class OracleHeadingTargetCfg(ObsGroup):
         """Wrap-safe oracle heading used by the teacher and student loss."""
 
-        direction_yaw_xy = ObsTerm(
-            func=mdp.goal_direction_yaw_xy,
+        active_waypoint_direction_yaw_xy = ObsTerm(
+            func=mdp.active_waypoint_direction_yaw_xy,
             params={
-                "goal_cfg": SceneEntityCfg("goal"),
+                "waypoint_marker_cfg": SceneEntityCfg("goal"),
                 "asset_cfg": SceneEntityCfg("robot"),
             },
         )
@@ -307,12 +328,13 @@ class EventsCfg:
         mode="startup",
         params={
             "curriculum_cfg": PARKOUR_CURRICULUM,
-            "fixed_level": None,
+            "initial_level_override": None,
+            "terrain_layout": DEFAULT_TERRAIN_LAYOUT,
         },
     )
 
-    reset_waypoints_and_commands = EventTerm(
-        func=mdp.reset_waypoints_and_commands_from_terrain_level,
+    reset_routes_and_commands = EventTerm(
+        func=mdp.reset_routes_and_commands,
         mode="reset",
         params={
             "curriculum_cfg": PARKOUR_CURRICULUM,
@@ -349,7 +371,7 @@ class EventsCfg:
         params={
             "position_range": (1.0, 1.0),
             "velocity_range": (0.0, 0.0),
-        },  # default_joint_pos
+        },
     )
 
 
@@ -449,7 +471,9 @@ class RewardsCfg:
         func=mdp.feet_stumble,
         weight=-0.5,
         params={
-            "stumble_cfg": mdp.config.FeetStumbleCfg(lateral_to_vertical_force_ratio=4.0, min_vertical_force=1.0),
+            "stumble_cfg": mdp.config.FeetStumbleCfg(
+                lateral_to_vertical_force_ratio=4.0, min_vertical_force=1.0
+            ),
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
         },
     )
@@ -522,7 +546,8 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
 
-    # None during adaptive training; set to an exact logical level for play.
+    # None during adaptive training; fixed evaluation selects both matrix axes.
+    evaluation_family: str | None = None
     evaluation_level: int | None = None
 
     # Post initialization.
@@ -562,47 +587,87 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
 
         self.synchronize_curriculum_config()
 
-    def evaluation_level_metadata(self) -> dict[str, object]:
-        """Return JSON-friendly metadata for the fixed evaluation level."""
+    def evaluation_course_metadata(self) -> dict[str, object]:
+        """Return JSON-friendly metadata for the fixed matrix cell."""
 
-        if self.evaluation_level is None:
+        if self.evaluation_family is None or self.evaluation_level is None:
             return {}
-        level = self.parkour_curriculum.levels[self.evaluation_level]
-        return {"index": self.evaluation_level, **level.metadata()}
+        family_index = self.parkour_curriculum.family_index(self.evaluation_family)
+        course = self.parkour_curriculum.course(
+            family_index,
+            self.evaluation_level,
+        )
+        return {
+            "family": self.evaluation_family,
+            "family_index": family_index,
+            "difficulty_index": self.evaluation_level,
+            "course": course.metadata(),
+        }
 
-    def set_evaluation_difficulty(self, level: int | None = None, seed: int | None = None) -> None:
-        """Freeze the environment at one reproducible logical difficulty."""
+    def set_evaluation_course(
+        self,
+        family: str | None = None,
+        level: int | None = None,
+        seed: int | None = None,
+    ) -> None:
+        """Freeze the environment at one reproducible family/difficulty cell."""
 
-        # ``__post_init__`` ran when this config object was first constructed,
-        # before Hydra applied its command-line overrides. Hydra does not call
-        # ``__post_init__`` again, so propagate any overridden curriculum values
-        # to terrain, events, rewards, and terminations before fixing the level.
-        self.synchronize_curriculum_config()
         curriculum_cfg = self.parkour_curriculum
+        curriculum_cfg.validate_configuration()
+        if family is None:
+            family = curriculum_cfg.family_names[0]
+        curriculum_cfg.family_index(family)
         if level is None:
             level = curriculum_cfg.max_level
         if not 0 <= level <= curriculum_cfg.max_level:
-            raise ValueError(f"difficulty level must be in [0, {curriculum_cfg.max_level}], got {level}.")
+            raise ValueError(
+                f"difficulty level must be in [0, {curriculum_cfg.max_level}], got {level}."
+            )
 
+        self.evaluation_family = family
         self.evaluation_level = level
         self.curriculum = None
-        self.events.initialize_terrain_levels.params["fixed_level"] = level
-        self.scene.ground.max_init_terrain_level = level
 
         terrain_generator = self.scene.ground.terrain_generator
         if terrain_generator is not None:
-            terrain_generator.num_rows = len(curriculum_cfg.levels)
-            # Generate at least one column, but never more columns than there
-            # are environments available to occupy the generated terrain.
-            terrain_generator.num_cols = max(1, min(terrain_generator.num_cols, self.scene.num_envs))
+            terrain_generator.num_rows = curriculum_cfg.num_difficulties
+            # Give every parallel evaluation environment its own tile column.
+            # All columns use the selected family, while the fixed row selects
+            # its difficulty.
+            terrain_generator.num_cols = max(1, self.scene.num_envs)
+            # This flag controls terrain generation: row N must represent
+            # difficulty N. It does not enable adaptive level updates, which
+            # are disabled for evaluation by self.curriculum = None above.
             terrain_generator.curriculum = True
             if seed is not None:
                 terrain_generator.seed = seed
 
+        # Synchronize after changing the column count so terrain generation and
+        # the startup event receive the same fixed-family column mapping.
+        self.synchronize_curriculum_config()
         self.observations.policy.enable_corruption = False
 
     def synchronize_curriculum_config(self) -> None:
-        """Propagate the authoritative curriculum to every manager consumer."""
+        """Validate and propagate the authoritative parkour curriculum.
+
+        ``parkour_curriculum`` is the single source of truth, but the terrain,
+        events, curriculum term, rewards, and terminations are separate nested
+        configs that are initially constructed from default values. Hydra or
+        programmatic overrides therefore do not automatically keep those
+        consumers synchronized.
+
+        This method rebuilds the physical terrain layout so row indices remain
+        difficulty indices and columns remain obstacle-family assignments. It
+        then passes the same curriculum object and its shared thresholds to
+        every dependent manager term. Fixed evaluation uses the same path, with
+        all columns mapped to the selected family and startup pinned to the
+        selected difficulty.
+
+        Call this after changing the curriculum, terrain column count, or
+        evaluation selection and before constructing the environment. It only
+        updates and validates configuration; runtime promotion and demotion are
+        performed separately by the curriculum manager.
+        """
 
         curriculum_cfg = self.parkour_curriculum
         curriculum_cfg.validate_configuration()
@@ -610,33 +675,55 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         terrain_generator = self.scene.ground.terrain_generator
         if terrain_generator is None:
             raise ValueError("ParkourLabEnvCfg requires a generated terrain.")
-        if not terrain_generator.curriculum or tuple(terrain_generator.difficulty_range) != (0.0, 1.0):
+        if not terrain_generator.curriculum or tuple(
+            terrain_generator.difficulty_range
+        ) != (0.0, 1.0):
             raise ValueError(
                 "The discrete parkour row mapping requires terrain curriculum mode and difficulty_range=(0.0, 1.0)."
             )
-        if "parkour_course" not in terrain_generator.sub_terrains:
-            raise ValueError("ParkourLabEnvCfg requires the 'parkour_course' sub-terrain.")
-
         # Ground support regions use course-local coordinates. Validate them
         # once here, after the scene's actual tile size is known and before
         # the terrain generator invokes the same level configuration per tile.
-        for level in curriculum_cfg.levels:
-            level.validate_terrain_size(terrain_generator.size)
+        for course in curriculum_cfg.courses:
+            course.validate_terrain_size(terrain_generator.size)
 
-        # Generate one terrain row per logical level so the row index and
-        # curriculum-level index have the same meaning.
-        terrain_generator.num_rows = len(curriculum_cfg.levels)
+        # Generate one terrain row per difficulty so row changes never change
+        # obstacle family.
+        terrain_generator.num_rows = curriculum_cfg.num_difficulties
 
-        # Give the terrain generator the same authoritative level definitions
-        # used by reset events, commands, rewards, and curriculum updates.
-        terrain_generator.sub_terrains["parkour_course"].levels = curriculum_cfg.levels
+        # Build the authoritative semantic mapping for the physical terrain
+        # columns. Training produces balanced family blocks; fixed evaluation
+        # maps every column to the selected family. Deriving the generated
+        # family set from this same mapping keeps mesh generation and runtime
+        # route selection synchronized.
+        terrain_layout = curriculum_cfg.terrain_layout(
+            terrain_generator.num_cols,
+            family_name=self.evaluation_family,
+        )
+        generated_family_indices = tuple(
+            dict.fromkeys(terrain_layout.family_index_by_column)
+        )
+        generated_families = tuple(
+            curriculum_cfg.families[index] for index in generated_family_indices
+        )
+        terrain_generator.sub_terrains = {
+            family.name: mdp.curriculums_config.ParkourTerrainCfg(
+                proportion=1.0 / len(generated_families),
+                levels=family.levels,
+                ground_thickness=0.05,
+            )
+            for family in generated_families
+        }
 
-        # Restrict initial terrain assignment to the configured starting range.
-        self.scene.ground.max_init_terrain_level = curriculum_cfg.initial_level
+        # Restrict training to the configured starting range; evaluation pins
+        # startup to its requested difficulty row.
+        initial_level = (
+            curriculum_cfg.initial_level
+            if self.evaluation_level is None
+            else self.evaluation_level
+        )
+        self.scene.ground.max_init_terrain_level = initial_level
 
-        # The marker starts at waypoint zero. Reset events select the matching
-        # route independently for every environment after terrain assignment.
-        self.scene.goal.init_state.pos = curriculum_cfg.levels[curriculum_cfg.initial_level].waypoints[0].position
         # Keep the visible marker footprint consistent with the configured XY
         # radius used by the waypoint transition condition.
         self.scene.goal.spawn.radius = curriculum_cfg.waypoint_reach_threshold
@@ -644,7 +731,13 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         # Pass the same curriculum object to reset events so initial terrain
         # assignment, active routes, and commands use the authoritative table.
         self.events.initialize_terrain_levels.params["curriculum_cfg"] = curriculum_cfg
-        self.events.reset_waypoints_and_commands.params["curriculum_cfg"] = curriculum_cfg
+        self.events.initialize_terrain_levels.params["terrain_layout"] = terrain_layout
+        self.events.initialize_terrain_levels.params["initial_level_override"] = (
+            self.evaluation_level
+        )
+        self.events.reset_routes_and_commands.params["curriculum_cfg"] = (
+            curriculum_cfg
+        )
 
         # The fixed evaluation configuration disables adaptive curriculum
         # updates, so synchronize this term only when it is present.
@@ -654,13 +747,21 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         # The success term owns route advancement before reward computation.
         # Synchronize its proximity and dwell contract with the authoritative
         # curriculum so only a safely reached final waypoint ends an episode.
-        self.terminations.success.params["reach_threshold"] = curriculum_cfg.waypoint_reach_threshold
-        self.terminations.success.params["reach_hold_s"] = curriculum_cfg.waypoint_reach_hold_s
+        self.terminations.success.params["reach_threshold"] = (
+            curriculum_cfg.waypoint_reach_threshold
+        )
+        self.terminations.success.params["reach_hold_s"] = (
+            curriculum_cfg.waypoint_reach_hold_s
+        )
 
         # Likewise, use one contact threshold for both the safety penalty and
         # trunk-contact termination.
-        self.rewards.illegal_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
-        self.terminations.trunk_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
+        self.rewards.illegal_contact.params["threshold"] = (
+            curriculum_cfg.base_contact_threshold
+        )
+        self.terminations.trunk_contact.params["threshold"] = (
+            curriculum_cfg.base_contact_threshold
+        )
 
         # Keep the contact-gated edge penalty tied to the same authoritative
         # level geometry and metric thresholds as terrain generation.
@@ -675,4 +776,7 @@ class ParkourLabEnvCfgPlay(ParkourLabEnvCfg):
         super().__post_init__()
         self.scene.num_envs = 1
         self.scene.ground.terrain_generator.num_cols = 1
-        self.set_evaluation_difficulty(self.parkour_curriculum.max_level)
+        self.set_evaluation_course(
+            self.parkour_curriculum.family_names[0],
+            self.parkour_curriculum.max_level,
+        )

@@ -156,9 +156,8 @@ def completed_course_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
         [num_envs]
     """
 
-    # ManagerBasedRLEnv computes terminations before rewards. The success term
-    # advances intermediate waypoints and records this one-step completion event.
-    return route.course_completed_this_step(env).float()
+    # ManagerBasedRLEnv computes and stores terminations before rewards.
+    return env.termination_manager.get_term("success").float()
 
 
 def velocity_along_goal_xy_capped(

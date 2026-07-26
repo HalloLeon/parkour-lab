@@ -14,145 +14,34 @@ from ..terrain.ramps import TiltedRampGeometry
 from .difficulty import difficulty_to_level
 from .levels import (
     ParkourDifficultyCfg,
+    ParkourFamilyCfg,
     ParkourLevelCfg,
     ParkourStructureCfg,
     ParkourSupportRegionCfg,
     ParkourWaypointCfg,
     base_ground_structures,
-    coerce_and_validate_levels,
-    coerce_level_cfg,
+    coerce_family_cfg,
 )
 
+# Terrain-local bounds of each 8 m by 4 m tile. They define ground-support
+# regions and constrain generated obstacle, ramp, and landing geometry.
 _TERRAIN_X_RANGE_M = (-4.0, 4.0)
 _TERRAIN_Y_RANGE_M = (-2.0, 2.0)
+
+# Terrain-local X coordinate around which each physical gap expands
+# symmetrically as its curriculum-controlled width changes.
 _GAP_CENTER_X_M = 2.0
-_GAP_WIDTH_M = 0.4
+
+# Required ground distance from a hurdle's rear face to its landing waypoint.
 _HURDLE_LANDING_MARGIN_M = 0.8
+
+# Terrain-local X boundary at which the tilted-ramp approach support region
+# ends; final landing regions must begin beyond it.
 _RAMP_APPROACH_END_X_M = 0.55
+
+# Longitudinal distance that ramp entry and exit waypoints are moved inside the
+# top-centerline endpoints, keeping targets away from exact support edges.
 _RAMP_WAYPOINT_INSET_M = 0.14
-_GAP_X_RANGE_M = (
-    _GAP_CENTER_X_M - 0.5 * _GAP_WIDTH_M,
-    _GAP_CENTER_X_M + 0.5 * _GAP_WIDTH_M,
-)
-
-
-@dataclass(frozen=True)
-class TiltedRampSegmentCfg:
-    """Length and orientation of one ramp in a tilted-ramp course."""
-
-    length: float
-    incline_degrees: float
-    yaw_degrees: float
-
-
-@dataclass(frozen=True)
-class TiltedRampCourseCfg:
-    """Geometry and placement of one complete two-ramp course."""
-
-    ramps: tuple[TiltedRampSegmentCfg, TiltedRampSegmentCfg]
-    ramp_width: float
-    ramp_thickness: float
-    first_ramp_center_xy: tuple[float, float]
-    inter_ramp_gap: float
-    inter_ramp_lateral_offset: float
-    landing_size: tuple[float, float]
-    landing_center_y: float
-
-    def difficulty_parameters(self) -> dict[str, float]:
-        """Return the course geometry as flat, JSON-compatible metadata."""
-
-        first_ramp, second_ramp = self.ramps
-        landing_length, landing_width = self.landing_size
-        return {
-            "ramp_1_incline_deg": first_ramp.incline_degrees,
-            "ramp_2_incline_deg": second_ramp.incline_degrees,
-            "ramp_1_yaw_deg": first_ramp.yaw_degrees,
-            "ramp_2_yaw_deg": second_ramp.yaw_degrees,
-            "ramp_1_length_m": first_ramp.length,
-            "ramp_2_length_m": second_ramp.length,
-            "ramp_width_m": self.ramp_width,
-            "ramp_thickness_m": self.ramp_thickness,
-            "ramp_1_center_x_m": self.first_ramp_center_xy[0],
-            "ramp_1_center_y_m": self.first_ramp_center_xy[1],
-            "inter_ramp_gap_m": self.inter_ramp_gap,
-            "inter_ramp_lateral_offset_m": self.inter_ramp_lateral_offset,
-            "landing_length_m": landing_length,
-            "landing_width_m": landing_width,
-            "landing_center_y_m": self.landing_center_y,
-        }
-
-    def landing_ranges(
-        self,
-    ) -> tuple[tuple[float, float], tuple[float, float]]:
-        """Return the validated XY ranges of the final landing region."""
-
-        if len(self.landing_size) != 2:
-            raise ValueError("Landing size must contain length and width.")
-        landing_length, landing_width = self.landing_size
-        if any(not math.isfinite(value) or value <= 0.0 for value in (landing_length, landing_width)):
-            raise ValueError("Landing length and width must be positive finite values.")
-        if not math.isfinite(self.landing_center_y):
-            raise ValueError("Landing center Y must be finite.")
-
-        x_range = (
-            _TERRAIN_X_RANGE_M[1] - landing_length,
-            _TERRAIN_X_RANGE_M[1],
-        )
-        y_range = (
-            self.landing_center_y - 0.5 * landing_width,
-            self.landing_center_y + 0.5 * landing_width,
-        )
-        if not (
-            _RAMP_APPROACH_END_X_M < x_range[0]
-            and _TERRAIN_Y_RANGE_M[0] <= y_range[0]
-            and y_range[1] <= _TERRAIN_Y_RANGE_M[1]
-        ):
-            raise ValueError("The final ramp landing must fit inside the terrain tile.")
-        return x_range, y_range
-
-    def ramp_geometries(
-        self,
-    ) -> tuple[TiltedRampGeometry, TiltedRampGeometry]:
-        """Construct and validate the two positioned ramp geometries."""
-
-        if len(self.ramps) != 2 or not all(isinstance(ramp, TiltedRampSegmentCfg) for ramp in self.ramps):
-            raise ValueError("Tilted-ramp courses require exactly two ramp configurations.")
-        if any(ramp.length <= 2.0 * _RAMP_WAYPOINT_INSET_M for ramp in self.ramps):
-            raise ValueError("Each ramp must be long enough for inset route waypoints.")
-        if not math.isfinite(self.inter_ramp_gap) or self.inter_ramp_gap < 0.0:
-            raise ValueError("Inter-ramp gap must be finite and non-negative.")
-        if not math.isfinite(self.inter_ramp_lateral_offset):
-            raise ValueError("Inter-ramp lateral offset must be finite.")
-
-        first_cfg, second_cfg = self.ramps
-        first_ramp = TiltedRampGeometry(
-            center_xy=self.first_ramp_center_xy,
-            length=first_cfg.length,
-            width=self.ramp_width,
-            thickness=self.ramp_thickness,
-            incline_radians=math.radians(first_cfg.incline_degrees),
-            yaw_radians=math.radians(first_cfg.yaw_degrees),
-        )
-        second_ramp = first_ramp.placed_after(
-            length=second_cfg.length,
-            width=self.ramp_width,
-            thickness=self.ramp_thickness,
-            incline_radians=math.radians(second_cfg.incline_degrees),
-            yaw_radians=math.radians(second_cfg.yaw_degrees),
-            gap=self.inter_ramp_gap,
-            lateral_offset=self.inter_ramp_lateral_offset,
-        )
-
-        # Collision geometry, rather than only its centerline, must stay inside
-        # the generated tile after applying both the bank angle and yaw.
-        for ramp in (first_ramp, second_ramp):
-            x_bounds, y_bounds = ramp.collision_bounds_xy
-            if not (
-                _TERRAIN_X_RANGE_M[0] <= x_bounds[0] < x_bounds[1] <= _TERRAIN_X_RANGE_M[1]
-                and _TERRAIN_Y_RANGE_M[0] <= y_bounds[0] < y_bounds[1] <= _TERRAIN_Y_RANGE_M[1]
-            ):
-                raise ValueError("Tilted-ramp collision geometry must lie inside the terrain tile.")
-        return first_ramp, second_ramp
 
 
 def _box_difficulty_parameters(
@@ -190,7 +79,9 @@ def _box_obstacle(
     dimensions = (obstacle_depth, obstacle_width, obstacle_height)
     if any(not math.isfinite(value) or value <= 0.0 for value in dimensions):
         raise ValueError("Box-obstacle height, width, and depth must be positive.")
-    if len(obstacle_position_xy) != 2 or any(not math.isfinite(value) for value in obstacle_position_xy):
+    if len(obstacle_position_xy) != 2 or any(
+        not math.isfinite(value) for value in obstacle_position_xy
+    ):
         raise ValueError("Box-obstacle XY position must contain two finite values.")
 
     center_x, center_y = obstacle_position_xy
@@ -245,11 +136,25 @@ def _flat_level() -> ParkourLevelCfg:
     )
 
 
-def _gap_level() -> ParkourLevelCfg:
-    """Create the first course whose base supports leave a physical gap."""
+def _gap_level(
+    *,
+    name: str,
+    difficulty_order: float,
+    gap_width: float,
+    target_speed: float,
+    min_clearance: float,
+) -> ParkourLevelCfg:
+    """Create a course whose base supports leave a physical gap."""
+
+    if not math.isfinite(gap_width) or gap_width <= 0.0:
+        raise ValueError("Gap width must be positive and finite.")
+    gap_x_range = (
+        _GAP_CENTER_X_M - 0.5 * gap_width,
+        _GAP_CENTER_X_M + 0.5 * gap_width,
+    )
 
     return ParkourLevelCfg(
-        name="level_3_gap",
+        name=name,
         obstacle_family="gap",
         waypoints=(
             ParkourWaypointCfg(position=(1.5, 0.0, 0.01)),
@@ -261,23 +166,23 @@ def _gap_level() -> ParkourLevelCfg:
             ParkourSupportRegionCfg.horizontal_rectangle(
                 name="approach_ground",
                 structure_name=None,
-                x_range=(_TERRAIN_X_RANGE_M[0], _GAP_X_RANGE_M[0]),
+                x_range=(_TERRAIN_X_RANGE_M[0], gap_x_range[0]),
                 y_range=_TERRAIN_Y_RANGE_M,
                 surface_z=0.0,
             ),
             ParkourSupportRegionCfg.horizontal_rectangle(
                 name="landing_ground",
                 structure_name=None,
-                x_range=(_GAP_X_RANGE_M[1], _TERRAIN_X_RANGE_M[1]),
+                x_range=(gap_x_range[1], _TERRAIN_X_RANGE_M[1]),
                 y_range=_TERRAIN_Y_RANGE_M,
                 surface_z=0.0,
             ),
         ),
-        target_speed=0.80,
-        min_clearance=0.27,
+        target_speed=target_speed,
+        min_clearance=min_clearance,
         difficulty=ParkourDifficultyCfg(
-            order=3.0,
-            parameters={"gap_width_m": _GAP_WIDTH_M},
+            order=difficulty_order,
+            parameters={"gap_width_m": gap_width},
         ),
     )
 
@@ -429,67 +334,101 @@ def _ramp_structure(
     )
 
 
+def _tilted_ramp_difficulty_parameters(
+    ramps: tuple[TiltedRampGeometry, ...],
+    *,
+    landing_x_range: tuple[float, float],
+    landing_y_range: tuple[float, float],
+) -> dict[str, float]:
+    """Describe the exact ramp sequence and landing as flat numeric metadata.
+
+    For every ramp after the first, ``gap_from_previous_m`` is the displacement
+    from the previous ramp's top-centerline end to the current ramp's
+    top-centerline start, projected onto the previous ramp's travel direction.
+    It is therefore a longitudinal separation in the previous ramp's local
+    frame, not the endpoints' Euclidean distance or the minimum clearance
+    between the rotated collision meshes. The perpendicular projection in that
+    same local frame is reported as ``lateral_offset_from_previous_m``.
+    """
+
+    parameters: dict[str, float] = {}
+    for index, ramp in enumerate(ramps, start=1):
+        prefix = f"ramp_{index}"
+        parameters.update(
+            {
+                f"{prefix}_incline_deg": round(math.degrees(ramp.incline_radians), 12),
+                f"{prefix}_yaw_deg": round(math.degrees(ramp.yaw_radians), 12),
+                f"{prefix}_length_m": ramp.length,
+                f"{prefix}_width_m": ramp.width,
+                f"{prefix}_thickness_m": ramp.thickness,
+                f"{prefix}_center_x_m": ramp.center_xy[0],
+                f"{prefix}_center_y_m": ramp.center_xy[1],
+            }
+        )
+        if index > 1:
+            previous = ramps[index - 2]
+            delta_x = ramp.centerline_start[0] - previous.centerline_end[0]
+            delta_y = ramp.centerline_start[1] - previous.centerline_end[1]
+            previous_travel_x, previous_travel_y = previous.travel_direction_xy
+            previous_left_x, previous_left_y = previous.left_direction_xy
+
+            # Decompose the endpoint displacement in the previous ramp's
+            # orthonormal travel/left basis:
+            # delta = gap * travel + lateral_offset * left.
+            parameters[f"{prefix}_gap_from_previous_m"] = round(
+                delta_x * previous_travel_x + delta_y * previous_travel_y,
+                12,
+            )
+            parameters[f"{prefix}_lateral_offset_from_previous_m"] = round(
+                delta_x * previous_left_x + delta_y * previous_left_y,
+                12,
+            )
+
+    landing_x_min, landing_x_max = landing_x_range
+    landing_y_min, landing_y_max = landing_y_range
+    parameters.update(
+        {
+            "landing_length_m": landing_x_max - landing_x_min,
+            "landing_width_m": landing_y_max - landing_y_min,
+            "landing_center_x_m": 0.5 * (landing_x_min + landing_x_max),
+            "landing_center_y_m": 0.5 * (landing_y_min + landing_y_max),
+        }
+    )
+    return parameters
+
+
 def _tilted_ramp_level(
     *,
     name: str,
     difficulty_order: float,
-    course: TiltedRampCourseCfg,
+    ramps: tuple[TiltedRampGeometry, ...],
+    landing_x_range: tuple[float, float],
+    landing_y_range: tuple[float, float],
     target_speed: float,
     min_clearance: float,
+    difficulty_parameters: dict[str, float],
 ) -> ParkourLevelCfg:
-    """Create two laterally banked ramps with an explicit redirected route."""
+    """Create a laterally banked ramp sequence with an explicit redirected route."""
 
-    first_ramp, second_ramp = course.ramp_geometries()
-    landing_x_range, landing_y_range = course.landing_ranges()
+    ramps = tuple(ramps)
+    if not ramps:
+        raise ValueError("Tilted-ramp courses require at least one ramp.")
+    if not all(isinstance(ramp, TiltedRampGeometry) for ramp in ramps):
+        raise TypeError("Every tilted-ramp course entry must be TiltedRampGeometry.")
+    if any(ramp.length <= 2.0 * _RAMP_WAYPOINT_INSET_M for ramp in ramps):
+        raise ValueError("Each ramp must be long enough for inset route waypoints.")
 
-    first_direction = first_ramp.travel_direction_xy
-    second_direction = second_ramp.travel_direction_xy
-    first_start = first_ramp.centerline_start
-    first_end = first_ramp.centerline_end
-    second_start = second_ramp.centerline_start
-    second_end = second_ramp.centerline_end
+    # Collision geometry, rather than only its centerline, must stay inside the
+    # generated tile after applying both the bank angle and yaw.
+    for ramp in ramps:
+        x_bounds, y_bounds = ramp.collision_bounds_xy
+        if not (
+            _TERRAIN_X_RANGE_M[0] <= x_bounds[0] < x_bounds[1] <= _TERRAIN_X_RANGE_M[1]
+            and _TERRAIN_Y_RANGE_M[0] <= y_bounds[0] < y_bounds[1] <= _TERRAIN_Y_RANGE_M[1]
+        ):
+            raise ValueError("Tilted-ramp collision geometry must lie inside the terrain tile.")
+
     marker_offset_z = 0.01
-
-    # Waypoint 0 aligns the approach with ramp one. Waypoints 1 and 2 bridge
-    # the inter-ramp gap/offset. Reaching waypoint 2 retargets waypoint 3,
-    # whose vector is exactly ramp two's yaw rather than the final goal line.
-    waypoints = (
-        ParkourWaypointCfg(
-            position=(
-                first_start[0] - 0.25 * first_direction[0],
-                first_start[1] - 0.25 * first_direction[1],
-                marker_offset_z,
-            )
-        ),
-        ParkourWaypointCfg(
-            position=(
-                first_end[0] - _RAMP_WAYPOINT_INSET_M * first_direction[0],
-                first_end[1] - _RAMP_WAYPOINT_INSET_M * first_direction[1],
-                first_ramp.top_center_z + marker_offset_z,
-            )
-        ),
-        ParkourWaypointCfg(
-            position=(
-                second_start[0] + _RAMP_WAYPOINT_INSET_M * second_direction[0],
-                second_start[1] + _RAMP_WAYPOINT_INSET_M * second_direction[1],
-                second_ramp.top_center_z + marker_offset_z,
-            )
-        ),
-        ParkourWaypointCfg(
-            position=(
-                second_end[0] - _RAMP_WAYPOINT_INSET_M * second_direction[0],
-                second_end[1] - _RAMP_WAYPOINT_INSET_M * second_direction[1],
-                second_ramp.top_center_z + marker_offset_z,
-            )
-        ),
-        ParkourWaypointCfg(
-            position=(
-                0.5 * (landing_x_range[0] + landing_x_range[1]),
-                course.landing_center_y,
-                marker_offset_z,
-            )
-        ),
-    )
     approach_region = ParkourSupportRegionCfg.horizontal_rectangle(
         name="approach_ground",
         structure_name=None,
@@ -497,119 +436,320 @@ def _tilted_ramp_level(
         y_range=_TERRAIN_Y_RANGE_M,
         surface_z=0.0,
     )
+    landing_region = ParkourSupportRegionCfg.horizontal_rectangle(
+        name="final_landing",
+        structure_name=None,
+        x_range=landing_x_range,
+        y_range=landing_y_range,
+        surface_z=0.0,
+    )
+    if not (
+        _RAMP_APPROACH_END_X_M < landing_region.x_range[0]
+        and _TERRAIN_X_RANGE_M[0] <= landing_region.x_range[0]
+        and landing_region.x_range[1] <= _TERRAIN_X_RANGE_M[1]
+        and _TERRAIN_Y_RANGE_M[0] <= landing_region.y_range[0]
+        and landing_region.y_range[1] <= _TERRAIN_Y_RANGE_M[1]
+    ):
+        raise ValueError("The final ramp landing must fit inside the terrain tile.")
+
+    structures = tuple(_ramp_structure(f"tilted_ramp_{index}", ramp) for index, ramp in enumerate(ramps, start=1))
+    ramp_supports = tuple(
+        ParkourSupportRegionCfg(
+            name=f"tilted_ramp_{index}_top",
+            structure_name=structure.name,
+            vertices=ramp.top_corners,
+        )
+        for index, (ramp, structure) in enumerate(
+            zip(ramps, structures),
+            start=1,
+        )
+    )
+
+    first_ramp = ramps[0]
+    first_direction_x, first_direction_y = first_ramp.travel_direction_xy
+    first_start = first_ramp.centerline_start
+
+    # The 0.25 m value is a fixed route-design offset, not a quantity derived
+    # from the ramp dimensions. Moving opposite the first ramp's unit travel
+    # direction places the initial target on flat approach ground, giving the
+    # route time to align with the ramp yaw before the robot reaches its edge.
+    # The support-region check below rejects layouts for which that assumption
+    # does not hold.
+    waypoints = [
+        ParkourWaypointCfg(
+            position=(
+                first_start[0] - 0.25 * first_direction_x,
+                first_start[1] - 0.25 * first_direction_y,
+                marker_offset_z,
+            )
+        )
+    ]
     if not approach_region.supports_waypoint(waypoints[0].position):
         raise ValueError("The first tilted-ramp waypoint must lie on approach ground.")
 
-    first_ramp_structure = _ramp_structure("tilted_ramp_1", first_ramp)
-    second_ramp_structure = _ramp_structure("tilted_ramp_2", second_ramp)
-    first_ramp_support = ParkourSupportRegionCfg(
-        name="tilted_ramp_1_top",
-        structure_name=first_ramp_structure.name,
-        vertices=first_ramp.top_corners,
+    # The first approach waypoint already aligns the route with ramp one. Every
+    # later ramp receives an entry waypoint so a gap or direction change is
+    # explicit, and every ramp receives an inset exit waypoint.
+    for index, (ramp, support) in enumerate(zip(ramps, ramp_supports)):
+        direction_x, direction_y = ramp.travel_direction_xy
+        ramp_waypoints: list[ParkourWaypointCfg] = []
+        if index > 0:
+            start = ramp.centerline_start
+            ramp_waypoints.append(
+                ParkourWaypointCfg(
+                    position=(
+                        start[0] + _RAMP_WAYPOINT_INSET_M * direction_x,
+                        start[1] + _RAMP_WAYPOINT_INSET_M * direction_y,
+                        ramp.top_center_z + marker_offset_z,
+                    )
+                )
+            )
+        end = ramp.centerline_end
+        ramp_waypoints.append(
+            ParkourWaypointCfg(
+                position=(
+                    end[0] - _RAMP_WAYPOINT_INSET_M * direction_x,
+                    end[1] - _RAMP_WAYPOINT_INSET_M * direction_y,
+                    ramp.top_center_z + marker_offset_z,
+                )
+            )
+        )
+        if not all(support.supports_waypoint(waypoint.position) for waypoint in ramp_waypoints):
+            raise ValueError(f"Ramp {index + 1} waypoints must lie on its top surface.")
+        waypoints.extend(ramp_waypoints)
+
+    final_waypoint = ParkourWaypointCfg(
+        position=(
+            0.5 * (landing_region.x_range[0] + landing_region.x_range[1]),
+            0.5 * (landing_region.y_range[0] + landing_region.y_range[1]),
+            marker_offset_z,
+        )
     )
-    second_ramp_support = ParkourSupportRegionCfg(
-        name="tilted_ramp_2_top",
-        structure_name=second_ramp_structure.name,
-        vertices=second_ramp.top_corners,
-    )
-    if not first_ramp_support.supports_waypoint(waypoints[1].position):
-        raise ValueError("The first ramp waypoint must lie on its top surface.")
-    if not all(second_ramp_support.supports_waypoint(waypoints[index].position) for index in (2, 3)):
-        raise ValueError("The second ramp waypoints must lie on its top surface.")
+    if not landing_region.supports_waypoint(final_waypoint.position):
+        raise ValueError("The final tilted-ramp waypoint must lie on its landing.")
+    waypoints.append(final_waypoint)
 
     return ParkourLevelCfg(
         name=name,
         obstacle_family="tilted_ramps",
-        waypoints=waypoints,
-        structures=(
-            first_ramp_structure,
-            second_ramp_structure,
-        ),
+        waypoints=tuple(waypoints),
+        structures=structures,
         # Annotate the exact top faces so the same terrain-independent edge
-        # reward covers horizontal ground and both banked ramp surfaces.
+        # reward covers horizontal ground and every banked ramp surface.
         support_regions=(
             approach_region,
-            first_ramp_support,
-            second_ramp_support,
-            ParkourSupportRegionCfg.horizontal_rectangle(
-                name="final_landing",
-                structure_name=None,
-                x_range=landing_x_range,
-                y_range=landing_y_range,
-                surface_z=0.0,
-            ),
+            *ramp_supports,
+            landing_region,
         ),
         target_speed=target_speed,
         min_clearance=min_clearance,
         difficulty=ParkourDifficultyCfg(
             order=difficulty_order,
-            parameters=course.difficulty_parameters(),
+            parameters=difficulty_parameters,
         ),
     )
 
 
-_DEFAULT_PARKOUR_LEVELS = (
-    _flat_level(),
+def _default_tilted_ramp_level(index: int) -> ParkourLevelCfg:
+    """Create one default two-ramp course at the requested difficulty row."""
+
+    first_length = round(1.0 + 0.025 * index, 3)
+    second_length = round(1.1 + 0.05 * index, 2)
+    first_incline_degrees = round(4.0 + 2.0 * index, 1)
+    second_incline_degrees = -first_incline_degrees
+    first_yaw_degrees = round(2.5 * index, 1)
+    second_yaw_degrees = round(12.0 + 5.0 * index, 1)
+    ramp_width = round(1.2 - 0.05 * index, 2)
+    ramp_thickness = 0.06
+    inter_ramp_gap = round(0.08 + 0.03 * index, 2)
+    inter_ramp_lateral_offset = round(0.08 + 0.08 * index, 2)
+    landing_length = round(1.10 - 0.05 * index, 2)
+    landing_width = 2.0
+    landing_center_y = 0.0
+
+    first_ramp = TiltedRampGeometry(
+        center_xy=(1.15, -0.45),
+        length=first_length,
+        width=ramp_width,
+        thickness=ramp_thickness,
+        incline_radians=math.radians(first_incline_degrees),
+        yaw_radians=math.radians(first_yaw_degrees),
+    )
+    second_ramp = first_ramp.placed_after(
+        length=second_length,
+        width=ramp_width,
+        thickness=ramp_thickness,
+        incline_radians=math.radians(second_incline_degrees),
+        yaw_radians=math.radians(second_yaw_degrees),
+        gap=inter_ramp_gap,
+        lateral_offset=inter_ramp_lateral_offset,
+    )
+    ramps = (first_ramp, second_ramp)
+    landing_x_range = (
+        _TERRAIN_X_RANGE_M[1] - landing_length,
+        _TERRAIN_X_RANGE_M[1],
+    )
+    landing_y_range = (
+        landing_center_y - 0.5 * landing_width,
+        landing_center_y + 0.5 * landing_width,
+    )
+
+    return _tilted_ramp_level(
+        name=f"tilted_ramps_difficulty_{index}",
+        difficulty_order=float(index),
+        ramps=ramps,
+        landing_x_range=landing_x_range,
+        landing_y_range=landing_y_range,
+        target_speed=round(0.65 + 0.05 * index, 2),
+        min_clearance=round(0.24 + 0.01 * index, 2),
+        difficulty_parameters=_tilted_ramp_difficulty_parameters(
+            ramps,
+            landing_x_range=landing_x_range,
+            landing_y_range=landing_y_range,
+        ),
+    )
+
+
+_NUM_DIFFICULTIES = 5
+
+_DEFAULT_GAP_LEVELS = tuple(
+    _gap_level(
+        name=f"gap_difficulty_{index}",
+        difficulty_order=float(index),
+        gap_width=round(0.10 + 0.10 * index, 2),
+        target_speed=round(0.60 + 0.05 * index, 2),
+        min_clearance=round(0.24 + 0.01 * index, 2),
+    )
+    for index in range(_NUM_DIFFICULTIES)
+)
+
+_DEFAULT_HIGH_STEP_LEVELS = tuple(
     _high_step_level(
-        name="level_1_high_step",
-        difficulty_order=1.0,
-        obstacle_height=0.16,
+        name=f"high_step_difficulty_{index}",
+        difficulty_order=float(index),
+        obstacle_height=round(0.08 + 0.04 * index, 2),
         obstacle_width=1.8,
         obstacle_depth=1.6,
         obstacle_position_xy=(2.8, 0.0),
-        target_speed=0.70,
-        min_clearance=0.25,
-    ),
+        target_speed=round(0.60 + 0.04 * index, 2),
+        min_clearance=round(0.24 + 0.01 * index, 2),
+    )
+    for index in range(_NUM_DIFFICULTIES)
+)
+
+_DEFAULT_HURDLE_LEVELS = tuple(
     _hurdle_level(
-        name="level_2_hurdle",
-        difficulty_order=2.0,
-        obstacle_height=0.12,
+        name=f"hurdle_difficulty_{index}",
+        difficulty_order=float(index),
+        obstacle_height=round(0.06 + 0.03 * index, 2),
         obstacle_width=1.8,
         obstacle_depth=0.18,
         obstacle_position_xy=(2.0, 0.0),
-        target_speed=0.75,
-        min_clearance=0.26,
-    ),
-    _gap_level(),
-    _tilted_ramp_level(
-        name="level_4_tilted_ramps",
-        difficulty_order=4.0,
-        course=TiltedRampCourseCfg(
-            ramps=(
-                TiltedRampSegmentCfg(
-                    length=1.1,
-                    incline_degrees=12.0,
-                    yaw_degrees=10.0,
-                ),
-                TiltedRampSegmentCfg(
-                    length=1.3,
-                    incline_degrees=-12.0,
-                    yaw_degrees=32.0,
-                ),
-            ),
-            ramp_width=1.0,
-            ramp_thickness=0.06,
-            first_ramp_center_xy=(1.15, -0.45),
-            inter_ramp_gap=0.20,
-            inter_ramp_lateral_offset=0.40,
-            landing_size=(0.90, 2.0),
-            landing_center_y=0.0,
-        ),
-        target_speed=0.85,
-        min_clearance=0.28,
+        target_speed=round(0.60 + 0.05 * index, 2),
+        min_clearance=round(0.24 + 0.01 * index, 2),
+    )
+    for index in range(_NUM_DIFFICULTIES)
+)
+
+_DEFAULT_TILTED_RAMP_LEVELS = tuple(_default_tilted_ramp_level(index) for index in range(_NUM_DIFFICULTIES))
+
+_DEFAULT_PARKOUR_FAMILIES = (
+    ParkourFamilyCfg(name="gap", levels=_DEFAULT_GAP_LEVELS),
+    ParkourFamilyCfg(name="high_step", levels=_DEFAULT_HIGH_STEP_LEVELS),
+    ParkourFamilyCfg(name="hurdle", levels=_DEFAULT_HURDLE_LEVELS),
+    ParkourFamilyCfg(
+        name="tilted_ramps",
+        levels=_DEFAULT_TILTED_RAMP_LEVELS,
     ),
 )
 
 
+@dataclass(frozen=True)
+class ParkourTerrainLayout:
+    """Map Isaac Lab's physical terrain grid to the curriculum matrix.
+
+    Isaac Lab stores generated tile origins in a grid whose shape is
+    ``(num_rows, num_columns, 3)``. This project gives those physical axes the
+    following semantic meaning:
+
+    * Physical row ``r`` represents curriculum difficulty ``r``. There must be
+      exactly one row for every shared difficulty in the curriculum.
+    * Physical columns are sampling slots rather than unique obstacle
+      families. Multiple columns can contain the same family so training can
+      allocate an equal number of environments to every family.
+      ``family_index_by_column[c]`` identifies which curriculum family is
+      generated in physical column ``c``.
+
+    Keeping both parts in one value object makes the complete grid contract
+    explicit wherever terrain generation and runtime indexing are connected.
+    For example, a five-difficulty, four-family training layout with 40 columns
+    has five rows and a mapping containing ten copies of each family index.
+    Fixed-family evaluation instead maps every column to the selected family
+    while retaining the same row-to-difficulty relationship.
+
+    Attributes:
+        num_difficulty_rows: Number of physical terrain rows, equal to the
+            number of shared curriculum difficulties.
+        family_index_by_column: One curriculum-family index for every physical
+            terrain column, ordered by column index.
+    """
+
+    num_difficulty_rows: int
+    family_index_by_column: tuple[int, ...]
+
+    @property
+    def num_columns(self) -> int:
+        """Return the number of physical terrain columns described."""
+
+        return len(self.family_index_by_column)
+
+    def validate(
+        self,
+        *,
+        curriculum_difficulties: int,
+        curriculum_families: int,
+        terrain_columns: int,
+        terrain_rows: int,
+    ) -> None:
+        """Require the semantic layout and generated terrain grid to agree."""
+
+        if self.num_difficulty_rows != curriculum_difficulties:
+            raise ValueError(
+                "The terrain layout and curriculum must describe the same "
+                "number of difficulty rows: "
+                f"got {self.num_difficulty_rows} and {curriculum_difficulties}."
+            )
+        if terrain_rows != self.num_difficulty_rows:
+            raise ValueError(
+                "Parkour terrain rows and difficulty levels must match "
+                f"one-to-one: got {terrain_rows} rows and "
+                f"{self.num_difficulty_rows} difficulties."
+            )
+        if terrain_columns != self.num_columns:
+            raise ValueError(
+                "The terrain layout must contain one family index per physical "
+                f"column: got {self.num_columns} indices and "
+                f"{terrain_columns} columns."
+            )
+        if any(
+            family_index < 0 or family_index >= curriculum_families
+            for family_index in self.family_index_by_column
+        ):
+            raise ValueError(
+                "The terrain layout contains an out-of-range family index."
+            )
+
+
 @configclass
 class ParkourCurriculumCfg:
-    """
-    Curriculum definition for the simplified parkour task.
+    """Balanced obstacle-family by difficulty curriculum matrix.
 
-    Levels should go from easiest to hardest.
+    Terrain rows are shared difficulty indices. Terrain columns are split
+    equally among ``families`` so PPO receives the same number of samples from
+    gaps, high steps, hurdles, and tilted ramps at every active difficulty.
     """
 
-    levels: tuple[ParkourLevelCfg, ...] = _DEFAULT_PARKOUR_LEVELS
+    families: tuple[ParkourFamilyCfg, ...] = _DEFAULT_PARKOUR_FAMILIES
 
     initial_level: int = 1
     # Balance the initial population over levels 0..initial_level. This gives
@@ -617,16 +757,16 @@ class ParkourCurriculumCfg:
     distribute_initial_levels: bool = True
     max_level: int = 4
 
-    # Adaptive curriculum.
-    promote_on_success: bool = True
-    demote_on_failure: bool = True
-
     # A waypoint changes only after the root remains within this XY radius for
     # ``waypoint_reach_hold_s``.
     waypoint_reach_threshold: float = 0.20
     waypoint_reach_hold_s: float = 0.10
-    successes_to_promote: int = 2  # Avoids promotion from one lucky success
-    failures_to_demote: int = 2  # Hysteresis prevents oscillating after one poor episode
+
+    # Progress thresholds. Promotion requires more than half of
+    # the configured route length; demotion requires less than half of the
+    # distance commanded during the completed episode.
+    promotion_course_fraction: float = 0.50
+    demotion_expected_distance_fraction: float = 0.50
 
     base_contact_threshold: float = 1.0
 
@@ -638,49 +778,184 @@ class ParkourCurriculumCfg:
     def __post_init__(self) -> None:
         self.validate_configuration()
 
+    def course(self, family_index: int, difficulty_index: int) -> ParkourLevelCfg:
+        """Return one cell of the family-by-difficulty matrix."""
+
+        if not 0 <= family_index < len(self.families):
+            raise IndexError("family_index is out of range.")
+        if not 0 <= difficulty_index < self.num_difficulties:
+            raise IndexError("difficulty_index is out of range.")
+        return self.families[family_index].levels[difficulty_index]
+
+    def course_index(self, family_index: int, difficulty_index: int) -> int:
+        """Flatten one matrix cell for vectorized runtime table indexing."""
+
+        self.course(family_index, difficulty_index)
+        return family_index * self.num_difficulties + difficulty_index
+
+    @property
+    def courses(self) -> tuple[ParkourLevelCfg, ...]:
+        """Return family-major matrix cells for runtime lookup tables."""
+
+        return tuple(level for family in self.families for level in family.levels)
+
+    def family_index(self, family_name: str) -> int:
+        """Return the stable index of a configured obstacle family."""
+
+        try:
+            return self.family_names.index(family_name)
+        except ValueError as error:
+            raise ValueError(
+                f"Unknown terrain family {family_name!r}; choose one of "
+                f"{list(self.family_names)}."
+            ) from error
+
+    @property
+    def family_names(self) -> tuple[str, ...]:
+        """Return obstacle-family names in their stable terrain-column order."""
+
+        return tuple(family.name for family in self.families)
+
+    def metadata(self) -> dict[str, object]:
+        """Return the complete JSON-compatible curriculum matrix."""
+
+        return {
+            "family_order": list(self.family_names),
+            "num_difficulties": self.num_difficulties,
+            "families": [family.metadata() for family in self.families],
+        }
+
+    @property
+    def num_difficulties(self) -> int:
+        """Return the shared number of terrain difficulty rows."""
+
+        return len(self.families[0].levels)
+
+    def terrain_layout(
+        self,
+        num_columns: int,
+        *,
+        family_name: str | None = None,
+    ) -> ParkourTerrainLayout:
+        """Describe how physical terrain rows and columns encode the matrix.
+
+        Training divides columns equally into contiguous family blocks,
+        matching Isaac Lab's equal-proportion sub-terrain layout. Supplying
+        ``family_name`` instead maps every column to that family for fixed
+        evaluation. Rows always retain their one-to-one correspondence with
+        the shared curriculum difficulties.
+        """
+
+        if (
+            isinstance(num_columns, bool)
+            or not isinstance(num_columns, int)
+            or num_columns <= 0
+        ):
+            raise ValueError("num_columns must be a positive integer.")
+
+        if family_name is not None:
+            family_index_by_column = (self.family_index(family_name),) * num_columns
+        else:
+            num_families = len(self.families)
+            if num_columns % num_families != 0:
+                raise ValueError(
+                    "Balanced family sampling requires num_columns to be "
+                    f"divisible by the {num_families} obstacle families."
+                )
+            columns_per_family = num_columns // num_families
+            family_index_by_column = tuple(
+                column // columns_per_family for column in range(num_columns)
+            )
+
+        return ParkourTerrainLayout(
+            num_difficulty_rows=self.num_difficulties,
+            family_index_by_column=family_index_by_column,
+        )
+
     def validate_configuration(self) -> None:
-        """Validate ordering, bounds, and curriculum transition settings."""
+        """Validate matrix shape, balance assumptions, and transition settings."""
 
-        # Hydra can turn nested dataclasses into dictionaries. Convert them
-        # back once and validate explicit easiest-to-hardest ordering so all
-        # downstream consumers receive one representation.
-        self.levels = coerce_and_validate_levels(self.levels)
+        # Hydra can turn nested dataclasses into dictionaries. Reconstruct each
+        # family once so all downstream consumers receive one typed matrix.
+        self.families = tuple(coerce_family_cfg(family) for family in self.families)
+        if not self.families:
+            raise ValueError("Parkour curriculum families must not be empty.")
 
-        if self.initial_level < 0 or self.initial_level >= len(self.levels):
+        family_names = self.family_names
+        if len(family_names) != len(set(family_names)):
+            raise ValueError("Parkour curriculum family names must be unique.")
+
+        difficulty_counts = {len(family.levels) for family in self.families}
+        if len(difficulty_counts) != 1:
+            raise ValueError(
+                "Every obstacle family must define the same difficulty rows."
+            )
+
+        difficulty_orders = tuple(
+            level.difficulty.order for level in self.families[0].levels
+        )
+        if any(
+            tuple(level.difficulty.order for level in family.levels)
+            != difficulty_orders
+            for family in self.families[1:]
+        ):
+            raise ValueError(
+                "Every obstacle family must use the same difficulty ranks by row."
+            )
+
+        if self.initial_level < 0 or self.initial_level >= self.num_difficulties:
             raise ValueError("initial_level is out of range.")
 
-        if self.max_level < self.initial_level or self.max_level >= len(self.levels):
+        if (
+            self.max_level < self.initial_level
+            or self.max_level >= self.num_difficulties
+        ):
             raise ValueError("max_level is out of range.")
 
-        if not np.isfinite(self.waypoint_reach_threshold) or self.waypoint_reach_threshold <= 0.0:
+        if (
+            not np.isfinite(self.waypoint_reach_threshold)
+            or self.waypoint_reach_threshold <= 0.0
+        ):
             raise ValueError("waypoint_reach_threshold must be positive.")
 
-        if not np.isfinite(self.waypoint_reach_hold_s) or self.waypoint_reach_hold_s < 0.0:
+        if (
+            not np.isfinite(self.waypoint_reach_hold_s)
+            or self.waypoint_reach_hold_s < 0.0
+        ):
             raise ValueError("waypoint_reach_hold_s must be non-negative.")
 
-        if self.successes_to_promote <= 0:
-            raise ValueError("successes_to_promote must be positive.")
+        if not 0.0 < self.promotion_course_fraction <= 1.0:
+            raise ValueError("promotion_course_fraction must be in (0, 1].")
 
-        if self.failures_to_demote <= 0:
-            raise ValueError("failures_to_demote must be positive.")
+        if not 0.0 < self.demotion_expected_distance_fraction <= 1.0:
+            raise ValueError("demotion_expected_distance_fraction must be in (0, 1].")
 
         if self.base_contact_threshold < 0.0:
             raise ValueError("base_contact_threshold must be non-negative.")
 
-        if not np.isfinite(self.edge_width_threshold) or self.edge_width_threshold <= 0.0:
+        if (
+            not np.isfinite(self.edge_width_threshold)
+            or self.edge_width_threshold <= 0.0
+        ):
             raise ValueError("edge_width_threshold must be positive.")
 
-        if not np.isfinite(self.foot_edge_contact_threshold) or self.foot_edge_contact_threshold < 0.0:
+        if (
+            not np.isfinite(self.foot_edge_contact_threshold)
+            or self.foot_edge_contact_threshold < 0.0
+        ):
             raise ValueError("foot_edge_contact_threshold must be non-negative.")
 
 
 DEFAULT_PARKOUR_CURRICULUM = ParkourCurriculumCfg()
 
 
-def parkour_terrain(difficulty: float, cfg: ParkourTerrainCfg) -> tuple[list[trimesh.Trimesh], np.ndarray]:
+def parkour_terrain(
+    difficulty: float, cfg: ParkourTerrainCfg
+) -> tuple[list[trimesh.Trimesh], np.ndarray]:
     """Generate a terrain tile from base-support patches and structures."""
 
-    level = coerce_level_cfg(cfg.levels[difficulty_to_level(difficulty, len(cfg.levels))])
+    levels = cfg.levels
+    level = levels[difficulty_to_level(difficulty, len(levels))]
     level.validate_terrain_size(cfg.size)
     terrain_center = _terrain_local_center(cfg)
     ground_structures = base_ground_structures(
@@ -702,7 +977,7 @@ class ParkourTerrainCfg(SubTerrainBaseCfg):
 
     function = parkour_terrain
 
-    levels: tuple[ParkourLevelCfg, ...] = DEFAULT_PARKOUR_CURRICULUM.levels
+    levels: tuple[ParkourLevelCfg, ...] = DEFAULT_PARKOUR_CURRICULUM.families[0].levels
 
     ground_thickness: float = 0.05
 
@@ -717,8 +992,8 @@ PARKOUR_TERRAIN_GENERATOR_CFG = TerrainGeneratorCfg(
     size=(8.0, 4.0),
     # Extra terrain border around the whole generated terrain.
     border_width=5.0,
-    # One terrain row per curriculum level.
-    num_rows=len(DEFAULT_PARKOUR_CURRICULUM.levels),
+    # One terrain row per shared difficulty level.
+    num_rows=DEFAULT_PARKOUR_CURRICULUM.num_difficulties,
     # Number of terrain columns per curriculum row.
     num_cols=40,
     # Horizontal resolution used by height-field/mesh terrain utilities.
@@ -744,17 +1019,16 @@ PARKOUR_TERRAIN_GENERATOR_CFG = TerrainGeneratorCfg(
     # use_cache=False is useful while actively developing terrain code, because
     # changes take effect immediately.
     use_cache=False,
-    # Dictionary of sub-terrain types.
-    #
-    # We only define one sub-terrain type, "parkour_course".
-    # Since its proportion is 1.0, every terrain tile is generated by
-    # ParkourTerrainCfg.
+    # Isaac Lab assigns sub-terrain types to contiguous column blocks in this
+    # stable dictionary order. Equal proportions and 40 divisible columns give
+    # every family exactly ten columns at every difficulty row.
     sub_terrains={
-        "parkour_course": ParkourTerrainCfg(
-            proportion=1.0,
-            levels=DEFAULT_PARKOUR_CURRICULUM.levels,
+        family.name: ParkourTerrainCfg(
+            proportion=1.0 / len(DEFAULT_PARKOUR_CURRICULUM.families),
+            levels=family.levels,
             ground_thickness=0.05,
         )
+        for family in DEFAULT_PARKOUR_CURRICULUM.families
     },
 )
 
@@ -785,10 +1059,14 @@ def _normalize_mesh_result(result: object, factory: object) -> list[trimesh.Trim
 
     # Report the factory as well as the accepted return types to make malformed
     # custom structure factories straightforward to identify.
-    raise TypeError(f"Mesh factory {factory!r} must return a Trimesh, Scene, or iterable of Trimesh objects.")
+    raise TypeError(
+        f"Mesh factory {factory!r} must return a Trimesh, Scene, or iterable of Trimesh objects."
+    )
 
 
-def _structure_meshes(structure: ParkourStructureCfg, terrain_center: np.ndarray) -> list[trimesh.Trimesh]:
+def _structure_meshes(
+    structure: ParkourStructureCfg, terrain_center: np.ndarray
+) -> list[trimesh.Trimesh]:
     """Create and rigidly transform all meshes produced by one structure."""
 
     # Call the configured factory with its declarative keyword arguments.

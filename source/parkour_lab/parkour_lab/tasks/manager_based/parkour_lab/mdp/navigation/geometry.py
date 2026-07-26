@@ -31,13 +31,13 @@ def _goal_direction_xy(
     return goal_vec_xy / goal_dist_xy
 
 
-def _goal_direction_yaw_xy(
+def _active_waypoint_direction_yaw_xy(
     env: ManagerBasedRLEnv,
-    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
-    Unit XY goal direction in the robot's yaw-aligned body frame.
+    Unit direction to the active waypoint in the robot's yaw-aligned frame.
 
     The first component points forward and the second points left. Roll and
     pitch do not affect this heading target, so it is equivalent to
@@ -59,14 +59,16 @@ def _goal_direction_yaw_xy(
         forward_direction_w / forward_norm,
         fallback_forward_w,
     )
-    goal_vector_w = _goal_vector_xy(env, goal_cfg, asset_cfg)
-    goal_distance = torch.linalg.norm(goal_vector_w, dim=-1, keepdim=True)
+    waypoint_vector_w = _goal_vector_xy(env, waypoint_marker_cfg, asset_cfg)
+    waypoint_distance = torch.linalg.norm(
+        waypoint_vector_w, dim=-1, keepdim=True
+    )
 
     # Heading is undefined exactly at the waypoint. Use body-forward as a
     # deterministic, unit-length target for that degenerate state.
-    goal_direction_w = torch.where(
-        goal_distance > 1.0e-6,
-        goal_vector_w / goal_distance,
+    waypoint_direction_w = torch.where(
+        waypoint_distance > 1.0e-6,
+        waypoint_vector_w / waypoint_distance,
         forward_direction_w,
     )
 
@@ -77,13 +79,13 @@ def _goal_direction_yaw_xy(
         (-forward_direction_w[:, 1], forward_direction_w[:, 0]), dim=-1
     )
 
-    # Project the world-frame goal direction onto that basis. The first dot
-    # product is the forward component (cosine of the heading error), and the
-    # second is the signed left component (sine of the heading error).
+    # Project the world-frame waypoint direction onto that basis. The first
+    # dot product is the forward component (cosine of the heading error), and
+    # the second is the signed left component (sine of the heading error).
     return torch.stack(
         (
-            torch.sum(goal_direction_w * forward_direction_w, dim=-1),
-            torch.sum(goal_direction_w * left_direction_w, dim=-1),
+            torch.sum(waypoint_direction_w * forward_direction_w, dim=-1),
+            torch.sum(waypoint_direction_w * left_direction_w, dim=-1),
         ),
         dim=-1,
     )

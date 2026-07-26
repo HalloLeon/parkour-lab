@@ -20,7 +20,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class TiltedRampGeometry:
-    """Describe one rectangular ramp whose top is cross-sloped by a roll.
+    """Represent a rectangular ramp whose top is cross-sloped by a roll.
 
     ``center_xy`` is the world-frame XY projection of the top face's center.
     It is not generally the XY position of the collision box's volume center.
@@ -37,6 +37,17 @@ class TiltedRampGeometry:
     ``low_edge_z`` fixes the lower of the two top-surface side edges. The
     derived collision-box position accounts for both the lateral roll and the
     horizontal displacement between the box center and its top-face center.
+
+    Attributes:
+        center_xy: World-frame XY projection of the top-face center.
+        length: Distance along the ramp's travel direction.
+        width: Distance across the tilted top surface.
+        thickness: Collision-slab thickness measured normal to the top surface.
+        incline_radians: Roll about the local X axis. Positive values raise the
+            local-left edge.
+        yaw_radians: Counterclockwise angle from world positive X to the local
+            positive X axis.
+        low_edge_z: Height of the lower top-surface side edge.
     """
 
     center_xy: tuple[float, float]
@@ -83,10 +94,8 @@ class TiltedRampGeometry:
     def travel_direction_xy(self) -> tuple[float, float]:
         """Return the unit XY direction of the ramp's local positive X axis."""
 
-        # Yaw is the counterclockwise angle from world +X in the XY plane, so
-        # its point on the unit circle has X coordinate ``cos(yaw)`` and Y
-        # coordinate ``sin(yaw)``. Since ``cos(yaw)^2 + sin(yaw)^2 = 1``, the
-        # returned travel direction is already normalized.
+        # Yaw is measured counterclockwise from world positive X. Its unit-circle
+        # coordinates ``(cos(yaw), sin(yaw))`` are therefore already normalized.
         return (math.cos(self.yaw_radians), math.sin(self.yaw_radians))
 
     @property
@@ -95,32 +104,20 @@ class TiltedRampGeometry:
 
         travel_x, travel_y = self.travel_direction_xy
 
-        # Rotating a 2D vector ``(x, y)`` by +90 degrees about world Z gives
-        # ``(-y, x)``. With the usual right-handed XY convention, this is left
-        # of the travel direction. The rotation preserves length and produces
-        # a perpendicular vector, so the result remains a unit direction.
+        # A positive 90-degree rotation maps ``(x, y)`` to ``(-y, x)``. In the
+        # right-handed XY plane, this produces the unit direction to the left.
         return (-travel_y, travel_x)
 
     @property
     def top_center_z(self) -> float:
         """Return the height at the center of the ramp's top surface."""
 
-        # The configured width is measured along the top surface. Before roll,
-        # the center-to-left-edge vector is ``(0, 0.5 * width, 0)`` in local
-        # coordinates. Rotating it about local X produces
-        # ``(0, 0.5 * width * cos(incline),
-        #       0.5 * width * sin(incline))``. The right-edge vector is its
-        # negative, so if ``z_center`` denotes the top-center height, then
-        #
-        # ``z_left  = z_center + 0.5 * width * sin(incline)`` and
-        # ``z_right = z_center - 0.5 * width * sin(incline)``.
-        #
-        # Whichever edge is lower therefore has height
-        # ``z_center - abs(0.5 * width * sin(incline))``. Setting this equal to
-        # ``low_edge_z`` and solving for ``z_center`` yields the expression
-        # below. Sine is used rather than tangent because ``width`` is the
-        # distance along the tilted surface, whose vertical projection is
-        # ``width * sin(incline)``.
+        # Half the surface width has vertical projection
+        # ``0.5 * width * sin(incline)``. The left and right edges receive
+        # opposite signed projections, so the lower edge lies their absolute
+        # magnitude below the top center. Adding that magnitude to
+        # ``low_edge_z`` recovers the center height. This uses sine rather than
+        # tangent because ``width`` is measured along the tilted surface.
         return self.low_edge_z + 0.5 * self.width * abs(math.sin(self.incline_radians))
 
     @property
@@ -155,32 +152,13 @@ class TiltedRampGeometry:
         sin_incline = math.sin(self.incline_radians)
         cos_incline = math.cos(self.incline_radians)
 
-        # In the ramp-local basis, the rolled normal is
-        # ``(0, -sin(incline), cos(incline))``. These numbers are coefficients
-        # of the local forward, left, and up basis vectors; they are not yet
-        # world-X, world-Y, and world-Z coordinates. Its zero forward
-        # coefficient removes any component along the travel direction.
-        #
-        # Before yaw, local left is ``(0, 1, 0)``. Rotating this vector about
-        # world Z by ``yaw`` gives
-        # ``R_z(yaw) * (0, 1, 0) = (-sin(yaw), cos(yaw), 0)``, which is exactly
-        # ``left_w = (left_x, left_y, 0)`` from ``left_direction_xy``. Yaw
-        # rotates only the horizontal plane: its rotation axis is world Z, so
-        # ``R_z(yaw) * (0, 0, 1) = (0, 0, 1)`` and world up is unchanged. The
-        # world normal can therefore be assembled directly from this yawed
-        # left basis vector and the unchanged up basis vector:
-        #
-        # ``n_w = 0 * travel_w
-        #        - sin(incline) * left_w
-        #        + cos(incline) * up_w``.
-        #
-        # Expanding this basis sum component by component gives
-        # ``n_w = (-sin * left_x, -sin * left_y, cos)``. A yawed local-left
-        # vector generally has both world-X and world-Y components, so the
-        # first returned value need not be zero even though the local-forward
-        # coefficient is zero. The final value comes solely from world up and
-        # remains positive for the permitted incline range, making this the
-        # upward-facing normal.
+        # In the ``(forward, left, up)`` basis, rolling about forward changes
+        # the top normal from ``(0, 0, 1)`` to
+        # ``(0, -sin(incline), cos(incline))``. Yaw maps local left to
+        # ``(left_x, left_y, 0)`` while leaving world up unchanged. Expanding
+        # those basis coefficients gives the components below. The positive
+        # cosine term keeps the normal upward-facing over the permitted incline
+        # range.
         return (
             -sin_incline * left_x,
             -sin_incline * left_y,
@@ -289,6 +267,26 @@ class TiltedRampGeometry:
         ramp's left direction. From that start point, half of the next ramp's
         length is applied along the next ramp's own yaw to obtain its center.
         Omitting ``low_edge_z`` retains this ramp's lower-edge height.
+
+        Args:
+            length: Length of the next ramp.
+            width: Surface width of the next ramp.
+            thickness: Collision-slab thickness of the next ramp.
+            incline_radians: Roll of the next ramp about its local X axis.
+            yaw_radians: World-frame yaw of the next ramp.
+            gap: Non-negative distance beyond this ramp's centerline end.
+            lateral_offset: Signed offset along this ramp's left direction.
+            low_edge_z: Lower-edge height of the next ramp. If omitted, reuse
+                this ramp's value.
+
+        Returns:
+            Validated geometry for the positioned next ramp.
+
+        Raises:
+            ValueError: If ``gap`` is negative or any numeric constraint is
+                invalid.
+            TypeError: If any numeric argument cannot be converted to a finite
+                non-Boolean float.
         """
 
         gap = _finite_float(gap, field_name="gap")
@@ -338,78 +336,32 @@ class TiltedRampGeometry:
         longitudinal_offset: float,
         lateral_offset: float,
     ) -> tuple[float, float, float]:
-        """Map local top-surface offsets to world-aligned XYZ coordinates."""
+        """Map local top-surface offsets to world-frame XYZ coordinates.
+
+        Args:
+            longitudinal_offset: Signed distance along the travel direction.
+            lateral_offset: Signed surface distance toward the local left.
+
+        Returns:
+            World-frame XYZ coordinates of the requested top-surface point.
+        """
 
         travel_x, travel_y = self.travel_direction_xy
         left_x, left_y = self.left_direction_xy
         cos_incline = math.cos(self.incline_radians)
         sin_incline = math.sin(self.incline_radians)
 
-        # Map local top-face coordinates to world coordinates.
+        # Yaw maps the longitudinal basis to
+        # ``travel_w = (travel_x, travel_y, 0)``. Roll leaves that axis
+        # unchanged and maps the lateral basis to
+        # ``left_w = (cos(incline) * left_x,
+        #             cos(incline) * left_y,
+        #             sin(incline))``.
         #
-        # Let the top-face center C be the local origin, with signed offsets in meters:
-        #
-        #   u = longitudinal_offset  # +forward, -backward
-        #   v = lateral_offset       # +left,    -right
-        #
-        # The ramp orientation first yaws about fixed world Z, then rolls about the
-        # resulting local X-axis (the travel direction):
-        #
-        #   R = Rz(yaw) @ Rx(incline)
-        #
-        # For column vectors, the rightmost matrix acts first. Using
-        #
-        #   cy = cos(yaw),  sy = sin(yaw)
-        #   ci = cos(incline),  si = sin(incline)
-        #
-        # the rotation matrices are
-        #
-        #        [ cy -sy  0 ]         [ 1  0   0 ]
-        #   Rz = [ sy  cy  0 ],   Rx = [ 0  ci -si ].
-        #        [  0   0  1 ]         [ 0  si  ci ]
-        #
-        # Their product is
-        #
-        #       [ cy -sy*ci   sy*si ]
-        #   R = [ sy  cy*ci  -cy*si ].
-        #       [  0     si      ci ]
-        #
-        # The local top surface is the z = 0 plane, with basis vectors
-        #
-        #   e_x = (1, 0, 0)  # forward
-        #   e_y = (0, 1, 0)  # left
-        #
-        # Applying R gives their world-space directions:
-        #
-        #   travel_w = R @ e_x
-        #            = (cy, sy, 0)
-        #            = (travel_x, travel_y, 0)
-        #
-        #   left_w = Rz @ e_y
-        #          = (-sy, cy, 0)
-        #          = (left_x, left_y, 0)
-        #
-        #   rolled_left_w = R @ e_y
-        #                 = (ci*left_x, ci*left_y, si)
-        #
-        # Thus roll leaves travel_w unchanged and tilts left_w toward world up. Since
-        # travel_w and rolled_left_w are perpendicular unit vectors, u and v remain
-        # exact signed distances along the tilted top surface.
-        #
-        # For q = (u, v, 0), the world point is
-        #
-        #   P = C + R @ q
-        #     = C + u*travel_w + v*rolled_left_w
-        #
-        # With
-        #
-        #   C = (self.center_xy[0], self.center_xy[1], self.top_center_z)
-        #
-        # this expands component-wise to
-        #
-        #   P.x = self.center_xy[0] + u*travel_x + v*ci*left_x
-        #   P.y = self.center_xy[1] + u*travel_y + v*ci*left_y
-        #   P.z = self.top_center_z + v*si
+        # The two rotated basis vectors remain perpendicular unit vectors, so
+        # both offsets remain exact signed distances along the top surface.
+        # Adding their scaled components to the top-face center produces the
+        # world point returned below.
         return (
             self.center_xy[0] + longitudinal_offset * travel_x + lateral_offset * cos_incline * left_x,
             self.center_xy[1] + longitudinal_offset * travel_y + lateral_offset * cos_incline * left_y,
@@ -418,7 +370,19 @@ class TiltedRampGeometry:
 
 
 def _finite_float(value: object, *, field_name: str) -> float:
-    """Return one finite float without accepting Boolean configuration values."""
+    """Convert a configuration value to a finite, non-Boolean float.
+
+    Args:
+        value: Candidate numeric value.
+        field_name: Configuration field named in validation errors.
+
+    Returns:
+        The converted finite float.
+
+    Raises:
+        TypeError: If ``value`` is Boolean or cannot be converted to a float.
+        ValueError: If the converted value is not finite.
+    """
 
     if isinstance(value, bool):
         raise TypeError(f"{field_name} must be a finite number, not bool.")
@@ -432,7 +396,19 @@ def _finite_float(value: object, *, field_name: str) -> float:
 
 
 def _positive_float(value: object, *, field_name: str) -> float:
-    """Return one finite positive float."""
+    """Convert a configuration value to a finite positive float.
+
+    Args:
+        value: Candidate numeric value.
+        field_name: Configuration field named in validation errors.
+
+    Returns:
+        The converted finite positive float.
+
+    Raises:
+        TypeError: If ``value`` is Boolean or cannot be converted to a float.
+        ValueError: If the converted value is not finite and positive.
+    """
 
     converted = _finite_float(value, field_name=field_name)
     if converted <= 0.0:

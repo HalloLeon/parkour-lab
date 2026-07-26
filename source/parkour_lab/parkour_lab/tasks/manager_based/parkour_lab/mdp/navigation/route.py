@@ -44,16 +44,16 @@ def active_waypoint_positions(
     """Derive active terrain-local waypoints, falling back before first reset."""
 
     table = getattr(env, "_parkour_waypoint_table", None)
-    route_levels = getattr(env, "_parkour_waypoint_level", None)
+    course_indices = getattr(env, "_parkour_course_index", None)
     active_indices = getattr(env, "_parkour_active_waypoint_index", None)
     if (
         table is not None
-        and route_levels is not None
+        and course_indices is not None
         and active_indices is not None
-        and route_levels.shape == (env.num_envs,)
+        and course_indices.shape == (env.num_envs,)
         and active_indices.shape == (env.num_envs,)
     ):
-        return table[route_levels, active_indices]
+        return table[course_indices, active_indices]
 
     goal = env.scene[goal_cfg.name]
     return goal.data.root_pos_w - env.scene.env_origins
@@ -85,27 +85,24 @@ def advance_active_waypoints(
     if reach_hold_s < 0.0:
         raise ValueError("reach_hold_s must be non-negative.")
     required_state = (
-        "_parkour_waypoint_table",
-        "_parkour_waypoint_count_by_level",
-        "_parkour_waypoint_level",
-        "_parkour_active_waypoint_index",
+        "_parkour_waypoint_table",  # Terrain-local XYZ waypoints for every course.
+        "_parkour_waypoint_count_by_course",  # Unpadded waypoint count per course.
+        "_parkour_course_index",  # Selected course for each environment.
+        "_parkour_active_waypoint_index",  # Current target waypoint per environment.
     )
     if not all(hasattr(env, name) for name in required_state):
         raise RuntimeError("Active waypoints must be initialized before stepping.")
 
     active_indices = env._parkour_active_waypoint_index
-    route_levels = env._parkour_waypoint_level
-    waypoint_counts = env._parkour_waypoint_count_by_level[route_levels]
-    active_positions = env._parkour_waypoint_table[route_levels, active_indices]
+    course_indices = env._parkour_course_index
+    waypoint_counts = env._parkour_waypoint_count_by_course[course_indices]
+    active_positions = env._parkour_waypoint_table[course_indices, active_indices]
     robot_pos = robot._root_pos_env(env, asset_cfg)
     distance_xy = torch.linalg.norm(
         robot_pos[:, :2] - active_positions[:, :2],
         dim=-1,
     )
-    # Completion is absorbing until the reset event selects a new route. This
-    # prevents repeated helper calls from counting the final waypoint twice.
-    already_completed = env._parkour_course_completed
-    within_radius = (distance_xy < reach_threshold) & ~already_completed
+    within_radius = distance_xy < reach_threshold
 
     # Intermediate waypoints only select a new direction. The final waypoint
     # retains the existing safety rule that a collapsed robot is not successful.
@@ -116,10 +113,17 @@ def advance_active_waypoints(
     )
     final_waypoint_eligible = clearance > min_clearance
 
+    progress = _route_progress_m(env, robot_pos[:, :2])
+    # Progress can decrease if the robot backtracks. Preserve the furthest point
+    # reached so curriculum decisions and evaluation summarize its best advance.
+    env._parkour_max_course_progress_m[:] = torch.maximum(
+        env._parkour_max_course_progress_m,
+        progress,
+    )
+
     (
         next_indices,
         next_hold_times_s,
-        _,
         completed_course,
     ) = _advance_route_state(
         active_indices,
@@ -134,39 +138,45 @@ def advance_active_waypoints(
     advanced = next_indices != active_indices
     env._parkour_active_waypoint_index[:] = next_indices
     env._parkour_waypoint_hold_time_s[:] = next_hold_times_s
+    # Retargeting replaces the nearby reached waypoint with the farther next one,
+    # making goal distance jump without robot motion. The progress reward uses
+    # this event to ignore that artificial change for the current step.
     env._parkour_active_waypoint_changed[:] = advanced
-    env._parkour_course_completed[:] = completed_course | already_completed
+    env._parkour_max_course_progress_m[:] = torch.where(
+        completed_course,
+        env._parkour_route_cumulative_m[course_indices, waypoint_counts - 1],
+        env._parkour_max_course_progress_m,
+    )
 
     advanced_env_ids = torch.nonzero(advanced, as_tuple=False).flatten()
     if advanced_env_ids.numel() > 0:
         next_waypoints = env._parkour_waypoint_table[
-            route_levels[advanced_env_ids],
+            course_indices[advanced_env_ids],
             next_indices[advanced_env_ids],
         ]
         _write_goal_marker(env, advanced_env_ids, next_waypoints, goal_cfg)
 
-    return env._parkour_course_completed
+    return completed_course
 
 
-def course_completed_this_step(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the final-waypoint event computed by the termination manager."""
+def last_episode_max_course_progress_m(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return each environment's latest completed-episode progress in metres."""
 
-    import torch
-
-    completed = getattr(env, "_parkour_course_completed", None)
-    if completed is None:
-        return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
-    return completed
+    progress = getattr(env, "_parkour_last_max_course_progress_m", None)
+    if progress is None:
+        raise RuntimeError("Route progress must be initialized before evaluation.")
+    return progress
 
 
-def reset_active_waypoints(
+def reset_routes(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor | None,
-    logical_levels: torch.Tensor,
+    family_indices: torch.Tensor,
+    difficulty_indices: torch.Tensor,
     curriculum_cfg: ParkourCurriculumCfg,
     goal_cfg: SceneEntityCfg,
-) -> None:
-    """Reset selected environments to the first waypoint of their new route.
+) -> torch.Tensor:
+    """Reset selected environments to the first waypoint of their new routes.
 
     This initializes the shared waypoint tables when necessary, assigns each
     selected environment its logical curriculum level, clears its route
@@ -178,10 +188,14 @@ def reset_active_waypoints(
             and goal-marker scene entity.
         env_ids: Indices of the environments being reset, or ``None`` for all
             environments.
-        logical_levels: Curriculum-level index for each selected environment.
-            Its shape must match the resolved ``env_ids`` tensor.
+        family_indices: Obstacle-family index for each selected environment.
+        difficulty_indices: Difficulty-row index for each selected environment.
         curriculum_cfg: Course definitions used to build the waypoint table.
         goal_cfg: Scene-entity selection for the visible goal marker.
+
+    Returns:
+        Flattened family-major course index for each reset environment. The
+        returned tensor is also stored in the authoritative route-state buffer.
     """
 
     import torch
@@ -189,26 +203,46 @@ def reset_active_waypoints(
     from .._shared.runtime import _all_env_ids
 
     env_ids = _all_env_ids(env, env_ids)
-    logical_levels = logical_levels.to(device=env.device, dtype=torch.long)
-    if logical_levels.shape != env_ids.shape:
-        raise ValueError("logical_levels must contain one level per reset environment.")
+    family_indices = family_indices.to(device=env.device, dtype=torch.long)
+    difficulty_indices = difficulty_indices.to(device=env.device, dtype=torch.long)
+    if (
+        family_indices.shape != env_ids.shape
+        or difficulty_indices.shape != env_ids.shape
+    ):
+        raise ValueError(
+            "family_indices and difficulty_indices must contain one value per reset environment."
+        )
 
     goal = env.scene[goal_cfg.name]
     dtype = goal.data.default_root_state.dtype
-    _ensure_waypoint_state(env, curriculum_cfg, dtype=dtype)
+    _ensure_route_state(env, curriculum_cfg, dtype=dtype)
 
-    num_levels = env._parkour_waypoint_table.shape[0]
-    if torch.any((logical_levels < 0) | (logical_levels >= num_levels)):
-        raise ValueError("logical_levels contains an out-of-range course level.")
+    if torch.any(
+        (family_indices < 0) | (family_indices >= len(curriculum_cfg.families))
+    ):
+        raise ValueError("family_indices contains an out-of-range obstacle family.")
+    if torch.any(
+        (difficulty_indices < 0)
+        | (difficulty_indices >= curriculum_cfg.num_difficulties)
+    ):
+        raise ValueError("difficulty_indices contains an out-of-range difficulty.")
 
-    env._parkour_waypoint_level[env_ids] = logical_levels
+    course_indices = (
+        family_indices * curriculum_cfg.num_difficulties + difficulty_indices
+    )
+    env._parkour_last_max_course_progress_m[env_ids] = (
+        env._parkour_max_course_progress_m[env_ids]
+    )
+    env._parkour_max_course_progress_m[env_ids] = 0.0
+
+    env._parkour_course_index[env_ids] = course_indices
     env._parkour_active_waypoint_index[env_ids] = 0
     env._parkour_waypoint_hold_time_s[env_ids] = 0.0
     env._parkour_active_waypoint_changed[env_ids] = False
-    env._parkour_course_completed[env_ids] = False
 
-    first_waypoints = env._parkour_waypoint_table[logical_levels, 0]
+    first_waypoints = env._parkour_waypoint_table[course_indices, 0]
     _write_goal_marker(env, env_ids, first_waypoints, goal_cfg)
+    return course_indices
 
 
 def _advance_route_state(
@@ -220,7 +254,7 @@ def _advance_route_state(
     *,
     step_dt_s: float,
     reach_hold_s: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Advance independently reached cursors without exceeding route lengths.
 
     ``final_waypoint_eligible`` lets the runtime impose a stricter completion
@@ -241,8 +275,7 @@ def _advance_route_state(
         reach_hold_s: Continuous time required inside the waypoint radius.
 
     Returns:
-        The next active indices, next dwell times, reached-waypoint mask, and
-        completed-course mask.
+        The next active indices, next dwell times, and completed-course mask.
     """
 
     # Accumulate dwell time only while an environment remains inside its active
@@ -252,7 +285,9 @@ def _advance_route_state(
 
     # Account for float32 accumulation (for example, 0.08 + 0.02 may be stored
     # just below 0.10) without shortening the dwell by a meaningful duration.
-    dwell_satisfied = within_radius & (next_hold_times_s >= reach_hold_s - step_dt_s * 1.0e-6)
+    dwell_satisfied = within_radius & (
+        next_hold_times_s >= reach_hold_s - step_dt_s * 1.0e-6
+    )
 
     # Each environment can follow a route of a different length, so determine
     # its final index from its own waypoint count rather than a shared constant.
@@ -278,126 +313,171 @@ def _advance_route_state(
     return (
         next_active_indices,
         next_hold_times_s,
-        reached_waypoint,
         completed_course,
     )
 
 
-def _ensure_waypoint_state(
+def _ensure_route_state(
     env: ManagerBasedRLEnv,
     curriculum_cfg: ParkourCurriculumCfg,
     *,
     dtype: torch.dtype,
 ) -> None:
-    """Create route constants and per-environment state on the runtime device."""
+    """Create immutable route tables once and ensure live per-environment state."""
 
     import torch
 
     from .._shared.runtime import _get_or_init_env_buffer
 
-    route_signature = tuple(tuple(waypoint.position for waypoint in level.waypoints) for level in curriculum_cfg.levels)
-    expected_device = torch.device(env.device)
-
-    # ``_parkour_waypoint_table`` stores every level's terrain-local XYZ
-    # waypoints in one padded tensor shaped [num_levels, max_waypoints, 3].
-    # ``_parkour_waypoint_count_by_level`` records each unpadded route length.
-    table = getattr(env, "_parkour_waypoint_table", None)
-    counts = getattr(env, "_parkour_waypoint_count_by_level", None)
-
-    # The plain-Python signature acts as a cache key. Rebuild the device-side
-    # constants if the configured routes, target device, or coordinate dtype
-    # changed since the previous initialization.
-    needs_route_table = (
-        getattr(env, "_parkour_waypoint_route_signature", None) != route_signature
-        or table is None
-        or counts is None
-        or table.device != expected_device
-        or counts.device != expected_device
-        or table.dtype != dtype
-    )
-    if needs_route_table:
-        max_waypoints = max(len(route) for route in route_signature)
+    if not hasattr(env, "_parkour_waypoint_table"):
+        courses = curriculum_cfg.courses
+        routes = tuple(
+            tuple(waypoint.position for waypoint in course.waypoints)
+            for course in courses
+        )
+        max_waypoints = max(len(route) for route in routes)
         table = torch.empty(
-            (len(route_signature), max_waypoints, 3),
+            (len(routes), max_waypoints, 3),
             device=env.device,
             dtype=dtype,
         )
         counts = torch.empty(
-            len(route_signature),
+            len(routes),
             device=env.device,
             dtype=torch.long,
         )
-        for level_index, route in enumerate(route_signature):
+        for course_index, route in enumerate(routes):
             route_tensor = torch.tensor(route, device=env.device, dtype=dtype)
 
             # Routes may contain different numbers of waypoints. Store the
             # actual length separately because the table must be rectangular
             # for vectorized indexing across levels and environments.
             count = route_tensor.shape[0]
-            table[level_index, :count] = route_tensor
+            table[course_index, :count] = route_tensor
 
             # Fill the unused suffix with the final waypoint instead of leaving
             # uninitialized memory. ``counts`` remains authoritative, so route
             # cursors never intentionally advance into these padding entries.
-            table[level_index, count:] = route_tensor[-1]
-            counts[level_index] = count
+            table[course_index, count:] = route_tensor[-1]
+            counts[course_index] = count
+        cumulative = torch.zeros(
+            (len(routes), max_waypoints),
+            device=env.device,
+            dtype=dtype,
+        )
+        for course_index, route in enumerate(routes):
+            previous_xy = torch.zeros(2, device=env.device, dtype=dtype)
+            distance = torch.zeros((), device=env.device, dtype=dtype)
+            for waypoint_index, position in enumerate(route):
+                waypoint_xy = torch.tensor(
+                    position[:2],
+                    device=env.device,
+                    dtype=dtype,
+                )
+                distance = distance + torch.linalg.norm(waypoint_xy - previous_xy)
+                cumulative[course_index, waypoint_index] = distance
+                previous_xy = waypoint_xy
+            cumulative[course_index, len(route) :] = distance
+        target_speeds = torch.tensor(
+            [course.target_speed for course in courses],
+            device=env.device,
+            dtype=dtype,
+        )
+        min_clearances = torch.tensor(
+            [course.min_clearance for course in courses],
+            device=env.device,
+            dtype=dtype,
+        )
+        env._parkour_waypoint_count_by_course = counts
+        env._parkour_route_cumulative_m = cumulative
+        env._parkour_target_speed_by_course = target_speeds
+        env._parkour_min_clearance_by_course = min_clearances
+        # Assign the sentinel last so a failed build is retried on the next reset.
         env._parkour_waypoint_table = table
-        env._parkour_waypoint_count_by_level = counts
 
-        # Remember which immutable route definition produced the cached table.
-        env._parkour_waypoint_route_signature = route_signature
-
-    # One integer per environment selecting a level row in the waypoint table.
-    # Reset derives it from the environment's terrain level, after any
-    # curriculum promotion or demotion. Keeping this selection with the route
-    # state ensures later lookups use the same course chosen for that episode.
-    _get_or_init_env_buffer(
-        env,
-        "_parkour_waypoint_level",
-        torch.zeros(env.num_envs, device=env.device, dtype=torch.long),
+    buffer_groups = (
+        (
+            torch.long,
+            (
+                "_parkour_course_index",
+                "_parkour_active_waypoint_index",
+            ),
+        ),
+        (
+            dtype,
+            (
+                "_parkour_waypoint_hold_time_s",
+                "_parkour_last_max_course_progress_m",
+                "_parkour_max_course_progress_m",
+            ),
+        ),
+        (
+            torch.bool,
+            ("_parkour_active_waypoint_changed",),
+        ),
     )
+    for buffer_dtype, names in buffer_groups:
+        initial_value = torch.zeros(
+            env.num_envs,
+            device=env.device,
+            dtype=buffer_dtype,
+        )
+        for name in names:
+            _get_or_init_env_buffer(env, name, initial_value)
 
-    # One integer cursor per environment selecting a waypoint column within its
-    # chosen route row. It starts at zero, advances by one after each reached
-    # intermediate waypoint, and remains at the final index after completion.
-    _get_or_init_env_buffer(
-        env,
-        "_parkour_active_waypoint_index",
-        torch.zeros(env.num_envs, device=env.device, dtype=torch.long),
-    )
 
-    # One floating-point dwell timer per environment, measured in seconds. It
-    # accumulates over consecutive control steps inside the active waypoint's
-    # reach radius. Leaving the radius, reaching the waypoint, or resetting the
-    # environment clears it to zero, which prevents brief fly-bys from counting.
-    _get_or_init_env_buffer(
-        env,
-        "_parkour_waypoint_hold_time_s",
-        torch.zeros(env.num_envs, device=env.device, dtype=dtype),
-    )
+def _route_progress_m(
+    env: ManagerBasedRLEnv,
+    robot_xy: torch.Tensor,
+) -> torch.Tensor:
+    """Project each robot onto its active route segment in metric XY distance."""
 
-    # One Boolean event per environment. The success termination term calls
-    # ``advance_active_waypoints`` once per control step, before rewards, and
-    # overwrites this entire buffer with the environments whose intermediate
-    # waypoint cursor advanced. The progress reward can therefore suppress the
-    # invalid old-target/new-target distance comparison during that same step;
-    # the next route update normally changes the event back to false. Episode
-    # reset also clears it explicitly for the selected environments.
-    _get_or_init_env_buffer(
-        env,
-        "_parkour_active_waypoint_changed",
-        torch.zeros(env.num_envs, device=env.device, dtype=torch.bool),
-    )
+    import torch
 
-    # One Boolean completion state per environment. Reaching the final waypoint
-    # with the required clearance sets it to true; it then remains true until
-    # reset. This absorbing behavior prevents duplicate completion events and
-    # supplies both the success termination and its sparse completion reward.
-    _get_or_init_env_buffer(
-        env,
-        "_parkour_course_completed",
-        torch.zeros(env.num_envs, device=env.device, dtype=torch.bool),
+    # robot_xy [num_envs, 2]: terrain-local robot XY positions.
+    # [num_envs]: course and target-waypoint cursor for each environment.
+    course_indices = env._parkour_course_index
+    active_indices = env._parkour_active_waypoint_index
+    # [num_envs]: start-waypoint cursor, clamped for the first route segment.
+    previous_indices = (active_indices - 1).clamp_min(0)
+    # [num_envs, 2]: XY waypoint preceding each active target.
+    previous_waypoints = env._parkour_waypoint_table[
+        course_indices,
+        previous_indices,
+        :2,
+    ]
+    # [num_envs, 2]: segment start; the first segment starts at local XY zero.
+    segment_starts = torch.where(
+        (active_indices > 0)[:, None],
+        previous_waypoints,
+        torch.zeros_like(previous_waypoints),
     )
+    # [num_envs, 2]: active target and directed segment vector.
+    segment_ends = env._parkour_waypoint_table[
+        course_indices,
+        active_indices,
+        :2,
+    ]
+    segment_vectors = segment_ends - segment_starts
+    # [num_envs]: squared length and clamped projection along each segment.
+    squared_lengths = torch.sum(segment_vectors.square(), dim=-1).clamp_min(
+        torch.finfo(robot_xy.dtype).eps
+    )
+    fraction = (
+        torch.sum((robot_xy - segment_starts) * segment_vectors, dim=-1)
+        / squared_lengths
+    ).clamp(0.0, 1.0)
+    # [num_envs]: active-segment length and distance completed before it.
+    segment_lengths = torch.sqrt(squared_lengths)
+    # The [num_courses, max_waypoints] table stores cumulative route distances.
+    prior_progress = torch.where(
+        active_indices > 0,
+        env._parkour_route_cumulative_m[course_indices, previous_indices],
+        torch.zeros_like(fraction),
+    )
+    # [num_envs]: total route distance reached by the projected robot position.
+    progress = prior_progress + fraction * segment_lengths
+    return progress
 
 
 def _write_goal_marker(

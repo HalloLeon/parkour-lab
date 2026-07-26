@@ -100,13 +100,13 @@ def goal_direction_body_xy(
     return goal_dir_b_xy / torch.linalg.norm(goal_dir_b_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
 
 
-def goal_direction_yaw_xy(
+def active_waypoint_direction_yaw_xy(
     env: ManagerBasedRLEnv,
-    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
-    Wrap-safe oracle heading target in the robot's yaw-aligned body frame.
+    Wrap-safe direction to the active waypoint in the robot's yaw-aligned frame.
 
     The unit vector is ``[forward, left]``. It is training-only supervision
     for the student's heading head and must never be concatenated into the
@@ -116,7 +116,9 @@ def goal_direction_yaw_xy(
         [num_envs, 2]
     """
 
-    return geometry._goal_direction_yaw_xy(env, goal_cfg, asset_cfg)
+    return geometry._active_waypoint_direction_yaw_xy(
+        env, waypoint_marker_cfg, asset_cfg
+    )
 
 
 def goal_distance_xy_w(
