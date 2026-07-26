@@ -10,10 +10,8 @@
 import argparse
 import sys
 
-from isaaclab.app import AppLauncher
-
 import cli_args
-
+from isaaclab.app import AppLauncher
 
 # Define evaluation arguments.
 parser = argparse.ArgumentParser(description="Evaluate an RSL-RL checkpoint.")
@@ -31,10 +29,22 @@ parser.add_argument(
     help="Base directory for evaluation videos and metrics. Defaults to the checkpoint run directory.",
 )
 parser.add_argument(
+    "--all_courses",
+    action="store_true",
+    default=False,
+    help="Evaluate every configured obstacle-family and difficulty combination.",
+)
+parser.add_argument(
     "--difficulty_level",
     type=int,
     default=None,
     help="Fixed logical difficulty level. Supported environments provide their configured default when omitted.",
+)
+parser.add_argument(
+    "--terrain_family",
+    type=str,
+    default=None,
+    help="Fixed obstacle family. Supported environments provide their configured default when omitted.",
 )
 parser.add_argument(
     "--eval_episodes",
@@ -68,6 +78,8 @@ for argument_name in ("video_length", "eval_episodes"):
     argument_value = getattr(args_cli, argument_name)
     if argument_value is not None and argument_value <= 0:
         parser.error(f"--{argument_name} must be a positive integer.")
+if args_cli.all_courses and (args_cli.terrain_family is not None or args_cli.difficulty_level is not None):
+    parser.error("--all_courses cannot be combined with --terrain_family or --difficulty_level.")
 # Enable cameras when recording video.
 if args_cli.video:
     args_cli.enable_cameras = True
@@ -87,6 +99,7 @@ import json
 import os
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from typing import TypedDict
@@ -117,6 +130,9 @@ from parkour_lab.learning.distillation.contracts import (
     load_teacher_checkpoint,
     sha256_file,
 )
+from parkour_lab.tasks.manager_based.parkour_lab.mdp.navigation.route import (
+    last_episode_max_course_progress_m,
+)
 from rsl_rl.runners import OnPolicyRunner
 from tensordict import TensorDict
 
@@ -130,6 +146,7 @@ class _EvaluationSummary(TypedDict):
     mean_return: float | None
     mean_episode_length_steps: float | None
     mean_episode_length_seconds: float | None
+    mean_max_course_progress_m: float | None
 
 
 class _EvaluationReport(TypedDict):
@@ -153,10 +170,13 @@ class _EvaluationReport(TypedDict):
     # Random seed used by the evaluated environment.
     seed: int | None
 
+    # Fixed obstacle family selected for this independent evaluation report.
+    terrain_family: str | None
+
     # Fixed curriculum level selected for this evaluation, when supported.
     difficulty_level: int | None
 
-    # Task-specific description of the selected difficulty level.
+    # Task-specific description of the selected family/difficulty matrix cell.
     difficulty_metadata: dict[str, object]
 
     # Number of parallel simulation environments used during evaluation.
@@ -174,7 +194,7 @@ class _EvaluationReport(TypedDict):
 
 @dataclass(frozen=True)
 class _ArtifactInfo:
-    """Paths and names shared by evaluation outputs."""
+    """Output directory and video filename prefix for one evaluation."""
 
     # Directory receiving ``metrics.json`` and any recorded video.
     directory: str
@@ -203,7 +223,7 @@ class _CheckpointInfo:
 
 @dataclass(frozen=True)
 class _InterfaceInfo:
-    """Teacher interface reconstructed for fixed evaluation."""
+    """Validated runtime interface metadata for the evaluated checkpoint."""
 
     # Runtime description of teacher observations, preprocessing, actions, and
     # control timing; ``None`` for a policy without the privileged-teacher route.
@@ -215,7 +235,7 @@ class _InterfaceInfo:
 
 @dataclass
 class _RolloutResult:
-    """Aggregate statistics collected from completed evaluation episodes."""
+    """Mutable accumulator for completed-episode statistics."""
 
     completed_episodes: int = 0
     return_sum: float = 0.0
@@ -223,6 +243,7 @@ class _RolloutResult:
     success_count: int = 0
     trunk_contact_count: int = 0
     timeout_count: int = 0
+    max_course_progress_m_sum: float = 0.0
 
     def record_completed(
         self,
@@ -231,8 +252,9 @@ class _RolloutResult:
         episode_returns: torch.Tensor,
         episode_lengths: torch.Tensor,
         outcomes: dict[str, torch.Tensor],
+        episode_max_course_progress_m: torch.Tensor,
     ) -> None:
-        """Add completed episodes without exceeding the requested total."""
+        """Accumulate newly completed episodes, capped at the requested total."""
 
         remaining = requested_episodes - self.completed_episodes
         completed_indices = torch.nonzero(done_mask, as_tuple=False).flatten()[:remaining]
@@ -245,9 +267,10 @@ class _RolloutResult:
         self.success_count += int(outcomes["success"][completed_indices].sum().item())
         self.trunk_contact_count += int(outcomes["trunk_contact"][completed_indices].sum().item())
         self.timeout_count += int(outcomes["timeout"][completed_indices].sum().item())
+        self.max_course_progress_m_sum += float(episode_max_course_progress_m[completed_indices].sum().item())
 
     def summary(self, step_dt: float) -> _EvaluationSummary:
-        """Calculate means and rates from the accumulated totals."""
+        """Return aggregate means and rates for the completed episodes."""
 
         if self.completed_episodes == 0:
             return {
@@ -257,6 +280,7 @@ class _RolloutResult:
                 "mean_return": None,
                 "mean_episode_length_steps": None,
                 "mean_episode_length_seconds": None,
+                "mean_max_course_progress_m": None,
             }
 
         count = self.completed_episodes
@@ -268,6 +292,7 @@ class _RolloutResult:
             "mean_return": self.return_sum / count,
             "mean_episode_length_steps": mean_length_steps,
             "mean_episode_length_seconds": mean_length_steps * step_dt,
+            "mean_max_course_progress_m": self.max_course_progress_m_sum / count,
         }
 
 
@@ -279,50 +304,25 @@ def main(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     agent_cfg: RslRlBaseRunnerCfg,
 ) -> None:
-    """Evaluate an RSL-RL agent."""
-    agent_cfg = _configure_runtime(env_cfg, agent_cfg)
-    evaluation_level, level_metadata = _configure_evaluation_difficulty(env_cfg, args_cli.difficulty_level)
+    """Evaluate a checkpoint on one course or the complete course matrix."""
+    agent_cfg = _apply_cli_overrides(env_cfg, agent_cfg)
     checkpoint = _resolve_checkpoint(agent_cfg)
-    artifacts = _create_artifacts(checkpoint, evaluation_level, env_cfg.seed)
-    env = _create_environment(env_cfg, agent_cfg, artifacts)
-    num_envs = env.num_envs
-    step_dt = env.unwrapped.step_dt
-
-    try:
-        observations = env.get_observations()
-        interface = _validate_teacher_interface(env.unwrapped, observations, agent_cfg, checkpoint.path)
-        policy = _load_policy(env, agent_cfg, checkpoint.path)
-        rollout = _run_evaluation(env, observations, policy)
-    finally:
-        # Closing also finalizes a partial or completed RecordVideo recording.
-        env.close()
-
-    metrics = _build_metrics(
-        env_cfg=env_cfg,
-        checkpoint=checkpoint,
-        interface=interface,
-        evaluation_level=evaluation_level,
-        level_metadata=level_metadata,
-        num_envs=num_envs,
-        step_dt=step_dt,
-        rollout=rollout,
-    )
-    metrics_path = _write_metrics(artifacts.directory, metrics)
-    _print_summary(metrics, metrics_path)
+    _evaluate_requested_courses(env_cfg, agent_cfg, checkpoint)
 
 
-def _build_metrics(
+def _build_evaluation_report(
     *,
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     checkpoint: _CheckpointInfo,
     interface: _InterfaceInfo,
+    evaluation_family: str | None,
     evaluation_level: int | None,
     level_metadata: dict[str, object],
     num_envs: int,
     step_dt: float,
     rollout: _RolloutResult,
 ) -> _EvaluationReport:
-    """Assemble the complete JSON-compatible evaluation report."""
+    """Build the JSON-compatible report for one fixed evaluation course."""
 
     return {
         "task": args_cli.task,
@@ -331,6 +331,7 @@ def _build_metrics(
         "teacher_interface": interface.teacher_interface,
         "teacher_interface_sha256": interface.teacher_interface_sha256,
         "seed": env_cfg.seed,
+        "terrain_family": evaluation_family,
         "difficulty_level": evaluation_level,
         "difficulty_metadata": level_metadata,
         "num_envs": num_envs,
@@ -340,38 +341,38 @@ def _build_metrics(
     }
 
 
-def _configure_evaluation_difficulty(
+def _configure_evaluation_course(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    requested_family: str | None,
     requested_level: int | None,
-) -> tuple[int | None, dict[str, object]]:
-    """Apply a task-specific fixed evaluation difficulty when the config supports it."""
+) -> tuple[str | None, int | None, dict[str, object]]:
+    """Freeze the config to one course and return its resolved metadata."""
 
-    set_difficulty = getattr(env_cfg, "set_evaluation_difficulty", None)
-    if not callable(set_difficulty):
-        if requested_level is not None:
+    set_course = getattr(env_cfg, "set_evaluation_course", None)
+    if not callable(set_course):
+        if requested_family is not None or requested_level is not None:
             raise ValueError(
-                f"Task '{args_cli.task}' does not support --difficulty_level because its environment config "
-                "does not define set_evaluation_difficulty()."
+                f"Task '{args_cli.task}' does not support fixed parkour matrix selection because its "
+                "environment config does not define set_evaluation_course()."
             )
-        return None, {}
+        return None, None, {}
 
-    # None lets the task select its own maximum or default after Hydra overrides
-    # have been synchronized.
-    result = set_difficulty(requested_level, seed=env_cfg.seed)
+    # None lets the task select its own default family and maximum difficulty
+    # after Hydra overrides have been synchronized.
+    set_course(requested_family, requested_level, seed=env_cfg.seed)
+    effective_family = getattr(env_cfg, "evaluation_family", requested_family)
     effective_level = getattr(env_cfg, "evaluation_level", requested_level)
-    if effective_level is None and isinstance(result, int):
-        effective_level = result
 
-    metadata_fn = getattr(env_cfg, "evaluation_level_metadata", None)
+    metadata_fn = getattr(env_cfg, "evaluation_course_metadata", None)
     metadata = metadata_fn() if callable(metadata_fn) else {}
-    return effective_level, metadata
+    return effective_family, effective_level, metadata
 
 
-def _configure_runtime(
+def _apply_cli_overrides(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     agent_cfg: RslRlBaseRunnerCfg,
 ) -> RslRlBaseRunnerCfg:
-    """Apply CLI overrides needed before constructing the environment."""
+    """Apply agent, environment-count, seed, and device CLI overrides."""
 
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     if args_cli.num_envs is not None:
@@ -382,13 +383,15 @@ def _configure_runtime(
     return agent_cfg
 
 
-def _create_artifacts(
+def _prepare_evaluation_artifacts(
     checkpoint: _CheckpointInfo,
+    evaluation_family: str | None,
     evaluation_level: int | None,
     seed: int | None,
 ) -> _ArtifactInfo:
-    """Create one collision-free artifact directory for this evaluation."""
+    """Create one output directory and derive its video filename prefix."""
 
+    family_component = _path_component(evaluation_family, "default")
     level_component = _path_component(evaluation_level, "default")
     seed_component = _path_component(seed, "default")
     evaluation_kind = "video" if args_cli.video else "metrics"
@@ -407,6 +410,7 @@ def _create_artifacts(
     directory = os.path.join(
         artifact_root,
         f"{checkpoint.stem}-{checkpoint.sha256[:8]}",
+        f"family_{family_component}",
         f"level_{level_component}",
         f"seed_{seed_component}",
         evaluation_kind,
@@ -416,16 +420,18 @@ def _create_artifacts(
     os.makedirs(directory, exist_ok=True)
     return _ArtifactInfo(
         directory=directory,
-        video_name_prefix=f"{checkpoint.stem}-level_{level_component}-seed_{seed_component}",
+        video_name_prefix=(
+            f"{checkpoint.stem}-family_{family_component}-level_{level_component}-seed_{seed_component}"
+        ),
     )
 
 
-def _create_environment(
+def _create_evaluation_environment(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     agent_cfg: RslRlBaseRunnerCfg,
     artifacts: _ArtifactInfo,
 ) -> RslRlVecEnvWrapper:
-    """Create, optionally record, and adapt the evaluation environment."""
+    """Instantiate one course and attach video and RSL-RL wrappers."""
 
     env_cfg.log_dir = artifacts.directory
     # Instantiate the registered Gym task with the resolved Isaac Lab
@@ -450,12 +456,93 @@ def _create_environment(
     return RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
 
-def _load_policy(
+def _evaluate_course(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    agent_cfg: RslRlBaseRunnerCfg,
+    checkpoint: _CheckpointInfo,
+    requested_family: str | None,
+    requested_level: int | None,
+) -> tuple[_EvaluationReport, str]:
+    """Evaluate one fixed course, finalize its video, and write its report."""
+
+    evaluation_family, evaluation_level, level_metadata = _configure_evaluation_course(
+        env_cfg,
+        requested_family,
+        requested_level,
+    )
+    artifacts = _prepare_evaluation_artifacts(
+        checkpoint,
+        evaluation_family,
+        evaluation_level,
+        env_cfg.seed,
+    )
+    env = _create_evaluation_environment(env_cfg, agent_cfg, artifacts)
+    num_envs = env.num_envs
+    step_dt = env.unwrapped.step_dt
+
+    try:
+        observations = env.get_observations()
+        interface = _validate_teacher_interface(
+            env.unwrapped,
+            observations,
+            agent_cfg,
+            checkpoint.path,
+        )
+        policy = _load_inference_policy(env, agent_cfg, checkpoint.path)
+        rollout = _collect_rollout_statistics(env, observations, policy)
+    finally:
+        # Closing also finalizes a partial or completed RecordVideo recording.
+        env.close()
+
+    report = _build_evaluation_report(
+        env_cfg=env_cfg,
+        checkpoint=checkpoint,
+        interface=interface,
+        evaluation_family=evaluation_family,
+        evaluation_level=evaluation_level,
+        level_metadata=level_metadata,
+        num_envs=num_envs,
+        step_dt=step_dt,
+        rollout=rollout,
+    )
+    report_path = _write_evaluation_report(artifacts.directory, report)
+    return report, report_path
+
+
+def _resolve_evaluation_courses(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+) -> tuple[tuple[str | None, int | None], ...]:
+    """Resolve the CLI selection to one course or every configured matrix cell."""
+
+    if not args_cli.all_courses:
+        return ((args_cli.terrain_family, args_cli.difficulty_level),)
+
+    set_course = getattr(env_cfg, "set_evaluation_course", None)
+    curriculum_cfg = getattr(env_cfg, "parkour_curriculum", None)
+    family_names = tuple(getattr(curriculum_cfg, "family_names", ()))
+    num_difficulties = getattr(curriculum_cfg, "num_difficulties", None)
+    if (
+        not callable(set_course)
+        or not family_names
+        or isinstance(num_difficulties, bool)
+        or not isinstance(num_difficulties, int)
+        or num_difficulties <= 0
+    ):
+        raise ValueError(
+            f"Task '{args_cli.task}' does not expose a parkour family/difficulty matrix for --all_courses."
+        )
+
+    return tuple(
+        (family_name, difficulty_level) for family_name in family_names for difficulty_level in range(num_difficulties)
+    )
+
+
+def _load_inference_policy(
     env: RslRlVecEnvWrapper,
     agent_cfg: RslRlBaseRunnerCfg,
     checkpoint_path: str,
 ) -> Callable[[TensorDict], torch.Tensor]:
-    """Load the feed-forward PPO teacher and return its inference callable."""
+    """Restore an OnPolicyRunner checkpoint and return its inference callable."""
 
     print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
     if agent_cfg.class_name != "OnPolicyRunner":
@@ -476,8 +563,8 @@ def _path_component(value: str | int | None, default: str) -> str:
     return "".join(character if character.isalnum() or character in {"-", "_", "."} else "_" for character in text)
 
 
-def _print_summary(metrics: _EvaluationReport, metrics_path: str) -> None:
-    """Print the concise human-readable evaluation summary."""
+def _print_evaluation_summary(report: _EvaluationReport, report_path: str) -> None:
+    """Print one course's aggregate metrics and report path."""
 
     def format_metric(value: float | None, *, rate: bool = False) -> str:
         """Format one optional scalar for terminal output."""
@@ -486,20 +573,23 @@ def _print_summary(metrics: _EvaluationReport, metrics_path: str) -> None:
             return "n/a"
         return f"{100.0 * value:.1f}%" if rate else f"{value:.4f}"
 
-    summary = metrics["summary"]
+    summary = report["summary"]
     print("[RESULT] Evaluation summary")
-    print(f"  Episodes: {metrics['completed_episodes']}/{metrics['requested_episodes']}")
+    print(f"  Terrain family: {report['terrain_family'] or 'n/a'}")
+    print(f"  Difficulty level: {report['difficulty_level']}")
+    print(f"  Episodes: {report['completed_episodes']}/{report['requested_episodes']}")
     print(f"  Success rate: {format_metric(summary['success_rate'], rate=True)}")
     print(f"  Trunk-contact rate: {format_metric(summary['trunk_contact_rate'], rate=True)}")
     print(f"  Timeout rate: {format_metric(summary['timeout_rate'], rate=True)}")
     print(f"  Mean return: {format_metric(summary['mean_return'])}")
     print(f"  Mean episode length (steps): {format_metric(summary['mean_episode_length_steps'])}")
     print(f"  Mean episode length (seconds): {format_metric(summary['mean_episode_length_seconds'])}")
-    print(f"  Metrics: {metrics_path}")
+    print(f"  Mean maximum course progress (m): {format_metric(summary['mean_max_course_progress_m'])}")
+    print(f"  Metrics: {report_path}")
 
 
 def _resolve_checkpoint(agent_cfg: RslRlBaseRunnerCfg) -> _CheckpointInfo:
-    """Resolve the requested checkpoint and calculate its stable identity."""
+    """Resolve the checkpoint path and calculate its stable identity."""
 
     log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
@@ -521,12 +611,12 @@ def _resolve_checkpoint(agent_cfg: RslRlBaseRunnerCfg) -> _CheckpointInfo:
     )
 
 
-def _run_evaluation(
+def _collect_rollout_statistics(
     env: RslRlVecEnvWrapper,
     observations: TensorDict,
     policy: Callable[[TensorDict], torch.Tensor],
 ) -> _RolloutResult:
-    """Collect fixed-evaluation episodes using deterministic policy actions."""
+    """Aggregate completed episodes while deterministic inference is running."""
 
     step_dt = env.unwrapped.step_dt
     episode_returns = torch.zeros(env.num_envs, device=env.unwrapped.device, dtype=torch.float32)
@@ -537,6 +627,8 @@ def _run_evaluation(
         start_time = time.time()
         with torch.inference_mode():
             actions = policy(observations)
+            # Advance every parallel environment and return its next observations,
+            # per-environment reward, episode-completion flags, and auxiliary data.
             observations, rewards, dones, _ = env.step(actions)
 
         rewards = rewards.reshape(-1).to(device=episode_returns.device)
@@ -544,13 +636,15 @@ def _run_evaluation(
         done_mask = dones.to(dtype=torch.bool)
         episode_returns += rewards
         episode_lengths += 1
-        outcomes = _termination_outcomes(env.unwrapped, done_mask)
+        outcomes = _read_termination_outcomes(env.unwrapped, done_mask)
+        episode_max_course_progress_m = last_episode_max_course_progress_m(env.unwrapped)
         rollout.record_completed(
             args_cli.eval_episodes,
             done_mask,
             episode_returns,
             episode_lengths,
             outcomes,
+            episode_max_course_progress_m,
         )
         episode_returns[done_mask] = 0.0
         episode_lengths[done_mask] = 0
@@ -562,11 +656,33 @@ def _run_evaluation(
     return rollout
 
 
-def _termination_outcomes(
+def _evaluate_requested_courses(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    agent_cfg: RslRlBaseRunnerCfg,
+    checkpoint: _CheckpointInfo,
+) -> None:
+    """Evaluate each CLI-selected course with an isolated environment config."""
+
+    for requested_family, requested_level in _resolve_evaluation_courses(env_cfg):
+        # Environment construction resolves manager terms and scene entities.
+        # Give every sweep cell a fresh config so those runtime changes and the
+        # fixed terrain selection cannot leak into the next evaluation.
+        course_env_cfg = deepcopy(env_cfg)
+        report, report_path = _evaluate_course(
+            course_env_cfg,
+            agent_cfg,
+            checkpoint,
+            requested_family,
+            requested_level,
+        )
+        _print_evaluation_summary(report, report_path)
+
+
+def _read_termination_outcomes(
     base_env: ManagerBasedRLEnv | DirectRLEnv,
     done_mask: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """Read outcome masks produced by the current environment step."""
+    """Read the per-environment outcome masks for the current step."""
 
     if not isinstance(base_env, ManagerBasedRLEnv):
         raise TypeError("Parkour evaluation outcomes require a ManagerBasedRLEnv.")
@@ -610,7 +726,7 @@ def _validate_teacher_interface(
     agent_cfg: RslRlBaseRunnerCfg,
     checkpoint_path: str,
 ) -> _InterfaceInfo:
-    """Verify that the checkpoint receives its recorded teacher interface."""
+    """Rebuild and validate the teacher interface when the policy uses one."""
 
     if tuple(agent_cfg.obs_groups.get("policy", ())) != TEACHER_OBSERVATION_GROUPS:
         return _InterfaceInfo(None, None)
@@ -626,12 +742,12 @@ def _validate_teacher_interface(
     return _InterfaceInfo(teacher_interface, teacher_interface_hash)
 
 
-def _write_metrics(artifact_dir: str, metrics: _EvaluationReport) -> str:
-    """Write the evaluation report and return its path."""
+def _write_evaluation_report(artifact_dir: str, report: _EvaluationReport) -> str:
+    """Serialize one course report as ``metrics.json`` and return its path."""
 
     metrics_path = os.path.join(artifact_dir, "metrics.json")
     with open(metrics_path, "w", encoding="utf-8") as metrics_file:
-        json.dump(_to_jsonable(metrics), metrics_file, indent=2, sort_keys=True)
+        json.dump(_to_jsonable(report), metrics_file, indent=2, sort_keys=True)
         metrics_file.write("\n")
     return metrics_path
 
