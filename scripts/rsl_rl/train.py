@@ -10,9 +10,8 @@
 import argparse
 import sys
 
-from isaaclab.app import AppLauncher
-
 import cli_args
+from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
@@ -52,6 +51,8 @@ parser.add_argument(
 )
 # Add RSL-RL command-line arguments.
 cli_args.add_rsl_rl_args(parser)
+# Add the explicit staged domain-randomization selector.
+cli_args.add_domain_randomization_args(parser)
 # Add Isaac Lab application arguments.
 AppLauncher.add_app_launcher_args(parser)
 # Parse this script's known options into ``args_cli`` and retain unrecognized
@@ -133,9 +134,18 @@ def main(
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
+    # Apply this after Hydra so an explicit CLI stage has final precedence.
+    cli_args.apply_domain_randomization_stage(env_cfg, args_cli)
     synchronize_curriculum = getattr(env_cfg, "synchronize_curriculum_config", None)
     if callable(synchronize_curriculum):
         synchronize_curriculum()
+    synchronize_randomization = getattr(
+        env_cfg,
+        "synchronize_domain_randomization_config",
+        None,
+    )
+    if callable(synchronize_randomization):
+        synchronize_randomization()
 
     # Set the seed before constructing the environment because initialization
     # may randomize state.

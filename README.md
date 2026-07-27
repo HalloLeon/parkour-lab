@@ -61,6 +61,33 @@ Runs are written beneath `logs/rsl_rl/parkour_lab/<run>/`. This includes policy
 checkpoints (`model_*.pt`), the resolved environment and agent configurations in
 `params/`, TensorBoard data, and optional clips in `videos/train/`.
 
+### Staged domain randomization
+
+Domain randomization is deliberately disabled by default so the teacher first
+learns the nominal task. Resume a successful nominal run with the narrow stage,
+then use the wide stage only after narrow training remains stable:
+
+```bash
+python scripts/rsl_rl/train.py \
+  --task=Parkour-Lab-v0 \
+  --resume \
+  --load_run=<nominal-run> \
+  --domain_randomization_stage=narrow \
+  --headless
+```
+
+Replace `narrow` with `wide` for the final stage. The selected profile perturbs
+contact friction and restitution, trunk payload and center of mass, actuator
+gains, initial pose and velocity, external pushes, control-step action latency,
+and delayed/noisy proprioception. The selected stage and configured ranges are
+stored in `params/env.yaml`. Action and observation widths do not change between
+stages. Fixed evaluation always selects `off`, removing randomization, noise,
+pushes, and delays before constructing the environment.
+
+The same option is available in `distill.py`. If it is supplied together with
+the advanced Hydra override `env.domain_randomization.stage=...`, the explicit
+CLI option takes precedence.
+
 ## Declarative course configuration
 
 Each curriculum matrix cell is a reusable course description rather than a
@@ -126,12 +153,14 @@ promote after traversing more than half the route and demote after traveling
 less than half the commanded speed times episode duration; promotion wins if
 both strict conditions hold.
 
-The teacher-interface manifest is version 6. Version 4 introduced complete
+The teacher-interface manifest is version 7. Version 4 introduced complete
 declarative terrain courses because physical support segmentation changes the
 privileged ray values seen by the teacher. Version 5 replaces horizontal-only
 support metadata with ordered planar XYZ boundaries, making the banked ramp
 surfaces and their safety edges part of the frozen checkpoint interface.
-Version 6 freezes the complete obstacle-family by difficulty matrix.
+Version 6 freezes the complete obstacle-family by difficulty matrix. Version 7
+separates training-only noise, delay, and corruption switches from the
+deterministic checkpoint inference interface.
 
 ## Phase 1 observation architecture
 

@@ -18,6 +18,7 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.noise import UniformNoiseCfg
 from isaaclab_assets.robots.unitree import UNITREE_A1_CFG
 
 from . import mdp
@@ -59,9 +60,12 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
-            restitution_combine_mode="multiply",
+            # The robot-side restitution sampled during domain randomization
+            # must not be multiplied by the nominal ground value of zero.
+            restitution_combine_mode="max",
             static_friction=1.0,
             dynamic_friction=1.0,
+            restitution=0.0,
         ),
         visual_material=sim_utils.PreviewSurfaceCfg(
             diffuse_color=(0.55, 0.48, 0.35), roughness=0.8
@@ -171,8 +175,13 @@ class ActionsCfg:
     #
     # target_joint_pos = default_joint_pos + scale * policy_action
 
-    joint_pos = mdp.JointPositionActionCfg(
-        asset_name="robot", joint_names=[".*"], scale=0.25, use_default_offset=True
+    joint_pos = mdp.DelayedJointPositionActionCfg(
+        asset_name="robot",
+        joint_names=[".*"],
+        scale=0.25,
+        use_default_offset=True,
+        min_delay_steps=0,
+        max_delay_steps=0,
     )
 
 
@@ -322,6 +331,14 @@ class ObservationsCfg:
 @configclass
 class EventsCfg:
     """Configuration for events."""
+
+    # Optional domain-randomization terms are populated from the selected
+    # nominal, narrow, or wide stage before the environment is constructed.
+    add_trunk_mass: EventTerm | None = None
+    push_robot: EventTerm | None = None
+    randomize_actuator_gains: EventTerm | None = None
+    randomize_robot_material: EventTerm | None = None
+    randomize_trunk_com: EventTerm | None = None
 
     initialize_terrain_levels = EventTerm(
         func=mdp.initialize_parkour_terrain_levels,
@@ -525,6 +542,10 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
     # Hydra/programmatic overrides to terrain, events, transitions, and dones.
     parkour_curriculum: mdp.curriculums_config.ParkourCurriculumCfg = PARKOUR_CURRICULUM
 
+    # Keep nominal learning deterministic, then opt into ``narrow`` and
+    # ``wide`` perturbations on resumed runs.
+    domain_randomization: mdp.DomainRandomizationCfg = mdp.DomainRandomizationCfg()
+
     # Scene settings.
     scene: ParkourLabSceneCfg = ParkourLabSceneCfg(num_envs=4096, env_spacing=8.0)
     viewer: ViewerCfg = ViewerCfg(
@@ -586,6 +607,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
             self.scene.base_height_scanner.update_period = self.decimation * self.sim.dt
 
         self.synchronize_curriculum_config()
+        self.synchronize_domain_randomization_config()
 
     def evaluation_course_metadata(self) -> dict[str, object]:
         """Return JSON-friendly metadata for the fixed matrix cell."""
@@ -627,6 +649,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         self.evaluation_family = family
         self.evaluation_level = level
         self.curriculum = None
+        self.domain_randomization.stage = "off"
 
         terrain_generator = self.scene.ground.terrain_generator
         if terrain_generator is not None:
@@ -645,7 +668,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         # Synchronize after changing the column count so terrain generation and
         # the startup event receive the same fixed-family column mapping.
         self.synchronize_curriculum_config()
-        self.observations.policy.enable_corruption = False
+        self.synchronize_domain_randomization_config()
 
     def synchronize_curriculum_config(self) -> None:
         """Validate and propagate the authoritative parkour curriculum.
@@ -766,6 +789,171 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         # Keep the contact-gated edge penalty tied to the same authoritative
         # level geometry and metric thresholds as terrain generation.
         self.rewards.feet_edge.params["curriculum_cfg"] = curriculum_cfg
+
+    def synchronize_domain_randomization_config(self) -> None:
+        """Propagate the selected randomization stage to all manager terms.
+
+        Hydra applies overrides after ``__post_init__``, so training entry
+        points call this method again before ``gym.make``. Fixed evaluation
+        selects ``off`` and follows the same path, removing every stochastic
+        event, observation corruption, and control delay without changing any
+        observation or action dimensions.
+        """
+
+        cfg = self.domain_randomization
+        scale = cfg.stage_scale
+        enabled = scale > 0.0
+
+        action_delay = mdp.scaled_delay(cfg.max_action_delay_steps, scale)
+        self.actions.joint_pos.min_delay_steps = 0
+        self.actions.joint_pos.max_delay_steps = action_delay
+
+        policy_cfg = self.observations.policy
+        policy_cfg.enable_corruption = enabled
+        proprioception_delay = mdp.scaled_delay(
+            cfg.max_proprioception_delay_steps,
+            scale,
+        )
+        proprioception_terms = {
+            "base_ang_vel": cfg.angular_velocity_noise,
+            "joint_pos": cfg.joint_position_noise_rad,
+            "joint_vel": cfg.joint_velocity_noise_rad_s,
+            "projected_gravity": cfg.gravity_noise,
+        }
+        for term_name, full_noise in proprioception_terms.items():
+            term_cfg = getattr(policy_cfg, term_name)
+            term_cfg.modifiers = (
+                [
+                    mdp.ProprioceptionDelayCfg(
+                        min_delay_steps=0,
+                        max_delay_steps=proprioception_delay,
+                    )
+                ]
+                if enabled
+                else None
+            )
+            noise = scale * full_noise
+            term_cfg.noise = (
+                UniformNoiseCfg(n_min=-noise, n_max=noise) if enabled else None
+            )
+
+        initial_angular_velocity = mdp.scaled_range(
+            cfg.initial_angular_velocity_range_rad_s,
+            scale,
+        )
+        initial_linear_velocity = mdp.scaled_range(
+            cfg.initial_linear_velocity_range_m_s,
+            scale,
+        )
+        initial_xy = mdp.scaled_range(cfg.initial_xy_range_m, scale)
+        initial_yaw = mdp.scaled_range(cfg.initial_yaw_range_rad, scale)
+        self.events.reset_base.params["pose_range"] = {
+            "x": initial_xy,
+            "y": initial_xy,
+            "yaw": initial_yaw,
+        }
+        self.events.reset_base.params["velocity_range"] = {
+            "x": initial_linear_velocity,
+            "y": initial_linear_velocity,
+            "z": initial_linear_velocity,
+            "roll": initial_angular_velocity,
+            "pitch": initial_angular_velocity,
+            "yaw": initial_angular_velocity,
+        }
+
+        if not enabled:
+            self.events.add_trunk_mass = None
+            self.events.push_robot = None
+            self.events.randomize_actuator_gains = None
+            self.events.randomize_robot_material = None
+            self.events.randomize_trunk_com = None
+            return
+
+        # Add a fixed per-environment trunk payload at simulator startup.
+        self.events.add_trunk_mass = EventTerm(
+            func=mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="trunk"),
+                "mass_distribution_params": mdp.scaled_range(
+                    cfg.added_trunk_mass_range_kg,
+                    scale,
+                ),
+                "operation": "add",
+            },
+        )
+        # Apply intermittent planar velocity impulses to train disturbance recovery.
+        self.events.push_robot = EventTerm(
+            func=mdp.push_by_setting_velocity,
+            mode="interval",
+            interval_range_s=cfg.push_interval_range_s,
+            params={
+                "asset_cfg": SceneEntityCfg("robot"),
+                "velocity_range": {
+                    "x": mdp.scaled_range(
+                        cfg.push_velocity_range_m_s,
+                        scale,
+                    ),
+                    "y": mdp.scaled_range(
+                        cfg.push_velocity_range_m_s,
+                        scale,
+                    ),
+                },
+            },
+        )
+        # Scale joint stiffness and damping to cover actuator-model error.
+        gain_scale = mdp.scaled_range(
+            cfg.actuator_gain_scale_range,
+            scale,
+            center=1.0,
+        )
+        self.events.randomize_actuator_gains = EventTerm(
+            func=mdp.randomize_actuator_gains,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+                "stiffness_distribution_params": gain_scale,
+                "damping_distribution_params": gain_scale,
+                "operation": "scale",
+            },
+        )
+        # Vary robot contact behavior through friction and restitution.
+        self.events.randomize_robot_material = EventTerm(
+            func=mdp.randomize_rigid_body_material,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+                "static_friction_range": mdp.scaled_range(
+                    cfg.static_friction_range,
+                    scale,
+                    center=1.0,
+                ),
+                "dynamic_friction_range": mdp.scaled_range(
+                    cfg.dynamic_friction_range,
+                    scale,
+                    center=1.0,
+                ),
+                "restitution_range": mdp.scaled_range(
+                    cfg.restitution_range,
+                    scale,
+                ),
+                "num_buckets": 64,  # Reuse 64 sampled material triples across shapes.
+                "make_consistent": True,  # Keep dynamic friction at most static friction.
+            },
+        )
+        # Shift the trunk center of mass to model uneven payload placement.
+        self.events.randomize_trunk_com = EventTerm(
+            func=mdp.randomize_rigid_body_com,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="trunk"),
+                "com_range": {
+                    "x": mdp.scaled_range(cfg.trunk_com_x_range_m, scale),
+                    "y": mdp.scaled_range(cfg.trunk_com_y_range_m, scale),
+                    "z": mdp.scaled_range(cfg.trunk_com_z_range_m, scale),
+                },
+            },
+        )
 
 
 @configclass

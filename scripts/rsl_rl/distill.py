@@ -10,8 +10,8 @@
 import argparse
 import sys
 
+import cli_args
 from isaaclab.app import AppLauncher
-
 
 parser = argparse.ArgumentParser(
     description="Run student-driven online action distillation."
@@ -103,6 +103,7 @@ parser.add_argument(
         "distillation pipeline and cannot train a terrain-aware student."
     ),
 )
+cli_args.add_domain_randomization_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
 
@@ -200,9 +201,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
         # Keep simulation, teacher, and student tensors on one device.
         agent_cfg.device = env_cfg.sim.device
 
+    # Apply this after Hydra so an explicit CLI stage has final precedence.
+    cli_args.apply_domain_randomization_stage(env_cfg, args_cli)
     synchronize_curriculum = getattr(env_cfg, "synchronize_curriculum_config", None)
     if callable(synchronize_curriculum):
         synchronize_curriculum()
+    synchronize_randomization = getattr(
+        env_cfg,
+        "synchronize_domain_randomization_config",
+        None,
+    )
+    if callable(synchronize_randomization):
+        synchronize_randomization()
 
     log_dir = (
         os.path.abspath(os.path.expanduser(args_cli.log_dir))

@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
     from tensordict import TensorDict
 
-TEACHER_INTERFACE_VERSION = 6
+TEACHER_INTERFACE_VERSION = 7
 
 DEPLOYABLE_STATE_GROUP = "policy"
 ORACLE_HEADING_GROUP = "heading_target"
@@ -287,6 +287,14 @@ def write_json(path: str | os.PathLike[str], value: object) -> None:
         output_file.write("\n")
 
 
+def _callable_name(value: Callable[..., object]) -> str:
+    """Return a callable's qualified name without hashing its implementation."""
+
+    module = getattr(value, "__module__", type(value).__module__)
+    qualname = getattr(value, "__qualname__", type(value).__qualname__)
+    return f"{module}.{qualname}"
+
+
 def _describe_observation_groups(
     base_env: ManagerBasedRLEnv,
     observations: TensorDict,
@@ -328,20 +336,11 @@ def _describe_observation_groups(
                 # Parallel-environment batch size is not part of the model.
                 "dimension": _flat_dimension(observations[group_name]),
                 "concatenate_terms": bool(observation_manager.group_obs_concatenate[group_name]),
-                "enable_corruption": bool(group_cfg.enable_corruption),
                 "terms": terms,
             }
         )
 
     return groups
-
-
-def _callable_name(value: Callable[..., object]) -> str:
-    """Return a callable's qualified name without hashing its implementation."""
-
-    module = getattr(value, "__module__", type(value).__module__)
-    qualname = getattr(value, "__qualname__", type(value).__qualname__)
-    return f"{module}.{qualname}"
 
 
 def _find_differences(expected: object, actual: object, path: str = "interface") -> list[str]:

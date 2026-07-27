@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
 
 
+DOMAIN_RANDOMIZATION_STAGES = ("off", "narrow", "wide")
+
+
 def add_rsl_rl_args(parser: argparse.ArgumentParser) -> None:
     """Add RSL-RL arguments to the parser.
 
@@ -66,6 +69,43 @@ def add_rsl_rl_checkpoint_args(parser: argparse.ArgumentParser) -> None:
         description="Arguments for selecting an RSL-RL checkpoint.",
     )
     _add_rsl_rl_checkpoint_args(arg_group)
+
+
+def add_domain_randomization_args(parser: argparse.ArgumentParser) -> None:
+    """Add the staged domain-randomization option to a script parser."""
+
+    arg_group = parser.add_argument_group(
+        "domain_randomization",
+        description="Arguments for staged environment domain randomization.",
+    )
+    arg_group.add_argument(
+        "--domain_randomization_stage",
+        choices=DOMAIN_RANDOMIZATION_STAGES,
+        default=None,
+        help=(
+            "Select the off, narrow, or wide domain-randomization stage for supported tasks. "
+            "Overrides env.domain_randomization.stage when provided."
+        ),
+    )
+
+
+def apply_domain_randomization_stage(
+    env_cfg: object,
+    args_cli: argparse.Namespace,
+) -> None:
+    """Apply the optional CLI stage to an environment that supports it."""
+
+    stage = getattr(args_cli, "domain_randomization_stage", None)
+    if stage is None:
+        return
+
+    randomization_cfg = getattr(env_cfg, "domain_randomization", None)
+    if randomization_cfg is None:
+        raise ValueError(
+            "--domain_randomization_stage is only supported by environments "
+            "with a domain_randomization configuration."
+        )
+    randomization_cfg.stage = stage
 
 
 def update_rsl_rl_cfg(agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Namespace) -> RslRlBaseRunnerCfg:
