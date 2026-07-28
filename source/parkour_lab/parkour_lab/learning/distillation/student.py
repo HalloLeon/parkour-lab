@@ -124,8 +124,9 @@ class StudentPolicy(nn.Module):
         self.heading = HeadingPredictor(cfg)
         self.motor = MotorActor(cfg.motor)
 
-        # Preserve the current smoke-test behavior until a later stage copies
-        # the trained teacher motor weights into this exact shared module.
+        # Give standalone students a neutral motor output. The distillation
+        # entry point replaces this state with the selected teacher's exact
+        # motor weights before creating the optimizer.
         motor_output = self.motor.output_layer
         nn.init.zeros_(motor_output.weight)
         nn.init.zeros_(motor_output.bias)

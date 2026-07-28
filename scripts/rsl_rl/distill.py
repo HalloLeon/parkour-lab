@@ -148,6 +148,11 @@ from isaaclab.envs import ManagerBasedRLEnvCfg
 from isaaclab.utils.io import dump_yaml
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
 from isaaclab_tasks.utils.hydra import hydra_task_config
+from parkour_lab.learning.distillation.architecture import (
+    DEFAULT_TERRAIN_LATENT_DIM,
+    HEADING_DIM,
+    MotorActor,
+)
 from parkour_lab.learning.distillation.contracts import (
     TEACHER_OBSERVATION_GROUPS,
     TeacherCheckpoint,
@@ -157,16 +162,14 @@ from parkour_lab.learning.distillation.contracts import (
     load_teacher_checkpoint,
     write_json,
 )
-from parkour_lab.learning.distillation.architecture import (
-    DEFAULT_TERRAIN_LATENT_DIM,
-    HEADING_DIM,
-    MotorInterfaceCfg,
-)
 from parkour_lab.learning.distillation.student import (
     STUDENT_OBSERVATION_GROUPS,
     StudentModelCfg,
     StudentPolicy,
     compute_distillation_losses,
+)
+from parkour_lab.learning.distillation.teacher.rsl_rl import (
+    register_rsl_rl_teacher_actor_critic,
 )
 from parkour_lab.tasks.manager_based.parkour_lab.mdp.observations import (
     student_exteroception_stub,
@@ -269,7 +272,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
             if uses_exteroception_stub
             else "perceptive_student_distillation"
         )
-        action_dim = env.unwrapped.action_manager.total_action_dim
         teacher_dim = sum(
             information_dimensions[name] for name in TEACHER_OBSERVATION_GROUPS
         )
@@ -284,13 +286,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
                 f"{terrain_latent_dim}."
             )
 
-        # Define the motor interface once so diagnostics and model creation use
-        # the same complete input width, including any future adaptation latent.
-        motor_cfg = MotorInterfaceCfg(
-            state_dim=information_dimensions["policy"],
-            terrain_latent_dim=terrain_latent_dim,
-            action_dim=action_dim,
+        teacher_policy, teacher_motor = _load_teacher_policy(
+            env,
+            agent_cfg,
+            checkpoint_path=teacher_checkpoint.checkpoint_path,
         )
+        motor_cfg = teacher_motor.cfg
 
         print(
             "[DISTILL] Frozen teacher: "
@@ -322,17 +323,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
                 "This run is a pipeline smoke test, not terrain-aware student training."
             )
 
-        teacher_policy = _load_teacher_policy(
-            env,
-            agent_cfg,
-            checkpoint_path=teacher_checkpoint.checkpoint_path,
-        )
-
         student_cfg = StudentModelCfg(motor=motor_cfg)
 
         # Create the student neural network from the resolved input and action
         # dimensions, then place its parameters on the simulation device.
         student = StudentPolicy(student_cfg).to(env.device)
+
+        # Start from the motor trained inside the modular teacher checkpoint.
+        # The shared MotorActor class and configuration make this a strict,
+        # key-for-key copy rather than a partial or shape-dependent transfer.
+        student.motor.load_state_dict(teacher_motor.state_dict(), strict=True)
 
         # Adam updates only the student parameters. ``weight_decay`` adds an
         # optional penalty for large weights; its zero default disables it.
@@ -558,11 +558,12 @@ def _load_teacher_policy(
     agent_cfg: RslRlBaseRunnerCfg,
     *,
     checkpoint_path: str,
-) -> Callable[[TensorDict], torch.Tensor]:
-    """Load the PPO teacher and return its deterministic inference callable."""
+) -> tuple[Callable[[TensorDict], torch.Tensor], MotorActor]:
+    """Load the PPO teacher and return its inference callable and shared motor."""
 
     # Construct the original PPO actor-critic so checkpoint loading and actor
     # preprocessing exactly match teacher training.
+    register_rsl_rl_teacher_actor_critic()
     teacher_runner = OnPolicyRunner(
         env,
         agent_cfg.to_dict(),
@@ -573,7 +574,9 @@ def _load_teacher_policy(
 
     # RSL-RL switches the policy to evaluation mode and returns its
     # deterministic ``act_inference`` method.
-    return teacher_runner.get_inference_policy(device=env.device)
+    teacher_policy = teacher_runner.get_inference_policy(device=env.device)
+    teacher_motor: MotorActor = teacher_runner.alg.policy.actor.motor
+    return teacher_policy, teacher_motor
 
 
 def _run_training(

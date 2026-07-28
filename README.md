@@ -153,14 +153,16 @@ promote after traversing more than half the route and demote after traveling
 less than half the commanded speed times episode duration; promotion wins if
 both strict conditions hold.
 
-The teacher-interface manifest is version 7. Version 4 introduced complete
+The teacher-interface manifest is version 8. Version 4 introduced complete
 declarative terrain courses because physical support segmentation changes the
 privileged ray values seen by the teacher. Version 5 replaces horizontal-only
 support metadata with ordered planar XYZ boundaries, making the banked ramp
 surfaces and their safety edges part of the frozen checkpoint interface.
 Version 6 freezes the complete obstacle-family by difficulty matrix. Version 7
 separates training-only noise, delay, and corruption switches from the
-deterministic checkpoint inference interface.
+deterministic checkpoint inference interface. Version 8 records the modular
+privileged scan encoder, fixed terrain latent, transferable motor actor, and
+their checkpoint paths and input ordering.
 
 ## Phase 1 observation architecture
 
@@ -211,13 +213,19 @@ offsets, scale `0.25`, interpreted relative to default joint positions at the
 same 50 Hz control rate. Observation asymmetry therefore does not alter the
 low-level controller or action interface.
 
-`learning/distillation/architecture.py` fixes the transferable motor input order
-as deployable state, two-component heading, 32-D terrain latent, and an optional
-adaptation latent. It provides a privileged scan encoder and reference teacher
-whose `MotorActor` has exactly the same configuration and state-dictionary
-layout as the student's motor. The current stock PPO teacher is not yet wired to
-that modular actor; doing so is a later teacher-architecture stage and must
-precede final teacher training.
+`learning/distillation/architecture.py` fixes the shared transferable motor
+input order as deployable state, two-component heading, 32-D terrain latent,
+and an optional adaptation latent. Teacher-specific PyTorch composition lives
+in `teacher/model.py`, while `teacher/rsl_rl.py` contains only the RSL-RL
+`ActorCritic` adapter and runner registration. The student remains in
+`student.py` because it does not currently require a package of its own. The
+Phase-1 RSL-RL actor compresses the 264-D privileged height-and-validity scan
+to the fixed 32-D terrain latent, then passes the 43-D deployable state, 2-D
+oracle heading, and that latent to `MotorActor`.
+Its checkpoint keeps the encoder under `actor.terrain_encoder` and the shared
+motor under `actor.motor`; the latter has exactly the same configuration and
+state-dictionary layout as the student's motor. Additional privileged state
+remains on the critic path only.
 
 Three controlled RSL-RL entry points support observation ablations without
 changing PPO settings, hidden layers, rewards, curricula, or actions:
@@ -342,18 +350,17 @@ student action. Consequently, `last_action` is the previously executed student
 action and training data comes from student-visited states. The initial losses
 are action Smooth L1/Huber (`1.0`), heading cosine direction (`0.2`), and raw
 heading-vector unit-norm regularization (`0.01`). The teacher is in evaluation
-mode, all of its parameters have gradients disabled, and only student
-parameters enter the optimizer.
+mode, label generation runs under inference mode, and only student parameters
+enter the optimizer.
 
 This stage does not render cameras, encode depth, or claim that the zero feature
 is deployable perception. It establishes and tests the information barrier and
 student-driven training semantics. The terrain-latent contract is fixed at 32
 values and stored with the student model; both the privileged scan encoder and
-future depth encoder must produce that width. Before fully student-driven perceptive training,
-the next stage should warm-start the otherwise zero-output motor student from
-teacher-labeled data and then switch to student-visited online rollouts. Teacher
-and student still emit the same 12 action values, which use the same scale,
-default-position offset, controller, and 50 Hz rate.
+future depth encoder must produce that width. A new student starts from the
+exact `actor.motor` weights in the selected teacher checkpoint before online
+updates begin. Teacher and student still emit the same 12 action values, which
+use the same scale, default-position offset, controller, and 50 Hz rate.
 
 Runs are stored beneath `logs/distillation/parkour_lab/`. Each run records the
 teacher checkpoint identity, runtime group dimensions and student group order,

@@ -101,6 +101,9 @@ from parkour_lab.learning.distillation.contracts import (
     interface_sha256,
     write_json,
 )
+from parkour_lab.learning.distillation.teacher.rsl_rl import (
+    register_rsl_rl_teacher_actor_critic,
+)
 from rsl_rl.runners import OnPolicyRunner
 
 # Use faster TF32 arithmetic for float32 matrix multiplications on supported
@@ -244,6 +247,7 @@ def main(
     # supervision that the stock RSL-RL distillation runner does not express.
     if agent_cfg.class_name != "OnPolicyRunner":
         raise ValueError("train.py supports only OnPolicyRunner; use distill.py for student distillation.")
+    register_rsl_rl_teacher_actor_critic()
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     # Record the Git commit and local code changes that produced this run so the
     # training result can be traced back to its exact repository state.

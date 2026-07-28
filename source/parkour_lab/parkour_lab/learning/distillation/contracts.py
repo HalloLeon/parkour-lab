@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
     from tensordict import TensorDict
 
-TEACHER_INTERFACE_VERSION = 7
+TEACHER_INTERFACE_VERSION = 8
 
 DEPLOYABLE_STATE_GROUP = "policy"
 ORACLE_HEADING_GROUP = "heading_target"
@@ -116,7 +116,6 @@ def build_teacher_interface(
 
     groups = _describe_observation_groups(base_env, observations, actor_groups)
     action_manager = base_env.action_manager
-    action_cfg = base_env.cfg.actions.joint_pos
 
     # The runtime descriptor contains the resolved joint order and transforms.
     action_descriptor = action_manager.get_term("joint_pos").IO_descriptor
@@ -133,42 +132,52 @@ def build_teacher_interface(
     ground_thickness_m = ground_thicknesses.pop()
     policy_cfg = agent_cfg.policy
 
+    # Import the tensor architecture only when building a live simulator
+    # manifest, keeping checkpoint identity helpers usable without PyTorch.
+    from .architecture import MotorInterfaceCfg
+    from .teacher.model import PrivilegedTeacherModelCfg
+
+    teacher_model_cfg = PrivilegedTeacherModelCfg(
+        motor=MotorInterfaceCfg(
+            state_dim=_flat_dimension(observations[DEPLOYABLE_STATE_GROUP]),
+            heading_dim=_flat_dimension(observations[ORACLE_HEADING_GROUP]),
+            terrain_latent_dim=int(policy_cfg.terrain_latent_dim),
+            action_dim=int(action_manager.total_action_dim),
+            hidden_dims=tuple(policy_cfg.actor_hidden_dims),
+        ),
+        terrain_scan_dim=_flat_dimension(observations[PRIVILEGED_TERRAIN_GROUP]),
+        scan_hidden_dims=tuple(policy_cfg.scan_encoder_hidden_dims),
+    )
+    teacher_model_cfg.validate()
+
     return {
         "interface_version": TEACHER_INTERFACE_VERSION,
         # Preserve the information boundary even though PPO concatenates all groups.
         "information_contract": {
             "deployable_state_group": DEPLOYABLE_STATE_GROUP,
-            "deployable_state_dimension": _flat_dimension(observations[DEPLOYABLE_STATE_GROUP]),
             "oracle_heading_group": ORACLE_HEADING_GROUP,
-            "oracle_heading_dimension": _flat_dimension(observations[ORACLE_HEADING_GROUP]),
             "heading_representation": "yaw_aligned_unit_xy",
-            # Freeze both the waypoint routes and their switching rule.
+            # Ordered routes are already frozen by ``terrain_curriculum.matrix``.
             "oracle_heading_source": {
                 "kind": "active_course_waypoint",
-                "waypoint_routes_by_family_m": [
-                    {
-                        "family": family.name,
-                        "routes": [
-                            [list(waypoint.position) for waypoint in level.waypoints] for level in family.levels
-                        ],
-                    }
-                    for family in curriculum_cfg.families
-                ],
                 "reach_threshold_m": float(curriculum_cfg.waypoint_reach_threshold),
                 "reach_hold_s": float(curriculum_cfg.waypoint_reach_hold_s),
                 "final_requires_min_clearance": True,
             },
             "privileged_terrain_group": PRIVILEGED_TERRAIN_GROUP,
-            "privileged_terrain_dimension": _flat_dimension(observations[PRIVILEGED_TERRAIN_GROUP]),
         },
         "actor": {
             "observation_groups": groups,
-            "input_dimension": sum(_flat_dimension(observations[name]) for name in actor_groups),
-            "network": {
+            "observation_normalization": bool(policy_cfg.actor_obs_normalization),
+            "architecture": {
                 "class_name": getattr(policy_cfg, "class_name", type(policy_cfg).__name__),
-                "hidden_dimensions": list(policy_cfg.actor_hidden_dims),
-                "activation": policy_cfg.activation,
-                "observation_normalization": bool(policy_cfg.actor_obs_normalization),
+                # These stable state-dictionary paths make the encoder and
+                # directly transferable motor identifiable in RSL-RL checkpoints.
+                "checkpoint_modules": {
+                    "terrain_encoder": "actor.terrain_encoder",
+                    "motor_actor": "actor.motor",
+                },
+                "model": teacher_model_cfg.to_dict(),
             },
         },
         "terrain_scan": {
@@ -196,22 +205,18 @@ def build_teacher_interface(
             "matrix": curriculum_cfg.metadata(),
         },
         "action": {
-            "dimension": int(action_manager.total_action_dim),
             "term_order": list(action_manager.active_terms),
             "term_dimensions": list(action_manager.action_term_dim),
             "joint_names": list(action_descriptor.joint_names),
             "scale": _simple_value(action_descriptor.scale),
             "offset": _simple_value(action_descriptor.offset),
             "clip": _simple_value(action_descriptor.clip),
-            "use_default_offset": bool(action_cfg.use_default_offset),
-            "preserve_order": bool(action_cfg.preserve_order),
             "wrapper_clip": _simple_value(agent_cfg.clip_actions),
         },
-        # Both time scales change how an identical action sequence behaves.
+        # Physics step and decimation determine integration and control rate.
         "timing": {
             "physics_dt_s": float(base_env.cfg.sim.dt),
             "decimation": int(base_env.cfg.decimation),
-            "control_dt_s": float(base_env.step_dt),
         },
     }
 

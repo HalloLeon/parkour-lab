@@ -10,10 +10,9 @@ but both must present the same ordered tensors to ``MotorActor``. Keeping that
 boundary in one module makes the motor weights directly copyable instead of
 depending on two independently assembled input vectors.
 
-The future depth and adaptation encoders are intentionally not implemented
-here. They only need to produce the latent widths recorded by
-``MotorInterfaceCfg``; adding those trainable models belongs to later roadmap
-stages.
+Teacher-specific composition lives in ``teacher/model.py``. Its RSL-RL
+adapter lives in ``teacher/rsl_rl.py``. Future depth and adaptation encoders
+only need to produce the latent widths recorded by ``MotorInterfaceCfg``.
 """
 
 from __future__ import annotations
@@ -178,93 +177,6 @@ class MotorActor(nn.Module):
             dim=-1,
         )
         return self.network(motor_input)
-
-
-class PrivilegedScanEncoder(nn.Module):
-    """Compress simulator-only terrain scans into the shared terrain latent."""
-
-    def __init__(
-        self,
-        scan_dim: int,
-        latent_dim: int = DEFAULT_TERRAIN_LATENT_DIM,
-        hidden_dims: tuple[int, ...] = (128, 64),
-    ) -> None:
-        super().__init__()
-
-        if scan_dim <= 0 or latent_dim <= 0:
-            raise ValueError("Scan and terrain-latent dimensions must be positive.")
-        if not hidden_dims or any(width <= 0 for width in hidden_dims):
-            raise ValueError("Scan-encoder hidden dimensions must be positive.")
-        self.scan_dim = scan_dim
-        self.latent_dim = latent_dim
-        self.network = _build_mlp(scan_dim, latent_dim, hidden_dims)
-
-    def forward(self, terrain_scan: torch.Tensor) -> torch.Tensor:
-        """Return one fixed-width terrain latent per environment."""
-
-        _validate_input(terrain_scan, self.scan_dim, "terrain_scan")
-        return self.network(terrain_scan)
-
-
-@dataclass(frozen=True)
-class PrivilegedTeacherModelCfg:
-    """Transfer-facing architecture of the future modular Phase-1 teacher."""
-
-    motor: MotorInterfaceCfg
-    terrain_scan_dim: int
-    scan_hidden_dims: tuple[int, ...] = (128, 64)
-
-    def validate(self) -> None:
-        """Validate the scan encoder and shared motor interface."""
-
-        self.motor.validate()
-        if self.terrain_scan_dim <= 0:
-            raise ValueError("terrain_scan_dim must be positive.")
-        if not self.scan_hidden_dims or any(
-            width <= 0 for width in self.scan_hidden_dims
-        ):
-            raise ValueError("Scan-encoder hidden dimensions must be positive.")
-
-    def to_dict(self) -> dict[str, object]:
-        """Return a JSON-compatible teacher architecture contract."""
-
-        return {
-            "motor": self.motor.to_dict(),
-            "terrain_scan_dim": self.terrain_scan_dim,
-            "scan_hidden_dims": list(self.scan_hidden_dims),
-        }
-
-
-class PrivilegedTeacherPolicy(nn.Module):
-    """Reference Phase-1 actor exposing a directly copyable motor module."""
-
-    def __init__(self, cfg: PrivilegedTeacherModelCfg) -> None:
-        super().__init__()
-        cfg.validate()
-        self.cfg = cfg
-        self.terrain_encoder = PrivilegedScanEncoder(
-            cfg.terrain_scan_dim,
-            cfg.motor.terrain_latent_dim,
-            cfg.scan_hidden_dims,
-        )
-        self.motor = MotorActor(cfg.motor)
-
-    def forward(
-        self,
-        deployable_state: torch.Tensor,
-        oracle_heading: torch.Tensor,
-        terrain_scan: torch.Tensor,
-        adaptation_latent: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Encode privileged geometry and return deterministic motor actions."""
-
-        terrain_latent = self.terrain_encoder(terrain_scan)
-        return self.motor(
-            deployable_state,
-            oracle_heading,
-            terrain_latent,
-            adaptation_latent,
-        )
 
 
 def _build_mlp(

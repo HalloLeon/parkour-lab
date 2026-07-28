@@ -130,6 +130,9 @@ from parkour_lab.learning.distillation.contracts import (
     load_teacher_checkpoint,
     sha256_file,
 )
+from parkour_lab.learning.distillation.teacher.rsl_rl import (
+    register_rsl_rl_teacher_actor_critic,
+)
 from parkour_lab.tasks.manager_based.parkour_lab.mdp.navigation.route import (
     last_episode_max_course_progress_m,
 )
@@ -551,6 +554,7 @@ def _load_inference_policy(
             "stock DistillationRunner checkpoints are not part of this project."
         )
     device = env.unwrapped.device
+    register_rsl_rl_teacher_actor_critic()
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=device)
     runner.load(checkpoint_path)
     return runner.get_inference_policy(device=device)

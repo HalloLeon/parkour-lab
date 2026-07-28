@@ -4,6 +4,23 @@ from isaaclab_rl.rsl_rl import (
     RslRlPpoActorCriticCfg,
     RslRlPpoAlgorithmCfg,
 )
+from parkour_lab.learning.distillation.architecture import (
+    DEFAULT_TERRAIN_LATENT_DIM,
+)
+
+
+@configclass
+class PrivilegedTeacherActorCriticCfg(RslRlPpoActorCriticCfg):
+    """Configuration for the modular Phase-1 teacher actor."""
+
+    class_name: str = "PrivilegedTeacherActorCritic"
+
+    # Compress the concatenated privileged heights and validity mask to the
+    # fixed representation consumed by the transferable motor actor.
+    terrain_latent_dim: int = DEFAULT_TERRAIN_LATENT_DIM
+
+    # Hidden-layer widths used before projecting that scan to the latent.
+    scan_encoder_hidden_dims: list[int] = [128, 64]
 
 
 @configclass
@@ -48,8 +65,9 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         ],
     }
 
-    # RSL-RL 3 configures both networks through one actor-critic policy object.
-    policy = RslRlPpoActorCriticCfg(
+    # RSL-RL 3 configures the custom actor and standard critic through one
+    # actor-critic policy object.
+    policy = PrivilegedTeacherActorCriticCfg(
         # Initial standard deviation of the Gaussian action distribution. This
         # controls exploration before the standard deviation is learned.
         init_noise_std=1.0,
@@ -59,7 +77,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # physical-unit terms before treating this as final normalization tuning.
         actor_obs_normalization=False,
         critic_obs_normalization=False,
-        # Hidden-layer widths of the action-producing actor network.
+        # Hidden-layer widths of the shared, directly transferable motor actor.
         actor_hidden_dims=[512, 256, 128],
         # Hidden-layer widths of the value-estimating critic network.
         critic_hidden_dims=[512, 256, 128],
