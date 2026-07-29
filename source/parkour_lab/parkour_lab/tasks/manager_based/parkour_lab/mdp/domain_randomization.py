@@ -220,6 +220,34 @@ def scaled_range(
     )
 
 
+def _batch_selection(
+    env_ids: Sequence[int] | slice | None,
+    num_envs: int,
+) -> tuple[Sequence[int] | slice | None, int]:
+    """Return DelayBuffer indices and the number of lags to sample."""
+
+    if env_ids is None or isinstance(env_ids, slice):
+        return env_ids, num_envs
+    return env_ids, len(env_ids)
+
+
+def _sample_lags(
+    count: int,
+    minimum: int,
+    maximum: int,
+    device: str,
+) -> torch.Tensor:
+    """Sample inclusive delays with DelayBuffer's integer dtype."""
+
+    return torch.randint(
+        minimum,
+        maximum + 1,
+        (count,),
+        device=device,
+        dtype=torch.int,
+    )
+
+
 __all__ = [
     "DelayedJointPositionAction",
     "DelayedJointPositionActionCfg",
