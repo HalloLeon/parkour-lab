@@ -92,7 +92,7 @@ DEFAULT_FEET_STUMBLE = FeetStumbleCfg()
 
 
 @configclass
-class GoalHeadingCfg:
+class WaypointHeadingCfg:
     """
     Configuration for heading-misalignment penalties while advancing.
     """
@@ -114,7 +114,7 @@ class GoalHeadingCfg:
             )
 
 
-DEFAULT_GOAL_HEADING = GoalHeadingCfg()
+DEFAULT_WAYPOINT_HEADING = WaypointHeadingCfg()
 
 
 @configclass
@@ -188,12 +188,12 @@ class RootStabilityCfg:
 
 
 @configclass
-class StableGoalProgressCfg:
+class StableWaypointProgressCfg:
     """
-    Configuration for stable XY goal-progress reward.
+    Configuration for stable XY active-waypoint progress reward.
 
     The reward has three parts:
-      - positive reward for reducing XY distance to the goal,
+      - positive reward for reducing XY distance to the active waypoint,
       - negative penalty for increasing XY distance,
       - small penalty for sideways/lateral drift while making progress.
     """
@@ -231,4 +231,4 @@ class StableGoalProgressCfg:
             raise ValueError("max_lateral_penalty must be positive.")
 
 
-DEFAULT_STABLE_GOAL_PROGRESS = StableGoalProgressCfg()
+DEFAULT_STABLE_WAYPOINT_PROGRESS = StableWaypointProgressCfg()

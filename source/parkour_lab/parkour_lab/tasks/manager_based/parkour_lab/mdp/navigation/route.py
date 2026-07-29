@@ -39,7 +39,7 @@ def active_waypoint_changed_this_step(env: ManagerBasedRLEnv) -> torch.Tensor:
 
 def active_waypoint_positions(
     env: ManagerBasedRLEnv,
-    goal_cfg: SceneEntityCfg,
+    waypoint_marker_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
     """Derive active terrain-local waypoints, falling back before first reset."""
 
@@ -55,16 +55,15 @@ def active_waypoint_positions(
     ):
         return table[course_indices, active_indices]
 
-    goal = env.scene[goal_cfg.name]
-    return goal.data.root_pos_w - env.scene.env_origins
+    waypoint_marker = env.scene[waypoint_marker_cfg.name]
+    return waypoint_marker.data.root_pos_w - env.scene.env_origins
 
 
 def advance_active_waypoints(
     env: ManagerBasedRLEnv,
     *,
     reach_threshold: float,
-    reach_hold_s: float,
-    goal_cfg: SceneEntityCfg,
+    waypoint_marker_cfg: SceneEntityCfg,
     asset_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
     """Update every route once and return final-course completions.
@@ -82,8 +81,6 @@ def advance_active_waypoints(
 
     if reach_threshold <= 0.0:
         raise ValueError("reach_threshold must be positive.")
-    if reach_hold_s < 0.0:
-        raise ValueError("reach_hold_s must be non-negative.")
     required_state = (
         "_parkour_waypoint_table",  # Terrain-local XYZ waypoints for every course.
         "_parkour_waypoint_count_by_course",  # Unpadded waypoint count per course.
@@ -103,6 +100,11 @@ def advance_active_waypoints(
         dim=-1,
     )
     within_radius = distance_xy < reach_threshold
+    passed_waypoint_plane = _active_waypoint_plane_passed(
+        env,
+        robot_pos[:, :2],
+        lateral_tolerance=reach_threshold,
+    )
 
     # Intermediate waypoints only select a new direction. The final waypoint
     # retains the existing safety rule that a collapsed robot is not successful.
@@ -121,26 +123,19 @@ def advance_active_waypoints(
         progress,
     )
 
-    (
-        next_indices,
-        next_hold_times_s,
-        completed_course,
-    ) = _advance_route_state(
+    next_indices, completed_course = _advance_route_state(
         active_indices,
         waypoint_counts,
-        env._parkour_waypoint_hold_time_s,
         within_radius,
+        passed_waypoint_plane,
         final_waypoint_eligible,
-        step_dt_s=float(env.step_dt),
-        reach_hold_s=reach_hold_s,
     )
 
     advanced = next_indices != active_indices
     env._parkour_active_waypoint_index[:] = next_indices
-    env._parkour_waypoint_hold_time_s[:] = next_hold_times_s
     # Retargeting replaces the nearby reached waypoint with the farther next one,
-    # making goal distance jump without robot motion. The progress reward uses
-    # this event to ignore that artificial change for the current step.
+    # making active-waypoint distance jump without robot motion. The progress
+    # reward uses this event to ignore that artificial change for the current step.
     env._parkour_active_waypoint_changed[:] = advanced
     env._parkour_max_course_progress_m[:] = torch.where(
         completed_course,
@@ -154,7 +149,12 @@ def advance_active_waypoints(
             course_indices[advanced_env_ids],
             next_indices[advanced_env_ids],
         ]
-        _write_goal_marker(env, advanced_env_ids, next_waypoints, goal_cfg)
+        _write_waypoint_marker(
+            env,
+            advanced_env_ids,
+            next_waypoints,
+            waypoint_marker_cfg,
+        )
 
     return completed_course
 
@@ -174,24 +174,25 @@ def reset_routes(
     family_indices: torch.Tensor,
     difficulty_indices: torch.Tensor,
     curriculum_cfg: ParkourCurriculumCfg,
-    goal_cfg: SceneEntityCfg,
+    waypoint_marker_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
     """Reset selected environments to the first waypoint of their new routes.
 
     This initializes the shared waypoint tables when necessary, assigns each
     selected environment its logical curriculum level, clears its route
-    progress and per-step event flags, and moves its goal marker to waypoint
+    progress and per-step event flag, and moves its visible marker to waypoint
     zero. Passing ``None`` as ``env_ids`` resets every environment.
 
     Args:
         env: Vectorized manager-based environment that owns the route buffers
-            and goal-marker scene entity.
+            and waypoint-marker scene entity.
         env_ids: Indices of the environments being reset, or ``None`` for all
             environments.
         family_indices: Obstacle-family index for each selected environment.
         difficulty_indices: Difficulty-row index for each selected environment.
         curriculum_cfg: Course definitions used to build the waypoint table.
-        goal_cfg: Scene-entity selection for the visible goal marker.
+        waypoint_marker_cfg: Scene-entity selection for the visible waypoint
+            marker.
 
     Returns:
         Flattened family-major course index for each reset environment. The
@@ -213,8 +214,8 @@ def reset_routes(
             "family_indices and difficulty_indices must contain one value per reset environment."
         )
 
-    goal = env.scene[goal_cfg.name]
-    dtype = goal.data.default_root_state.dtype
+    waypoint_marker = env.scene[waypoint_marker_cfg.name]
+    dtype = waypoint_marker.data.default_root_state.dtype
     _ensure_route_state(env, curriculum_cfg, dtype=dtype)
 
     if torch.any(
@@ -237,84 +238,113 @@ def reset_routes(
 
     env._parkour_course_index[env_ids] = course_indices
     env._parkour_active_waypoint_index[env_ids] = 0
-    env._parkour_waypoint_hold_time_s[env_ids] = 0.0
     env._parkour_active_waypoint_changed[env_ids] = False
 
     first_waypoints = env._parkour_waypoint_table[course_indices, 0]
-    _write_goal_marker(env, env_ids, first_waypoints, goal_cfg)
+    _write_waypoint_marker(
+        env,
+        env_ids,
+        first_waypoints,
+        waypoint_marker_cfg,
+    )
     return course_indices
+
+
+def _active_waypoint_plane_passed(
+    env: ManagerBasedRLEnv,
+    robot_xy: torch.Tensor,
+    *,
+    lateral_tolerance: float,
+) -> torch.Tensor:
+    """Detect route-plane crossings without accepting lateral shortcuts."""
+
+    import torch
+
+    # [num_envs]: course and active-waypoint cursor for each environment.
+    course_indices = env._parkour_course_index
+    active_indices = env._parkour_active_waypoint_index
+    # [num_envs]: waypoint cursor immediately before each active target.
+    previous_indices = (active_indices - 1).clamp_min(0)
+    # [num_envs, 2]: XY waypoint preceding each active target.
+    previous_waypoints = env._parkour_waypoint_table[
+        course_indices,
+        previous_indices,
+        :2,
+    ]
+    # [num_envs, 2]: segment start; the condition broadcasts over XY.
+    segment_starts = torch.where(
+        (active_indices > 0)[:, None],
+        previous_waypoints,
+        torch.zeros_like(previous_waypoints),
+    )
+    # [num_envs, 2]: active target and vector from segment start to target.
+    segment_ends = env._parkour_waypoint_table[
+        course_indices,
+        active_indices,
+        :2,
+    ]
+    segment_vectors = segment_ends - segment_starts
+    segment_lengths = torch.linalg.norm(segment_vectors, dim=-1)
+    valid_segment = segment_lengths > torch.finfo(robot_xy.dtype).eps
+    unit_directions = (
+        segment_vectors
+        / segment_lengths.clamp_min(torch.finfo(robot_xy.dtype).eps)[:, None]
+    )
+    relative_position = robot_xy - segment_starts
+    longitudinal = torch.sum(relative_position * unit_directions, dim=-1)
+    lateral_vector = relative_position - longitudinal[:, None] * unit_directions
+    lateral_distance = torch.linalg.norm(lateral_vector, dim=-1)
+    return (
+        valid_segment
+        & (longitudinal >= segment_lengths)
+        & (lateral_distance < lateral_tolerance)
+    )
 
 
 def _advance_route_state(
     active_indices: torch.Tensor,
     waypoint_counts: torch.Tensor,
-    hold_times_s: torch.Tensor,
     within_radius: torch.Tensor,
+    passed_waypoint_plane: torch.Tensor,
     final_waypoint_eligible: torch.Tensor,
-    *,
-    step_dt_s: float,
-    reach_hold_s: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Advance independently reached cursors without exceeding route lengths.
 
-    ``final_waypoint_eligible`` lets the runtime impose a stricter completion
-    condition on the last waypoint while intermediate routing points advance
-    from proximity alone.
+    Intermediate routing points advance immediately from proximity or a safe
+    crossing of their route-normal plane. Final completion instead requires
+    proximity and ``final_waypoint_eligible``.
 
     Args:
         active_indices: Current waypoint index for each parallel environment.
             Each value is a cursor into that environment's configured route.
         waypoint_counts: Number of valid waypoints in each environment's route.
-        hold_times_s: Time each environment has continuously remained within
-            its active waypoint radius.
         within_radius: Whether each environment is currently close enough to
             its active waypoint.
+        passed_waypoint_plane: Whether each environment passed its active
+            waypoint along the current route segment while remaining inside
+            the configured lateral corridor.
         final_waypoint_eligible: Whether each environment satisfies the extra
             completion condition required at its final waypoint.
-        step_dt_s: Duration represented by this state update, in seconds.
-        reach_hold_s: Continuous time required inside the waypoint radius.
 
     Returns:
-        The next active indices, next dwell times, and completed-course mask.
+        The next active indices and completed-course mask.
     """
-
-    # Accumulate dwell time only while an environment remains inside its active
-    # waypoint radius. Multiplication by the Boolean mask resets the timer to
-    # zero immediately after the robot leaves that radius.
-    next_hold_times_s = (hold_times_s + step_dt_s) * within_radius
-
-    # Account for float32 accumulation (for example, 0.08 + 0.02 may be stored
-    # just below 0.10) without shortening the dwell by a meaningful duration.
-    dwell_satisfied = within_radius & (
-        next_hold_times_s >= reach_hold_s - step_dt_s * 1.0e-6
-    )
 
     # Each environment can follow a route of a different length, so determine
     # its final index from its own waypoint count rather than a shared constant.
     final_waypoint = active_indices == waypoint_counts - 1
 
-    # Proximity and dwell time are sufficient for an intermediate waypoint.
-    # The final waypoint additionally requires the caller's completion gate,
-    # such as the minimum-clearance check used by the runtime.
-    reached_waypoint = dwell_satisfied & (~final_waypoint | final_waypoint_eligible)
+    # Intermediate route markers are control targets rather than places where
+    # the robot should stop. Retarget as soon as the robot enters their radius
+    # or crosses the marker plane inside the same lateral tolerance.
+    advance_cursor = (~final_waypoint) & (within_radius | passed_waypoint_plane)
 
-    # Split a reached event into mutually exclusive outcomes: the final target
-    # completes the course, while an intermediate target advances the cursor.
-    completed_course = reached_waypoint & final_waypoint
-    advance_cursor = reached_waypoint & ~final_waypoint
+    completed_course = final_waypoint & within_radius & final_waypoint_eligible
 
     # Adding a Boolean tensor increments selected cursors by exactly one. Final
     # cursors are excluded above, so no index can exceed its route length.
     next_active_indices = active_indices + advance_cursor
-
-    # Begin a fresh dwell interval after reaching a waypoint; otherwise retain
-    # the accumulated time for environments that are still approaching it.
-    next_hold_times_s = next_hold_times_s * ~reached_waypoint
-    return (
-        next_active_indices,
-        next_hold_times_s,
-        completed_course,
-    )
+    return next_active_indices, completed_course
 
 
 def _ensure_route_state(
@@ -346,8 +376,23 @@ def _ensure_route_state(
             device=env.device,
             dtype=torch.long,
         )
-        for course_index, route in enumerate(routes):
+        milestone_table = torch.zeros(
+            (len(routes), max_waypoints),
+            device=env.device,
+            dtype=torch.bool,
+        )
+        milestone_counts = torch.zeros(
+            len(routes),
+            device=env.device,
+            dtype=torch.long,
+        )
+        for course_index, (course, route) in enumerate(zip(courses, routes)):
             route_tensor = torch.tensor(route, device=env.device, dtype=dtype)
+            milestone_flags = torch.tensor(
+                [waypoint.is_rewarded_milestone for waypoint in course.waypoints],
+                device=env.device,
+                dtype=torch.bool,
+            )
 
             # Routes may contain different numbers of waypoints. Store the
             # actual length separately because the table must be rectangular
@@ -360,6 +405,8 @@ def _ensure_route_state(
             # cursors never intentionally advance into these padding entries.
             table[course_index, count:] = route_tensor[-1]
             counts[course_index] = count
+            milestone_table[course_index, :count] = milestone_flags
+            milestone_counts[course_index] = milestone_flags[:-1].sum()
         cumulative = torch.zeros(
             (len(routes), max_waypoints),
             device=env.device,
@@ -389,6 +436,8 @@ def _ensure_route_state(
             dtype=dtype,
         )
         env._parkour_waypoint_count_by_course = counts
+        env._parkour_waypoint_milestone_table = milestone_table
+        env._parkour_milestone_count_by_course = milestone_counts
         env._parkour_route_cumulative_m = cumulative
         env._parkour_target_speed_by_course = target_speeds
         env._parkour_min_clearance_by_course = min_clearances
@@ -406,7 +455,6 @@ def _ensure_route_state(
         (
             dtype,
             (
-                "_parkour_waypoint_hold_time_s",
                 "_parkour_last_max_course_progress_m",
                 "_parkour_max_course_progress_m",
             ),
@@ -480,35 +528,35 @@ def _route_progress_m(
     return progress
 
 
-def _write_goal_marker(
+def _write_waypoint_marker(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
     waypoint_pos: torch.Tensor,
-    goal_cfg: SceneEntityCfg,
+    waypoint_marker_cfg: SceneEntityCfg,
 ) -> None:
     """Move selected kinematic markers from terrain-local to world positions."""
 
     import torch
 
-    goal = env.scene[goal_cfg.name]
+    waypoint_marker = env.scene[waypoint_marker_cfg.name]
 
     # Each default root-state row contains 13 values:
     # ``[position_xyz(3), quaternion_wxyz(4), linear_velocity_xyz(3),
     # angular_velocity_xyz(3)]``. Select the requested environments and retain
     # only the first seven pose values because velocity is written separately.
-    goal_pose = goal.data.default_root_state[env_ids, :7].clone()
-    goal_pose[:, :3] = waypoint_pos + env.scene.env_origins[env_ids]
+    marker_pose = waypoint_marker.data.default_root_state[env_ids, :7].clone()
+    marker_pose[:, :3] = waypoint_pos + env.scene.env_origins[env_ids]
     zero_velocity = torch.zeros(
         (env_ids.numel(), 6),
         device=env.device,
-        dtype=goal_pose.dtype,
+        dtype=marker_pose.dtype,
     )
-    # ``goal_pose`` has shape ``[len(env_ids), 7]``. Each row contains the
+    # ``marker_pose`` has shape ``[len(env_ids), 7]``. Each row contains the
     # world-frame position ``(x, y, z)`` followed by the root quaternion
-    # ``(w, x, y, z)`` for one selected goal marker.
-    goal.write_root_pose_to_sim(goal_pose, env_ids=env_ids)
+    # ``(w, x, y, z)`` for one selected waypoint marker.
+    waypoint_marker.write_root_pose_to_sim(marker_pose, env_ids=env_ids)
 
     # ``zero_velocity`` has shape ``[len(env_ids), 6]``. Each row contains
     # world-frame linear velocity ``(vx, vy, vz)`` followed by angular
     # velocity ``(wx, wy, wz)``, all zero so the kinematic marker stays still.
-    goal.write_root_velocity_to_sim(zero_velocity, env_ids=env_ids)
+    waypoint_marker.write_root_velocity_to_sim(zero_velocity, env_ids=env_ids)

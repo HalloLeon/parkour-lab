@@ -24,8 +24,7 @@ def base_contact_done(
 def completed_course_done(
     env: ManagerBasedRLEnv,
     reach_threshold: float,
-    reach_hold_s: float,
-    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Advance active waypoints and terminate only after the safe final one.
@@ -37,7 +36,6 @@ def completed_course_done(
     return advance_active_waypoints(
         env,
         reach_threshold=reach_threshold,
-        reach_hold_s=reach_hold_s,
-        goal_cfg=goal_cfg,
+        waypoint_marker_cfg=waypoint_marker_cfg,
         asset_cfg=asset_cfg,
     )

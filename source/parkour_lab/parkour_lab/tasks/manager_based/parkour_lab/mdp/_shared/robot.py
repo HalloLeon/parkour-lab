@@ -45,7 +45,7 @@ def _root_forward_xy_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = Scene
 
     # Keep only the horizontal part of the world-frame forward vector.
     #
-    # We discard z because goal navigation uses the ground-plane heading:
+    # We discard z because waypoint navigation uses the ground-plane heading:
     #
     #     forward_w  = [x, y, z]
     #     forward_xy = [x, y]

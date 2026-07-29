@@ -25,8 +25,11 @@ def reset_routes_and_commands(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor | None,
     curriculum_cfg: curriculums_config.ParkourCurriculumCfg = curriculums_config.DEFAULT_PARKOUR_CURRICULUM,
-    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
 ) -> None:
     curriculums.reset_routes_and_commands(
-        env=env, env_ids=env_ids, curriculum_cfg=curriculum_cfg, goal_cfg=goal_cfg
+        env=env,
+        env_ids=env_ids,
+        curriculum_cfg=curriculum_cfg,
+        waypoint_marker_cfg=waypoint_marker_cfg,
     )

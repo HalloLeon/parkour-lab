@@ -95,25 +95,30 @@ def parkour_terrain_levels(
 
     family_index_buffer = _family_index_buffer(env)
     success_streak_buffer = _success_streak_buffer(env)
+    demotion_streak_buffer = _demotion_streak_buffer(env)
     if env_ids.numel() == 0:
         empty_bool = torch.zeros(0, device=env.device, dtype=torch.bool)
         return _curriculum_stats(
             terrain=terrain,
             curriculum_cfg=curriculum_cfg,
             success_streaks=success_streak_buffer,
+            demotion_streaks=demotion_streak_buffer,
             family_indices=family_index_buffer[env_ids],
             maximum_progress=torch.zeros(0, device=env.device),
             promotion_ready=empty_bool,
+            poor_failure_event=empty_bool,
             demotion_ready=empty_bool,
             success_event=empty_bool,
             failure_event=empty_bool,
             actual_change=torch.zeros(0, device=env.device, dtype=torch.long),
         )
 
-    success_event, _, failure_event = _terminal_event_masks(
+    success_event, terminal_event, failure_event = _terminal_event_masks(
         env,
         env_ids,
     )
+    old_levels = terrain.terrain_levels[env_ids].clone()
+
     updated_streaks, promotion_ready = _success_streak_transition(
         success_streak_buffer[env_ids],
         success_event,
@@ -122,14 +127,23 @@ def parkour_terrain_levels(
     )
     success_streak_buffer[env_ids] = updated_streaks
 
-    maximum_progress, demotion_ready = _progress_transition_decisions(
+    maximum_progress, poor_failure_event = _progress_transition_decisions(
         env,
         env_ids,
         failure_event,
         curriculum_cfg,
     )
+    # Flat terrain has no lower row. Do not accumulate a stale demotion streak
+    # there that could become ready despite being unable to change level.
+    poor_failure_event = poor_failure_event & (old_levels > 0)
+    updated_demotion_streaks, demotion_ready = _demotion_streak_transition(
+        demotion_streak_buffer[env_ids],
+        poor_failure_event,
+        terminal_event,
+        required_failures=curriculum_cfg.demotion_failures_required,
+    )
+    demotion_streak_buffer[env_ids] = updated_demotion_streaks
 
-    old_levels = terrain.terrain_levels[env_ids].clone()
     move_up = promotion_ready & (old_levels < curriculum_cfg.max_level)
     move_down = demotion_ready & (old_levels > 0) & (~move_up)
 
@@ -142,14 +156,17 @@ def parkour_terrain_levels(
     actual_change = new_levels - old_levels
     level_changed = actual_change != 0
     success_streak_buffer[env_ids[level_changed]] = 0
+    demotion_streak_buffer[env_ids[level_changed]] = 0
 
     return _curriculum_stats(
         terrain=terrain,
         curriculum_cfg=curriculum_cfg,
         success_streaks=success_streak_buffer,
+        demotion_streaks=demotion_streak_buffer,
         family_indices=family_index_buffer[env_ids],
         maximum_progress=maximum_progress,
         promotion_ready=promotion_ready,
+        poor_failure_event=poor_failure_event,
         demotion_ready=demotion_ready,
         success_event=success_event,
         failure_event=failure_event,
@@ -161,21 +178,21 @@ def reset_routes_and_commands(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor | None,
     curriculum_cfg: config.ParkourCurriculumCfg = config.DEFAULT_PARKOUR_CURRICULUM,
-    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
 ) -> None:
-    """Reset the route cursor, goal marker, and commands for selected environments.
+    """Reset the route cursor, waypoint marker, and commands.
 
     The terrain level has already been updated by the CurriculumManager before
     reset events are applied.
 
     Args:
-        env: Vectorized environment containing terrain, route, goal-marker, and
-            command state.
+        env: Vectorized environment containing terrain, route, waypoint-marker,
+            and command state.
         env_ids: Environments beginning a new episode, or ``None`` for all
             environments.
         curriculum_cfg: Course matrix used to resolve the selected family and
             difficulty into route geometry and scalar commands.
-        goal_cfg: Scene-entity selection for the visible waypoint marker.
+        waypoint_marker_cfg: Scene-entity selection for the visible marker.
     """
 
     env_ids = _all_env_ids(env, env_ids)
@@ -198,7 +215,7 @@ def reset_routes_and_commands(
         family_indices,
         difficulty_indices,
         curriculum_cfg,
-        goal_cfg,
+        waypoint_marker_cfg,
     )
     set_commands(
         env=env,
@@ -212,9 +229,11 @@ def _curriculum_stats(
     terrain: TerrainImporter,
     curriculum_cfg: config.ParkourCurriculumCfg,
     success_streaks: torch.Tensor,
+    demotion_streaks: torch.Tensor,
     family_indices: torch.Tensor,
     maximum_progress: torch.Tensor,
     promotion_ready: torch.Tensor,
+    poor_failure_event: torch.Tensor,
     demotion_ready: torch.Tensor,
     success_event: torch.Tensor,
     failure_event: torch.Tensor,
@@ -241,12 +260,14 @@ def _curriculum_stats(
             (population_levels == curriculum_cfg.max_level).float().mean()
         ),
         "mean_success_streak": success_streaks.float().mean(),
+        "mean_demotion_streak": demotion_streaks.float().mean(),
         "success_rate": _event_rate(success_event),
         "failure_rate": _event_rate(failure_event),
         "mean_max_course_progress_m": (
             maximum_progress.float().mean() if maximum_progress.numel() > 0 else zero
         ),
         "promotion_ready_rate": _event_rate(promotion_ready),
+        "poor_failure_rate": _event_rate(poor_failure_event),
         "demotion_ready_rate": _event_rate(demotion_ready),
         "promotion_rate": _event_rate(actual_change > 0),
         "demotion_rate": _event_rate(actual_change < 0),
@@ -379,6 +400,16 @@ def _progress_transition_decisions(
     return maximum_progress, demotion_ready
 
 
+def _demotion_streak_buffer(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return consecutive clearly under-progress failures per environment."""
+
+    return _get_or_init_env_buffer(
+        env,
+        "_parkour_demotion_streak",
+        torch.zeros(env.num_envs, device=env.device, dtype=torch.long),
+    )
+
+
 def _success_streak_buffer(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Return consecutive successful completions for every environment."""
 
@@ -386,6 +417,54 @@ def _success_streak_buffer(env: ManagerBasedRLEnv) -> torch.Tensor:
         env,
         "_parkour_success_streak",
         torch.zeros(env.num_envs, device=env.device, dtype=torch.long),
+    )
+
+
+def _demotion_streak_transition(
+    demotion_streaks: torch.Tensor,
+    poor_failure_event: torch.Tensor,
+    terminal_event: torch.Tensor,
+    *,
+    required_failures: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Update poor-failure counts and return demotion readiness.
+
+    Only a terminal failure below the progress threshold increments the streak.
+    Any other completed episode clears it, while initial and manual resets
+    preserve it because they provide no outcome evidence.
+    """
+
+    incremented = torch.clamp(demotion_streaks + 1, max=required_failures)
+    updated_streaks = torch.where(
+        poor_failure_event,
+        incremented,
+        demotion_streaks,
+    )
+    completed_without_poor_failure = terminal_event & (~poor_failure_event)
+    updated_streaks = torch.where(
+        completed_without_poor_failure,
+        torch.zeros_like(demotion_streaks),
+        updated_streaks,
+    )
+    demotion_ready = poor_failure_event & (updated_streaks >= required_failures)
+    return updated_streaks, demotion_ready
+
+
+def _demotion_transition_mask(
+    maximum_progress: torch.Tensor,
+    expected_distances: torch.Tensor,
+    failure_event: torch.Tensor,
+    *,
+    demotion_expected_distance_fraction: float,
+) -> torch.Tensor:
+    """Return which failed episodes made too little commanded progress.
+
+    The strict comparison leaves exact-threshold outcomes unchanged. Successful
+    completions, initial resets, and manual resets remain ineligible.
+    """
+
+    return failure_event & (
+        maximum_progress < demotion_expected_distance_fraction * expected_distances
     )
 
 
@@ -412,24 +491,6 @@ def _success_streak_transition(
     )
     promotion_ready = success_event & (updated_streaks >= required_successes)
     return updated_streaks, promotion_ready
-
-
-def _demotion_transition_mask(
-    maximum_progress: torch.Tensor,
-    expected_distances: torch.Tensor,
-    failure_event: torch.Tensor,
-    *,
-    demotion_expected_distance_fraction: float,
-) -> torch.Tensor:
-    """Return which failed episodes made too little commanded progress.
-
-    The strict comparison leaves exact-threshold outcomes unchanged. Successful
-    completions, initial resets, and manual resets remain ineligible.
-    """
-
-    return failure_event & (
-        maximum_progress < demotion_expected_distance_fraction * expected_distances
-    )
 
 
 def _terminal_event_masks(

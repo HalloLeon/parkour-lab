@@ -275,9 +275,15 @@ class ParkourSupportRegionCfg:
 
 @dataclass(frozen=True)
 class ParkourWaypointCfg:
-    """One ordered course waypoint in terrain-local XYZ coordinates."""
+    """One ordered course waypoint in terrain-local XYZ coordinates.
+
+    ``is_rewarded_milestone`` distinguishes physical obstacle progress from a
+    waypoint used only to align or redirect the route. Final waypoints must
+    leave it false because safe course completion has its own reward.
+    """
 
     position: tuple[float, float, float]
+    is_rewarded_milestone: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -285,11 +291,16 @@ class ParkourWaypointCfg:
             "position",
             _float_triplet(self.position, field_name="waypoint position"),
         )
+        if not isinstance(self.is_rewarded_milestone, bool):
+            raise TypeError("is_rewarded_milestone must be a Boolean.")
 
     def metadata(self) -> dict[str, object]:
         """Return a JSON-compatible description of this waypoint."""
 
-        return {"position": list(self.position)}
+        return {
+            "position": list(self.position),
+            "is_rewarded_milestone": self.is_rewarded_milestone,
+        }
 
 
 @dataclass(frozen=True)
@@ -319,12 +330,12 @@ class ParkourLevelCfg:
     # of existing structure geometry and may be inclined convex polygons.
     support_regions: tuple[ParkourSupportRegionCfg, ...]
 
-    # Desired velocity toward the active goal in meters per second. It is
-    # exposed as a command and used to normalize goal-directed velocity reward.
+    # Desired velocity toward the active waypoint in meters per second. It is
+    # exposed as a command and normalizes waypoint-directed velocity reward.
     target_speed: float
 
     # Required robot-base clearance above the terrain in meters. Safety,
-    # stability, and successful-goal checks consume this level-specific value.
+    # stability and final-waypoint completion consume this level-specific value.
     min_clearance: float
 
     # Explicit easiest-to-hardest rank plus obstacle-family-specific values.
@@ -365,12 +376,13 @@ class ParkourLevelCfg:
             raise ValueError(f"{self.name}: support-region names must be unique.")
 
         self._validate_support_references(structure_by_name)
+        self._validate_rewarded_milestones()
         self._validate_final_waypoint()
         self._validate_training_targets()
 
     @property
-    def goal_pos(self) -> tuple[float, float, float]:
-        """Return the final course waypoint for metadata compatibility."""
+    def final_waypoint_pos(self) -> tuple[float, float, float]:
+        """Return the final course waypoint."""
 
         return self.waypoints[-1].position
 
@@ -388,7 +400,7 @@ class ParkourLevelCfg:
             "difficulty": self.difficulty.metadata(),
             # Keep the derived endpoint convenient for reports and external
             # tooling; runtime navigation uses the ordered ``waypoints`` above.
-            "goal_pos": list(self.goal_pos),
+            "final_waypoint_pos": list(self.final_waypoint_pos),
         }
 
     def validate_terrain_size(self, size: tuple[float, float]) -> None:
@@ -435,9 +447,26 @@ class ParkourLevelCfg:
     def _validate_final_waypoint(self) -> None:
         """Require the final waypoint to lie on a configured support region."""
 
+        if self.waypoints[-1].is_rewarded_milestone:
+            raise ValueError(
+                f"{self.name}: the final waypoint uses the course-completion "
+                "reward and cannot also be an intermediate rewarded milestone."
+            )
         final_position = self.waypoints[-1].position
         if not any(region.supports_waypoint(final_position) for region in self.support_regions):
             raise ValueError(f"{self.name}: final waypoint must lie on a valid support region.")
+
+    def _validate_rewarded_milestones(self) -> None:
+        """Require every rewarded intermediate milestone to lie on support."""
+
+        for index, waypoint in enumerate(self.waypoints[:-1]):
+            if waypoint.is_rewarded_milestone and not any(
+                region.supports_waypoint(waypoint.position)
+                for region in self.support_regions
+            ):
+                raise ValueError(
+                    f"{self.name}: rewarded waypoint {index} must lie on a valid support region."
+                )
 
     def _validate_support_references(
         self,
@@ -751,7 +780,13 @@ def coerce_waypoint_cfg(
         return waypoint
     if not isinstance(waypoint, Mapping) or "position" not in waypoint:
         raise TypeError("Waypoint must be a mapping containing 'position'.")
-    return ParkourWaypointCfg(position=cast(tuple[float, float, float], waypoint["position"]))
+    return ParkourWaypointCfg(
+        position=cast(tuple[float, float, float], waypoint["position"]),
+        is_rewarded_milestone=cast(
+            bool,
+            waypoint.get("is_rewarded_milestone", False),
+        ),
+    )
 
 
 # Polygon-geometry helpers.

@@ -72,8 +72,8 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         ),
     )
 
-    goal: RigidObjectCfg = RigidObjectCfg(
-        prim_path="{ENV_REGEX_NS}/Goal",
+    waypoint_marker: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/WaypointMarker",
         spawn=sim_utils.CylinderCfg(
             radius=PARKOUR_CURRICULUM.waypoint_reach_threshold,
             height=0.02,
@@ -261,10 +261,10 @@ class ObservationsCfg:
 
         # Exact distance to the simulator waypoint can improve value
         # estimation but is not available to the deployed motor policy.
-        goal_distance_xy = ObsTerm(
-            func=mdp.goal_distance_xy_w,
+        active_waypoint_distance_xy = ObsTerm(
+            func=mdp.active_waypoint_distance_xy,
             params={
-                "goal_cfg": SceneEntityCfg("goal"),
+                "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
                 "asset_cfg": SceneEntityCfg("robot"),
             },
         )
@@ -305,7 +305,7 @@ class ObservationsCfg:
         active_waypoint_direction_yaw_xy = ObsTerm(
             func=mdp.active_waypoint_direction_yaw_xy,
             params={
-                "waypoint_marker_cfg": SceneEntityCfg("goal"),
+                "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
                 "asset_cfg": SceneEntityCfg("robot"),
             },
         )
@@ -355,7 +355,7 @@ class EventsCfg:
         mode="reset",
         params={
             "curriculum_cfg": PARKOUR_CURRICULUM,
-            "goal_cfg": SceneEntityCfg("goal"),
+            "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
         },
     )
 
@@ -407,38 +407,45 @@ class RewardsCfg:
     """
     Task, safety, and motion-quality rewards for parkour locomotion.
 
-    Normalized world-frame velocity toward the goal is the only dense progress
-    signal. Safety remains separate so low clearance or recovery does not erase
-    the directional learning signal. Flight and absolute roll/pitch are not
+    Normalized world-frame velocity toward the active waypoint is the dense
+    progress signal. One-shot physical-milestone and completion bonuses make
+    discrete progress unambiguous without rewarding proximity every step.
+    Safety remains separate so low clearance or recovery does not erase the
+    directional learning signal. Flight and absolute roll/pitch are not
     penalized directly because both can be necessary on parkour terrain.
     """
 
-    # Goal task.
-    velocity_along_goal_xy = RewTerm(
-        func=mdp.velocity_along_goal_xy_capped,
+    # Active-waypoint task.
+    velocity_along_waypoint_xy = RewTerm(
+        func=mdp.velocity_along_waypoint_xy_capped,
         weight=1.0,
         params={
-            "goal_cfg": SceneEntityCfg("goal"),
+            "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
             "asset_cfg": SceneEntityCfg("robot"),
         },
     )
 
-    goal_heading_misalignment = RewTerm(
-        func=mdp.goal_heading_misalignment_l2,
+    waypoint_heading_misalignment = RewTerm(
+        func=mdp.waypoint_heading_misalignment_l2,
         weight=-0.05,
         params={
-            "heading_cfg": mdp.config.GoalHeadingCfg(
+            "heading_cfg": mdp.config.WaypointHeadingCfg(
                 max_heading_error=1.0, min_forward_speed=0.1, full_forward_speed=0.5
             ),
-            "goal_cfg": SceneEntityCfg("goal"),
+            "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
             "asset_cfg": SceneEntityCfg("robot"),
         },
     )
 
-    completed_course = RewTerm(
-        func=mdp.completed_course_reward,
-        weight=100.0,
+    # Explicit physical milestones split one conservative +2 shaping budget;
+    # approach and alignment-only route markers do not receive a bonus.
+    intermediate_milestone = RewTerm(
+        func=mdp.intermediate_milestone_reward,
+        weight=2.0,
+        params={"asset_cfg": SceneEntityCfg("robot")},
     )
+
+    completed_course = RewTerm(func=mdp.completed_course_reward, weight=10.0)
 
     # Safety.
     illegal_contact = RewTerm(
@@ -516,8 +523,7 @@ class TerminationsCfg:
         func=mdp.completed_course_done,
         params={
             "reach_threshold": PARKOUR_CURRICULUM.waypoint_reach_threshold,
-            "reach_hold_s": PARKOUR_CURRICULUM.waypoint_reach_hold_s,
-            "goal_cfg": SceneEntityCfg("goal"),
+            "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
             "asset_cfg": SceneEntityCfg("robot"),
         },
     )
@@ -749,7 +755,9 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
 
         # Keep the visible marker footprint consistent with the configured XY
         # radius used by the waypoint transition condition.
-        self.scene.goal.spawn.radius = curriculum_cfg.waypoint_reach_threshold
+        self.scene.waypoint_marker.spawn.radius = (
+            curriculum_cfg.waypoint_reach_threshold
+        )
 
         # Pass the same curriculum object to reset events so initial terrain
         # assignment, active routes, and commands use the authoritative table.
@@ -758,9 +766,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         self.events.initialize_terrain_levels.params["initial_level_override"] = (
             self.evaluation_level
         )
-        self.events.reset_routes_and_commands.params["curriculum_cfg"] = (
-            curriculum_cfg
-        )
+        self.events.reset_routes_and_commands.params["curriculum_cfg"] = curriculum_cfg
 
         # The fixed evaluation configuration disables adaptive curriculum
         # updates, so synchronize this term only when it is present.
@@ -768,13 +774,9 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
             self.curriculum.terrain_levels.params["curriculum_cfg"] = curriculum_cfg
 
         # The success term owns route advancement before reward computation.
-        # Synchronize its proximity and dwell contract with the authoritative
-        # curriculum so only a safely reached final waypoint ends an episode.
+        # Synchronize its waypoint radius with the authoritative curriculum.
         self.terminations.success.params["reach_threshold"] = (
             curriculum_cfg.waypoint_reach_threshold
-        )
-        self.terminations.success.params["reach_hold_s"] = (
-            curriculum_cfg.waypoint_reach_hold_s
         )
 
         # Likewise, use one contact threshold for both the safety penalty and

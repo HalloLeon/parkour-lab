@@ -12,7 +12,9 @@ from .navigation import geometry
 from .terrain import queries
 
 
-def base_clearance_obs(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def base_clearance_obs(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
     """
     Base/root clearance above the support surface underneath the robot.
 
@@ -57,52 +59,67 @@ def foot_contact_state(
     return in_contact.float() - 0.5
 
 
-def goal_direction_body_xy(
+def active_waypoint_direction_body_xy(
     env: ManagerBasedRLEnv,
-    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
-    Direction from robot to goal, expressed in the robot body frame.
+    Direction to the active waypoint in the robot body frame.
 
     Returns:
         [num_envs, 2]
 
     Interpretation:
-        x component: goal is in front/behind robot
-        y component: goal is left/right of robot
+        x component: waypoint is in front/behind robot
+        y component: waypoint is left/right of robot
     """
 
     asset: Articulation = env.scene[asset_cfg.name]
 
-    goal_vec_xy = geometry._goal_vector_xy(env, goal_cfg, asset_cfg)
+    waypoint_vector_xy = geometry._active_waypoint_vector_xy(
+        env,
+        waypoint_marker_cfg,
+        asset_cfg,
+    )
 
-    goal_vec_w = torch.zeros((goal_vec_xy.shape[0], 3), device=goal_vec_xy.device, dtype=goal_vec_xy.dtype)
-    goal_vec_w[:, :2] = goal_vec_xy
+    waypoint_vector_w = torch.zeros(
+        (waypoint_vector_xy.shape[0], 3),
+        device=waypoint_vector_xy.device,
+        dtype=waypoint_vector_xy.dtype,
+    )
+    waypoint_vector_w[:, :2] = waypoint_vector_xy
 
-    # Rotate the world-frame goal vector into the robot body frame.
+    # Rotate the world-frame waypoint vector into the robot body frame.
     #
     # If q is the robot root orientation, this applies the inverse rotation:
     #
-    #     goal_vec_b = q^-1 * goal_vec_w * q
+    #     waypoint_vector_b = q^-1 * waypoint_vector_w * q
     #
     # This answers the question:
     #
-    #     "Where is the goal relative to the robot's own forward/left axes?"
+    #     "Where is the waypoint relative to the robot's forward/left axes?"
     #
     # Examples:
-    #   robot yaw =   0 deg, goal world +x -> goal_vec_b ≈ [ 1,  0, 0]
-    #   robot yaw =  90 deg, goal world +x -> goal_vec_b ≈ [ 0, -1, 0]
-    #   robot yaw = 180 deg, goal world +x -> goal_vec_b ≈ [-1,  0, 0]
-    goal_vec_b = quat_apply_inverse(asset.data.root_quat_w, goal_vec_w)
-    goal_dir_b_xy = goal_vec_b[:, :2]
+    #   robot yaw =   0 deg, waypoint world +x -> vector_b ≈ [ 1,  0, 0]
+    #   robot yaw =  90 deg, waypoint world +x -> vector_b ≈ [ 0, -1, 0]
+    #   robot yaw = 180 deg, waypoint world +x -> vector_b ≈ [-1,  0, 0]
+    waypoint_vector_b = quat_apply_inverse(
+        asset.data.root_quat_w,
+        waypoint_vector_w,
+    )
+    waypoint_direction_b_xy = waypoint_vector_b[:, :2]
 
-    return goal_dir_b_xy / torch.linalg.norm(goal_dir_b_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
+    return waypoint_direction_b_xy / torch.linalg.norm(
+        waypoint_direction_b_xy,
+        dim=-1,
+        keepdim=True,
+    ).clamp_min(1.0e-6)
 
 
 def active_waypoint_direction_yaw_xy(
     env: ManagerBasedRLEnv,
-    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
@@ -121,22 +138,28 @@ def active_waypoint_direction_yaw_xy(
     )
 
 
-def goal_distance_xy_w(
+def active_waypoint_distance_xy(
     env: ManagerBasedRLEnv,
-    goal_cfg: SceneEntityCfg = SceneEntityCfg("goal"),
+    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """
-    XY distance from robot root to goal.
+    XY distance from robot root to the active waypoint.
 
     Returns:
         [num_envs, 1]
     """
 
-    return geometry._goal_distance_xy(env, goal_cfg, asset_cfg).unsqueeze(-1)
+    return geometry._active_waypoint_distance_xy(
+        env,
+        waypoint_marker_cfg,
+        asset_cfg,
+    ).unsqueeze(-1)
 
 
-def student_exteroception_stub(env: ManagerBasedRLEnv, feature_dim: int = 64) -> torch.Tensor:
+def student_exteroception_stub(
+    env: ManagerBasedRLEnv, feature_dim: int = 64
+) -> torch.Tensor:
     """
     Return an information-free placeholder for a future depth embedding.
 
@@ -225,7 +248,9 @@ def _terrain_height_scan_components(
     asset: Articulation = env.scene[asset_cfg.name]
 
     if not isinstance(sensor, RayCaster):
-        raise TypeError(f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}.")
+        raise TypeError(
+            f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}."
+        )
 
     return queries._terrain_height_components(
         asset.data.root_pos_w[:, 2],

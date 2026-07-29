@@ -11,12 +11,13 @@ They are imported here so references such as ``mdp.base_contact`` continue
 to work.
 """
 
-from .reward_terms.goal import (
+from .reward_terms.waypoint import (
     completed_course_reward,
-    goal_heading_misalignment_l2,
-    goal_progress_xy_stable,
-    velocity_along_goal_xy_capped,
-    velocity_along_goal_xy_clearance_capped,
+    intermediate_milestone_reward,
+    velocity_along_waypoint_xy_capped,
+    velocity_along_waypoint_xy_clearance_capped,
+    waypoint_heading_misalignment_l2,
+    waypoint_progress_xy_stable,
 )
 from .reward_terms.limb import (
     feet_edge,
@@ -29,12 +30,13 @@ from .reward_terms.root_motion import root_chatter_l2
 from .reward_terms.safety import base_clearance_below_l2, base_contact
 
 __all__ = [
-    # Goal-directed task terms.
-    "velocity_along_goal_xy_capped",
-    "velocity_along_goal_xy_clearance_capped",
-    "goal_progress_xy_stable",
-    "goal_heading_misalignment_l2",
+    # Active-waypoint task terms.
     "completed_course_reward",
+    "intermediate_milestone_reward",
+    "velocity_along_waypoint_xy_capped",
+    "velocity_along_waypoint_xy_clearance_capped",
+    "waypoint_heading_misalignment_l2",
+    "waypoint_progress_xy_stable",
     # Safety and clearance penalties.
     "base_contact",
     "base_clearance_below_l2",

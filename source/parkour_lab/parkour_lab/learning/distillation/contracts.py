@@ -161,7 +161,8 @@ def build_teacher_interface(
             "oracle_heading_source": {
                 "kind": "active_course_waypoint",
                 "reach_threshold_m": float(curriculum_cfg.waypoint_reach_threshold),
-                "reach_hold_s": float(curriculum_cfg.waypoint_reach_hold_s),
+                "intermediate_transition": "radius_or_route_plane",
+                "final_transition": "radius",
                 "final_requires_min_clearance": True,
             },
             "privileged_terrain_group": PRIVILEGED_TERRAIN_GROUP,

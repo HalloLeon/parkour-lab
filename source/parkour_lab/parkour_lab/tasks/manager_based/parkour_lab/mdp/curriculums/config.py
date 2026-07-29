@@ -164,7 +164,10 @@ def _gap_level(
         obstacle_family="gap",
         waypoints=(
             ParkourWaypointCfg(position=(1.5, 0.0, 0.01)),
-            ParkourWaypointCfg(position=(2.5, 0.0, 0.01)),
+            ParkourWaypointCfg(
+                position=(2.5, 0.0, 0.01),
+                is_rewarded_milestone=True,
+            ),
             ParkourWaypointCfg(position=(3.8, 0.0, 0.01)),
         ),
         structures=(),
@@ -507,7 +510,8 @@ def _tilted_ramp_level(
                         start[0] + _RAMP_WAYPOINT_INSET_M * direction_x,
                         start[1] + _RAMP_WAYPOINT_INSET_M * direction_y,
                         ramp.top_center_z + marker_offset_z,
-                    )
+                    ),
+                    is_rewarded_milestone=True,
                 )
             )
         end = ramp.centerline_end
@@ -517,7 +521,8 @@ def _tilted_ramp_level(
                     end[0] - _RAMP_WAYPOINT_INSET_M * direction_x,
                     end[1] - _RAMP_WAYPOINT_INSET_M * direction_y,
                     ramp.top_center_z + marker_offset_z,
-                )
+                ),
+                is_rewarded_milestone=True,
             )
         )
         if not all(support.supports_waypoint(waypoint.position) for waypoint in ramp_waypoints):
@@ -775,18 +780,19 @@ class ParkourCurriculumCfg:
     distribute_initial_levels: bool = True
     max_level: int = 5
 
-    # A waypoint changes only after the root remains within this XY radius for
-    # ``waypoint_reach_hold_s``.
+    # Intermediate routing targets advance on radius entry or a route-plane
+    # crossing inside this XY corridor. Final completion requires radius entry
+    # and safe base clearance, but no dwell.
     waypoint_reach_threshold: float = 0.20
-    waypoint_reach_hold_s: float = 0.10
 
     # Require repeated mastery at the final waypoint instead of promoting from
     # partial route progress. A terminal failure clears the per-environment
     # streak, so these must be consecutive successful completions.
     promotion_successes_required: int = 2
 
-    # Demotion remains progress-based so a curriculum level that is clearly too
-    # difficult can move down without waiting for the full episode horizon.
+    # Demotion remains progress-based, but one poor episode is not enough to
+    # undo a promotion. Only consecutive clearly under-progress failures count.
+    demotion_failures_required: int = 2
     demotion_expected_distance_fraction: float = 0.50
 
     base_contact_threshold: float = 1.0
@@ -940,17 +946,18 @@ class ParkourCurriculumCfg:
             raise ValueError("waypoint_reach_threshold must be positive.")
 
         if (
-            not np.isfinite(self.waypoint_reach_hold_s)
-            or self.waypoint_reach_hold_s < 0.0
-        ):
-            raise ValueError("waypoint_reach_hold_s must be non-negative.")
-
-        if (
             isinstance(self.promotion_successes_required, bool)
             or not isinstance(self.promotion_successes_required, int)
             or self.promotion_successes_required <= 0
         ):
             raise ValueError("promotion_successes_required must be a positive integer.")
+
+        if (
+            isinstance(self.demotion_failures_required, bool)
+            or not isinstance(self.demotion_failures_required, int)
+            or self.demotion_failures_required <= 0
+        ):
+            raise ValueError("demotion_failures_required must be a positive integer.")
 
         if not 0.0 < self.demotion_expected_distance_fraction <= 1.0:
             raise ValueError("demotion_expected_distance_fraction must be in (0, 1].")
