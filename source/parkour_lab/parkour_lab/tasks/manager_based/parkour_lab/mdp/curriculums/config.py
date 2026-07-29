@@ -113,12 +113,18 @@ def _box_obstacle(
     )
 
 
-def _flat_level() -> ParkourLevelCfg:
-    """Create the obstacle-free entry level of the default curriculum."""
+def _flat_level(obstacle_family: str) -> ParkourLevelCfg:
+    """Create one obstacle-free entry row for an eventual obstacle family.
+
+    Every terrain column retains its assigned family while row zero shares the
+    same flat geometry. Promotion from this bootstrap row therefore moves an
+    environment into the easiest course of its existing family instead of
+    resampling or changing obstacle type.
+    """
 
     return ParkourLevelCfg(
-        name="level_0_flat",
-        obstacle_family="flat",
+        name=f"{obstacle_family}_flat_entry",
+        obstacle_family=obstacle_family,
         waypoints=(ParkourWaypointCfg(position=(3.8, 0.0, 0.01)),),
         structures=(),
         support_regions=(
@@ -596,7 +602,9 @@ def _default_tilted_ramp_level(index: int) -> ParkourLevelCfg:
 
     return _tilted_ramp_level(
         name=f"tilted_ramps_difficulty_{index}",
-        difficulty_order=float(index),
+        # Curriculum row zero is the shared flat entry; obstacle index zero is
+        # therefore the first family-specific row.
+        difficulty_order=float(index + 1),
         ramps=ramps,
         landing_x_range=landing_x_range,
         landing_y_range=landing_y_range,
@@ -610,48 +618,53 @@ def _default_tilted_ramp_level(index: int) -> ParkourLevelCfg:
     )
 
 
-_NUM_DIFFICULTIES = 5
+_NUM_DIFFICULTIES = 6
 
-_DEFAULT_GAP_LEVELS = tuple(
+_DEFAULT_GAP_LEVELS = (_flat_level(obstacle_family="gap"),) + tuple(
     _gap_level(
-        name=f"gap_difficulty_{index}",
-        difficulty_order=float(index),
-        gap_width=round(0.10 + 0.10 * index, 2),
-        target_speed=round(0.60 + 0.05 * index, 2),
-        min_clearance=round(0.24 + 0.01 * index, 2),
+        name=f"gap_difficulty_{obstacle_index}",
+        difficulty_order=float(obstacle_index + 1),
+        gap_width=round(0.10 + 0.10 * obstacle_index, 2),
+        target_speed=round(0.60 + 0.05 * obstacle_index, 2),
+        min_clearance=round(0.24 + 0.01 * obstacle_index, 2),
     )
-    for index in range(_NUM_DIFFICULTIES)
+    for obstacle_index in range(_NUM_DIFFICULTIES - 1)
 )
 
-_DEFAULT_HIGH_STEP_LEVELS = tuple(
+_DEFAULT_HIGH_STEP_LEVELS = (_flat_level(obstacle_family="high_step"),) + tuple(
     _high_step_level(
-        name=f"high_step_difficulty_{index}",
-        difficulty_order=float(index),
-        obstacle_height=round(0.08 + 0.04 * index, 2),
+        name=f"high_step_difficulty_{obstacle_index}",
+        difficulty_order=float(obstacle_index + 1),
+        obstacle_height=round(0.08 + 0.04 * obstacle_index, 2),
         obstacle_width=1.8,
         obstacle_depth=1.6,
         obstacle_position_xy=(2.8, 0.0),
-        target_speed=round(0.60 + 0.04 * index, 2),
-        min_clearance=round(0.24 + 0.01 * index, 2),
+        target_speed=round(0.60 + 0.04 * obstacle_index, 2),
+        min_clearance=round(0.24 + 0.01 * obstacle_index, 2),
     )
-    for index in range(_NUM_DIFFICULTIES)
+    for obstacle_index in range(_NUM_DIFFICULTIES - 1)
 )
 
-_DEFAULT_HURDLE_LEVELS = tuple(
+_DEFAULT_HURDLE_LEVELS = (_flat_level(obstacle_family="hurdle"),) + tuple(
     _hurdle_level(
-        name=f"hurdle_difficulty_{index}",
-        difficulty_order=float(index),
-        obstacle_height=round(0.06 + 0.03 * index, 2),
+        name=f"hurdle_difficulty_{obstacle_index}",
+        difficulty_order=float(obstacle_index + 1),
+        obstacle_height=round(0.06 + 0.03 * obstacle_index, 2),
         obstacle_width=1.8,
         obstacle_depth=0.18,
         obstacle_position_xy=(2.0, 0.0),
-        target_speed=round(0.60 + 0.05 * index, 2),
-        min_clearance=round(0.24 + 0.01 * index, 2),
+        target_speed=round(0.60 + 0.05 * obstacle_index, 2),
+        min_clearance=round(0.24 + 0.01 * obstacle_index, 2),
     )
-    for index in range(_NUM_DIFFICULTIES)
+    for obstacle_index in range(_NUM_DIFFICULTIES - 1)
 )
 
-_DEFAULT_TILTED_RAMP_LEVELS = tuple(_default_tilted_ramp_level(index) for index in range(_NUM_DIFFICULTIES))
+_DEFAULT_TILTED_RAMP_LEVELS = (
+    _flat_level(obstacle_family="tilted_ramps"),
+) + tuple(
+    _default_tilted_ramp_level(obstacle_index)
+    for obstacle_index in range(_NUM_DIFFICULTIES - 1)
+)
 
 _DEFAULT_PARKOUR_FAMILIES = (
     ParkourFamilyCfg(name="gap", levels=_DEFAULT_GAP_LEVELS),
@@ -682,8 +695,8 @@ class ParkourTerrainLayout:
 
     Keeping both parts in one value object makes the complete grid contract
     explicit wherever terrain generation and runtime indexing are connected.
-    For example, a five-difficulty, four-family training layout with 40 columns
-    has five rows and a mapping containing ten copies of each family index.
+    For example, a six-difficulty, four-family training layout with 40 columns
+    has six rows and a mapping containing ten copies of each family index.
     Fixed-family evaluation instead maps every column to the selected family
     while retaining the same row-to-difficulty relationship.
 
@@ -755,21 +768,25 @@ class ParkourCurriculumCfg:
 
     families: tuple[ParkourFamilyCfg, ...] = _DEFAULT_PARKOUR_FAMILIES
 
-    initial_level: int = 1
-    # Balance the initial population over levels 0..initial_level. This gives
-    # PPO easy examples while avoiding a synchronized single-level population.
+    # Bootstrap every environment on the shared flat row. Terrain columns
+    # already assign future obstacle families, so mastered environments spread
+    # asynchronously into the easiest family-specific courses.
+    initial_level: int = 0
     distribute_initial_levels: bool = True
-    max_level: int = 4
+    max_level: int = 5
 
     # A waypoint changes only after the root remains within this XY radius for
     # ``waypoint_reach_hold_s``.
     waypoint_reach_threshold: float = 0.20
     waypoint_reach_hold_s: float = 0.10
 
-    # Progress thresholds. Promotion requires more than half of
-    # the configured route length; demotion requires less than half of the
-    # distance commanded during the completed episode.
-    promotion_course_fraction: float = 0.50
+    # Require repeated mastery at the final waypoint instead of promoting from
+    # partial route progress. A terminal failure clears the per-environment
+    # streak, so these must be consecutive successful completions.
+    promotion_successes_required: int = 2
+
+    # Demotion remains progress-based so a curriculum level that is clearly too
+    # difficult can move down without waiting for the full episode horizon.
     demotion_expected_distance_fraction: float = 0.50
 
     base_contact_threshold: float = 1.0
@@ -928,8 +945,12 @@ class ParkourCurriculumCfg:
         ):
             raise ValueError("waypoint_reach_hold_s must be non-negative.")
 
-        if not 0.0 < self.promotion_course_fraction <= 1.0:
-            raise ValueError("promotion_course_fraction must be in (0, 1].")
+        if (
+            isinstance(self.promotion_successes_required, bool)
+            or not isinstance(self.promotion_successes_required, int)
+            or self.promotion_successes_required <= 0
+        ):
+            raise ValueError("promotion_successes_required must be a positive integer.")
 
         if not 0.0 < self.demotion_expected_distance_fraction <= 1.0:
             raise ValueError("demotion_expected_distance_fraction must be in (0, 1].")
