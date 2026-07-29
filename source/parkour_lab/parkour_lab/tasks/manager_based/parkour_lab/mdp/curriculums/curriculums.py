@@ -462,7 +462,7 @@ def _validate_terrain_layout(
             "The parkour curriculum requires TerrainImporterCfg with terrain_type='generator'."
         )
 
-    terrain_layout.validate(
+    terrain_layout.validate_grid(
         curriculum_difficulties=curriculum_cfg.num_difficulties,
         curriculum_families=len(curriculum_cfg.families),
         terrain_columns=int(terrain.terrain_origins.shape[1]),

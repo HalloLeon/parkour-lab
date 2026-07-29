@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import MISSING
 
 import numpy as np
 import trimesh
@@ -664,7 +664,7 @@ _DEFAULT_PARKOUR_FAMILIES = (
 )
 
 
-@dataclass(frozen=True)
+@configclass
 class ParkourTerrainLayout:
     """Map Isaac Lab's physical terrain grid to the curriculum matrix.
 
@@ -687,6 +687,10 @@ class ParkourTerrainLayout:
     Fixed-family evaluation instead maps every column to the selected family
     while retaining the same row-to-difficulty relationship.
 
+    The layout is a mutable configclass because it is stored in an event term's
+    ``params`` mapping. Isaac Lab's Hydra bridge reconstructs that mapping by
+    assigning fields back onto the existing object, even without CLI overrides.
+
     Attributes:
         num_difficulty_rows: Number of physical terrain rows, equal to the
             number of shared curriculum difficulties.
@@ -694,8 +698,8 @@ class ParkourTerrainLayout:
             terrain column, ordered by column index.
     """
 
-    num_difficulty_rows: int
-    family_index_by_column: tuple[int, ...]
+    num_difficulty_rows: int = MISSING
+    family_index_by_column: tuple[int, ...] = MISSING
 
     @property
     def num_columns(self) -> int:
@@ -703,7 +707,7 @@ class ParkourTerrainLayout:
 
         return len(self.family_index_by_column)
 
-    def validate(
+    def validate_grid(
         self,
         *,
         curriculum_difficulties: int,
