@@ -122,6 +122,42 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+def _configure_resumed_parkour_curriculum(
+    env_cfg: object,
+    resume: bool,
+) -> bool:
+    """Start resumed adaptive parkour training with replay across every row.
+
+    RSL-RL checkpoints restore the optimizer, policy, and runner state, but the
+    per-environment terrain level and mastery/demotion streaks live in the
+    environment. They therefore do not exist yet when a new process resumes.
+    Reuse the curriculum's deterministic startup distribution over rows zero
+    through ``initial_level``, expanding that upper bound to ``max_level``.
+
+    Fixed evaluation has no adaptive curriculum and is intentionally left
+    untouched. Returning whether replay was configured keeps this helper pure
+    enough for simulator-free tests and lets the caller explain the behavior.
+    """
+
+    if not resume:
+        return False
+
+    adaptive_term = getattr(env_cfg, "curriculum", None)
+    curriculum_cfg = getattr(env_cfg, "parkour_curriculum", None)
+    synchronize = getattr(env_cfg, "synchronize_curriculum_config", None)
+    if adaptive_term is None or curriculum_cfg is None or not callable(synchronize):
+        return False
+    if (
+        getattr(env_cfg, "evaluation_family", None) is not None
+        or getattr(env_cfg, "evaluation_level", None) is not None
+    ):
+        return False
+
+    curriculum_cfg.initial_level = curriculum_cfg.max_level
+    curriculum_cfg.distribute_initial_levels = True
+    return True
+
+
 # Capture the task ID and agent entry-point name now. The returned wrapper later
 # loads their registered configuration defaults, lets Hydra consume the retained
 # ``sys.argv`` overrides, and calls this function as ``main(env_cfg, agent_cfg)``.
@@ -139,9 +175,19 @@ def main(
     )
     # Apply this after Hydra so an explicit CLI stage has final precedence.
     cli_args.apply_domain_randomization_stage(env_cfg, args_cli)
+    resumed_curriculum_replay = _configure_resumed_parkour_curriculum(
+        env_cfg,
+        agent_cfg.resume,
+    )
     synchronize_curriculum = getattr(env_cfg, "synchronize_curriculum_config", None)
     if callable(synchronize_curriculum):
         synchronize_curriculum()
+    if resumed_curriculum_replay:
+        print(
+            "[INFO] Resumed adaptive curriculum will replay all terrain rows "
+            "with a deterministic balanced startup distribution; runtime "
+            "levels and curriculum memory are initialized anew."
+        )
     synchronize_randomization = getattr(
         env_cfg,
         "synchronize_domain_randomization_config",
@@ -201,11 +247,15 @@ def main(
     env_cfg.log_dir = log_dir
 
     # Create the Isaac Lab environment.
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
+    gym_env: gym.Env = gym.make(
+        args_cli.task,
+        cfg=env_cfg,
+        render_mode="rgb_array" if args_cli.video else None,
+    )
 
     # Convert multi-agent environments to the single-agent RSL-RL interface.
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
+    if isinstance(gym_env.unwrapped, DirectMARLEnv):
+        gym_env = multi_agent_to_single_agent(gym_env)
 
     # Resolve the checkpoint selected for resuming PPO training. Student
     # distillation has its own explicit entry point in ``distill.py``.
@@ -224,10 +274,13 @@ def main(
         }
         print("[INFO] Recording videos during training.")
         print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+        gym_env = gym.wrappers.RecordVideo(gym_env, **video_kwargs)
 
     # Adapt the Isaac Lab environment to the RSL-RL vector interface.
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    env: RslRlVecEnvWrapper = RslRlVecEnvWrapper(
+        gym_env,
+        clip_actions=agent_cfg.clip_actions,
+    )
 
     # Record the compact actor interface needed to load future teacher
     # checkpoints safely. Unused environment details remain intentionally

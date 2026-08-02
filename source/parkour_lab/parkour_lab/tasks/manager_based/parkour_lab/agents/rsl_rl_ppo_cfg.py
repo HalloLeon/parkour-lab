@@ -59,15 +59,18 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     # Number of environment steps collected from each parallel environment
     # before one PPO update is performed. The total rollout size per iteration
-    # is ``num_envs * num_steps_per_env``.
-    num_steps_per_env = 24
+    # is ``num_envs * num_steps_per_env``. Forty-eight steps provide a longer
+    # temporal window for obstacle approach, traversal, and landing credit.
+    num_steps_per_env = 48
 
-    # Maximum number of PPO iterations. Each iteration collects a rollout,
-    # computes returns and advantages, and updates the policy and value model.
-    max_iterations = 150
+    # Nominal Phase-1 training budget. This is long enough for environments to
+    # revisit the curriculum after bootstrap; 150 iterations is only a smoke
+    # test and must not be treated as an obstacle-mastery budget.
+    max_iterations = 1000
 
-    # Number of PPO iterations between checkpoints.
-    save_interval = 50
+    # Number of PPO iterations between checkpoints. This retains ten evenly
+    # spaced snapshots over the nominal training run.
+    save_interval = 100
 
     # Experiment directory name used beneath ``logs/rsl_rl``.
     experiment_name = "parkour_lab"
@@ -136,8 +139,9 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         learning_rate=1.0e-3,
         # Adapt the learning rate using the measured KL divergence.
         schedule="adaptive",
-        # Discount factor applied to future rewards.
-        gamma=0.99,
+        # Discount factor applied to future rewards. The longer horizon retains
+        # useful credit from obstacle approach through landing and completion.
+        gamma=0.995,
         # Generalized Advantage Estimation bias-variance parameter.
         lam=0.95,
         # Target KL divergence used by the adaptive learning-rate schedule.
