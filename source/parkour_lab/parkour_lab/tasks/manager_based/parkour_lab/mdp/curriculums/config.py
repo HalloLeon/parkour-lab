@@ -776,8 +776,8 @@ class ParkourCurriculumCfg:
     # Bootstrap every environment on the shared flat row. Terrain columns
     # already assign future obstacle families, so mastered environments spread
     # asynchronously into the easiest family-specific courses.
-    initial_level: int = 0
     distribute_initial_levels: bool = True
+    initial_level: int = 0
     max_level: int = 5
 
     # Intermediate routing targets advance on radius entry or a route-plane
@@ -833,8 +833,7 @@ class ParkourCurriculumCfg:
             return self.family_names.index(family_name)
         except ValueError as error:
             raise ValueError(
-                f"Unknown terrain family {family_name!r}; choose one of "
-                f"{list(self.family_names)}."
+                f"Unknown terrain family {family_name!r}; choose one of {list(self.family_names)}."
             ) from error
 
     @property
