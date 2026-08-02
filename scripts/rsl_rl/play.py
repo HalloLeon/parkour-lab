@@ -439,11 +439,15 @@ def _create_evaluation_environment(
     env_cfg.log_dir = artifacts.directory
     # Instantiate the registered Gym task with the resolved Isaac Lab
     # configuration, requesting rendered RGB frames only when recording video.
-    env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
-    if isinstance(env.unwrapped, DirectMARLEnv):
-        env = multi_agent_to_single_agent(env)
+    gym_env: gym.Env = gym.make(
+        args_cli.task,
+        cfg=env_cfg,
+        render_mode="rgb_array" if args_cli.video else None,
+    )
+    if isinstance(gym_env.unwrapped, DirectMARLEnv):
+        gym_env = multi_agent_to_single_agent(gym_env)
 
-    video_length = args_cli.video_length or int(env.unwrapped.max_episode_length)
+    video_length = args_cli.video_length or int(gym_env.unwrapped.max_episode_length)
     if args_cli.video:
         video_kwargs = {
             "video_folder": artifacts.directory,
@@ -454,9 +458,9 @@ def _create_evaluation_environment(
         }
         print("[INFO] Recording an evaluation video.")
         print_dict(video_kwargs, nesting=4)
-        env = gym.wrappers.RecordVideo(env, **video_kwargs)
+        gym_env = gym.wrappers.RecordVideo(gym_env, **video_kwargs)
 
-    return RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    return RslRlVecEnvWrapper(gym_env, clip_actions=agent_cfg.clip_actions)
 
 
 def _evaluate_course(

@@ -52,7 +52,7 @@ def main() -> None:
         use_fabric=not args_cli.disable_fabric,
     )
     # Instantiate the registered Gym environment.
-    env = gym.make(args_cli.task, cfg=env_cfg)
+    env: gym.Env = gym.make(args_cli.task, cfg=env_cfg)
 
     # Report the vectorized observation and action spaces.
     print(f"[INFO]: Gym observation space: {env.observation_space}")
