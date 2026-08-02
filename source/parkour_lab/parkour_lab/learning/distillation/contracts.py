@@ -244,7 +244,7 @@ def build_teacher_interface(
         },
         "action": {
             "term_order": list(action_manager.active_terms),
-            "term_dimensions": list(action_manager.action_term_dim),
+            "term_dimensions": [int(dimension) for dimension in action_manager.action_term_dim],
             "joint_names": list(action_descriptor.joint_names),
             "scale": _simple_value(action_descriptor.scale),
             "offset": _simple_value(action_descriptor.offset),
@@ -365,7 +365,11 @@ def _describe_observation_groups(
             terms.append(
                 {
                     "name": term_name,
-                    "shape": list(term_shape),
+                    # Flattened history dimensions come from NumPy's
+                    # ``prod`` in Isaac Lab and are therefore ``np.int64``.
+                    # Normalize every resolved dimension at this boundary so
+                    # the interface remains directly JSON serializable.
+                    "shape": [int(dimension) for dimension in term_shape],
                     "function": _callable_name(term_cfg.func),
                     "simple_params": _simple_mapping(term_cfg.params),
                     "clip": _simple_value(term_cfg.clip),
