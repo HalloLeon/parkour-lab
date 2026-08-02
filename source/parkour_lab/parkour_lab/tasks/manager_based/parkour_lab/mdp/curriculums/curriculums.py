@@ -161,12 +161,17 @@ class ParkourTerrainCurriculum(ManagerTermBase):
             env_ids,
         )
         old_levels = terrain.terrain_levels[env_ids].clone()
+        required_successes = torch.where(
+            old_levels == 0,
+            curriculum_cfg.bootstrap_promotion_successes_required,
+            curriculum_cfg.promotion_successes_required,
+        )
 
         updated_successes, promotion_ready = _success_streak_transition(
             self.consecutive_successes[env_ids],
             success_event,
             failure_event,
-            required_successes=curriculum_cfg.promotion_successes_required,
+            required_successes=required_successes,
         )
         self.consecutive_successes[env_ids] = updated_successes
 
@@ -456,13 +461,13 @@ def _success_streak_transition(
     success_event: torch.Tensor,
     failure_event: torch.Tensor,
     *,
-    required_successes: int,
+    required_successes: int | torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Update consecutive-success counts and return promotion readiness.
 
     Manual resets preserve the current streak because they are neither success
     nor failure outcomes. Successful completions increment and saturate at the
-    configured requirement; any terminal failure clears the streak.
+    per-environment requirement; any terminal failure clears the streak.
     """
 
     incremented = torch.clamp(success_streaks + 1, max=required_successes)

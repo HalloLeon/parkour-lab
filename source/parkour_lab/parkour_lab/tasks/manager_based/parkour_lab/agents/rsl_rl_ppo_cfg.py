@@ -30,6 +30,11 @@ class PrivilegedTeacherActorCriticCfg(RslRlPpoActorCriticCfg):
     # proprioception/action history.
     history_encoder_hidden_dims: list[int] = [256, 128]
 
+    # Bound learned exploration so entropy optimization cannot produce invalid
+    # or physically meaningless action distributions during long runs.
+    min_noise_std: float = 0.05
+    max_noise_std: float = 1.5
+
 
 @configclass
 class RegularizedPPOCfg(RslRlPpoAlgorithmCfg):
@@ -51,6 +56,10 @@ class RegularizedPPOCfg(RslRlPpoAlgorithmCfg):
     privileged_regularization_coef_end: float = 0.1
     privileged_regularization_warmup_iterations: int = 200
     privileged_regularization_ramp_iterations: int = 300
+
+    # The stock adaptive schedule may otherwise increase the shared optimizer
+    # rate to 1e-2, including for the adaptation encoders.
+    max_learning_rate: float = 1.0e-3
 
 
 @configclass
@@ -77,6 +86,12 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     # Logging backend used for training metrics.
     logger = "tensorboard"
+
+    # Bound the action that reaches Isaac Lab's ActionManager. This also bounds
+    # last_action observations and the squared action-rate reward, preventing a
+    # rare policy outlier from feeding back through the actor, critic, and
+    # adaptation history.
+    clip_actions = 5.0
 
     # Dictionary keys name RSL-RL network inputs; list entries name Isaac Lab
     # observation groups declared on ObservationsCfg in parkour_lab_env_cfg.py:
@@ -105,6 +120,9 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # Initial standard deviation of the Gaussian action distribution. This
         # controls exploration before the standard deviation is learned.
         init_noise_std=1.0,
+        # Keep the direct parameter used by existing checkpoints and their Adam
+        # state; the custom actor projects it into positive safe bounds.
+        noise_std_type="scalar",
         # Keep learned running statistics disabled: the deployable student and
         # exported motor actor do not carry an RSL-RL normalizer. Every actor
         # observation must instead use a fixed, deployment-reproducible scale at
@@ -130,13 +148,13 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # objective during one update.
         clip_param=0.2,
         # Weight of the entropy bonus that encourages action exploration.
-        entropy_coef=0.005,
+        entropy_coef=0.001,
         # Number of passes over each collected rollout.
         num_learning_epochs=5,
         # Number of minibatches used for every learning epoch.
         num_mini_batches=4,
         # Initial optimizer learning rate.
-        learning_rate=1.0e-3,
+        learning_rate=3.0e-4,
         # Adapt the learning rate using the measured KL divergence.
         schedule="adaptive",
         # Discount factor applied to future rewards. The longer horizon retains

@@ -125,9 +125,10 @@ class ParkourCurriculumCfg:
     # and safe base clearance, but no dwell.
     waypoint_reach_threshold: float = 0.20
 
-    # Require repeated mastery at the final waypoint instead of promoting from
-    # partial route progress. A terminal failure clears the per-environment
-    # streak, so these must be consecutive successful completions.
+    # A single safe completion is enough to leave the shared obstacle-free
+    # bootstrap row. Obstacle rows still require repeated mastery at the final
+    # waypoint; a terminal failure clears the per-environment streak.
+    bootstrap_promotion_successes_required: int = 1
     promotion_successes_required: int = 2
 
     # Demotion uses safe normalized route progress so the threshold has the
@@ -285,6 +286,15 @@ class ParkourCurriculumCfg:
             or self.waypoint_reach_threshold <= 0.0
         ):
             raise ValueError("waypoint_reach_threshold must be positive.")
+
+        if (
+            isinstance(self.bootstrap_promotion_successes_required, bool)
+            or not isinstance(self.bootstrap_promotion_successes_required, int)
+            or self.bootstrap_promotion_successes_required <= 0
+        ):
+            raise ValueError(
+                "bootstrap_promotion_successes_required must be a positive integer."
+            )
 
         if (
             isinstance(self.promotion_successes_required, bool)

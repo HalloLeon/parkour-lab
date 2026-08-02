@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Mapping, Sequence
 from typing import Literal
 
@@ -53,6 +54,8 @@ class PrivilegedTeacherActorCritic(ActorCritic):
         activation: str = "elu",
         init_noise_std: float = 1.0,
         noise_std_type: Literal["scalar", "log"] = "scalar",
+        min_noise_std: float = 0.05,
+        max_noise_std: float = 1.5,
         dynamics_encoder_hidden_dims: Sequence[int] = (128, 64),
         history_encoder_hidden_dims: Sequence[int] = (256, 128),
         scan_encoder_hidden_dims: Sequence[int] = (128, 64),
@@ -73,9 +76,15 @@ class PrivilegedTeacherActorCritic(ActorCritic):
             raise ValueError("The shared teacher/student motor actor requires ELU.")
         if actor_obs_normalization:
             raise ValueError(
-                "The adaptation encoders require raw actor observations; "
-                "actor_obs_normalization must remain disabled."
+                "The adaptation encoders require raw actor observations; actor_obs_normalization must remain disabled."
             )
+        if (
+            not math.isfinite(min_noise_std)
+            or not math.isfinite(max_noise_std)
+            or min_noise_std <= 0.0
+            or max_noise_std < min_noise_std
+        ):
+            raise ValueError("Action-noise bounds must be finite and satisfy 0 < min_noise_std <= max_noise_std.")
 
         super().__init__(
             obs,
@@ -90,6 +99,8 @@ class PrivilegedTeacherActorCritic(ActorCritic):
             noise_std_type=noise_std_type,
             **kwargs,
         )
+        self.min_noise_std = min_noise_std
+        self.max_noise_std = max_noise_std
 
         terrain_scan_dim = (
             int(obs[PRIVILEGED_TERRAIN_GROUP].shape[-1]) if actor_groups == TEACHER_OBSERVATION_GROUPS else None
@@ -116,7 +127,17 @@ class PrivilegedTeacherActorCritic(ActorCritic):
         # Persist the ROA schedule position in normal policy checkpoints so a
         # resumed run does not restart its regularization ramp or rollout cycle.
         self.register_buffer("roa_update_count", torch.zeros((), dtype=torch.long))
+        self.enforce_action_std_bounds_()
         print(f"Modular teacher actor: {self.actor}")
+
+    def update_distribution(self, obs: torch.Tensor) -> None:
+        """Build the privileged actor distribution with bounded exploration."""
+
+        mean = self.actor(obs)
+        self.distribution = torch.distributions.Normal(
+            mean,
+            self._bounded_action_std(mean),
+        )
 
     # Extend ActorCritic.act with ROA's history-conditioned path.
     def act(
@@ -132,15 +153,40 @@ class PrivilegedTeacherActorCritic(ActorCritic):
             return super().act(obs, **kwargs)
 
         mean = self.act_inference_from_history(obs)
-        std: torch.Tensor
-        if self.noise_std_type == "scalar":
-            std = self.std.expand_as(mean)  # Direct per-action standard deviation.
-        elif self.noise_std_type == "log":
-            std = torch.exp(self.log_std).expand_as(mean)  # Convert log standard deviation.
-        else:
-            raise ValueError(f"Unsupported noise_std_type: {self.noise_std_type!r}.")
-        self.distribution = torch.distributions.Normal(mean, std)
+        self.distribution = torch.distributions.Normal(
+            mean,
+            self._bounded_action_std(mean),
+        )
         return self.distribution.sample()
+
+    def enforce_action_std_bounds_(self) -> None:
+        """Project the learned noise parameter into its configured safe range."""
+
+        with torch.no_grad():
+            if self.noise_std_type == "scalar":
+                parameter = self.std
+                lower_bound = self.min_noise_std
+                upper_bound = self.max_noise_std
+            elif self.noise_std_type == "log":
+                parameter = self.log_std
+                lower_bound = math.log(self.min_noise_std)
+                upper_bound = math.log(self.max_noise_std)
+            else:
+                raise ValueError(f"Unsupported noise_std_type: {self.noise_std_type!r}.")
+            if not torch.isfinite(parameter).all():
+                raise FloatingPointError("The learned action-noise parameter became non-finite.")
+            parameter.clamp_(min=lower_bound, max=upper_bound)
+
+    def load_state_dict(
+        self,
+        state_dict: Mapping[str, torch.Tensor],
+        strict: bool = True,
+    ) -> object:
+        """Load a compatible checkpoint and project its action noise safely."""
+
+        result = super().load_state_dict(state_dict, strict=strict)
+        self.enforce_action_std_bounds_()
+        return result
 
     def act_inference_from_history(
         self,
@@ -155,6 +201,24 @@ class PrivilegedTeacherActorCritic(ActorCritic):
             terrain_scan,
             obs[ADAPTATION_HISTORY_GROUP],
         )
+
+    def _bounded_action_std(self, mean: torch.Tensor) -> torch.Tensor:
+        """Return the bounded positive per-action standard deviation."""
+
+        if self.noise_std_type == "scalar":
+            std = self.std.clamp(
+                min=self.min_noise_std,
+                max=self.max_noise_std,
+            )
+        elif self.noise_std_type == "log":
+            log_std = self.log_std.clamp(
+                min=math.log(self.min_noise_std),
+                max=math.log(self.max_noise_std),
+            )
+            std = torch.exp(log_std)
+        else:
+            raise ValueError(f"Unsupported noise_std_type: {self.noise_std_type!r}.")
+        return std.expand_as(mean)
 
 
 class RegularizedPPO(PPO):
@@ -172,6 +236,7 @@ class RegularizedPPO(PPO):
         privileged_regularization_coef_start: float = 0.0,
         privileged_regularization_ramp_iterations: int = 300,
         privileged_regularization_warmup_iterations: int = 200,
+        max_learning_rate: float = 1.0e-3,
         **kwargs: object,
     ) -> None:
         super().__init__(policy, **kwargs)
@@ -183,12 +248,15 @@ class RegularizedPPO(PPO):
             raise ValueError("privileged_regularization_ramp_iterations must be positive.")
         if privileged_regularization_warmup_iterations < 0:
             raise ValueError("privileged_regularization_warmup_iterations cannot be negative.")
+        if max_learning_rate <= 0.0 or max_learning_rate < self.learning_rate:
+            raise ValueError("max_learning_rate must be positive and no smaller than the initial learning rate.")
         self.adaptation_loss_coef = adaptation_loss_coef
         self.history_rollout_interval = history_rollout_interval
         self.privileged_regularization_coef_end = privileged_regularization_coef_end
         self.privileged_regularization_coef_start = privileged_regularization_coef_start
         self.privileged_regularization_ramp_iterations = privileged_regularization_ramp_iterations
         self.privileged_regularization_warmup_iterations = privileged_regularization_warmup_iterations
+        self.max_learning_rate = max_learning_rate
         self._history_rollout = False
         self._update_count: int | None = None
 
@@ -286,13 +354,36 @@ class RegularizedPPO(PPO):
                 + regularization_coef * privileged_regularization_loss
             )
 
+            loss_is_finite = torch.isfinite(loss).to(dtype=torch.int32)
+            if self.is_multi_gpu:
+                # Every rank must reach the same failure decision before any
+                # rank enters the gradient all-reduce below.
+                torch.distributed.all_reduce(
+                    loss_is_finite,
+                    op=torch.distributed.ReduceOp.MIN,
+                )
+            if not loss_is_finite:
+                raise FloatingPointError(
+                    "RegularizedPPO produced a non-finite loss before the "
+                    "optimizer step: "
+                    f"surrogate={surrogate_loss.detach().item():.6g}, "
+                    f"value={value_loss.detach().item():.6g}, "
+                    f"adaptation={adaptation_loss.detach().item():.6g}, "
+                    "privileged_regularization="
+                    f"{privileged_regularization_loss.detach().item():.6g}."
+                )
+
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if self.is_multi_gpu:
+                self.reduce_parameters()
             torch.nn.utils.clip_grad_norm_(
                 self.policy.parameters(),
                 self.max_grad_norm,
+                error_if_nonfinite=True,
             )
             self.optimizer.step()
+            self.policy.enforce_action_std_bounds_()
 
             mean_adaptation_loss += float(adaptation_loss.detach().item())
             mean_entropy += float(entropy_batch.mean().detach().item())
@@ -335,12 +426,31 @@ class RegularizedPPO(PPO):
                 dim=-1,
             )
             kl_mean = torch.mean(kl)
+            if self.is_multi_gpu:
+                torch.distributed.all_reduce(
+                    kl_mean,
+                    op=torch.distributed.ReduceOp.SUM,
+                )
+                kl_mean /= self.gpu_world_size
+            if not torch.isfinite(kl_mean):
+                raise FloatingPointError("The adaptive PPO KL divergence became non-finite.")
             # The policy moved too far from the rollout policy, so take smaller optimization steps.
-            if kl_mean > self.desired_kl * 2.0:
-                self.learning_rate = max(1.0e-5, self.learning_rate / 1.5)
-            # The policy update was conservative, so allow larger steps while keeping the rate bounded.
-            elif 0.0 < kl_mean < self.desired_kl / 2.0:
-                self.learning_rate = min(1.0e-2, self.learning_rate * 1.5)
+            if self.gpu_global_rank == 0:
+                if kl_mean > self.desired_kl * 2.0:
+                    self.learning_rate = max(1.0e-5, self.learning_rate / 1.5)
+                # The policy update was conservative, so allow larger steps while keeping the rate bounded.
+                elif 0.0 < kl_mean < self.desired_kl / 2.0:
+                    self.learning_rate = min(
+                        self.max_learning_rate,
+                        self.learning_rate * 1.5,
+                    )
+            if self.is_multi_gpu:
+                learning_rate = torch.tensor(
+                    self.learning_rate,
+                    device=self.device,
+                )
+                torch.distributed.broadcast(learning_rate, src=0)
+                self.learning_rate = learning_rate.item()
             for parameter_group in self.optimizer.param_groups:
                 parameter_group["lr"] = self.learning_rate
 

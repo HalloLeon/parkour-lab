@@ -126,17 +126,21 @@ def _configure_resumed_parkour_curriculum(
     env_cfg: object,
     resume: bool,
 ) -> bool:
-    """Start resumed adaptive parkour training with replay across every row.
+    """Detect resumed adaptive training without widening its startup rows.
 
     RSL-RL checkpoints restore the optimizer, policy, and runner state, but the
     per-environment terrain level and mastery/demotion streaks live in the
     environment. They therefore do not exist yet when a new process resumes.
-    Reuse the curriculum's deterministic startup distribution over rows zero
-    through ``initial_level``, expanding that upper bound to ``max_level``.
+    Reuse the explicitly configured ``initial_level`` and startup-distribution
+    policy. Silently expanding that frontier to ``max_level`` can place an early
+    checkpoint on courses it has never mastered and destabilize the resumed
+    optimizer. Users can still set a known frontier explicitly with a Hydra
+    override.
 
     Fixed evaluation has no adaptive curriculum and is intentionally left
-    untouched. Returning whether replay was configured keeps this helper pure
-    enough for simulator-free tests and lets the caller explain the behavior.
+    untouched. Returning whether runtime curriculum state is being recreated
+    keeps this helper pure enough for simulator-free tests and lets the caller
+    explain the behavior.
     """
 
     if not resume:
@@ -153,8 +157,6 @@ def _configure_resumed_parkour_curriculum(
     ):
         return False
 
-    curriculum_cfg.initial_level = curriculum_cfg.max_level
-    curriculum_cfg.distribute_initial_levels = True
     return True
 
 
@@ -184,9 +186,9 @@ def main(
         synchronize_curriculum()
     if resumed_curriculum_replay:
         print(
-            "[INFO] Resumed adaptive curriculum will replay all terrain rows "
-            "with a deterministic balanced startup distribution; runtime "
-            "levels and curriculum memory are initialized anew."
+            "[INFO] Resumed adaptive curriculum is initialized anew over its "
+            "configured startup rows; per-environment levels and curriculum "
+            "memory are not stored in RSL-RL checkpoints."
         )
     synchronize_randomization = getattr(
         env_cfg,
