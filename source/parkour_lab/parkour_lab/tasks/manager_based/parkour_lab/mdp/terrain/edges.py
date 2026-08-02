@@ -106,10 +106,9 @@ def foot_edge_contact_mask(
     import torch
 
     from .._shared import contact, robot, runtime
+    from ..navigation import route
 
-    course_indices = getattr(env, "_parkour_course_index", None)
-    if course_indices is None or course_indices.shape != (env.num_envs,):
-        raise RuntimeError("Active courses must be initialized before evaluating edges.")
+    course_indices = route.active_course_indices(env)
 
     foot_positions = robot._selected_body_pos_env(env, asset_cfg)
 

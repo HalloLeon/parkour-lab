@@ -52,6 +52,7 @@ INITIAL_WAYPOINT_POS = DEFAULT_LEVEL.waypoints[0].position
 class ParkourLabSceneCfg(InteractiveSceneCfg):
     """Configuration for a parkour lab scene."""
 
+    # Course assets.
     ground: TerrainImporterCfg = TerrainImporterCfg(
         prim_path="/World/Ground",
         terrain_type="generator",
@@ -84,7 +85,13 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         init_state=RigidObjectCfg.InitialStateCfg(pos=INITIAL_WAYPOINT_POS),
     )
 
+    # Robot.
     robot: ArticulationCfg = UNITREE_A1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+
+    # Contact sensors.
+    base_contact: ContactSensorCfg = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/trunk", history_length=3
+    )
 
     feet_contact: ContactSensorCfg = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*_foot", history_length=3, track_air_time=True
@@ -95,10 +102,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         history_length=3,
     )
 
-    base_contact: ContactSensorCfg = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/trunk", history_length=3
-    )
-
+    # Ray sensors.
     # One downward terrain ray at the trunk origin provides geometry-agnostic
     # base clearance for flat ground, slopes, and arbitrary terrain meshes.
     base_height_scanner: RayCasterCfg = RayCasterCfg(
@@ -153,6 +157,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         max_distance=25.0,
     )
 
+    # Lighting.
     dome_light: AssetBaseCfg = AssetBaseCfg(
         prim_path="/World/DomeLight",
         spawn=sim_utils.DomeLightCfg(color=(0.9, 0.9, 0.9), intensity=500.0),
@@ -194,7 +199,7 @@ class ObservationsCfg:
         """Deployable proprioception and command state shared by both actors."""
 
         # Body orientation and angular motion.
-        base_ang_vel = ObsTerm(func=mdp.base_ang_vel)
+        base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.25)
         projected_gravity = ObsTerm(func=mdp.projected_gravity)
 
         # The operator-supplied speed is deployable; the oracle waypoint
@@ -204,7 +209,7 @@ class ObservationsCfg:
 
         # Joint state.
         joint_pos = ObsTerm(func=mdp.joint_pos_rel)
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel)
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=0.05)
 
         # Previous action.
         last_action = ObsTerm(func=mdp.last_action)
@@ -222,11 +227,11 @@ class ObservationsCfg:
         height_scan = ObsTerm(
             func=mdp.terrain_height_scan,
             params={
+                "asset_cfg": SceneEntityCfg("robot"),
                 "obs_cfg": mdp.config.HeightScanObservationCfg(
                     num_rays=132, vertical_offset=0.30, clip=0.50
                 ),
                 "sensor_cfg": SceneEntityCfg("height_scanner"),
-                "asset_cfg": SceneEntityCfg("robot"),
             },
         )
 
@@ -235,11 +240,11 @@ class ObservationsCfg:
         height_scan_validity = ObsTerm(
             func=mdp.terrain_height_scan_validity,
             params={
+                "asset_cfg": SceneEntityCfg("robot"),
                 "obs_cfg": mdp.config.HeightScanObservationCfg(
                     num_rays=132, vertical_offset=0.30, clip=0.50
                 ),
                 "sensor_cfg": SceneEntityCfg("height_scanner"),
-                "asset_cfg": SceneEntityCfg("robot"),
             },
         )
 
@@ -253,10 +258,12 @@ class ObservationsCfg:
 
         # Keep this group limited to state that materially improves value
         # estimation and is absent from both policy and terrain groups.
-        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel, scale=0.5)
 
         base_clearance = ObsTerm(
-            func=mdp.base_clearance_obs, params={"asset_cfg": SceneEntityCfg("robot")}
+            func=mdp.base_clearance_obs,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+            scale=2.0,
         )
 
         # Exact distance to the simulator waypoint can improve value
@@ -264,18 +271,21 @@ class ObservationsCfg:
         active_waypoint_distance_xy = ObsTerm(
             func=mdp.active_waypoint_distance_xy,
             params={
-                "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
                 "asset_cfg": SceneEntityCfg("robot"),
+                "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
             },
+            scale=0.25,
         )
+
+        route_phase = ObsTerm(func=mdp.route_phase)
 
         # Isaac Lab derives these contacts from its physics contact sensor.
         # Keep them critic-only until equivalent hardware sensing is defined.
         foot_contacts = ObsTerm(
             func=mdp.foot_contact_state,
             params={
-                "threshold": 1.0,
                 "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+                "threshold": 1.0,
             },
         )
 
@@ -305,8 +315,8 @@ class ObservationsCfg:
         active_waypoint_direction_yaw_xy = ObsTerm(
             func=mdp.active_waypoint_direction_yaw_xy,
             params={
-                "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
                 "asset_cfg": SceneEntityCfg("robot"),
+                "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
             },
         )
 
@@ -340,6 +350,7 @@ class EventsCfg:
     randomize_robot_material: EventTerm | None = None
     randomize_trunk_com: EventTerm | None = None
 
+    # Startup initialization.
     initialize_terrain_levels = EventTerm(
         func=mdp.initialize_parkour_terrain_levels,
         mode="startup",
@@ -350,15 +361,8 @@ class EventsCfg:
         },
     )
 
-    reset_routes_and_commands = EventTerm(
-        func=mdp.reset_routes_and_commands,
-        mode="reset",
-        params={
-            "curriculum_cfg": PARKOUR_CURRICULUM,
-            "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
-        },
-    )
-
+    # Episode resets. This declaration order is behavioral: reset the route
+    # only after the robot base and joints have reached their new state.
     # Reset the robot base at the beginning of each episode.
     #
     # We keep the initial pose deterministic for now:
@@ -397,8 +401,11 @@ class CurriculumCfg:
     """Curriculum terms."""
 
     terrain_levels = CurrTerm(
-        func=mdp.parkour_terrain_levels,
-        params={"curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM},
+        func=mdp.ParkourTerrainCurriculum,
+        params={
+            "curriculum_cfg": mdp.curriculums_config.DEFAULT_PARKOUR_CURRICULUM,
+            "terrain_layout": DEFAULT_TERRAIN_LAYOUT,
+        },
     )
 
 
@@ -420,74 +427,86 @@ class RewardsCfg:
         func=mdp.velocity_along_waypoint_xy_capped,
         weight=1.0,
         params={
-            "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
             "asset_cfg": SceneEntityCfg("robot"),
+            "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
         },
     )
 
     waypoint_heading_misalignment = RewTerm(
         func=mdp.waypoint_heading_misalignment_l2,
-        weight=-0.05,
+        weight=-0.1,
         params={
+            "asset_cfg": SceneEntityCfg("robot"),
             "heading_cfg": mdp.config.WaypointHeadingCfg(
                 max_heading_error=1.0, min_forward_speed=0.1, full_forward_speed=0.5
             ),
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
-            "asset_cfg": SceneEntityCfg("robot"),
         },
     )
 
     # Explicit physical milestones split one conservative +2 shaping budget;
     # approach and alignment-only route markers do not receive a bonus.
+    completed_course = RewTerm(func=mdp.completed_course_reward, weight=10.0)
+
     intermediate_milestone = RewTerm(
         func=mdp.intermediate_milestone_reward,
         weight=2.0,
-        params={"asset_cfg": SceneEntityCfg("robot")},
     )
-
-    completed_course = RewTerm(func=mdp.completed_course_reward, weight=10.0)
 
     # Safety.
-    illegal_contact = RewTerm(
-        func=mdp.base_contact,
-        weight=-200.0,
-        params={
-            "threshold": PARKOUR_CURRICULUM.base_contact_threshold,
-            "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk"),
-        },
-    )
-
-    leg_contact = RewTerm(
-        func=mdp.undesired_contacts,
-        weight=-0.5,
-        params={"threshold": 1.0, "sensor_cfg": SceneEntityCfg("leg_contact")},
-    )
-
     base_clearance_below = RewTerm(
         func=mdp.base_clearance_below_l2,
         weight=-3.0,
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
 
+    illegal_contact = RewTerm(
+        func=mdp.base_contact,
+        weight=-10.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk"),
+            "threshold": PARKOUR_CURRICULUM.base_contact_threshold,
+            "timestep_independent": True,
+        },
+    )
+
+    leg_contact = RewTerm(
+        func=mdp.undesired_contacts,
+        weight=-0.5,
+        params={"sensor_cfg": SceneEntityCfg("leg_contact"), "threshold": 1.0},
+    )
+
     # Motion quality and regularization.
     # Keep vertical motion affordable enough for deliberate takeoff and landing.
-    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
+    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
     joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.0002)
-    action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
 
+    # Posture regularization.
     hip_deviation = RewTerm(
         func=mdp.joint_deviation_l2,
         weight=-0.002,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_hip_joint")},
     )
 
+    # Foot-placement quality.
+    feet_edge = RewTerm(
+        func=mdp.feet_edge,
+        weight=-1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "curriculum_cfg": PARKOUR_CURRICULUM,
+            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+        },
+    )
+
     feet_slide = RewTerm(
         func=mdp.feet_slide,
         weight=-0.05,
         params={
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
         },
     )
 
@@ -495,20 +514,11 @@ class RewardsCfg:
         func=mdp.feet_stumble,
         weight=-0.5,
         params={
+            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
             "stumble_cfg": mdp.config.FeetStumbleCfg(
-                lateral_to_vertical_force_ratio=4.0, min_vertical_force=1.0
+                lateral_to_vertical_force_ratio=4.0,
+                min_vertical_force=1.0,
             ),
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
-        },
-    )
-
-    feet_edge = RewTerm(
-        func=mdp.feet_edge,
-        weight=-1.0,
-        params={
-            "curriculum_cfg": PARKOUR_CURRICULUM,
-            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
         },
     )
 
@@ -522,17 +532,31 @@ class TerminationsCfg:
     success = DoneTerm(
         func=mdp.completed_course_done,
         params={
-            "reach_threshold": PARKOUR_CURRICULUM.waypoint_reach_threshold,
-            "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
             "asset_cfg": SceneEntityCfg("robot"),
+            "feet_asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "feet_contact_cfg": SceneEntityCfg(
+                "feet_contact",
+                body_names=".*_foot",
+            ),
+            "trunk_contact_cfg": SceneEntityCfg(
+                "base_contact",
+                body_names="trunk",
+            ),
+            "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
+            "contact_threshold": PARKOUR_CURRICULUM.base_contact_threshold,
+            "max_completion_tilt": 0.5,
+            "max_completion_vertical_speed": 0.5,
+            "reach_threshold": PARKOUR_CURRICULUM.waypoint_reach_threshold,
+            "support_margin": 0.05,
+            "support_plane_tolerance": 0.12,
         },
     )
 
     trunk_contact = DoneTerm(
         func=mdp.base_contact_done,
         params={
-            "threshold": PARKOUR_CURRICULUM.base_contact_threshold,
             "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk"),
+            "threshold": PARKOUR_CURRICULUM.base_contact_threshold,
         },
     )
 
@@ -563,13 +587,11 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         resolution=(1280, 720),
     )
 
-    # Basic settings.
-    observations: ObservationsCfg = ObservationsCfg()
+    # Manager settings.
     actions: ActionsCfg = ActionsCfg()
-    events: EventsCfg = EventsCfg()
     curriculum: CurriculumCfg | None = CurriculumCfg()
-
-    # MDP settings.
+    events: EventsCfg = EventsCfg()
+    observations: ObservationsCfg = ObservationsCfg()
     rewards: RewardsCfg = RewardsCfg()
     terminations: TerminationsCfg = TerminationsCfg()
 
@@ -596,21 +618,21 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physics_material = self.scene.ground.physics_material
 
         # Contact sensors should update every physics step.
+        if self.scene.base_contact is not None:
+            self.scene.base_contact.update_period = self.sim.dt
+
         if self.scene.feet_contact is not None:
             self.scene.feet_contact.update_period = self.sim.dt
 
         if self.scene.leg_contact is not None:
             self.scene.leg_contact.update_period = self.sim.dt
 
-        if self.scene.base_contact is not None:
-            self.scene.base_contact.update_period = self.sim.dt
-
         # Height scanner updates at policy rate.
-        if self.scene.height_scanner is not None:
-            self.scene.height_scanner.update_period = self.decimation * self.sim.dt
-
         if self.scene.base_height_scanner is not None:
             self.scene.base_height_scanner.update_period = self.decimation * self.sim.dt
+
+        if self.scene.height_scanner is not None:
+            self.scene.height_scanner.update_period = self.decimation * self.sim.dt
 
         self.synchronize_curriculum_config()
         self.synchronize_domain_randomization_config()
@@ -760,23 +782,28 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         )
 
         # Pass the same curriculum object to reset events so initial terrain
-        # assignment, active routes, and commands use the authoritative table.
+        # assignment and active routes use the authoritative table.
         self.events.initialize_terrain_levels.params["curriculum_cfg"] = curriculum_cfg
         self.events.initialize_terrain_levels.params["terrain_layout"] = terrain_layout
         self.events.initialize_terrain_levels.params["initial_level_override"] = (
             self.evaluation_level
         )
-        self.events.reset_routes_and_commands.params["curriculum_cfg"] = curriculum_cfg
+        self.events.reset_routes.params["curriculum_cfg"] = curriculum_cfg
+        self.events.reset_routes.params["terrain_layout"] = terrain_layout
 
         # The fixed evaluation configuration disables adaptive curriculum
         # updates, so synchronize this term only when it is present.
         if self.curriculum is not None:
             self.curriculum.terrain_levels.params["curriculum_cfg"] = curriculum_cfg
+            self.curriculum.terrain_levels.params["terrain_layout"] = terrain_layout
 
         # The success term owns route advancement before reward computation.
         # Synchronize its waypoint radius with the authoritative curriculum.
         self.terminations.success.params["reach_threshold"] = (
             curriculum_cfg.waypoint_reach_threshold
+        )
+        self.terminations.success.params["contact_threshold"] = (
+            curriculum_cfg.base_contact_threshold
         )
 
         # Likewise, use one contact threshold for both the safety penalty and

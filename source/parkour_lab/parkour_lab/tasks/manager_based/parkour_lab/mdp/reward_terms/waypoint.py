@@ -16,7 +16,6 @@ from ..commands import get_min_clearance, get_target_speed
 from ..navigation import geometry, route
 from ..terrain import queries
 
-
 # Dense waypoint-progress shaping.
 
 
@@ -60,18 +59,22 @@ def waypoint_heading_misalignment_l2(
         upper=heading_cfg.full_forward_speed,
     )
 
-    normalized_heading_error = torch.clamp(
-        heading_error / heading_cfg.max_heading_error, min=0.0, max=1.0
-    )
+    normalized_heading_error = torch.clamp(heading_error / heading_cfg.max_heading_error, min=0.0, max=1.0)
 
-    return advancing_gate * normalized_heading_error.square()
+    penalty = advancing_gate * normalized_heading_error.square()
+    # A waypoint switch changes the desired heading after the robot has already
+    # acted toward the previous target. Skip that transition sample so route
+    # retargeting is not penalized as policy-induced heading misalignment.
+    return torch.where(
+        route.active_waypoint_changed_this_step(env),
+        torch.zeros_like(penalty),
+        penalty,
+    )
 
 
 def waypoint_progress_xy_stable(
     env: ManagerBasedRLEnv,
-    progress_cfg: config.StableWaypointProgressCfg = (
-        config.DEFAULT_STABLE_WAYPOINT_PROGRESS
-    ),
+    progress_cfg: config.StableWaypointProgressCfg = (config.DEFAULT_STABLE_WAYPOINT_PROGRESS),
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
@@ -102,12 +105,6 @@ def waypoint_progress_xy_stable(
         asset_cfg=asset_cfg,
     )
 
-    distance_buffer_name = runtime._private_buffer_name(
-        "parkour_prev_active_waypoint_distance_xy",
-        waypoint_marker_cfg.name,
-        asset_cfg.name,
-    )
-
     root_xy_buffer_name = runtime._private_buffer_name(
         "parkour_prev_root_xy_for_waypoint_progress",
         waypoint_marker_cfg.name,
@@ -126,20 +123,27 @@ def waypoint_progress_xy_stable(
         route.active_waypoint_changed_this_step(env),
     )
 
-    progress = runtime._difference_from_previous_env_buffer(
-        env,
-        buffer_name=distance_buffer_name,
-        current_value=current_distance,
-        reset_mask=distance_reference_changed,
-    )
-
     root_delta_xy = robot._root_xy_delta_from_previous(
         env, buffer_name=root_xy_buffer_name, reset_mask=just_reset, asset_cfg=asset_cfg
     )
-
-    stable = _root_stability_mask(
-        env, stability_cfg=progress_cfg.stability, asset_cfg=asset_cfg
+    current_root_xy = robot._root_pos_env(env, asset_cfg)[:, :2]
+    previous_root_xy = current_root_xy - root_delta_xy
+    active_waypoint_xy = route.active_waypoint_positions(
+        env,
+        waypoint_marker_cfg,
+    )[:, :2]
+    previous_distance = torch.linalg.norm(
+        previous_root_xy - active_waypoint_xy,
+        dim=-1,
     )
+    progress = previous_distance - current_distance
+    progress = torch.where(
+        distance_reference_changed,
+        torch.zeros_like(progress),
+        progress,
+    )
+
+    stable = _root_stability_mask(env, stability_cfg=progress_cfg.stability, asset_cfg=asset_cfg)
 
     progress = runtime._gate_positive_values(values=progress, gate=stable)
 
@@ -176,11 +180,7 @@ def waypoint_progress_xy_stable(
         torch.zeros_like(lateral_penalty),
     )
 
-    return (
-        positive_reward
-        - negative_penalty
-        - progress_cfg.lateral_drift_weight * lateral_penalty
-    )
+    return positive_reward - negative_penalty - progress_cfg.lateral_drift_weight * lateral_penalty
 
 
 # Sparse course events.
@@ -200,10 +200,7 @@ def completed_course_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
     return completed.float() / float(env.step_dt)
 
 
-def intermediate_milestone_reward(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
+def intermediate_milestone_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Return a safe, one-shot fraction of the course's milestone bonus.
 
     The termination term advances route cursors before rewards are computed.
@@ -212,50 +209,18 @@ def intermediate_milestone_reward(
     of rewarded milestones prevents routes with extra control markers from
     receiving a larger shaping budget.
 
-    Intermediate route advancement uses proximity or a corridor-constrained
-    route-plane crossing. The reward additionally requires safe base clearance
-    so a collapsed robot cannot earn shaping merely by triggering the route
-    transition.
+    A physical milestone can advance only after a recently contacted foot is
+    on its explicitly named support polygon. The route transition therefore
+    establishes safe landing before this reward consumes the cursor-change
+    event; no duplicate reward-specific landing buffer is needed.
 
     Returns:
         [num_envs]
     """
 
-    required_state = (
-        "_parkour_active_waypoint_index",
-        "_parkour_course_index",
-        "_parkour_milestone_count_by_course",
-        "_parkour_waypoint_milestone_table",
-    )
-    if not all(hasattr(env, name) for name in required_state):
-        raise RuntimeError(
-            "Active routes must be initialized before milestone rewards."
-        )
-
-    changed = route.active_waypoint_changed_this_step(env)
-    course_indices = env._parkour_course_index
-    reached_indices = (env._parkour_active_waypoint_index - 1).clamp_min(0)
-    reached = (
-        changed
-        & env._parkour_waypoint_milestone_table[
-            course_indices,
-            reached_indices,
-        ]
-    )
-    milestone_counts = env._parkour_milestone_count_by_course[course_indices].clamp_min(
-        1
-    )
-
-    clearance = queries._base_clearance(env, asset_cfg)
-    min_clearance = get_min_clearance(env).to(
-        device=clearance.device,
-        dtype=clearance.dtype,
-    )
-    safely_reached = reached & (clearance > min_clearance)
     # Isaac Lab multiplies reward terms by ``env.step_dt``. Divide this one-step
     # event here so the configured weight remains the exact per-course bonus.
-    reward_rate = safely_reached.float() / float(env.step_dt)
-    return reward_rate / milestone_counts.to(dtype=reward_rate.dtype)
+    return route.reached_milestone_reward_fractions(env) / float(env.step_dt)
 
 
 # Dense waypoint-velocity shaping.
@@ -271,16 +236,16 @@ def velocity_along_waypoint_xy_capped(
 
     The reward follows:
 
-        min(dot(root_velocity_xy_w, waypoint_direction_xy_w), target_speed)
-        ----------------------------------------------------------------
-                              target_speed
+        clamp(dot(root_velocity_xy_w, waypoint_direction_xy_w) / target_speed,
+              -1, 1)
 
     Projecting world-frame velocity onto the waypoint direction avoids
     rewarding a robot that turns around and moves in its body-forward direction
-    away from the waypoint. Capping at the command prevents additional reward for
-    overspeed without penalizing short speed bursts needed for parkour. Dividing
-    by the command gives every curriculum level the same maximum reward of 1.0.
-    Moving away from the waypoint produces a negative reward.
+    away from the waypoint. The symmetric clamp prevents overspeed from earning
+    extra reward and bounds collision-induced reverse spikes. Dividing by the
+    command gives every curriculum level the same ``[-1, 1]`` scale. The
+    retarget step is zeroed because its new direction did not produce the
+    action being evaluated.
 
     This reward does not check whether the robot is upright or has enough
     clearance. Use velocity_along_waypoint_xy_clearance_capped for the gated
@@ -302,7 +267,16 @@ def velocity_along_waypoint_xy_capped(
     )
     normalization_speed = target_speed.clamp_min(torch.finfo(target_speed.dtype).eps)
 
-    return torch.minimum(velocity_along_waypoint, target_speed) / normalization_speed
+    normalized_velocity = torch.clamp(
+        velocity_along_waypoint / normalization_speed,
+        min=-1.0,
+        max=1.0,
+    )
+    return torch.where(
+        route.active_waypoint_changed_this_step(env),
+        torch.zeros_like(normalized_velocity),
+        normalized_velocity,
+    )
 
 
 def velocity_along_waypoint_xy_clearance_capped(
@@ -336,9 +310,7 @@ def velocity_along_waypoint_xy_clearance_capped(
 
     clearance = queries._base_clearance(env, asset_cfg=asset_cfg)
 
-    has_enough_clearance = clearance > get_min_clearance(env).to(
-        device=clearance.device, dtype=clearance.dtype
-    )
+    has_enough_clearance = clearance > get_min_clearance(env).to(device=clearance.device, dtype=clearance.dtype)
 
     return reward * has_enough_clearance.to(dtype=reward.dtype)
 

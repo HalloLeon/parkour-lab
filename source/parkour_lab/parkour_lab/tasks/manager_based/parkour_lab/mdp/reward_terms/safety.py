@@ -26,14 +26,17 @@ def base_clearance_below_l2(
       - the top of an obstacle
       - later, another support surface
 
-    This is an L2 penalty:
+    This is a normalized L2 penalty:
 
-        penalty = max(min_clearance - clearance, 0)^2
+        error = clamp((min_clearance - clearance) / min_clearance, 0, 1)
+        penalty = error^2
 
     where:
 
         clearance = base_height - support_surface_height_under_base
 
+    Normalizing by the commanded minimum gives the term a useful and stable
+    ``[0, 1]`` scale instead of squaring a small distance measured in metres.
     Use with a negative reward weight.
 
     Returns:
@@ -44,7 +47,12 @@ def base_clearance_below_l2(
 
     min_clearance = get_min_clearance(env).to(device=clearance.device, dtype=clearance.dtype)
 
-    clearance_error = torch.clamp(min_clearance - clearance, min=0.0)
+    normalization = min_clearance.clamp_min(torch.finfo(clearance.dtype).eps)
+    clearance_error = torch.clamp(
+        (min_clearance - clearance) / normalization,
+        min=0.0,
+        max=1.0,
+    )
 
     return clearance_error.square()
 
@@ -53,9 +61,13 @@ def base_contact(
     env: ManagerBasedRLEnv,
     threshold: float = 1.0,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("base_contact", body_names="trunk"),
+    timestep_independent: bool = False,
 ) -> torch.Tensor:
-    """
-    Penalty signal for illegal trunk/base contact.
+    """Penalty signal for illegal trunk/base contact.
+
+    Set ``timestep_independent`` when contact also terminates the episode. The
+    one-step signal is then divided by the control timestep before Isaac Lab's
+    reward integration, so its configured weight is the exact crash penalty.
 
     Returns:
         Tensor of shape [num_envs].
@@ -75,4 +87,7 @@ def base_contact(
     # [num_envs]
     has_illegal_contact = torch.any(force_norm > threshold, dim=(1, 2))
 
-    return has_illegal_contact.float()
+    penalty = has_illegal_contact.float()
+    if timestep_independent:
+        return penalty / float(env.step_dt)
+    return penalty

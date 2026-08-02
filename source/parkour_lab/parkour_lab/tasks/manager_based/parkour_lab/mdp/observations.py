@@ -8,8 +8,11 @@ from isaaclab.utils.math import quat_apply_inverse
 from . import config
 from ._shared import contact
 from .commands import get_target_speed
-from .navigation import geometry
+from .navigation import geometry, route
 from .terrain import queries
+
+
+# Robot state and course commands.
 
 
 def base_clearance_obs(
@@ -57,6 +60,9 @@ def foot_contact_state(
     in_contact = torch.any(force_norm > threshold, dim=1)
 
     return in_contact.float() - 0.5
+
+
+# Route state.
 
 
 def active_waypoint_direction_body_xy(
@@ -157,6 +163,24 @@ def active_waypoint_distance_xy(
     ).unsqueeze(-1)
 
 
+def route_phase(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return normalized route-cursor and safe-progress phase for the critic.
+
+    The first component locates the active waypoint in the ordered route. The
+    second reports the greatest corridor-valid route progress divided by the
+    selected course length. Both components are fixed to ``[0, 1]`` and expose
+    task phase without leaking obstacle-family or difficulty labels.
+
+    Returns:
+        [num_envs, 2]
+    """
+
+    return route.route_phase(env)
+
+
+# Student exteroception boundary.
+
+
 def student_exteroception_stub(
     env: ManagerBasedRLEnv, feature_dim: int = 64
 ) -> torch.Tensor:
@@ -176,6 +200,9 @@ def student_exteroception_stub(
     if feature_dim <= 0:
         raise ValueError("feature_dim must be positive.")
     return torch.zeros((env.num_envs, feature_dim), device=env.device)
+
+
+# Privileged terrain observations.
 
 
 def terrain_height_scan(
@@ -234,6 +261,9 @@ def terrain_height_scan_validity(
         asset_cfg=asset_cfg,
     )
     return validity
+
+
+# Private observation helpers.
 
 
 def _terrain_height_scan_components(

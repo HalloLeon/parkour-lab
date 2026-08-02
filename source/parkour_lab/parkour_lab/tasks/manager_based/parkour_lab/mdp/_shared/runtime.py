@@ -6,50 +6,17 @@ from isaaclab.envs import ManagerBasedRLEnv
 
 def _all_env_ids(
     env: ManagerBasedRLEnv,
-    env_ids: Sequence[int] | torch.Tensor | None,
+    env_ids: Sequence[int] | torch.Tensor | slice | None,
 ) -> torch.Tensor:
     """Return selected environment indices as a device-local integer tensor."""
 
     if env_ids is None:
         return torch.arange(env.num_envs, device=env.device, dtype=torch.long)
 
+    if isinstance(env_ids, slice):
+        return torch.arange(env.num_envs, device=env.device, dtype=torch.long)[env_ids]
+
     return torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
-
-
-def _difference_from_previous_env_buffer(
-    env: ManagerBasedRLEnv,
-    *,
-    buffer_name: str,
-    current_value: torch.Tensor,
-    reset_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """
-    Compute previous_value - current_value using an environment-level buffer.
-
-    The buffer is always updated, even when reset_mask is true.
-
-    Returns:
-        [num_envs]
-    """
-
-    previous_value = _get_or_init_env_buffer(
-        env=env, name=buffer_name, value=current_value
-    )
-
-    difference = previous_value - current_value
-
-    if reset_mask is not None:
-        difference = torch.where(reset_mask, torch.zeros_like(difference), difference)
-
-    _set_env_buffer(env=env, name=buffer_name, value=current_value)
-
-    return difference
-
-
-def _env_torch_device(env: ManagerBasedRLEnv) -> torch.device:
-    """Return Isaac Lab's string-valued device as a normalized torch device."""
-
-    return torch.device(env.device)
 
 
 def _episode_start_mask(

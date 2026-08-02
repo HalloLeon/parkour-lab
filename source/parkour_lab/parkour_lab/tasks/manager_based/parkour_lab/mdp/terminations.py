@@ -26,8 +26,25 @@ def completed_course_done(
     reach_threshold: float,
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    feet_asset_cfg: SceneEntityCfg = SceneEntityCfg(
+        "robot",
+        body_names=".*_foot",
+    ),
+    feet_contact_cfg: SceneEntityCfg = SceneEntityCfg(
+        "feet_contact",
+        body_names=".*_foot",
+    ),
+    trunk_contact_cfg: SceneEntityCfg = SceneEntityCfg(
+        "base_contact",
+        body_names="trunk",
+    ),
+    contact_threshold: float = 1.0,
+    max_completion_tilt: float = 0.5,
+    max_completion_vertical_speed: float = 0.5,
+    support_margin: float = 0.05,
+    support_plane_tolerance: float = 0.12,
 ) -> torch.Tensor:
-    """Advance active waypoints and terminate only after the safe final one.
+    """Advance routes and terminate only on a supported, stable, crash-free finish.
 
     Returns:
         [num_envs]
@@ -38,4 +55,12 @@ def completed_course_done(
         reach_threshold=reach_threshold,
         waypoint_marker_cfg=waypoint_marker_cfg,
         asset_cfg=asset_cfg,
+        feet_asset_cfg=feet_asset_cfg,
+        feet_contact_cfg=feet_contact_cfg,
+        trunk_contact_cfg=trunk_contact_cfg,
+        contact_threshold=contact_threshold,
+        max_completion_tilt=max_completion_tilt,
+        max_completion_vertical_speed=max_completion_vertical_speed,
+        support_margin=support_margin,
+        support_plane_tolerance=support_plane_tolerance,
     )

@@ -21,15 +21,19 @@ def initialize_parkour_terrain_levels(
     )
 
 
-def reset_routes_and_commands(
+def reset_routes(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor | None,
+    terrain_layout: curriculums_config.ParkourTerrainLayout,
     curriculum_cfg: curriculums_config.ParkourCurriculumCfg = curriculums_config.DEFAULT_PARKOUR_CURRICULUM,
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> None:
-    curriculums.reset_routes_and_commands(
+    curriculums.reset_routes(
         env=env,
         env_ids=env_ids,
+        terrain_layout=terrain_layout,
         curriculum_cfg=curriculum_cfg,
         waypoint_marker_cfg=waypoint_marker_cfg,
+        asset_cfg=asset_cfg,
     )
