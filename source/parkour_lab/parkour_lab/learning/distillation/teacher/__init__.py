@@ -6,15 +6,17 @@
 """Framework-independent privileged-teacher models."""
 
 from .model import (
+    DeployableHistoryEncoder,
+    PrivilegedDynamicsEncoder,
     PrivilegedScanEncoder,
     PrivilegedTeacherActor,
     PrivilegedTeacherModelCfg,
-    PrivilegedTeacherPolicy,
 )
 
 __all__ = [
+    "DeployableHistoryEncoder",
+    "PrivilegedDynamicsEncoder",
     "PrivilegedScanEncoder",
     "PrivilegedTeacherActor",
     "PrivilegedTeacherModelCfg",
-    "PrivilegedTeacherPolicy",
 ]

@@ -13,10 +13,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as functional
 
+from .adaptation import DeployableHistoryEncoder
 from .architecture import MotorActor, MotorInterfaceCfg, _build_mlp, _validate_input
 
-STUDENT_OBSERVATION_GROUPS = ("policy", "student_exteroception")
-"""Deployable state and temporary terrain-latent groups used by the student."""
+STUDENT_OBSERVATION_GROUPS = (
+    "policy",
+    "student_exteroception",
+    "adaptation_history",
+)
+"""Deployable state, terrain latent, and causal history used by the student."""
 
 
 @dataclass(frozen=True)
@@ -24,13 +29,24 @@ class StudentModelCfg:
     """Heading-prediction and loss settings around one shared motor actor."""
 
     # Shared teacher/student motor contract. It fixes the deployable-state,
-    # heading, terrain-latent, optional adaptation-latent, and action widths as
-    # well as the motor MLP hidden layers and tensor concatenation order.
+    # heading, terrain-latent, adaptation-latent, and action widths as well as
+    # the motor MLP hidden layers and tensor concatenation order.
     motor: MotorInterfaceCfg
+
+    # Width of the flattened causal state history supplied by Isaac Lab.
+    history_dim: int
+
+    # Hidden-layer widths of the encoder that estimates the teacher's
+    # privileged dynamics latent from deployable state-action history.
+    adaptation_hidden_dims: tuple[int, ...] = (256, 128)
 
     # Hidden-layer widths of the MLP that predicts the two-component heading
     # from deployable state and the terrain latent.
     heading_hidden_dims: tuple[int, ...] = (256, 128)
+
+    # Multiplier for aligning the history-based adaptation estimate with the
+    # detached latent produced from privileged simulator dynamics.
+    adaptation_loss_weight: float = 1.0
 
     # Multiplier for the Smooth L1 loss between student and teacher actions.
     motor_loss_weight: float = 1.0
@@ -48,7 +64,10 @@ class StudentModelCfg:
 
         return {
             "motor": self.motor.to_dict(),
+            "history_dim": self.history_dim,
+            "adaptation_hidden_dims": list(self.adaptation_hidden_dims),
             "heading_hidden_dims": list(self.heading_hidden_dims),
+            "adaptation_loss_weight": self.adaptation_loss_weight,
             "motor_loss_weight": self.motor_loss_weight,
             "heading_direction_loss_weight": self.heading_direction_loss_weight,
             "heading_norm_loss_weight": self.heading_norm_loss_weight,
@@ -58,11 +77,14 @@ class StudentModelCfg:
         """Validate dimensions and non-negative loss weights."""
 
         self.motor.validate()
-        if not self.heading_hidden_dims or any(
-            width <= 0 for width in self.heading_hidden_dims
-        ):
-            raise ValueError("Heading hidden dimensions must be positive.")
+        for name in ("adaptation_hidden_dims", "heading_hidden_dims"):
+            dimensions = getattr(self, name)
+            if not dimensions or any(width <= 0 for width in dimensions):
+                raise ValueError(f"{name} must contain positive dimensions.")
+        if self.history_dim <= 0:
+            raise ValueError("history_dim must be positive.")
         for name in (
+            "adaptation_loss_weight",
             "motor_loss_weight",
             "heading_direction_loss_weight",
             "heading_norm_loss_weight",
@@ -121,6 +143,11 @@ class StudentPolicy(nn.Module):
         super().__init__()
         cfg.validate()
         self.cfg = cfg
+        self.history_encoder = DeployableHistoryEncoder(
+            cfg.history_dim,
+            cfg.motor.adaptation_latent_dim,
+            cfg.adaptation_hidden_dims,
+        )
         self.heading = HeadingPredictor(cfg)
         self.motor = MotorActor(cfg.motor)
 
@@ -135,14 +162,14 @@ class StudentPolicy(nn.Module):
         self,
         deployable_state: torch.Tensor,
         terrain_latent: torch.Tensor,
-        adaptation_latent: torch.Tensor | None = None,
+        deployable_history: torch.Tensor,
     ) -> torch.Tensor:
         """Return deterministic motor actions executed during online rollout."""
 
-        actions, _, _ = self.forward(
+        actions, _, _, _ = self.forward(
             deployable_state,
             terrain_latent,
-            adaptation_latent,
+            deployable_history,
         )
         return actions
 
@@ -150,9 +177,9 @@ class StudentPolicy(nn.Module):
         self,
         deployable_state: torch.Tensor,
         terrain_latent: torch.Tensor,
-        adaptation_latent: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return motor actions, unit heading commands, and raw heading vectors."""
+        deployable_history: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return actions, headings, and the history-based adaptation latent."""
 
         _validate_input(
             deployable_state,
@@ -173,23 +200,26 @@ class StudentPolicy(nn.Module):
             deployable_state,
             terrain_latent,
         )
+        adaptation_latent = self.history_encoder(deployable_history)
         actions = self.motor(
             deployable_state,
             heading_command,
             terrain_latent,
             adaptation_latent,
         )
-        return actions, heading_command, raw_heading
+        return actions, heading_command, raw_heading, adaptation_latent
 
 
 def compute_distillation_losses(
     student: StudentPolicy,
     deployable_state: torch.Tensor,
     terrain_latent: torch.Tensor,
+    deployable_history: torch.Tensor,
     oracle_heading: torch.Tensor,
     teacher_action: torch.Tensor,
+    privileged_adaptation_target: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """Compute robust action imitation and wrap-safe heading supervision."""
+    """Compute action, heading, and privileged-latent supervision."""
 
     _validate_input(
         oracle_heading,
@@ -201,9 +231,15 @@ def compute_distillation_losses(
         student.cfg.motor.action_dim,
         "teacher_action",
     )
-    actions, heading_command, raw_heading = student(
+    _validate_input(
+        privileged_adaptation_target,
+        student.cfg.motor.adaptation_latent_dim,
+        "privileged_adaptation_target",
+    )
+    actions, heading_command, raw_heading, adaptation_latent = student(
         deployable_state,
         terrain_latent,
+        deployable_history,
     )
     # Normalize each final-dimension XY pair with its L2 norm so the motor
     # network receives a unit direction rather than an arbitrary magnitude.
@@ -229,8 +265,17 @@ def compute_distillation_losses(
     # direction loss alone ignores magnitude, so this squared mean penalty
     # discourages unstable near-zero or unnecessarily large raw predictions.
     heading_norm = (torch.linalg.norm(raw_heading, dim=-1) - 1.0).square().mean()
+
+    # Regress the deployable history encoder toward the representation used by
+    # the teacher motor. Detaching the target keeps this student update from
+    # modifying or retaining the privileged teacher graph.
+    adaptation_alignment = functional.smooth_l1_loss(
+        adaptation_latent,
+        privileged_adaptation_target.detach(),
+    )
     total = (
-        student.cfg.motor_loss_weight * motor
+        student.cfg.adaptation_loss_weight * adaptation_alignment
+        + student.cfg.motor_loss_weight * motor
         + student.cfg.heading_direction_loss_weight * heading_direction
         + student.cfg.heading_norm_loss_weight * heading_norm
     )
@@ -241,6 +286,7 @@ def compute_distillation_losses(
     heading_error_deg = torch.rad2deg(torch.acos(heading_cosine)).mean()
     return {
         "total": total,
+        "adaptation_alignment": adaptation_alignment,
         "motor_huber": motor,
         "heading_direction": heading_direction,
         "heading_norm": heading_norm,

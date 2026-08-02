@@ -30,10 +30,12 @@ if TYPE_CHECKING:
     from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
     from tensordict import TensorDict
 
-TEACHER_INTERFACE_VERSION = 8
+TEACHER_INTERFACE_VERSION = 13
 
+ADAPTATION_HISTORY_GROUP = "adaptation_history"
 DEPLOYABLE_STATE_GROUP = "policy"
 ORACLE_HEADING_GROUP = "heading_target"
+PRIVILEGED_DYNAMICS_GROUP = "dynamics"
 PRIVILEGED_TERRAIN_GROUP = "terrain"
 
 # RSL-RL concatenates the deployable, oracle, and privileged inputs in this order.
@@ -41,12 +43,15 @@ TEACHER_OBSERVATION_GROUPS = (
     DEPLOYABLE_STATE_GROUP,
     ORACLE_HEADING_GROUP,
     PRIVILEGED_TERRAIN_GROUP,
+    PRIVILEGED_DYNAMICS_GROUP,
 )
 
 __all__ = [
+    "ADAPTATION_HISTORY_GROUP",
     "InterfaceMismatchError",
     "DEPLOYABLE_STATE_GROUP",
     "ORACLE_HEADING_GROUP",
+    "PRIVILEGED_DYNAMICS_GROUP",
     "PRIVILEGED_TERRAIN_GROUP",
     "TEACHER_INTERFACE_VERSION",
     "TEACHER_OBSERVATION_GROUPS",
@@ -115,6 +120,11 @@ def build_teacher_interface(
         )
 
     groups = _describe_observation_groups(base_env, observations, actor_groups)
+    history_group = _describe_observation_groups(
+        base_env,
+        observations,
+        (ADAPTATION_HISTORY_GROUP,),
+    )[0]
     action_manager = base_env.action_manager
 
     # The runtime descriptor contains the resolved joint order and transforms.
@@ -122,6 +132,7 @@ def build_teacher_interface(
     height_obs_cfg = base_env.cfg.observations.terrain.height_scan.params["obs_cfg"]
     scanner_cfg = base_env.cfg.scene.height_scanner
     curriculum_cfg = base_env.cfg.parkour_curriculum
+    success_params = base_env.cfg.terminations.success.params
     terrain_generator_cfg = base_env.cfg.scene.ground.terrain_generator
     terrain_cfgs = terrain_generator_cfg.sub_terrains.values()
     ground_thicknesses = {float(terrain_cfg.ground_thickness) for terrain_cfg in terrain_cfgs}
@@ -131,6 +142,8 @@ def build_teacher_interface(
         )
     ground_thickness_m = ground_thicknesses.pop()
     policy_cfg = agent_cfg.policy
+    dynamics_recorder = base_env.event_manager.get_term_cfg("record_privileged_dynamics").func
+    dynamics_component_names = list(dynamics_recorder.component_names)
 
     # Import the tensor architecture only when building a live simulator
     # manifest, keeping checkpoint identity helpers usable without PyTorch.
@@ -145,7 +158,11 @@ def build_teacher_interface(
             action_dim=int(action_manager.total_action_dim),
             hidden_dims=tuple(policy_cfg.actor_hidden_dims),
         ),
+        history_dim=_flat_dimension(observations[ADAPTATION_HISTORY_GROUP]),
+        privileged_dynamics_dim=_flat_dimension(observations[PRIVILEGED_DYNAMICS_GROUP]),
         terrain_scan_dim=_flat_dimension(observations[PRIVILEGED_TERRAIN_GROUP]),
+        dynamics_hidden_dims=tuple(policy_cfg.dynamics_encoder_hidden_dims),
+        history_hidden_dims=tuple(policy_cfg.history_encoder_hidden_dims),
         scan_hidden_dims=tuple(policy_cfg.scan_encoder_hidden_dims),
     )
     teacher_model_cfg.validate()
@@ -155,16 +172,25 @@ def build_teacher_interface(
         # Preserve the information boundary even though PPO concatenates all groups.
         "information_contract": {
             "deployable_state_group": DEPLOYABLE_STATE_GROUP,
+            "deployable_history_group": ADAPTATION_HISTORY_GROUP,
             "oracle_heading_group": ORACLE_HEADING_GROUP,
             "heading_representation": "yaw_aligned_unit_xy",
             # Ordered routes are already frozen by ``terrain_curriculum.matrix``.
             "oracle_heading_source": {
                 "kind": "active_course_waypoint",
                 "reach_threshold_m": float(curriculum_cfg.waypoint_reach_threshold),
-                "intermediate_transition": "radius_or_route_plane",
-                "final_transition": "radius",
+                "control_waypoint_transition": "radius_or_true_route_plane_crossing",
+                "physical_waypoint_transition": "radius_and_named_support_contact",
+                "support_contact_threshold_n": float(success_params["contact_threshold"]),
+                "support_margin_m": float(success_params["support_margin"]),
+                "support_plane_tolerance_m": float(success_params["support_plane_tolerance"]),
+                "final_transition": "radius_and_named_support_contact",
+                "final_requires_no_trunk_contact": True,
                 "final_requires_min_clearance": True,
+                "final_max_projected_gravity_xy_norm": float(success_params["max_completion_tilt"]),
+                "final_max_vertical_speed_m_s": float(success_params["max_completion_vertical_speed"]),
             },
+            "privileged_dynamics_group": PRIVILEGED_DYNAMICS_GROUP,
             "privileged_terrain_group": PRIVILEGED_TERRAIN_GROUP,
         },
         "actor": {
@@ -175,11 +201,22 @@ def build_teacher_interface(
                 # These stable state-dictionary paths make the encoder and
                 # directly transferable motor identifiable in RSL-RL checkpoints.
                 "checkpoint_modules": {
+                    "dynamics_encoder": "actor.dynamics_encoder",
+                    "history_encoder": "actor.history_encoder",
                     "terrain_encoder": "actor.terrain_encoder",
                     "motor_actor": "actor.motor",
                 },
                 "model": teacher_model_cfg.to_dict(),
             },
+        },
+        "adaptation": {
+            "privileged_dynamics_components": dynamics_component_names,
+            "privileged_dynamics_dimension": _flat_dimension(observations[PRIVILEGED_DYNAMICS_GROUP]),
+            "deployable_history": history_group,
+            "history_layout": "term_major_flattened_oldest_to_newest",
+            "history_length": int(base_env.cfg.observations.adaptation_history.history_length),
+            "includes_previous_action": "last_action"
+            in base_env.observation_manager.active_terms[ADAPTATION_HISTORY_GROUP],
         },
         "terrain_scan": {
             "num_rays": int(height_obs_cfg.num_rays),
@@ -333,6 +370,8 @@ def _describe_observation_groups(
                     "simple_params": _simple_mapping(term_cfg.params),
                     "clip": _simple_value(term_cfg.clip),
                     "scale": _simple_value(term_cfg.scale),
+                    "history_length": int(term_cfg.history_length),
+                    "flatten_history_dim": bool(term_cfg.flatten_history_dim),
                 }
             )
 
@@ -342,6 +381,8 @@ def _describe_observation_groups(
                 # Parallel-environment batch size is not part of the model.
                 "dimension": _flat_dimension(observations[group_name]),
                 "concatenate_terms": bool(observation_manager.group_obs_concatenate[group_name]),
+                "history_length": _simple_value(group_cfg.history_length),
+                "flatten_history_dim": bool(group_cfg.flatten_history_dim),
                 "terms": terms,
             }
         )

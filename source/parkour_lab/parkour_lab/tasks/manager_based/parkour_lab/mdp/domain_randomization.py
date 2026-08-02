@@ -12,8 +12,10 @@ from collections.abc import Sequence
 from typing import Literal
 
 import torch
+from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedEnv
 from isaaclab.envs.mdp.actions import JointPositionAction, JointPositionActionCfg
+from isaaclab.managers import EventTermCfg, ManagerTermBase, SceneEntityCfg
 from isaaclab.managers.action_manager import ActionTerm
 from isaaclab.utils import configclass
 from isaaclab.utils.buffers import DelayBuffer
@@ -150,6 +152,98 @@ class ProprioceptionDelay(ModifierBase):
         self._delay_buffer.reset(batch_ids=batch_ids)
 
 
+class RecordPrivilegedDynamics(ManagerTermBase):
+    """Record the actual persistent dynamics randomized for each environment."""
+
+    def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv) -> None:
+        super().__init__(cfg, env)
+        self.asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self.asset: Articulation = env.scene[self.asset_cfg.name]
+        joint_ids = self.asset_cfg.joint_ids
+        joint_names = (
+            self.asset.joint_names[joint_ids]
+            if isinstance(joint_ids, slice)
+            else [self.asset.joint_names[index] for index in joint_ids]
+        )
+        self.component_names = privileged_dynamics_component_names(joint_names)
+
+        # ObservationManager queries term dimensions before startup events run.
+        # Allocate the final shape now; the startup call fills it after every
+        # persistent physics randomizer has written its sampled values.
+        self.values = torch.zeros(
+            (env.num_envs, len(self.component_names)),
+            device=env.device,
+        )
+
+    def __call__(
+        self,
+        env: ManagerBasedEnv,
+        env_ids: torch.Tensor | None,
+        asset_cfg: SceneEntityCfg,
+    ) -> None:
+        """Read actual simulator properties after startup randomization."""
+
+        del env, env_ids, asset_cfg
+        body_ids = self.asset_cfg.body_ids
+        joint_ids = self.asset_cfg.joint_ids
+
+        # N: environments, B: selected bodies (B=1), S: collision shapes,
+        # J: selected joints.
+        # Post-randomization PhysX masses and nominal asset masses: (N, B).
+        masses = self.asset.root_physx_view.get_masses()[:, body_ids]
+        default_masses = self.asset.data.default_mass[:, body_ids]
+        # Relative change from nominal (zero means unchanged): (N, B).
+        mass_ratio = (
+            masses.to(self.values) / default_masses.to(self.values).clamp_min(1.0e-6)
+            - 1.0
+        )
+        # Post-randomization local COM xyz: (N, B, 3).
+        centers_of_mass = self.asset.root_physx_view.get_coms()[:, body_ids, :3].to(
+            self.values
+        )
+        # Per-shape (static friction, dynamic friction, restitution): (N, S, 3).
+        # Mean across shapes: (N, 3).
+        materials = self.asset.root_physx_view.get_material_properties().to(self.values)
+        mean_material = materials.mean(dim=1)
+
+        # Explicit actuator models such as A1's DC motors keep their operative
+        # gains on the actuator objects; the PhysX joint buffers remain zero.
+        # Assemble the current global gain tensors from those actuator-local
+        # values so this vector records the gains that actually produce torque.
+        # Full-robot operative gains: (N, number of robot joints).
+        stiffness = self.asset.data.default_joint_stiffness.clone()
+        damping = self.asset.data.default_joint_damping.clone()
+        for actuator in self.asset.actuators.values():
+            stiffness[:, actuator.joint_indices] = actuator.stiffness
+            damping[:, actuator.joint_indices] = actuator.damping
+
+        # Selected operative gains and relative changes from nominal: (N, J).
+        stiffness = stiffness[:, joint_ids]
+        default_stiffness = self.asset.data.default_joint_stiffness[:, joint_ids]
+        stiffness_ratio = (stiffness / default_stiffness.clamp_min(1.0e-6) - 1.0).to(
+            self.values
+        )
+        damping = damping[:, joint_ids]
+        default_damping = self.asset.data.default_joint_damping[:, joint_ids]
+        damping_ratio = (damping / default_damping.clamp_min(1.0e-6) - 1.0).to(
+            self.values
+        )
+
+        # Concatenated feature vector: (N, 4B + 3 + 2J) = (N, 7 + 2J).
+        self.values.copy_(
+            torch.cat(
+                (
+                    mass_ratio,
+                    centers_of_mass.flatten(start_dim=1),
+                    mean_material,
+                    stiffness_ratio,
+                    damping_ratio,
+                ),
+                dim=-1,
+            )
+        )
+
+
 @configclass
 class DelayedJointPositionActionCfg(JointPositionActionCfg):
     """Configuration for delayed joint-position actions."""
@@ -173,30 +267,30 @@ class ProprioceptionDelayCfg(ModifierCfg):
 ##
 
 
-def _batch_selection(
-    env_ids: Sequence[int] | slice | None,
-    num_envs: int,
-) -> tuple[Sequence[int] | slice | None, int]:
-    """Return DelayBuffer indices and the number of lags to sample."""
+def privileged_dynamics(env: ManagerBasedEnv) -> torch.Tensor:
+    """Return the persistent randomized dynamics recorded at startup."""
 
-    if env_ids is None or isinstance(env_ids, slice):
-        return env_ids, num_envs
-    return env_ids, len(env_ids)
+    recorder = env.event_manager.get_term_cfg("record_privileged_dynamics").func
+    if not isinstance(recorder, RecordPrivilegedDynamics):
+        raise TypeError("record_privileged_dynamics must use RecordPrivilegedDynamics.")
+    return recorder.values.clone()
 
 
-def _sample_lags(
-    count: int,
-    minimum: int,
-    maximum: int,
-    device: str,
-) -> torch.Tensor:
-    """Sample inclusive integer delays using Isaac Lab's seeded Torch RNG."""
+def privileged_dynamics_component_names(
+    joint_names: Sequence[str],
+) -> tuple[str, ...]:
+    """Return the stable semantic order of the privileged dynamics vector."""
 
-    return torch.randint(
-        minimum,
-        maximum + 1,
-        (count,),
-        device=device,
+    return (
+        "trunk_mass_ratio_minus_one",
+        "trunk_com_x",
+        "trunk_com_y",
+        "trunk_com_z",
+        "mean_static_friction",
+        "mean_dynamic_friction",
+        "mean_restitution",
+        *(f"joint_stiffness_ratio_minus_one:{name}" for name in joint_names),
+        *(f"joint_damping_ratio_minus_one:{name}" for name in joint_names),
     )
 
 
@@ -254,6 +348,9 @@ __all__ = [
     "DomainRandomizationCfg",
     "ProprioceptionDelay",
     "ProprioceptionDelayCfg",
+    "RecordPrivilegedDynamics",
+    "privileged_dynamics",
+    "privileged_dynamics_component_names",
     "scaled_delay",
     "scaled_range",
 ]

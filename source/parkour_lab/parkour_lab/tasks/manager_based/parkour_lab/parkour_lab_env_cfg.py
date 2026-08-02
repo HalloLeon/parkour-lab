@@ -20,6 +20,9 @@ from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import UniformNoiseCfg
 from isaaclab_assets.robots.unitree import UNITREE_A1_CFG
+from parkour_lab.learning.distillation.adaptation import (
+    DEPLOYABLE_HISTORY_LENGTH,
+)
 
 from . import mdp
 
@@ -219,6 +222,27 @@ class ObservationsCfg:
             self.concatenate_terms = True
 
     @configclass
+    class AdaptationHistoryCfg(DeployablePolicyCfg):
+        """Causal deployable state-action history used for online adaptation."""
+
+        def __post_init__(self) -> None:
+            super().__post_init__()
+            # Isaac Lab stores history for every inherited term independently,
+            # resets it per environment, then concatenates the flattened terms.
+            self.history_length = DEPLOYABLE_HISTORY_LENGTH
+            self.flatten_history_dim = True
+
+    @configclass
+    class PrivilegedDynamicsCfg(ObsGroup):
+        """Actual persistent physics properties available only in simulation."""
+
+        properties = ObsTerm(func=mdp.privileged_dynamics)
+
+        def __post_init__(self) -> None:
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
     class PrivilegedTerrainCfg(ObsGroup):
         """Simulator ray-cast geometry consumed by the Phase 1 teacher."""
 
@@ -327,10 +351,12 @@ class ObservationsCfg:
     # Both teacher and student consume this one deployable state definition.
     # Their terrain and heading sources differ, but the state term order cannot
     # drift because there is no duplicated student-state observation group.
-    policy: DeployablePolicyCfg = DeployablePolicyCfg()
-    terrain: PrivilegedTerrainCfg = PrivilegedTerrainCfg()
+    adaptation_history: AdaptationHistoryCfg = AdaptationHistoryCfg()
     critic_privileged: CriticPrivilegedCfg = CriticPrivilegedCfg()
+    dynamics: PrivilegedDynamicsCfg = PrivilegedDynamicsCfg()
+    policy: DeployablePolicyCfg = DeployablePolicyCfg()
     student_exteroception: StudentExteroceptionCfg = StudentExteroceptionCfg()
+    terrain: PrivilegedTerrainCfg = PrivilegedTerrainCfg()
 
     # RSL-RL appends this oracle group to the Phase-1 teacher. Distillation also
     # uses it as the heading label, but the student motor receives only its own
@@ -392,6 +418,35 @@ class EventsCfg:
         params={
             "position_range": (1.0, 1.0),
             "velocity_range": (0.0, 0.0),
+        },
+    )
+
+    # Seed route crossing history from the robot's actual post-reset position.
+    # Curriculum updates have already selected the new terrain row, while the
+    # physical terrain column continues to identify the obstacle family.
+    reset_routes = EventTerm(
+        func=mdp.reset_routes,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "curriculum_cfg": PARKOUR_CURRICULUM,
+            "terrain_layout": DEFAULT_TERRAIN_LAYOUT,
+            "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
+        },
+    )
+
+    # Startup recording. Keep this final so every persistent randomizer has
+    # already written the runtime properties captured by the privileged target.
+    record_privileged_dynamics = EventTerm(
+        func=mdp.RecordPrivilegedDynamics,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=["trunk"],
+                joint_names=[".*"],
+                preserve_order=True,
+            )
         },
     )
 
@@ -837,8 +892,12 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         self.actions.joint_pos.min_delay_steps = 0
         self.actions.joint_pos.max_delay_steps = action_delay
 
-        policy_cfg = self.observations.policy
-        policy_cfg.enable_corruption = enabled
+        deployable_groups = (
+            self.observations.adaptation_history,
+            self.observations.policy,
+        )
+        for group_cfg in deployable_groups:
+            group_cfg.enable_corruption = enabled
         proprioception_delay = mdp.scaled_delay(
             cfg.max_proprioception_delay_steps,
             scale,
@@ -850,21 +909,22 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
             "projected_gravity": cfg.gravity_noise,
         }
         for term_name, full_noise in proprioception_terms.items():
-            term_cfg = getattr(policy_cfg, term_name)
-            term_cfg.modifiers = (
-                [
-                    mdp.ProprioceptionDelayCfg(
-                        min_delay_steps=0,
-                        max_delay_steps=proprioception_delay,
-                    )
-                ]
-                if enabled
-                else None
-            )
-            noise = scale * full_noise
-            term_cfg.noise = (
-                UniformNoiseCfg(n_min=-noise, n_max=noise) if enabled else None
-            )
+            for group_cfg in deployable_groups:
+                term_cfg = getattr(group_cfg, term_name)
+                term_cfg.modifiers = (
+                    [
+                        mdp.ProprioceptionDelayCfg(
+                            min_delay_steps=0,
+                            max_delay_steps=proprioception_delay,
+                        )
+                    ]
+                    if enabled
+                    else None
+                )
+                noise = scale * full_noise
+                term_cfg.noise = (
+                    UniformNoiseCfg(n_min=-noise, n_max=noise) if enabled else None
+                )
 
         initial_angular_velocity = mdp.scaled_range(
             cfg.initial_angular_velocity_range_rad_s,

@@ -151,7 +151,6 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 from parkour_lab.learning.distillation.architecture import (
     DEFAULT_TERRAIN_LATENT_DIM,
     HEADING_DIM,
-    MotorActor,
 )
 from parkour_lab.learning.distillation.contracts import (
     TEACHER_OBSERVATION_GROUPS,
@@ -169,6 +168,7 @@ from parkour_lab.learning.distillation.student import (
     compute_distillation_losses,
 )
 from parkour_lab.learning.distillation.teacher.rsl_rl import (
+    PrivilegedTeacherActor,
     register_rsl_rl_teacher_actor_critic,
 )
 from parkour_lab.tasks.manager_based.parkour_lab.mdp.observations import (
@@ -177,7 +177,7 @@ from parkour_lab.tasks.manager_based.parkour_lab.mdp.observations import (
 from rsl_rl.runners import OnPolicyRunner
 from tensordict import TensorDict
 
-STUDENT_CHECKPOINT_VERSION = 3
+STUDENT_CHECKPOINT_VERSION = 4
 """Serialization version of student checkpoints written by this script."""
 
 
@@ -231,8 +231,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
     )
     os.makedirs(log_dir, exist_ok=False)
 
-    env = gym.make(args_cli.task, cfg=env_cfg)
-    env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+    gym_env: gym.Env = gym.make(args_cli.task, cfg=env_cfg)
+    env: RslRlVecEnvWrapper = RslRlVecEnvWrapper(
+        gym_env,
+        clip_actions=agent_cfg.clip_actions,
+    )
 
     try:
         observations = env.get_observations()
@@ -245,9 +248,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
             context="Online-distillation runtime",
         )
         required_groups = tuple(
-            dict.fromkeys(
-                (*TEACHER_OBSERVATION_GROUPS, *STUDENT_OBSERVATION_GROUPS)
-            )
+            dict.fromkeys((*TEACHER_OBSERVATION_GROUPS, *STUDENT_OBSERVATION_GROUPS))
         )
         information_dimensions = {
             group_name: int(observations[group_name].shape[-1])
@@ -286,12 +287,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
                 f"{terrain_latent_dim}."
             )
 
-        teacher_policy, teacher_motor = _load_teacher_policy(
+        teacher_policy, teacher_actor = _load_teacher_policy(
             env,
             agent_cfg,
             checkpoint_path=teacher_checkpoint.checkpoint_path,
         )
-        motor_cfg = teacher_motor.cfg
+        motor_cfg = teacher_actor.motor.cfg
 
         print(
             "[DISTILL] Frozen teacher: "
@@ -300,17 +301,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
         )
         print(
             "[DISTILL] Teacher actor groups: policy -> heading_target -> terrain "
+            "-> dynamics "
             f"({information_dimensions['policy']} + "
             f"{information_dimensions['heading_target']} + "
-            f"{information_dimensions['terrain']} = "
+            f"{information_dimensions['terrain']} + "
+            f"{information_dimensions['dynamics']} = "
             f"{teacher_dim})"
         )
         print(
             "[DISTILL] Student inputs: policy -> predicted heading -> terrain latent "
-            "-> adaptation latent "
+            "-> history-estimated adaptation latent "
             f"({information_dimensions['policy']} + {HEADING_DIM} + "
             f"{information_dimensions['student_exteroception']} + "
-            f"{motor_cfg.adaptation_latent_dim} = "
+            f"history[{information_dimensions['adaptation_history']}] "
+            f"->{motor_cfg.adaptation_latent_dim} = "
             f"{motor_cfg.input_dim})"
         )
         print(
@@ -323,7 +327,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
                 "This run is a pipeline smoke test, not terrain-aware student training."
             )
 
-        student_cfg = StudentModelCfg(motor=motor_cfg)
+        student_cfg = StudentModelCfg(
+            motor=motor_cfg,
+            history_dim=information_dimensions["adaptation_history"],
+            adaptation_hidden_dims=tuple(agent_cfg.policy.history_encoder_hidden_dims),
+        )
 
         # Create the student neural network from the resolved input and action
         # dimensions, then place its parameters on the simulation device.
@@ -332,7 +340,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
         # Start from the motor trained inside the modular teacher checkpoint.
         # The shared MotorActor class and configuration make this a strict,
         # key-for-key copy rather than a partial or shape-dependent transfer.
-        student.motor.load_state_dict(teacher_motor.state_dict(), strict=True)
+        student.motor.load_state_dict(teacher_actor.motor.state_dict(), strict=True)
+        student.history_encoder.load_state_dict(
+            teacher_actor.history_encoder.state_dict(),
+            strict=True,
+        )
 
         # Adam updates only the student parameters. ``weight_decay`` adds an
         # optional penalty for large weights; its zero default disables it.
@@ -393,6 +405,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
             env,
             observations,
             teacher_policy,
+            teacher_actor,
             student=student,
             optimizer=optimizer,
             start_iteration=start_iteration,
@@ -409,10 +422,18 @@ def _collect_rollout(
     observations: TensorDict,
     student: StudentPolicy,
     teacher_policy: Callable[[TensorDict], torch.Tensor],
+    teacher_actor: PrivilegedTeacherActor,
     steps: int,
 ) -> tuple[
     TensorDict,
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
     dict[str, float | int],
 ]:
     """Collect labels and actions from states visited by the student."""
@@ -420,8 +441,10 @@ def _collect_rollout(
     student.eval()
     rollout_state: list[torch.Tensor] = []
     rollout_terrain_latent: list[torch.Tensor] = []
+    rollout_history: list[torch.Tensor] = []
     rollout_heading_target: list[torch.Tensor] = []
     rollout_teacher_action: list[torch.Tensor] = []
+    rollout_adaptation_target: list[torch.Tensor] = []
     reward_sum = 0.0
     done_count = 0
     action_l2_sum = 0.0
@@ -434,15 +457,20 @@ def _collect_rollout(
         with torch.inference_mode():
             deployable_state = observations["policy"]
             terrain_latent = observations["student_exteroception"]
+            deployable_history = observations["adaptation_history"]
             heading_target = observations["heading_target"]
             teacher_action = teacher_policy(observations)
+            privileged_adaptation_target = teacher_actor.dynamics_encoder(
+                observations["dynamics"]
+            )
 
-            # Produce the deterministic motor command from only the shared
-            # deployable state and temporary terrain latent. This action,
-            # rather than the teacher label, advances the environment below.
+            # Produce the deterministic motor command from deployable state,
+            # temporary terrain features, and causal history. This action,
+            # rather than the privileged teacher label, advances the simulator.
             student_action = student.act_inference(
                 deployable_state,
                 terrain_latent,
+                deployable_history,
             )
             if not torch.isfinite(student_action).all():
                 raise RuntimeError("The student produced a non-finite action.")
@@ -452,8 +480,10 @@ def _collect_rollout(
         # buffers when the environment advances to the next state.
         rollout_state.append(deployable_state.clone())
         rollout_terrain_latent.append(terrain_latent.clone())
+        rollout_history.append(deployable_history.clone())
         rollout_heading_target.append(heading_target.clone())
         rollout_teacher_action.append(teacher_action.clone())
+        rollout_adaptation_target.append(privileged_adaptation_target.clone())
         action_l2_sum += float(action_l2.sum().item())
         action_l2_max = max(action_l2_max, float(action_l2.max().item()))
         action_l2_count += int(action_l2.numel())
@@ -467,11 +497,20 @@ def _collect_rollout(
     batches = (
         torch.cat(rollout_state, dim=0),
         torch.cat(rollout_terrain_latent, dim=0),
+        torch.cat(rollout_history, dim=0),
         torch.cat(rollout_heading_target, dim=0),
         torch.cat(rollout_teacher_action, dim=0),
+        torch.cat(rollout_adaptation_target, dim=0),
     )
     for batch_name, batch in zip(
-        ("deployable state", "terrain latent", "heading target", "teacher action"),
+        (
+            "deployable state",
+            "terrain latent",
+            "deployable history",
+            "heading target",
+            "teacher action",
+            "privileged adaptation target",
+        ),
         batches,
     ):
         if not torch.isfinite(batch).all():
@@ -558,8 +597,8 @@ def _load_teacher_policy(
     agent_cfg: RslRlBaseRunnerCfg,
     *,
     checkpoint_path: str,
-) -> tuple[Callable[[TensorDict], torch.Tensor], MotorActor]:
-    """Load the PPO teacher and return its inference callable and shared motor."""
+) -> tuple[Callable[[TensorDict], torch.Tensor], PrivilegedTeacherActor]:
+    """Load the PPO teacher and return its inference callable and actor."""
 
     # Construct the original PPO actor-critic so checkpoint loading and actor
     # preprocessing exactly match teacher training.
@@ -575,14 +614,15 @@ def _load_teacher_policy(
     # RSL-RL switches the policy to evaluation mode and returns its
     # deterministic ``act_inference`` method.
     teacher_policy = teacher_runner.get_inference_policy(device=env.device)
-    teacher_motor: MotorActor = teacher_runner.alg.policy.actor.motor
-    return teacher_policy, teacher_motor
+    teacher_actor: PrivilegedTeacherActor = teacher_runner.alg.policy.actor
+    return teacher_policy, teacher_actor
 
 
 def _run_training(
     env: RslRlVecEnvWrapper,
     observations: TensorDict,
     teacher_policy: Callable[[TensorDict], torch.Tensor],
+    teacher_actor: PrivilegedTeacherActor,
     *,
     student: StudentPolicy,
     optimizer: torch.optim.Optimizer,
@@ -601,6 +641,7 @@ def _run_training(
             observations,
             student,
             teacher_policy,
+            teacher_actor,
             args_cli.steps_per_iteration,
         )
         losses = _update_student(
@@ -622,6 +663,7 @@ def _run_training(
         print(
             f"[DISTILL] {iteration + 1}/{args_cli.max_iterations} "
             f"motor={losses['motor_huber']:.6f} "
+            f"adaptation={losses['adaptation_alignment']:.6f} "
             f"heading={losses['heading_error_deg']:.2f} deg "
             f"action_l2={metrics['rollout_action_l2_mean']:.4f} "
             f"reward={metrics['mean_step_reward']:.4f}"
@@ -676,7 +718,14 @@ def _update_student(
     student: StudentPolicy,
     optimizer: torch.optim.Optimizer,
     *,
-    batches: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    batches: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ],
     learning_epochs: int,
     num_mini_batches: int,
     max_grad_norm: float,
@@ -692,6 +741,7 @@ def _update_student(
     # update count before being returned for iteration-level logging.
     accumulated = {
         "total": 0.0,
+        "adaptation_alignment": 0.0,
         "motor_huber": 0.0,
         "heading_direction": 0.0,
         "heading_norm": 0.0,
@@ -718,6 +768,8 @@ def _update_student(
                 batches[1][indices],
                 batches[2][indices],
                 batches[3][indices],
+                batches[4][indices],
+                batches[5][indices],
             )
 
             # Clear gradients from the preceding mini-batch, backpropagate the

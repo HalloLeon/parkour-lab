@@ -11,8 +11,9 @@ boundary in one module makes the motor weights directly copyable instead of
 depending on two independently assembled input vectors.
 
 Teacher-specific composition lives in ``teacher/model.py``. Its RSL-RL
-adapter lives in ``teacher/rsl_rl.py``. Future depth and adaptation encoders
-only need to produce the latent widths recorded by ``MotorInterfaceCfg``.
+adapter lives in ``teacher/rsl_rl.py``. Privileged and deployable adaptation
+encoders live on opposite sides of this contract but produce the same latent
+width recorded by ``MotorInterfaceCfg``.
 """
 
 from __future__ import annotations
@@ -21,6 +22,9 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
+
+DEFAULT_ADAPTATION_LATENT_DIM = 20
+"""Width shared by privileged and history-based dynamics encoders."""
 
 DEFAULT_TERRAIN_LATENT_DIM = 32
 """Default width shared by the privileged scan and future depth encoders."""
@@ -57,9 +61,9 @@ class MotorInterfaceCfg:
     # the two-component unit vector ``[cos(error), sin(error)]``.
     heading_dim: int = HEADING_DIM
 
-    # Width reserved for a future latent that estimates unobserved dynamics;
-    # zero disables this optional input in the current implementation.
-    adaptation_latent_dim: int = 0
+    # Width of the dynamics representation. The teacher derives it from
+    # privileged simulator parameters; the student estimates it from history.
+    adaptation_latent_dim: int = DEFAULT_ADAPTATION_LATENT_DIM
 
     # Output widths of the motor MLP's hidden linear layers, in network order.
     hidden_dims: tuple[int, ...] = (512, 256, 128)
@@ -85,8 +89,8 @@ class MotorInterfaceCfg:
             raise ValueError(
                 f"heading_dim must be {HEADING_DIM} for a yaw-aligned unit vector."
             )
-        if self.adaptation_latent_dim < 0:
-            raise ValueError("adaptation_latent_dim must be non-negative.")
+        if self.adaptation_latent_dim <= 0:
+            raise ValueError("adaptation_latent_dim must be positive.")
         if not self.hidden_dims or any(width <= 0 for width in self.hidden_dims):
             raise ValueError("Motor hidden dimensions must be positive.")
 
@@ -128,7 +132,7 @@ class MotorActor(nn.Module):
         deployable_state: torch.Tensor,
         heading: torch.Tensor,
         terrain_latent: torch.Tensor,
-        adaptation_latent: torch.Tensor | None = None,
+        adaptation_latent: torch.Tensor,
     ) -> torch.Tensor:
         """Return actions from tensors supplied in the frozen interface order."""
 
@@ -140,20 +144,11 @@ class MotorActor(nn.Module):
             "terrain_latent",
         )
 
-        if adaptation_latent is None:
-            if self.cfg.adaptation_latent_dim != 0:
-                raise ValueError(
-                    "adaptation_latent is required by the configured motor interface."
-                )
-            adaptation_latent = deployable_state.new_empty(
-                (deployable_state.shape[0], 0)
-            )
-        else:
-            _validate_input(
-                adaptation_latent,
-                self.cfg.adaptation_latent_dim,
-                "adaptation_latent",
-            )
+        _validate_input(
+            adaptation_latent,
+            self.cfg.adaptation_latent_dim,
+            "adaptation_latent",
+        )
 
         _validate_matching_batches(
             deployable_state,
@@ -165,8 +160,7 @@ class MotorActor(nn.Module):
         # Concatenate features for each sample along the last dimension. The
         # resulting shape is ``[batch_size, cfg.input_dim]``, where
         # ``cfg.input_dim = state_dim + heading_dim + terrain_latent_dim +
-        # adaptation_latent_dim``. A disabled adaptation latent has shape
-        # ``[batch_size, 0]`` and therefore adds no columns.
+        # adaptation_latent_dim``.
         motor_input = torch.cat(
             (
                 deployable_state,
