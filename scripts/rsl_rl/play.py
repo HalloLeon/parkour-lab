@@ -8,7 +8,6 @@
 # Launch Isaac Sim before importing modules that depend on it.
 
 import argparse
-import os
 import sys
 
 import cli_args
@@ -74,9 +73,6 @@ cli_args.add_rsl_rl_checkpoint_args(parser)
 # Add Isaac Lab application arguments.
 AppLauncher.add_app_launcher_args(parser)
 # Split recognized CLI options from the remaining Hydra configuration overrides.
-_original_cli_args = tuple(sys.argv[1:])
-_launch_working_directory = os.getcwd()
-_launch_script_path = os.path.abspath(__file__)
 args_cli, hydra_args = parser.parse_known_args()
 for argument_name in ("video_length", "eval_episodes"):
     argument_value = getattr(args_cli, argument_name)
@@ -84,9 +80,9 @@ for argument_name in ("video_length", "eval_episodes"):
         parser.error(f"--{argument_name} must be a positive integer.")
 if args_cli.all_courses and (args_cli.terrain_family is not None or args_cli.difficulty_level is not None):
     parser.error("--all_courses cannot be combined with --terrain_family or --difficulty_level.")
-# Isaac Lab 2.3.1 requires the rendering-enabled experience to attach an
-# in-memory stage in headless mode. No camera sensor is created unless needed.
-args_cli.enable_cameras = True
+# Enable cameras when recording video.
+if args_cli.video:
+    args_cli.enable_cameras = True
 
 # ``hydra_task_config`` reads the global ``sys.argv`` when the decorated
 # ``main`` is called later. Leave it only the script name and unparsed Hydra
@@ -96,14 +92,15 @@ sys.argv = [sys.argv[0]] + hydra_args
 # Launch the Omniverse application.
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
-_simulation_app_closed = False
 
 # The remaining imports require the running simulation application.
 
-import subprocess
+import json
+import os
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from typing import TypedDict
 
@@ -111,7 +108,15 @@ import gymnasium as gym
 import isaaclab_tasks  # noqa: F401
 import parkour_lab.tasks  # noqa: F401
 import torch
-from isaaclab.envs import ManagerBasedRLEnv, ManagerBasedRLEnvCfg
+from isaaclab.envs import (
+    DirectMARLEnv,
+    DirectMARLEnvCfg,
+    DirectRLEnv,
+    DirectRLEnvCfg,
+    ManagerBasedRLEnv,
+    ManagerBasedRLEnvCfg,
+    multi_agent_to_single_agent,
+)
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
@@ -124,7 +129,6 @@ from parkour_lab.learning.distillation.contracts import (
     interface_sha256,
     load_teacher_checkpoint,
     sha256_file,
-    write_json,
 )
 from parkour_lab.learning.distillation.teacher.rsl_rl import (
     register_rsl_rl_teacher_actor_critic,
@@ -151,18 +155,43 @@ class _EvaluationSummary(TypedDict):
 class _EvaluationReport(TypedDict):
     """Complete evaluation report written to ``metrics.json``."""
 
+    # Registered Gym task used to create the evaluation environment.
     task: str | None
+
+    # Absolute path identifying the checkpoint evaluated in this report.
     checkpoint: str
+
+    # Complete SHA-256 hash identifying the exact checkpoint file contents.
     checkpoint_sha256: str
+
+    # Reconstructed teacher observation, action, terrain, and timing interface.
     teacher_interface: dict[str, object] | None
+
+    # SHA-256 identity of the reconstructed teacher-interface description.
     teacher_interface_sha256: str | None
+
+    # Random seed used by the evaluated environment.
     seed: int | None
+
+    # Fixed obstacle family selected for this independent evaluation report.
     terrain_family: str | None
+
+    # Fixed curriculum level selected for this evaluation, when supported.
     difficulty_level: int | None
+
+    # Task-specific description of the selected family/difficulty matrix cell.
     difficulty_metadata: dict[str, object]
+
+    # Number of parallel simulation environments used during evaluation.
     num_envs: int
+
+    # Target number of completed episodes requested on the command line.
     requested_episodes: int
+
+    # Number of completed episodes actually included in the aggregate metrics.
     completed_episodes: int
+
+    # Aggregate returns, episode lengths, and termination rates.
     summary: _EvaluationSummary
 
 
@@ -170,7 +199,10 @@ class _EvaluationReport(TypedDict):
 class _ArtifactInfo:
     """Output directory and video filename prefix for one evaluation."""
 
+    # Directory receiving ``metrics.json`` and any recorded video.
     directory: str
+
+    # Descriptive filename prefix containing the checkpoint, level, and seed.
     video_name_prefix: str
 
 
@@ -178,9 +210,17 @@ class _ArtifactInfo:
 class _CheckpointInfo:
     """Resolved identity of the evaluated checkpoint."""
 
+    # Absolute path of the checkpoint loaded by RSL-RL.
     path: str
+
+    # SHA-256 hash of the checkpoint contents, used to distinguish files that
+    # share a name but contain different model weights.
     sha256: str
+
+    # Filesystem-safe checkpoint filename without its extension.
     stem: str
+
+    # Directory containing the checkpoint and its training artifacts.
     log_dir: str
 
 
@@ -188,7 +228,11 @@ class _CheckpointInfo:
 class _InterfaceInfo:
     """Validated runtime interface metadata for the evaluated checkpoint."""
 
+    # Runtime description of teacher observations, preprocessing, actions, and
+    # control timing; ``None`` for a policy without the privileged-teacher route.
     teacher_interface: dict[str, object] | None
+
+    # Hash of ``teacher_interface`` used to identify its exact contents.
     teacher_interface_sha256: str | None
 
 
@@ -260,7 +304,7 @@ class _RolloutResult:
 # ``sys.argv`` overrides, and calls this function as ``main(env_cfg, agent_cfg)``.
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(
-    env_cfg: ManagerBasedRLEnvCfg,
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     agent_cfg: RslRlBaseRunnerCfg,
 ) -> None:
     """Evaluate a checkpoint on one course or the complete course matrix."""
@@ -271,7 +315,7 @@ def main(
 
 def _build_evaluation_report(
     *,
-    env_cfg: ManagerBasedRLEnvCfg,
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     checkpoint: _CheckpointInfo,
     interface: _InterfaceInfo,
     evaluation_family: str | None,
@@ -301,7 +345,7 @@ def _build_evaluation_report(
 
 
 def _configure_evaluation_course(
-    env_cfg: ManagerBasedRLEnvCfg,
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     requested_family: str | None,
     requested_level: int | None,
 ) -> tuple[str | None, int | None, dict[str, object]]:
@@ -328,7 +372,7 @@ def _configure_evaluation_course(
 
 
 def _apply_cli_overrides(
-    env_cfg: ManagerBasedRLEnvCfg,
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     agent_cfg: RslRlBaseRunnerCfg,
 ) -> RslRlBaseRunnerCfg:
     """Apply agent, environment-count, seed, and device CLI overrides."""
@@ -385,25 +429,13 @@ def _prepare_evaluation_artifacts(
     )
 
 
-def _configure_evaluation_stage(env_cfg: ManagerBasedRLEnvCfg) -> None:
-    """Select a stage configuration compatible with Isaac Lab 2.3.1."""
-
-    use_in_memory = args_cli.headless and not args_cli.video
-    env_cfg.sim.create_stage_in_memory = use_in_memory
-    if use_in_memory:
-        env_cfg.scene.clone_in_fabric = False
-        env_cfg.scene.ground.visual_material = None
-        env_cfg.scene.waypoint_marker.spawn.visual_material = None
-
-
 def _create_evaluation_environment(
-    env_cfg: ManagerBasedRLEnvCfg,
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     agent_cfg: RslRlBaseRunnerCfg,
     artifacts: _ArtifactInfo,
 ) -> RslRlVecEnvWrapper:
     """Instantiate one course and attach video and RSL-RL wrappers."""
 
-    _configure_evaluation_stage(env_cfg)
     env_cfg.log_dir = artifacts.directory
     # Instantiate the registered Gym task with the resolved Isaac Lab
     # configuration, requesting rendered RGB frames only when recording video.
@@ -412,8 +444,11 @@ def _create_evaluation_environment(
         cfg=env_cfg,
         render_mode="rgb_array" if args_cli.video else None,
     )
+    if isinstance(gym_env.unwrapped, DirectMARLEnv):
+        gym_env = multi_agent_to_single_agent(gym_env)
+
+    video_length = args_cli.video_length or int(gym_env.unwrapped.max_episode_length)
     if args_cli.video:
-        video_length = args_cli.video_length or int(gym_env.unwrapped.max_episode_length)
         video_kwargs = {
             "video_folder": artifacts.directory,
             "step_trigger": lambda step: step == 0,
@@ -429,7 +464,7 @@ def _create_evaluation_environment(
 
 
 def _evaluate_course(
-    env_cfg: ManagerBasedRLEnvCfg,
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     agent_cfg: RslRlBaseRunnerCfg,
     checkpoint: _CheckpointInfo,
     requested_family: str | None,
@@ -482,7 +517,7 @@ def _evaluate_course(
 
 
 def _resolve_evaluation_courses(
-    env_cfg: ManagerBasedRLEnvCfg,
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
 ) -> tuple[tuple[str | None, int | None], ...]:
     """Resolve the CLI selection to one course or every configured matrix cell."""
 
@@ -635,94 +670,35 @@ def _collect_rollout_statistics(
 
 
 def _evaluate_requested_courses(
-    env_cfg: ManagerBasedRLEnvCfg,
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     agent_cfg: RslRlBaseRunnerCfg,
     checkpoint: _CheckpointInfo,
 ) -> None:
-    """Evaluate selected courses, isolating configs for a genuine sweep."""
+    """Evaluate each CLI-selected course with an isolated environment config."""
 
-    requested_courses = _resolve_evaluation_courses(env_cfg)
-    if len(requested_courses) > 1:
-        _evaluate_courses_in_subprocesses(requested_courses, checkpoint)
-        return
-
-    requested_family, requested_level = requested_courses[0]
-    # Match Isaac Lab's official playback path for one course by passing the
-    # Hydra-populated config directly to exactly one Gym environment.
-    report, report_path = _evaluate_course(
-        env_cfg,
-        agent_cfg,
-        checkpoint,
-        requested_family,
-        requested_level,
-    )
-    _print_evaluation_summary(report, report_path)
-
-
-def _evaluate_courses_in_subprocesses(
-    requested_courses: tuple[tuple[str | None, int | None], ...],
-    checkpoint: _CheckpointInfo,
-) -> None:
-    """Evaluate every sweep cell in a fresh Isaac Sim process."""
-
-    _close_simulation_application()
-    for requested_family, requested_level in requested_courses:
-        command = _evaluation_subprocess_command(
-            checkpoint.path,
+    for requested_family, requested_level in _resolve_evaluation_courses(env_cfg):
+        # Environment construction resolves manager terms and scene entities.
+        # Give every sweep cell a fresh config so those runtime changes and the
+        # fixed terrain selection cannot leak into the next evaluation.
+        course_env_cfg = deepcopy(env_cfg)
+        report, report_path = _evaluate_course(
+            course_env_cfg,
+            agent_cfg,
+            checkpoint,
             requested_family,
             requested_level,
         )
-        print(
-            f"[INFO] Starting isolated course evaluation: family={requested_family}, level={requested_level}",
-            flush=True,
-        )
-        subprocess.run(command, cwd=_launch_working_directory, check=True)
-
-
-def _evaluation_subprocess_command(
-    checkpoint_path: str,
-    requested_family: str | None,
-    requested_level: int | None,
-) -> tuple[str, ...]:
-    """Build one child command from the original CLI without sweep selection."""
-
-    forwarded_args: list[str] = []
-    skip_next = False
-    for argument in _original_cli_args:
-        if skip_next:
-            skip_next = False
-            continue
-        if argument == "--all_courses":
-            continue
-        if argument == "--checkpoint":
-            skip_next = True
-            continue
-        if argument.startswith("--checkpoint="):
-            continue
-        forwarded_args.append(argument)
-
-    forwarded_args.append(f"--checkpoint={checkpoint_path}")
-    if requested_family is not None:
-        forwarded_args.append(f"--terrain_family={requested_family}")
-    if requested_level is not None:
-        forwarded_args.append(f"--difficulty_level={requested_level}")
-    return (sys.executable, _launch_script_path, *forwarded_args)
-
-
-def _close_simulation_application() -> None:
-    """Close the parent SimulationApp at most once."""
-
-    global _simulation_app_closed
-    if not _simulation_app_closed:
-        simulation_app.close()
-        _simulation_app_closed = True
+        _print_evaluation_summary(report, report_path)
 
 
 def _read_termination_outcomes(
-    base_env: ManagerBasedRLEnv,
+    base_env: ManagerBasedRLEnv | DirectRLEnv,
     done_mask: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
     """Read the per-environment outcome masks for the current step."""
+
+    if not isinstance(base_env, ManagerBasedRLEnv):
+        raise TypeError("Parkour evaluation outcomes require a ManagerBasedRLEnv.")
 
     termination_manager = base_env.termination_manager
     return {
@@ -732,8 +708,33 @@ def _read_termination_outcomes(
     }
 
 
+def _to_jsonable(value: object) -> object:
+    """Recursively convert tensors and config objects to JSON-compatible values."""
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if is_dataclass(value) and not isinstance(value, type):
+        return _to_jsonable(asdict(value))
+    if isinstance(value, dict):
+        return {str(key): _to_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_jsonable(item) for item in value]
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _to_jsonable(to_dict())
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return _to_jsonable(item())
+        except (TypeError, ValueError):
+            pass
+    return str(value)
+
+
 def _validate_teacher_interface(
-    base_env: ManagerBasedRLEnv,
+    base_env: ManagerBasedRLEnv | DirectRLEnv,
     observations: TensorDict,
     agent_cfg: RslRlBaseRunnerCfg,
     checkpoint_path: str,
@@ -758,7 +759,9 @@ def _write_evaluation_report(artifact_dir: str, report: _EvaluationReport) -> st
     """Serialize one course report as ``metrics.json`` and return its path."""
 
     metrics_path = os.path.join(artifact_dir, "metrics.json")
-    write_json(metrics_path, report)
+    with open(metrics_path, "w", encoding="utf-8") as metrics_file:
+        json.dump(_to_jsonable(report), metrics_file, indent=2, sort_keys=True)
+        metrics_file.write("\n")
     return metrics_path
 
 
@@ -766,4 +769,4 @@ if __name__ == "__main__":
     try:
         main()
     finally:
-        _close_simulation_application()
+        simulation_app.close()
