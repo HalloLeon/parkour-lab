@@ -84,9 +84,9 @@ for argument_name in ("video_length", "eval_episodes"):
         parser.error(f"--{argument_name} must be a positive integer.")
 if args_cli.all_courses and (args_cli.terrain_family is not None or args_cli.difficulty_level is not None):
     parser.error("--all_courses cannot be combined with --terrain_family or --difficulty_level.")
-# Enable cameras when recording video.
-if args_cli.video:
-    args_cli.enable_cameras = True
+# Isaac Lab 2.3.1 requires the rendering-enabled experience to attach an
+# in-memory stage in headless mode. No camera sensor is created unless needed.
+args_cli.enable_cameras = True
 
 # ``hydra_task_config`` reads the global ``sys.argv`` when the decorated
 # ``main`` is called later. Leave it only the script name and unparsed Hydra
@@ -108,7 +108,6 @@ from datetime import datetime, timezone
 from typing import TypedDict
 
 import gymnasium as gym
-import isaaclab.sim as sim_utils
 import isaaclab_tasks  # noqa: F401
 import parkour_lab.tasks  # noqa: F401
 import torch
@@ -387,10 +386,14 @@ def _prepare_evaluation_artifacts(
 
 
 def _configure_evaluation_stage(env_cfg: ManagerBasedRLEnvCfg) -> None:
-    """Register the USD-context stage before Isaac Lab 2.3.1 initializes PhysX."""
+    """Select a stage configuration compatible with Isaac Lab 2.3.1."""
 
-    env_cfg.sim.create_stage_in_memory = False
-    sim_utils.get_current_stage_id()
+    use_in_memory = args_cli.headless and not args_cli.video
+    env_cfg.sim.create_stage_in_memory = use_in_memory
+    if use_in_memory:
+        env_cfg.scene.clone_in_fabric = False
+        env_cfg.scene.ground.visual_material = None
+        env_cfg.scene.waypoint_marker.spawn.visual_material = None
 
 
 def _create_evaluation_environment(
