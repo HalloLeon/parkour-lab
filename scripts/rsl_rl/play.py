@@ -8,6 +8,7 @@
 # Launch Isaac Sim before importing modules that depend on it.
 
 import argparse
+import os
 import sys
 
 import cli_args
@@ -73,6 +74,9 @@ cli_args.add_rsl_rl_checkpoint_args(parser)
 # Add Isaac Lab application arguments.
 AppLauncher.add_app_launcher_args(parser)
 # Split recognized CLI options from the remaining Hydra configuration overrides.
+_original_cli_args = tuple(sys.argv[1:])
+_launch_working_directory = os.getcwd()
+_launch_script_path = os.path.abspath(__file__)
 args_cli, hydra_args = parser.parse_known_args()
 for argument_name in ("video_length", "eval_episodes"):
     argument_value = getattr(args_cli, argument_name)
@@ -92,14 +96,14 @@ sys.argv = [sys.argv[0]] + hydra_args
 # Launch the Omniverse application.
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
+_simulation_app_closed = False
 
 # The remaining imports require the running simulation application.
 
 import json
-import os
+import subprocess
 import time
 from collections.abc import Callable
-from copy import deepcopy
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from typing import TypedDict
@@ -677,41 +681,80 @@ def _evaluate_requested_courses(
     """Evaluate selected courses, isolating configs for a genuine sweep."""
 
     requested_courses = _resolve_evaluation_courses(env_cfg)
-    is_sweep = len(requested_courses) > 1
+    if len(requested_courses) > 1:
+        _evaluate_courses_in_subprocesses(requested_courses, checkpoint)
+        return
+
+    requested_family, requested_level = requested_courses[0]
+    # Match Isaac Lab's official playback path for one course by passing the
+    # Hydra-populated config directly to exactly one Gym environment.
+    report, report_path = _evaluate_course(
+        env_cfg,
+        agent_cfg,
+        checkpoint,
+        requested_family,
+        requested_level,
+    )
+    _print_evaluation_summary(report, report_path)
+
+
+def _evaluate_courses_in_subprocesses(
+    requested_courses: tuple[tuple[str | None, int | None], ...],
+    checkpoint: _CheckpointInfo,
+) -> None:
+    """Evaluate every sweep cell in a fresh Isaac Sim process."""
+
+    _close_simulation_application()
     for requested_family, requested_level in requested_courses:
-        if is_sweep:
-            # Environment construction resolves manager terms and scene
-            # entities. Give every sweep cell a fresh config so those runtime
-            # changes and fixed terrain selection cannot leak into the next
-            # evaluation.
-            course_env_cfg = deepcopy(env_cfg)
-        else:
-            # Match Isaac Lab's official playback path for one course by using
-            # the Hydra-populated config directly.
-            course_env_cfg = env_cfg
-        _prepare_evaluation_stage(course_env_cfg)
-        report, report_path = _evaluate_course(
-            course_env_cfg,
-            agent_cfg,
-            checkpoint,
+        command = _evaluation_subprocess_command(
+            checkpoint.path,
             requested_family,
             requested_level,
         )
-        _print_evaluation_summary(report, report_path)
+        print(
+            f"[INFO] Starting isolated course evaluation: family={requested_family}, level={requested_level}",
+            flush=True,
+        )
+        subprocess.run(command, cwd=_launch_working_directory, check=True)
 
 
-def _prepare_evaluation_stage(
-    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
-) -> None:
-    """Select a PhysX-backed stage lifecycle for one evaluation."""
+def _evaluation_subprocess_command(
+    checkpoint_path: str,
+    requested_family: str | None,
+    requested_level: int | None,
+) -> tuple[str, ...]:
+    """Build one child command from the original CLI without sweep selection."""
 
-    # SimulationContext passes this exact stage to Isaac Sim and
-    # ManagerBasedEnv explicitly attaches it to PhysX. Its close path also
-    # detaches and clears the stage, which makes the next course safe. Isaac Lab
-    # falls back to a fresh attached stage on Isaac Sim versions before 5.0.
-    env_cfg.sim.create_stage_in_memory = True
-    # Isaac Lab does not support combining these two stage optimizations.
-    env_cfg.scene.clone_in_fabric = False
+    forwarded_args: list[str] = []
+    skip_next = False
+    for argument in _original_cli_args:
+        if skip_next:
+            skip_next = False
+            continue
+        if argument == "--all_courses":
+            continue
+        if argument == "--checkpoint":
+            skip_next = True
+            continue
+        if argument.startswith("--checkpoint="):
+            continue
+        forwarded_args.append(argument)
+
+    forwarded_args.append(f"--checkpoint={checkpoint_path}")
+    if requested_family is not None:
+        forwarded_args.append(f"--terrain_family={requested_family}")
+    if requested_level is not None:
+        forwarded_args.append(f"--difficulty_level={requested_level}")
+    return (sys.executable, _launch_script_path, *forwarded_args)
+
+
+def _close_simulation_application() -> None:
+    """Close the parent SimulationApp at most once."""
+
+    global _simulation_app_closed
+    if not _simulation_app_closed:
+        simulation_app.close()
+        _simulation_app_closed = True
 
 
 def _read_termination_outcomes(
@@ -792,4 +835,4 @@ if __name__ == "__main__":
     try:
         main()
     finally:
-        simulation_app.close()
+        _close_simulation_application()
