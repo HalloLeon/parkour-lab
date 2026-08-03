@@ -106,6 +106,7 @@ from typing import TypedDict
 
 import gymnasium as gym
 import isaaclab_tasks  # noqa: F401
+import omni.usd
 import parkour_lab.tasks  # noqa: F401
 import torch
 from isaaclab.envs import (
@@ -437,6 +438,15 @@ def _create_evaluation_environment(
     """Instantiate one course and attach video and RSL-RL wrappers."""
 
     env_cfg.log_dir = artifacts.directory
+    # Isaac Lab environments own the simulation context associated with the
+    # current USD stage.  Reusing that stage after an environment is closed can
+    # leave PhysX without an active scene, and even the first environment may
+    # inherit stale stage state from application start-up.  Isaac Lab's own
+    # repeated-environment harness creates a new context stage before each
+    # ``gym.make`` call for this reason.
+    if not env_cfg.sim.create_stage_in_memory:
+        if not omni.usd.get_context().new_stage():
+            raise RuntimeError("Failed to create a clean USD stage for evaluation.")
     # Instantiate the registered Gym task with the resolved Isaac Lab
     # configuration, requesting rendered RGB frames only when recording video.
     gym_env: gym.Env = gym.make(
@@ -526,6 +536,11 @@ def _resolve_evaluation_courses(
 
     set_course = getattr(env_cfg, "set_evaluation_course", None)
     curriculum_cfg = getattr(env_cfg, "parkour_curriculum", None)
+    validate_curriculum = getattr(curriculum_cfg, "validate_configuration", None)
+    if callable(validate_curriculum):
+        # Hydra/OmegaConf may reconstruct nested configclass entries as plain
+        # mappings.  Normalize them before reading computed matrix properties.
+        validate_curriculum()
     family_names = tuple(getattr(curriculum_cfg, "family_names", ()))
     num_difficulties = getattr(curriculum_cfg, "num_difficulties", None)
     if (
