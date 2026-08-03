@@ -106,7 +106,6 @@ from typing import TypedDict
 
 import gymnasium as gym
 import isaaclab_tasks  # noqa: F401
-import omni.usd
 import parkour_lab.tasks  # noqa: F401
 import torch
 from isaaclab.envs import (
@@ -438,15 +437,6 @@ def _create_evaluation_environment(
     """Instantiate one course and attach video and RSL-RL wrappers."""
 
     env_cfg.log_dir = artifacts.directory
-    # Isaac Lab environments own the simulation context associated with the
-    # current USD stage.  Reusing that stage after an environment is closed can
-    # leave PhysX without an active scene, and even the first environment may
-    # inherit stale stage state from application start-up.  Isaac Lab's own
-    # repeated-environment harness creates a new context stage before each
-    # ``gym.make`` call for this reason.
-    if not env_cfg.sim.create_stage_in_memory:
-        if not omni.usd.get_context().new_stage():
-            raise RuntimeError("Failed to create a clean USD stage for evaluation.")
     # Instantiate the registered Gym task with the resolved Isaac Lab
     # configuration, requesting rendered RGB frames only when recording video.
     gym_env: gym.Env = gym.make(
@@ -684,13 +674,22 @@ def _evaluate_requested_courses(
     agent_cfg: RslRlBaseRunnerCfg,
     checkpoint: _CheckpointInfo,
 ) -> None:
-    """Evaluate each CLI-selected course with an isolated environment config."""
+    """Evaluate selected courses, isolating configs for a genuine sweep."""
 
-    for requested_family, requested_level in _resolve_evaluation_courses(env_cfg):
-        # Environment construction resolves manager terms and scene entities.
-        # Give every sweep cell a fresh config so those runtime changes and the
-        # fixed terrain selection cannot leak into the next evaluation.
-        course_env_cfg = deepcopy(env_cfg)
+    requested_courses = _resolve_evaluation_courses(env_cfg)
+    is_sweep = len(requested_courses) > 1
+    for requested_family, requested_level in requested_courses:
+        if is_sweep:
+            # Environment construction resolves manager terms and scene
+            # entities. Give every sweep cell a fresh config so those runtime
+            # changes and fixed terrain selection cannot leak into the next
+            # evaluation.
+            course_env_cfg = deepcopy(env_cfg)
+        else:
+            # Match Isaac Lab's official playback path for one course by using
+            # the Hydra-populated config directly.
+            course_env_cfg = env_cfg
+        _prepare_evaluation_stage(course_env_cfg)
         report, report_path = _evaluate_course(
             course_env_cfg,
             agent_cfg,
@@ -699,6 +698,20 @@ def _evaluate_requested_courses(
             requested_level,
         )
         _print_evaluation_summary(report, report_path)
+
+
+def _prepare_evaluation_stage(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+) -> None:
+    """Select a PhysX-backed stage lifecycle for one evaluation."""
+
+    # SimulationContext passes this exact stage to Isaac Sim and
+    # ManagerBasedEnv explicitly attaches it to PhysX. Its close path also
+    # detaches and clears the stage, which makes the next course safe. Isaac Lab
+    # falls back to a fresh attached stage on Isaac Sim versions before 5.0.
+    env_cfg.sim.create_stage_in_memory = True
+    # Isaac Lab does not support combining these two stage optimizations.
+    env_cfg.scene.clone_in_fabric = False
 
 
 def _read_termination_outcomes(
