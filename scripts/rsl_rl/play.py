@@ -108,13 +108,11 @@ from datetime import datetime, timezone
 from typing import TypedDict
 
 import gymnasium as gym
+import isaaclab.sim as sim_utils
 import isaaclab_tasks  # noqa: F401
 import parkour_lab.tasks  # noqa: F401
 import torch
-from isaaclab.envs import (
-    ManagerBasedRLEnv,
-    ManagerBasedRLEnvCfg,
-)
+from isaaclab.envs import ManagerBasedRLEnv, ManagerBasedRLEnvCfg
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
@@ -389,15 +387,10 @@ def _prepare_evaluation_artifacts(
 
 
 def _configure_evaluation_stage(env_cfg: ManagerBasedRLEnvCfg) -> None:
-    """Use a PhysX-attached stage that also works with Isaac Lab 2.3.1."""
+    """Register the USD-context stage before Isaac Lab 2.3.1 initializes PhysX."""
 
-    env_cfg.sim.create_stage_in_memory = True
-    env_cfg.scene.clone_in_fabric = False
-    if args_cli.headless and not args_cli.video:
-        # Isaac Lab 2.3.1 authors PreviewSurface materials on the detached USD
-        # context. They are unnecessary when nothing is rendered.
-        env_cfg.scene.ground.visual_material = None
-        env_cfg.scene.waypoint_marker.spawn.visual_material = None
+    env_cfg.sim.create_stage_in_memory = False
+    sim_utils.get_current_stage_id()
 
 
 def _create_evaluation_environment(
