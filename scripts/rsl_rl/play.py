@@ -52,6 +52,18 @@ parser.add_argument(
     default=10,
     help="Number of completed episodes to evaluate.",
 )
+parser.add_argument(
+    "--policy_mode",
+    choices=("privileged_mean", "privileged_sampled", "history_mean", "history_sampled"),
+    default="privileged_mean",
+    help="Teacher action path used for the diagnostic rollout.",
+)
+parser.add_argument(
+    "--reset_profile",
+    choices=("canonical", "jitter"),
+    default="canonical",
+    help="Use the exact reset or isolated narrow initial-state jitter.",
+)
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
@@ -102,6 +114,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
+from functools import partial
 from typing import TypedDict
 
 import gymnasium as gym
@@ -172,6 +185,11 @@ class _EvaluationReport(TypedDict):
 
     # Random seed used by the evaluated environment.
     seed: int | None
+
+    policy_mode: str
+    reset_profile: str
+    reset_parameters: dict[str, object]
+    training_config: dict[str, dict[str, str]]
 
     # Fixed obstacle family selected for this independent evaluation report.
     terrain_family: str | None
@@ -327,6 +345,7 @@ def _build_evaluation_report(
 ) -> _EvaluationReport:
     """Build the JSON-compatible report for one fixed evaluation course."""
 
+    reset_base = getattr(getattr(env_cfg, "events", None), "reset_base", None)
     return {
         "task": args_cli.task,
         "checkpoint": checkpoint.path,
@@ -334,6 +353,10 @@ def _build_evaluation_report(
         "teacher_interface": interface.teacher_interface,
         "teacher_interface_sha256": interface.teacher_interface_sha256,
         "seed": env_cfg.seed,
+        "policy_mode": args_cli.policy_mode,
+        "reset_profile": args_cli.reset_profile,
+        "reset_parameters": getattr(reset_base, "params", {}),
+        "training_config": _training_config_provenance(checkpoint.log_dir),
         "terrain_family": evaluation_family,
         "difficulty_level": evaluation_level,
         "difficulty_metadata": level_metadata,
@@ -363,6 +386,11 @@ def _configure_evaluation_course(
     # None lets the task select its own default family and maximum difficulty
     # after Hydra overrides have been synchronized.
     set_course(requested_family, requested_level, seed=env_cfg.seed)
+    if args_cli.reset_profile != "canonical":
+        set_reset_profile = getattr(env_cfg, "set_evaluation_reset_profile", None)
+        if not callable(set_reset_profile):
+            raise ValueError(f"Task '{args_cli.task}' does not support --reset_profile jitter.")
+        set_reset_profile(args_cli.reset_profile)
     effective_family = getattr(env_cfg, "evaluation_family", requested_family)
     effective_level = getattr(env_cfg, "evaluation_level", requested_level)
 
@@ -398,7 +426,7 @@ def _prepare_evaluation_artifacts(
     level_component = _path_component(evaluation_level, "default")
     seed_component = _path_component(seed, "default")
     evaluation_kind = "video" if args_cli.video else "metrics"
-    evaluation_settings = f"episodes_{args_cli.eval_episodes}"
+    evaluation_settings = f"{args_cli.policy_mode}-{args_cli.reset_profile}-episodes_{args_cli.eval_episodes}"
     if args_cli.video:
         evaluation_settings += f"-steps_{args_cli.video_length or 'full'}"
     # Build a readable UTC identifier as ``run_YYYYMMDD_HHMMSS``: ``%Y`` is
@@ -424,7 +452,8 @@ def _prepare_evaluation_artifacts(
     return _ArtifactInfo(
         directory=directory,
         video_name_prefix=(
-            f"{checkpoint.stem}-family_{family_component}-level_{level_component}-seed_{seed_component}"
+            f"{checkpoint.stem}-{args_cli.policy_mode}-{args_cli.reset_profile}-"
+            f"family_{family_component}-level_{level_component}-seed_{seed_component}"
         ),
     )
 
@@ -565,8 +594,17 @@ def _load_inference_policy(
     device = env.unwrapped.device
     register_rsl_rl_teacher_actor_critic()
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=device)
-    runner.load(checkpoint_path)
-    return runner.get_inference_policy(device=device)
+    runner.load(checkpoint_path, load_optimizer=False)
+    inference_policy = runner.get_inference_policy(device=device)
+    policy = runner.alg.policy
+    if args_cli.policy_mode == "privileged_mean":
+        return inference_policy
+    if args_cli.policy_mode == "privileged_sampled":
+        return policy.act
+    history_policy = getattr(policy, "act_inference_from_history", None)
+    if not callable(history_policy):
+        raise TypeError("History evaluation requires a privileged teacher checkpoint.")
+    return history_policy if args_cli.policy_mode == "history_mean" else partial(policy.act, use_history=True)
 
 
 def _path_component(value: str | int | None, default: str) -> str:
@@ -588,6 +626,8 @@ def _print_evaluation_summary(report: _EvaluationReport, report_path: str) -> No
 
     summary = report["summary"]
     print("[RESULT] Evaluation summary")
+    print(f"  Policy mode: {report['policy_mode']}")
+    print(f"  Reset profile: {report['reset_profile']}")
     print(f"  Terrain family: {report['terrain_family'] or 'n/a'}")
     print(f"  Difficulty level: {report['difficulty_level']}")
     print(f"  Episodes: {report['completed_episodes']}/{report['requested_episodes']}")
@@ -629,7 +669,7 @@ def _collect_rollout_statistics(
     observations: TensorDict,
     policy: Callable[[TensorDict], torch.Tensor],
 ) -> _RolloutResult:
-    """Aggregate completed episodes while deterministic inference is running."""
+    """Aggregate completed episodes for the selected policy mode."""
 
     step_dt = env.unwrapped.step_dt
     episode_returns = torch.zeros(env.num_envs, device=env.unwrapped.device, dtype=torch.float32)
@@ -731,6 +771,17 @@ def _to_jsonable(value: object) -> object:
         except (TypeError, ValueError):
             pass
     return str(value)
+
+
+def _training_config_provenance(log_dir: str) -> dict[str, dict[str, str]]:
+    """Identify the archived environment and agent configurations."""
+
+    provenance = {}
+    for name in ("env.yaml", "agent.yaml"):
+        path = os.path.join(log_dir, "params", name)
+        if os.path.isfile(path):
+            provenance[name] = {"path": path, "sha256": sha256_file(path)}
+    return provenance
 
 
 def _validate_teacher_interface(

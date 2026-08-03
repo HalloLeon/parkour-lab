@@ -753,6 +753,15 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         self.synchronize_curriculum_config()
         self.synchronize_domain_randomization_config()
 
+    def set_evaluation_reset_profile(self, profile: str) -> None:
+        """Select exact resets or isolated narrow initial-state jitter."""
+
+        try:
+            scale = {"canonical": 0.0, "jitter": 0.5}[profile]
+        except KeyError as error:
+            raise ValueError(f"Unsupported evaluation reset profile: {profile!r}.") from error
+        self._set_initial_state_randomization(scale)
+
     def synchronize_curriculum_config(self) -> None:
         """Validate and propagate the authoritative parkour curriculum.
 
@@ -926,29 +935,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
                     UniformNoiseCfg(n_min=-noise, n_max=noise) if enabled else None
                 )
 
-        initial_angular_velocity = mdp.scaled_range(
-            cfg.initial_angular_velocity_range_rad_s,
-            scale,
-        )
-        initial_linear_velocity = mdp.scaled_range(
-            cfg.initial_linear_velocity_range_m_s,
-            scale,
-        )
-        initial_xy = mdp.scaled_range(cfg.initial_xy_range_m, scale)
-        initial_yaw = mdp.scaled_range(cfg.initial_yaw_range_rad, scale)
-        self.events.reset_base.params["pose_range"] = {
-            "x": initial_xy,
-            "y": initial_xy,
-            "yaw": initial_yaw,
-        }
-        self.events.reset_base.params["velocity_range"] = {
-            "x": initial_linear_velocity,
-            "y": initial_linear_velocity,
-            "z": initial_linear_velocity,
-            "roll": initial_angular_velocity,
-            "pitch": initial_angular_velocity,
-            "yaw": initial_angular_velocity,
-        }
+        self._set_initial_state_randomization(scale)
 
         if not enabled:
             self.events.add_trunk_mass = None
@@ -1043,6 +1030,22 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
                 },
             },
         )
+
+    def _set_initial_state_randomization(self, scale: float) -> None:
+        """Apply only the configured initial root-state perturbations."""
+
+        cfg = self.domain_randomization
+        linear = mdp.scaled_range(cfg.initial_linear_velocity_range_m_s, scale)
+        angular = mdp.scaled_range(cfg.initial_angular_velocity_range_rad_s, scale)
+        xy = mdp.scaled_range(cfg.initial_xy_range_m, scale)
+        self.events.reset_base.params["pose_range"] = {
+            "x": xy,
+            "y": xy,
+            "yaw": mdp.scaled_range(cfg.initial_yaw_range_rad, scale),
+        }
+        self.events.reset_base.params["velocity_range"] = {
+            axis: linear if axis in {"x", "y", "z"} else angular for axis in ("x", "y", "z", "roll", "pitch", "yaw")
+        }
 
 
 @configclass
