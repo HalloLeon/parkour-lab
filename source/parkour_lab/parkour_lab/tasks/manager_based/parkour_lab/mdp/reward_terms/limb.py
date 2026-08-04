@@ -21,7 +21,7 @@ from ..terrain import edges
 def feet_air_time(
     env: ManagerBasedRLEnv,
     threshold: float = 0.5,
-    flat_weight: float = 0.25,
+    flat_weight: float = 0.0,
     obstacle_weight: float = 0.01,
     curriculum_cfg: ParkourCurriculumCfg = DEFAULT_PARKOUR_CURRICULUM,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot"),
@@ -30,8 +30,9 @@ def feet_air_time(
 
     The raw event matches Isaac Lab's quadruped locomotion term: air time above
     ``threshold`` is credited on first contact, and the term is disabled for a
-    near-zero speed command.  Row zero uses the flat-gait acquisition weight;
-    obstacle rows retain only the much smaller rough-terrain weight.
+    near-zero speed command. Row zero is disabled by default so ordinary flat
+    gait is not pushed toward long aerial phases; obstacle rows retain a small
+    rough-terrain weight.
 
     The configured reward-manager weight should be ``1.0`` because
     ``flat_weight`` and ``obstacle_weight`` are applied here per environment.

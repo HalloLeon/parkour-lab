@@ -71,14 +71,16 @@ def waypoint_velocity_tracking_exp(
     std: float = 0.5,
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    overspeed_std: float = 0.3,
 ) -> torch.Tensor:
-    """Reward forward waypoint speed while suppressing lateral motion.
+    """Track forward waypoint speed while suppressing lateral motion.
 
-    Forward motion is normalized by the commanded speed and capped at one;
-    standing still and moving backward receive zero. Lateral velocity supplies
-    the exponential alignment factor::
+    Forward motion retains a linear acquisition signal up to the commanded
+    speed, while a one-sided exponential gate suppresses overspeed. Standing
+    still and moving backward receive zero::
 
         clamp(v_parallel / target_speed, 0, 1)
+        * exp(-relu(v_parallel - target_speed)^2 / overspeed_std^2)
         * exp(-||v_perpendicular||^2 / std^2)
 
     The term is bounded in ``[0, 1]`` and masks the one sample on which the route
@@ -88,8 +90,8 @@ def waypoint_velocity_tracking_exp(
         Tensor with shape ``(num_envs,)``.
     """
 
-    if std <= 0.0:
-        raise ValueError("std must be positive.")
+    if std <= 0.0 or overspeed_std <= 0.0:
+        raise ValueError("std and overspeed_std must be positive.")
 
     waypoint_direction_xy = geometry._active_waypoint_direction_xy(
         env,
@@ -116,10 +118,14 @@ def waypoint_velocity_tracking_exp(
         min=0.0,
         max=1.0,
     )
+    speed_alignment = torch.exp(
+        -torch.relu(velocity_along_waypoint - target_speed).square()
+        / float(overspeed_std) ** 2
+    )
     lateral_alignment = torch.exp(
         -torch.sum(lateral_velocity_xy.square(), dim=-1) / float(std) ** 2
     )
-    reward = forward_fraction * lateral_alignment
+    reward = forward_fraction * speed_alignment * lateral_alignment
     return torch.where(
         route.active_waypoint_changed_this_step(env),
         torch.zeros_like(reward),

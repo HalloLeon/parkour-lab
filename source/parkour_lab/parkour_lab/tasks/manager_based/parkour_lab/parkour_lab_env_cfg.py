@@ -482,6 +482,7 @@ class RewardsCfg:
         weight=1.5,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
+            "overspeed_std": 0.3,
             "std": 0.5,
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
         },
@@ -512,7 +513,7 @@ class RewardsCfg:
             "curriculum_cfg": PARKOUR_CURRICULUM,
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
             "threshold": 0.5,
-            "flat_weight": 0.25,
+            "flat_weight": 0.0,
             "obstacle_weight": 0.01,
         },
     )
