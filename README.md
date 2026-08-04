@@ -180,7 +180,9 @@ and tilt, and no trunk contact. Event rewards are divided by the control
 timestep before Isaac Lab's reward integration, making these configured amounts
 the exact per-event bonuses. The terminating trunk-contact penalty uses the same
 rule for an exact `-10`; a trunk crash takes precedence if crash and success
-would otherwise occur on the same step.
+would otherwise occur on the same step. Falling more than 0.5 m below the
+environment-local course is also a terminal failure, which ends unrecoverable
+gap falls promptly without confusing elevated terrain with world height.
 
 Maximum progress is projected onto the active route segment only inside its
 lateral corridor, remains monotonic within an episode, and does not increase
@@ -199,15 +201,16 @@ post-promotion grace counters. Static thresholds remain in
 `ParkourCurriculumCfg`; the episode row selected by frontier/replay sampling
 remains authoritative in `TerrainImporter.terrain_levels`.
 
-Dense acquisition scales positive forward speed up to the active course target,
-then exponentially suppresses overspeed and lateral velocity. Standing still
-and moving backward receive zero. The positive heading kernel is gated by the
-same forward-speed fraction, so facing the target while stationary earns
-nothing. Both terms are suppressed on the exact retarget step so a marker jump
-is not mistaken for robot motion. Flat terrain disables feet-air-time shaping
-and obstacle-only leg, edge, and stumble penalties; small air-time shaping and
-the contact penalties activate after promotion. Low-clearance error remains
-normalized to `[0, 1]` before its squared penalty.
+Dense acquisition scales positive forward speed up to the active course target
+and suppresses lateral velocity; faster motion earns no extra dense reward but
+remains available for obstacle takeoff. On the flat bootstrap only, a bounded
+overspeed penalty and the heading gate discourage sprinting, while a small
+no-feet-contact penalty discourages repeated hopping. Standing still and moving
+backward receive zero. Reward samples on the exact retarget step are masked so
+a marker jump is not mistaken for robot motion. Flat terrain disables
+feet-air-time shaping and obstacle-only leg, edge, and stumble penalties; small
+air-time shaping and the contact penalties activate after promotion.
+Low-clearance error remains normalized to `[0, 1]` before its squared penalty.
 
 The teacher-interface manifest is version 13. Version 4 introduced complete
 declarative terrain courses because physical support segmentation changes the
@@ -367,9 +370,9 @@ python scripts/rsl_rl/play.py \
 process for every cell so simulation state cannot leak between courses. The
 expected application restarts are printed as sweep progress. This option cannot
 be combined with the two single-cell selectors. Evaluation reports success,
-maximum course progress, trunk contact, timeout, return, episode length,
-forward speed, overspeed, vertical-velocity RMS, and all-feet-airborne fraction
-for each selected matrix cell. It writes
+maximum course progress, trunk contact, below-course falls, timeout, return,
+episode length, forward speed, overspeed, vertical-velocity RMS, and
+all-feet-airborne fraction for each selected matrix cell. It writes
 `metrics.json` plus the optional MP4 beneath
 `<run>/evaluation/<checkpoint>-<hash>/family_<family>/level_<n>/seed_<seed>/`, separated
 into `metrics/episodes_<n>/` and `video/episodes_<n>-steps_<length>/`.

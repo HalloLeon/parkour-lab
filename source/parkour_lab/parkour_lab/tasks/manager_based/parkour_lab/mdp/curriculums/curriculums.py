@@ -526,10 +526,10 @@ def _terminal_event_masks(
     """Return success, terminal, and failure masks for a reset batch.
 
     CurriculumManager runs only for reset environments. ``reset_buf`` therefore
-    covers trunk contact, timeout, and future failure terminations. Requiring a
+    covers trunk contact, falls, timeout, and future failure terminations. Requiring a
     positive episode length keeps initial and repeated manual resets neutral.
-    Trunk contact wins if success and a crash fire during the same step: a
-    robot cannot earn mastery by arriving at the exit gate while collapsed.
+    A trunk contact or fall wins if it fires with success during the same step:
+    a robot cannot earn mastery by reaching the exit gate while crashing.
     """
 
     has_completed_step = env.episode_length_buf[env_ids] > 0
@@ -558,7 +558,14 @@ def _terminal_event_masks(
         )
         & terminal_event
     )
-    success_event = raw_success_event & (~trunk_contact_event)
+    fell_below_event = (
+        env.termination_manager.get_term("fell_below_course")[env_ids].to(
+            device=env.device,
+            dtype=torch.bool,
+        )
+        & terminal_event
+    )
+    success_event = raw_success_event & (~trunk_contact_event) & (~fell_below_event)
     failure_event = terminal_event & (~success_event)
     return success_event, terminal_event, failure_event
 

@@ -37,6 +37,18 @@ def active_course_indices(
     return _parkour_runtime(env).route.course_indices[env_ids]
 
 
+def active_difficulty_indices(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return difficulty rows for the retained active courses."""
+
+    from .state import _parkour_runtime
+
+    runtime = _parkour_runtime(env)
+    return active_course_indices(env, env_ids) % runtime.courses.num_difficulties
+
+
 def active_waypoint_changed_this_step(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Return which environments switched targets during the current step.
 
@@ -166,9 +178,7 @@ def normalized_course_progress(
     maximum_progress = runtime.route.maximum_progress_m[env_ids]
     return (
         maximum_progress
-        / course_lengths.to(dtype=maximum_progress.dtype).clamp_min(
-            torch.finfo(maximum_progress.dtype).eps
-        )
+        / course_lengths.to(dtype=maximum_progress.dtype).clamp_min(torch.finfo(maximum_progress.dtype).eps)
     ).clamp(min=0.0, max=1.0)
 
 
@@ -321,10 +331,7 @@ def advance_active_waypoints(
         supported
         & (~trunk_contact)
         & (clearance > min_clearance)
-        & (
-            torch.abs(robot._root_lin_vel_z(env, asset_cfg))
-            < max_completion_vertical_speed
-        )
+        & (torch.abs(robot._root_lin_vel_z(env, asset_cfg)) < max_completion_vertical_speed)
         & (
             torch.linalg.norm(
                 robot._root_projected_gravity_xy(env, asset_cfg),
@@ -433,35 +440,21 @@ def reset_routes(
     env_ids = _all_env_ids(env, env_ids)
     family_indices = family_indices.to(device=env.device, dtype=torch.long)
     difficulty_indices = difficulty_indices.to(device=env.device, dtype=torch.long)
-    if (
-        family_indices.shape != env_ids.shape
-        or difficulty_indices.shape != env_ids.shape
-    ):
-        raise ValueError(
-            "family_indices and difficulty_indices must contain one value per reset environment."
-        )
+    if family_indices.shape != env_ids.shape or difficulty_indices.shape != env_ids.shape:
+        raise ValueError("family_indices and difficulty_indices must contain one value per reset environment.")
 
     waypoint_marker = env.scene[waypoint_marker_cfg.name]
     dtype = waypoint_marker.data.default_root_state.dtype
     runtime = _ensure_parkour_runtime(env, curriculum_cfg, dtype=dtype)
 
-    if torch.any(
-        (family_indices < 0) | (family_indices >= len(curriculum_cfg.families))
-    ):
+    if torch.any((family_indices < 0) | (family_indices >= len(curriculum_cfg.families))):
         raise ValueError("family_indices contains an out-of-range obstacle family.")
-    if torch.any(
-        (difficulty_indices < 0)
-        | (difficulty_indices >= curriculum_cfg.num_difficulties)
-    ):
+    if torch.any((difficulty_indices < 0) | (difficulty_indices >= curriculum_cfg.num_difficulties)):
         raise ValueError("difficulty_indices contains an out-of-range difficulty.")
 
-    course_indices = (
-        family_indices * curriculum_cfg.num_difficulties + difficulty_indices
-    )
+    course_indices = family_indices * curriculum_cfg.num_difficulties + difficulty_indices
     route_state = runtime.route
-    route_state.previous_episode_maximum_progress_m[env_ids] = (
-        route_state.maximum_progress_m[env_ids]
-    )
+    route_state.previous_episode_maximum_progress_m[env_ids] = route_state.maximum_progress_m[env_ids]
     route_state.maximum_progress_m[env_ids] = 0.0
     route_state.course_indices[env_ids] = course_indices
     route_state.active_waypoint_indices[env_ids] = 0
@@ -525,10 +518,7 @@ def _active_waypoint_plane_passed(
     segment_vectors = segment_ends - segment_starts
     segment_lengths = torch.linalg.norm(segment_vectors, dim=-1)
     valid_segment = segment_lengths > torch.finfo(robot_xy.dtype).eps
-    unit_directions = (
-        segment_vectors
-        / segment_lengths.clamp_min(torch.finfo(robot_xy.dtype).eps)[:, None]
-    )
+    unit_directions = segment_vectors / segment_lengths.clamp_min(torch.finfo(robot_xy.dtype).eps)[:, None]
     # Project both robot samples onto the route direction. The target plane is at
     # ``segment_lengths`` along this direction.
     previous_longitudinal = torch.sum(
@@ -541,24 +531,19 @@ def _active_waypoint_plane_passed(
     )
     # A crossing occurs only when the robot moves from behind the target plane to
     # the plane or beyond it during this step.
-    crossed_forward = (previous_longitudinal < segment_lengths) & (
-        current_longitudinal >= segment_lengths
-    )
+    crossed_forward = (previous_longitudinal < segment_lengths) & (current_longitudinal >= segment_lengths)
 
     # Treat the motion between samples as a straight line. This fraction says how
     # far through the step the robot reaches the target plane. The epsilon keeps
     # division safe for non-crossing rows, which are rejected below.
     longitudinal_delta = current_longitudinal - previous_longitudinal
     crossing_fraction = (
-        (segment_lengths - previous_longitudinal)
-        / longitudinal_delta.clamp_min(torch.finfo(robot_xy.dtype).eps)
+        (segment_lengths - previous_longitudinal) / longitudinal_delta.clamp_min(torch.finfo(robot_xy.dtype).eps)
     ).clamp(0.0, 1.0)
     # ``crossing_xy`` is the estimated XY position where that straight-line motion
     # intersects the target plane. ``[:, None]`` applies one fraction to both XY
     # coordinates for each environment.
-    crossing_xy = previous_robot_xy + crossing_fraction[:, None] * (
-        robot_xy - previous_robot_xy
-    )
+    crossing_xy = previous_robot_xy + crossing_fraction[:, None] * (robot_xy - previous_robot_xy)
 
     # Remove the component parallel to the route; the remaining vector is the
     # lateral offset from the route centerline at the crossing point.
@@ -641,9 +626,7 @@ def _active_waypoint_supported(
         dim=-1,
     )
     # foot - d * unit_normal is its orthogonal projection onto the plane.
-    projected_feet = (
-        foot_positions - signed_plane_distance[..., None] * support_normals[:, None, :]
-    )
+    projected_feet = foot_positions - signed_plane_distance[..., None] * support_normals[:, None, :]
     # Vector from every edge start to every projected foot.
     edge_to_foot = projected_feet[:, :, None, :] - edge_starts[:, None, :, :]
     # ((edge x edge_to_foot) dot normal) / |edge| is the signed distance
@@ -720,16 +703,9 @@ def _advance_route_state(
     # only while the root is nearby and a contacted foot is on its support.
     control_reached = (~support_required) & (within_radius | passed_waypoint_plane)
     physical_reached = support_required & within_radius & supported
-    advance_cursor = (
-        (~final_waypoint) & route_state_eligible & (control_reached | physical_reached)
-    )
+    advance_cursor = (~final_waypoint) & route_state_eligible & (control_reached | physical_reached)
 
-    completed_course = (
-        final_waypoint
-        & physical_reached
-        & route_state_eligible
-        & final_waypoint_eligible
-    )
+    completed_course = final_waypoint & physical_reached & route_state_eligible & final_waypoint_eligible
 
     # Adding a Boolean tensor increments selected cursors by exactly one. Final
     # cursors are excluded above, so no index can exceed its route length.
@@ -776,13 +752,9 @@ def _route_progress_m(
     ]
     segment_vectors = segment_ends - segment_starts
     # [num_envs]: squared length and clamped projection along each segment.
-    squared_lengths = torch.sum(segment_vectors.square(), dim=-1).clamp_min(
-        torch.finfo(robot_xy.dtype).eps
-    )
+    squared_lengths = torch.sum(segment_vectors.square(), dim=-1).clamp_min(torch.finfo(robot_xy.dtype).eps)
     relative_position = robot_xy - segment_starts
-    fraction = (
-        torch.sum(relative_position * segment_vectors, dim=-1) / squared_lengths
-    ).clamp(0.0, 1.0)
+    fraction = (torch.sum(relative_position * segment_vectors, dim=-1) / squared_lengths).clamp(0.0, 1.0)
     # [num_envs]: active-segment length and distance completed before it.
     segment_lengths = torch.sqrt(squared_lengths)
     unit_directions = segment_vectors / segment_lengths[:, None]

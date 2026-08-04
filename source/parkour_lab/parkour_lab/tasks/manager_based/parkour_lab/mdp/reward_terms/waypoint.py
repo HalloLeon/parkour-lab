@@ -19,16 +19,31 @@ from ..terrain import queries
 # Dense waypoint-progress shaping.
 
 
+def _mask_waypoint_change(
+    env: ManagerBasedRLEnv,
+    values: torch.Tensor,
+) -> torch.Tensor:
+    """Discard the sample whose action targeted the preceding waypoint."""
+
+    return torch.where(
+        route.active_waypoint_changed_this_step(env),
+        torch.zeros_like(values),
+        values,
+    )
+
+
 def waypoint_heading_alignment_exp(
     env: ManagerBasedRLEnv,
+    overspeed_std: float = 0.3,
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Reward alignment while advancing toward the active waypoint.
+    """Reward alignment while advancing at a suitable course speed.
 
     The exponential heading kernel is multiplied by the fraction of commanded
     forward speed, so alignment alone cannot earn return while standing still.
-    The term remains bounded in ``[0, 1]``.
+    On the flat bootstrap, a one-sided exponential gate also suppresses
+    overspeed. Obstacle rows retain heading guidance during takeoff.
 
     The action preceding a waypoint transition targeted the old waypoint, so
     that single retarget sample is masked rather than credited against the new
@@ -37,6 +52,9 @@ def waypoint_heading_alignment_exp(
     Returns:
         Tensor with shape ``(num_envs,)``.
     """
+
+    if overspeed_std <= 0.0:
+        raise ValueError("overspeed_std must be positive.")
 
     heading_error = geometry._heading_error_to_active_waypoint_xy(
         env,
@@ -53,17 +71,20 @@ def waypoint_heading_alignment_exp(
         dtype=velocity_along_waypoint.dtype,
     )
     advancing_gate = torch.clamp(
-        velocity_along_waypoint
-        / target_speed.clamp_min(torch.finfo(target_speed.dtype).eps),
+        velocity_along_waypoint / target_speed.clamp_min(torch.finfo(target_speed.dtype).eps),
         min=0.0,
         max=1.0,
     )
-    reward = advancing_gate * torch.exp(-torch.abs(heading_error))
-    return torch.where(
-        route.active_waypoint_changed_this_step(env),
-        torch.zeros_like(reward),
-        reward,
+    flat_speed_gate = torch.exp(
+        -torch.relu(velocity_along_waypoint - target_speed).square() / float(overspeed_std) ** 2
     )
+    speed_gate = torch.where(
+        route.active_difficulty_indices(env) == 0,
+        flat_speed_gate,
+        torch.ones_like(flat_speed_gate),
+    )
+    reward = advancing_gate * speed_gate * torch.exp(-torch.abs(heading_error))
+    return _mask_waypoint_change(env, reward)
 
 
 def waypoint_velocity_tracking_exp(
@@ -71,16 +92,15 @@ def waypoint_velocity_tracking_exp(
     std: float = 0.5,
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    overspeed_std: float = 0.3,
 ) -> torch.Tensor:
-    """Track forward waypoint speed while suppressing lateral motion.
+    """Reward capped forward acquisition while suppressing lateral motion.
 
-    Forward motion retains a linear acquisition signal up to the commanded
-    speed, while a one-sided exponential gate suppresses overspeed. Standing
-    still and moving backward receive zero::
+    Forward motion receives a linear acquisition signal up to the commanded
+    speed. Faster motion earns no additional dense reward, but remains
+    available for obstacle takeoff. Standing still and moving backward receive
+    zero::
 
         clamp(v_parallel / target_speed, 0, 1)
-        * exp(-relu(v_parallel - target_speed)^2 / overspeed_std^2)
         * exp(-||v_perpendicular||^2 / std^2)
 
     The term is bounded in ``[0, 1]`` and masks the one sample on which the route
@@ -90,8 +110,8 @@ def waypoint_velocity_tracking_exp(
         Tensor with shape ``(num_envs,)``.
     """
 
-    if std <= 0.0 or overspeed_std <= 0.0:
-        raise ValueError("std and overspeed_std must be positive.")
+    if std <= 0.0:
+        raise ValueError("std must be positive.")
 
     waypoint_direction_xy = geometry._active_waypoint_direction_xy(
         env,
@@ -103,34 +123,55 @@ def waypoint_velocity_tracking_exp(
         root_velocity_xy * waypoint_direction_xy,
         dim=-1,
     )
-    lateral_velocity_xy = (
-        root_velocity_xy
-        - velocity_along_waypoint.unsqueeze(-1) * waypoint_direction_xy
-    )
+    lateral_velocity_xy = root_velocity_xy - velocity_along_waypoint.unsqueeze(-1) * waypoint_direction_xy
 
     target_speed = get_target_speed(env).to(
         device=root_velocity_xy.device,
         dtype=root_velocity_xy.dtype,
     )
     forward_fraction = torch.clamp(
-        velocity_along_waypoint
-        / target_speed.clamp_min(torch.finfo(target_speed.dtype).eps),
+        velocity_along_waypoint / target_speed.clamp_min(torch.finfo(target_speed.dtype).eps),
         min=0.0,
         max=1.0,
     )
-    speed_alignment = torch.exp(
-        -torch.relu(velocity_along_waypoint - target_speed).square()
-        / float(overspeed_std) ** 2
+    lateral_alignment = torch.exp(-torch.sum(lateral_velocity_xy.square(), dim=-1) / float(std) ** 2)
+    return _mask_waypoint_change(
+        env,
+        forward_fraction * lateral_alignment,
     )
-    lateral_alignment = torch.exp(
-        -torch.sum(lateral_velocity_xy.square(), dim=-1) / float(std) ** 2
+
+
+def flat_waypoint_overspeed_l2(
+    env: ManagerBasedRLEnv,
+    max_excess_ratio: float = 2.0,
+    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize normalized overspeed only on the flat bootstrap.
+
+    The quadratic remains corrective throughout the expected speed range and
+    is capped before squaring to bound collision outliers. Configure this term
+    with a negative weight.
+    """
+
+    if max_excess_ratio <= 0.0:
+        raise ValueError("max_excess_ratio must be positive.")
+
+    velocity_along_waypoint = geometry._velocity_along_active_waypoint_xy(
+        env,
+        waypoint_marker_cfg=waypoint_marker_cfg,
+        asset_cfg=asset_cfg,
     )
-    reward = forward_fraction * speed_alignment * lateral_alignment
-    return torch.where(
-        route.active_waypoint_changed_this_step(env),
-        torch.zeros_like(reward),
-        reward,
+    target_speed = get_target_speed(env).to(
+        device=velocity_along_waypoint.device,
+        dtype=velocity_along_waypoint.dtype,
     )
+    excess_ratio = torch.relu(velocity_along_waypoint - target_speed) / target_speed.clamp_min(
+        torch.finfo(target_speed.dtype).eps
+    )
+    penalty = torch.clamp(excess_ratio, max=max_excess_ratio).square()
+    penalty *= (route.active_difficulty_indices(env) == 0).to(dtype=penalty.dtype)
+    return _mask_waypoint_change(env, penalty)
 
 
 def waypoint_heading_misalignment_l2(
@@ -179,11 +220,7 @@ def waypoint_heading_misalignment_l2(
     # A waypoint switch changes the desired heading after the robot has already
     # acted toward the previous target. Skip that transition sample so route
     # retargeting is not penalized as policy-induced heading misalignment.
-    return torch.where(
-        route.active_waypoint_changed_this_step(env),
-        torch.zeros_like(penalty),
-        penalty,
-    )
+    return _mask_waypoint_change(env, penalty)
 
 
 def waypoint_progress_xy_stable(
@@ -386,11 +423,7 @@ def velocity_along_waypoint_xy_capped(
         min=-1.0,
         max=1.0,
     )
-    return torch.where(
-        route.active_waypoint_changed_this_step(env),
-        torch.zeros_like(normalized_velocity),
-        normalized_velocity,
-    )
+    return _mask_waypoint_change(env, normalized_velocity)
 
 
 def velocity_along_waypoint_xy_clearance_capped(

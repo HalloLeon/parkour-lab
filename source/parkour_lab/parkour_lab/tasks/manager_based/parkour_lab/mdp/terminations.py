@@ -2,7 +2,7 @@ import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
-from ._shared import contact
+from ._shared import contact, robot
 from .navigation.route import advance_active_waypoints
 
 
@@ -13,12 +13,21 @@ def base_contact_done(
 ) -> torch.Tensor:
     """Return which environments exceed the trunk-contact force threshold."""
 
-    force_norm = contact._force_norm_mask(env, sensor_cfg=sensor_cfg)
+    return torch.any(
+        contact._force_norm_mask(env, sensor_cfg=sensor_cfg) > threshold,
+        dim=(1, 2),
+    )
 
-    # [num_envs]
-    base_contact = torch.any(force_norm > threshold, dim=(1, 2))
 
-    return base_contact
+def fell_below_course(
+    env: ManagerBasedRLEnv,
+    minimum_height: float = -0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate robots that fall far below their environment-local course."""
+
+    root_height = robot._root_height_env(env, asset_cfg)
+    return (~torch.isfinite(root_height)) | (root_height < minimum_height)
 
 
 def completed_course_done(

@@ -23,7 +23,6 @@ def feet_air_time(
     threshold: float = 0.5,
     flat_weight: float = 0.0,
     obstacle_weight: float = 0.01,
-    curriculum_cfg: ParkourCurriculumCfg = DEFAULT_PARKOUR_CURRICULUM,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot"),
 ) -> torch.Tensor:
     """Reward foot swing duration with curriculum-level-aware strength.
@@ -48,9 +47,7 @@ def feet_air_time(
 
     contact._require_body_ids(sensor_cfg, role="feet air time")
     contact_sensor: ContactSensor = env.scene[sensor_cfg.name]
-    first_contact = contact_sensor.compute_first_contact(env.step_dt)[
-        :, sensor_cfg.body_ids
-    ]
+    first_contact = contact_sensor.compute_first_contact(env.step_dt)[:, sensor_cfg.body_ids]
     last_air_time = contact_sensor.data.last_air_time[:, sensor_cfg.body_ids]
     reward = torch.sum(
         (last_air_time - threshold) * first_contact.to(dtype=last_air_time.dtype),
@@ -65,7 +62,6 @@ def feet_air_time(
         reference=reward,
         flat_value=flat_weight,
         obstacle_value=obstacle_weight,
-        curriculum_cfg=curriculum_cfg,
     )
 
 
@@ -111,7 +107,6 @@ def obstacle_only_feet_edge(
         reference=penalty,
         flat_value=0.0,
         obstacle_value=1.0,
-        curriculum_cfg=curriculum_cfg,
     )
 
 
@@ -148,7 +143,6 @@ def feet_stumble(
 def obstacle_only_feet_stumble(
     env: ManagerBasedRLEnv,
     stumble_cfg: config.FeetStumbleCfg = config.DEFAULT_FEET_STUMBLE,
-    curriculum_cfg: ParkourCurriculumCfg = DEFAULT_PARKOUR_CURRICULUM,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot"),
 ) -> torch.Tensor:
     """Return the stumble penalty only on obstacle-bearing rows."""
@@ -163,14 +157,12 @@ def obstacle_only_feet_stumble(
         reference=penalty,
         flat_value=0.0,
         obstacle_value=1.0,
-        curriculum_cfg=curriculum_cfg,
     )
 
 
 def obstacle_only_undesired_contacts(
     env: ManagerBasedRLEnv,
     threshold: float = 1.0,
-    curriculum_cfg: ParkourCurriculumCfg = DEFAULT_PARKOUR_CURRICULUM,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("leg_contact"),
 ) -> torch.Tensor:
     """Count undesired contacts only after leaving the flat bootstrap row."""
@@ -185,7 +177,6 @@ def obstacle_only_undesired_contacts(
         reference=penalty,
         flat_value=0.0,
         obstacle_value=1.0,
-        curriculum_cfg=curriculum_cfg,
     )
 
 
@@ -194,7 +185,6 @@ def level_scaled_feet_slide(
     flat_scale: float = 0.5,
     obstacle_scale: float = 1.0,
     contact_threshold: float = 1.0,
-    curriculum_cfg: ParkourCurriculumCfg = DEFAULT_PARKOUR_CURRICULUM,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=".*_foot"),
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot"),
 ) -> torch.Tensor:
@@ -222,7 +212,6 @@ def level_scaled_feet_slide(
         reference=penalty,
         flat_value=flat_scale,
         obstacle_value=obstacle_scale,
-        curriculum_cfg=curriculum_cfg,
     )
 
 
@@ -253,27 +242,24 @@ def no_feet_contact(
         [num_envs]
     """
 
-    contact_sensor: ContactSensor = env.scene[sensor_cfg.name]
+    force_norm = contact._force_norm_mask(env, sensor_cfg=sensor_cfg)
+    return (~torch.any(force_norm > threshold, dim=(1, 2))).float()
 
-    # [num_envs, history_length, num_bodies, 3]
-    net_forces = contact_sensor.data.net_forces_w_history
 
-    if sensor_cfg.body_ids is not None:
-        net_forces = net_forces[:, :, sensor_cfg.body_ids, :]
+def flat_only_no_feet_contact(
+    env: ManagerBasedRLEnv,
+    threshold: float = 1.0,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot"),
+) -> torch.Tensor:
+    """Penalize fully airborne motion only on the flat bootstrap row."""
 
-    # [num_envs, history_length, num_bodies]
-    force_norm = torch.linalg.norm(net_forces, dim=-1)
-
-    # Has each foot contacted recently?
-    # [num_envs, num_bodies]
-    feet_in_contact = torch.any(force_norm > threshold, dim=1)
-
-    # [num_envs]
-    num_feet_in_contact = torch.sum(feet_in_contact.float(), dim=-1)
-
-    no_contact = num_feet_in_contact < 1.0
-
-    return no_contact.float()
+    penalty = no_feet_contact(env, threshold=threshold, sensor_cfg=sensor_cfg)
+    return penalty * _difficulty_level_weight(
+        env,
+        reference=penalty,
+        flat_value=1.0,
+        obstacle_value=0.0,
+    )
 
 
 def rapid_feet_motion_l2(
@@ -329,15 +315,9 @@ def _difficulty_level_weight(
     reference: torch.Tensor,
     flat_value: float,
     obstacle_value: float,
-    curriculum_cfg: ParkourCurriculumCfg,
 ) -> torch.Tensor:
     """Return one flat/obstacle scalar for each retained episode course."""
 
-    course_indices = route.active_course_indices(env)
-    difficulty_indices = torch.remainder(
-        course_indices,
-        curriculum_cfg.num_difficulties,
-    )
     flat = torch.full_like(reference, flat_value)
     obstacle = torch.full_like(reference, obstacle_value)
-    return torch.where(difficulty_indices == 0, flat, obstacle)
+    return torch.where(route.active_difficulty_indices(env) == 0, flat, obstacle)

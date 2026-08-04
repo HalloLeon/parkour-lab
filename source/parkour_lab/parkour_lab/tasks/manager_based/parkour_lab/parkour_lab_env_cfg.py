@@ -71,9 +71,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
             dynamic_friction=1.0,
             restitution=0.0,
         ),
-        visual_material=sim_utils.PreviewSurfaceCfg(
-            diffuse_color=(0.55, 0.48, 0.35), roughness=0.8
-        ),
+        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.55, 0.48, 0.35), roughness=0.8),
     )
 
     waypoint_marker: RigidObjectCfg = RigidObjectCfg(
@@ -92,9 +90,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = UNITREE_A1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     # Contact sensors.
-    base_contact: ContactSensorCfg = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/trunk", history_length=3
-    )
+    base_contact: ContactSensorCfg = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/trunk", history_length=3)
 
     feet_contact: ContactSensorCfg = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*_foot", history_length=3, track_air_time=True
@@ -252,9 +248,7 @@ class ObservationsCfg:
             func=mdp.terrain_height_scan,
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
-                "obs_cfg": mdp.config.HeightScanObservationCfg(
-                    num_rays=132, vertical_offset=0.30, clip=0.50
-                ),
+                "obs_cfg": mdp.config.HeightScanObservationCfg(num_rays=132, vertical_offset=0.30, clip=0.50),
                 "sensor_cfg": SceneEntityCfg("height_scanner"),
             },
         )
@@ -265,9 +259,7 @@ class ObservationsCfg:
             func=mdp.terrain_height_scan_validity,
             params={
                 "asset_cfg": SceneEntityCfg("robot"),
-                "obs_cfg": mdp.config.HeightScanObservationCfg(
-                    num_rays=132, vertical_offset=0.30, clip=0.50
-                ),
+                "obs_cfg": mdp.config.HeightScanObservationCfg(num_rays=132, vertical_offset=0.30, clip=0.50),
                 "sensor_cfg": SceneEntityCfg("height_scanner"),
             },
         )
@@ -469,11 +461,11 @@ class RewardsCfg:
     """
     Task, safety, and motion-quality rewards for parkour locomotion.
 
-    Forward-speed and forward-gated heading tracking provide dense acquisition
-    without paying a stationary policy. One-shot physical-milestone and
-    completion bonuses make discrete progress unambiguous without rewarding
-    proximity every step. Safety remains separate, while level-aware contact
-    shaping keeps the flat bootstrap from penalizing gait discovery.
+    Capped forward acquisition remains available on every course. Flat-only
+    overspeed, heading, and flight shaping encourage a walking bootstrap
+    without suppressing the faster takeoff motions needed by obstacles.
+    One-shot physical milestones and completion bonuses make discrete progress
+    unambiguous, while safety remains separate.
     """
 
     # Active-waypoint task.
@@ -482,8 +474,17 @@ class RewardsCfg:
         weight=1.5,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "overspeed_std": 0.3,
             "std": 0.5,
+            "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
+        },
+    )
+
+    flat_overspeed = RewTerm(
+        func=mdp.flat_waypoint_overspeed_l2,
+        weight=-0.25,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "max_excess_ratio": 2.0,
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
         },
     )
@@ -493,6 +494,7 @@ class RewardsCfg:
         weight=0.5,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
+            "overspeed_std": 0.3,
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
         },
     )
@@ -510,11 +512,19 @@ class RewardsCfg:
         func=mdp.feet_air_time,
         weight=1.0,
         params={
-            "curriculum_cfg": PARKOUR_CURRICULUM,
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
             "threshold": 0.5,
             "flat_weight": 0.0,
             "obstacle_weight": 0.01,
+        },
+    )
+
+    flat_no_feet_contact = RewTerm(
+        func=mdp.flat_only_no_feet_contact,
+        weight=-0.2,
+        params={
+            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+            "threshold": 1.0,
         },
     )
 
@@ -539,7 +549,6 @@ class RewardsCfg:
         func=mdp.obstacle_only_undesired_contacts,
         weight=-0.5,
         params={
-            "curriculum_cfg": PARKOUR_CURRICULUM,
             "sensor_cfg": SceneEntityCfg("leg_contact"),
             "threshold": 1.0,
         },
@@ -575,7 +584,6 @@ class RewardsCfg:
         weight=-0.05,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
-            "curriculum_cfg": PARKOUR_CURRICULUM,
             "flat_scale": 0.5,
             "obstacle_scale": 1.0,
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
@@ -586,7 +594,6 @@ class RewardsCfg:
         func=mdp.obstacle_only_feet_stumble,
         weight=-0.5,
         params={
-            "curriculum_cfg": PARKOUR_CURRICULUM,
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
             "stumble_cfg": mdp.config.FeetStumbleCfg(
                 lateral_to_vertical_force_ratio=4.0,
@@ -630,6 +637,14 @@ class TerminationsCfg:
         params={
             "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk"),
             "threshold": PARKOUR_CURRICULUM.base_contact_threshold,
+        },
+    )
+
+    fell_below_course = DoneTerm(
+        func=mdp.fell_below_course,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "minimum_height": -0.5,
         },
     )
 
@@ -743,9 +758,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         if level is None:
             level = curriculum_cfg.max_level
         if not 0 <= level <= curriculum_cfg.max_level:
-            raise ValueError(
-                f"difficulty level must be in [0, {curriculum_cfg.max_level}], got {level}."
-            )
+            raise ValueError(f"difficulty level must be in [0, {curriculum_cfg.max_level}], got {level}.")
 
         self.evaluation_family = family
         self.evaluation_level = level
@@ -808,9 +821,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         terrain_generator = self.scene.ground.terrain_generator
         if terrain_generator is None:
             raise ValueError("ParkourLabEnvCfg requires a generated terrain.")
-        if not terrain_generator.curriculum or tuple(
-            terrain_generator.difficulty_range
-        ) != (0.0, 1.0):
+        if not terrain_generator.curriculum or tuple(terrain_generator.difficulty_range) != (0.0, 1.0):
             raise ValueError(
                 "The discrete parkour row mapping requires terrain curriculum mode and difficulty_range=(0.0, 1.0)."
             )
@@ -833,12 +844,8 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
             terrain_generator.num_cols,
             family_name=self.evaluation_family,
         )
-        generated_family_indices = tuple(
-            dict.fromkeys(terrain_layout.family_index_by_column)
-        )
-        generated_families = tuple(
-            curriculum_cfg.families[index] for index in generated_family_indices
-        )
+        generated_family_indices = tuple(dict.fromkeys(terrain_layout.family_index_by_column))
+        generated_families = tuple(curriculum_cfg.families[index] for index in generated_family_indices)
         terrain_generator.sub_terrains = {
             family.name: mdp.curriculums_config.ParkourTerrainCfg(
                 proportion=1.0 / len(generated_families),
@@ -850,26 +857,18 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
 
         # Restrict training to the configured starting range; evaluation pins
         # startup to its requested difficulty row.
-        initial_level = (
-            curriculum_cfg.initial_level
-            if self.evaluation_level is None
-            else self.evaluation_level
-        )
+        initial_level = curriculum_cfg.initial_level if self.evaluation_level is None else self.evaluation_level
         self.scene.ground.max_init_terrain_level = initial_level
 
         # Keep the visible marker footprint consistent with the configured XY
         # radius used by the waypoint transition condition.
-        self.scene.waypoint_marker.spawn.radius = (
-            curriculum_cfg.waypoint_reach_threshold
-        )
+        self.scene.waypoint_marker.spawn.radius = curriculum_cfg.waypoint_reach_threshold
 
         # Pass the same curriculum object to reset events so initial terrain
         # assignment and active routes use the authoritative table.
         self.events.initialize_terrain_levels.params["curriculum_cfg"] = curriculum_cfg
         self.events.initialize_terrain_levels.params["terrain_layout"] = terrain_layout
-        self.events.initialize_terrain_levels.params["initial_level_override"] = (
-            self.evaluation_level
-        )
+        self.events.initialize_terrain_levels.params["initial_level_override"] = self.evaluation_level
         self.events.reset_routes.params["curriculum_cfg"] = curriculum_cfg
         self.events.reset_routes.params["terrain_layout"] = terrain_layout
 
@@ -881,32 +880,16 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
 
         # The success term owns route advancement before reward computation.
         # Synchronize its waypoint radius with the authoritative curriculum.
-        self.terminations.success.params["reach_threshold"] = (
-            curriculum_cfg.waypoint_reach_threshold
-        )
-        self.terminations.success.params["contact_threshold"] = (
-            curriculum_cfg.base_contact_threshold
-        )
+        self.terminations.success.params["reach_threshold"] = curriculum_cfg.waypoint_reach_threshold
+        self.terminations.success.params["contact_threshold"] = curriculum_cfg.base_contact_threshold
 
         # Likewise, use one contact threshold for both the safety penalty and
         # trunk-contact termination.
-        self.rewards.illegal_contact.params["threshold"] = (
-            curriculum_cfg.base_contact_threshold
-        )
-        self.terminations.trunk_contact.params["threshold"] = (
-            curriculum_cfg.base_contact_threshold
-        )
+        self.rewards.illegal_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
+        self.terminations.trunk_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
 
-        # Keep every level-aware reward tied to the same authoritative matrix
-        # used by terrain generation and route state.
-        for term_name in (
-            "feet_air_time",
-            "leg_contact",
-            "feet_edge",
-            "feet_slide",
-            "feet_stumble",
-        ):
-            getattr(self.rewards, term_name).params["curriculum_cfg"] = curriculum_cfg
+        # Edge geometry, unlike simple level gates, needs the full course table.
+        self.rewards.feet_edge.params["curriculum_cfg"] = curriculum_cfg
 
     def synchronize_domain_randomization_config(self) -> None:
         """Propagate the selected randomization stage to all manager terms.
@@ -956,9 +939,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
                     else None
                 )
                 noise = scale * full_noise
-                term_cfg.noise = (
-                    UniformNoiseCfg(n_min=-noise, n_max=noise) if enabled else None
-                )
+                term_cfg.noise = UniformNoiseCfg(n_min=-noise, n_max=noise) if enabled else None
 
         self._set_initial_state_randomization(scale)
 
