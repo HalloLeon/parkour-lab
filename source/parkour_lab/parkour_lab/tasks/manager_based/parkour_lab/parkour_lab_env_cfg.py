@@ -469,11 +469,11 @@ class RewardsCfg:
     """
     Task, safety, and motion-quality rewards for parkour locomotion.
 
-    Positive target-speed and heading tracking provide the dense acquisition
-    signal. One-shot physical-milestone and completion bonuses make discrete
-    progress unambiguous without rewarding proximity every step. Safety remains
-    separate, while level-aware contact shaping keeps the flat bootstrap from
-    penalizing the foot motion needed to discover a gait.
+    Forward-speed and forward-gated heading tracking provide dense acquisition
+    without paying a stationary policy. One-shot physical-milestone and
+    completion bonuses make discrete progress unambiguous without rewarding
+    proximity every step. Safety remains separate, while level-aware contact
+    shaping keeps the flat bootstrap from penalizing gait discovery.
     """
 
     # Active-waypoint task.

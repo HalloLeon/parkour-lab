@@ -55,6 +55,19 @@ def active_waypoint_changed_this_step(env: ManagerBasedRLEnv) -> torch.Tensor:
     return runtime.route.waypoint_changed
 
 
+def course_completed_this_step(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return which environments safely completed a course this step."""
+
+    import torch
+
+    from .state import _parkour_runtime_or_none
+
+    runtime = _parkour_runtime_or_none(env)
+    if runtime is None:
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    return runtime.route.course_completed
+
+
 def active_waypoint_positions(
     env: ManagerBasedRLEnv,
     waypoint_marker_cfg: SceneEntityCfg,
@@ -354,6 +367,7 @@ def advance_active_waypoints(
     # making active-waypoint distance jump without robot motion. The progress
     # reward uses this event to ignore that artificial change for the current step.
     route_state.waypoint_changed[:] = advanced
+    route_state.course_completed[:] = completed_course
     route_state.maximum_progress_m[:] = torch.where(
         completed_course,
         courses.cumulative_distances_m[course_indices, waypoint_counts - 1],
@@ -452,6 +466,7 @@ def reset_routes(
     route_state.course_indices[env_ids] = course_indices
     route_state.active_waypoint_indices[env_ids] = 0
     route_state.waypoint_changed[env_ids] = False
+    route_state.course_completed[env_ids] = False
     route_state.previous_root_xy[env_ids] = robot._root_pos_env(
         env,
         asset_cfg,

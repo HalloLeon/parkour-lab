@@ -54,8 +54,8 @@ class RouteState:
     ``course_indices`` retains the completed episode's course until reset, so
     curriculum progress is normalized against the right route. The two progress
     tensors distinguish the running maximum from the post-reset evaluation
-    snapshot. ``previous_root_xy`` and ``waypoint_changed`` bridge manager
-    ordering for plane crossings and one-step retarget events respectively.
+    snapshot. ``previous_root_xy`` bridges manager ordering for plane crossings;
+    the Boolean event tensors expose one-step retarget and completion events.
     """
 
     # Selected course and active cursor. The selected course determines the
@@ -70,8 +70,9 @@ class RouteState:
     # Completed-episode evaluation snapshot.
     previous_episode_maximum_progress_m: torch.Tensor
 
-    # One-step route-transition event.
+    # One-step route-transition events.
     waypoint_changed: torch.Tensor
+    course_completed: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,6 +311,11 @@ def _build_route_state(
             device=env.device,
             dtype=torch.bool,
         ),
+        course_completed=torch.zeros(
+            env.num_envs,
+            device=env.device,
+            dtype=torch.bool,
+        ),
     )
 
 
@@ -330,6 +336,8 @@ def _runtime_matches(
     courses = runtime.courses
     route = runtime.route
     device = torch.device(env.device)
+    waypoint_changed = getattr(route, "waypoint_changed", None)
+    course_completed = getattr(route, "course_completed", None)
     return (
         courses.num_difficulties == curriculum_cfg.num_difficulties
         and courses.waypoints.shape[0] == len(curriculum_cfg.courses)
@@ -340,4 +348,12 @@ def _runtime_matches(
         and route.previous_root_xy.shape == (env.num_envs, 2)
         and route.previous_root_xy.device == device
         and route.previous_root_xy.dtype == dtype
+        and isinstance(waypoint_changed, torch.Tensor)
+        and waypoint_changed.shape == (env.num_envs,)
+        and waypoint_changed.device == device
+        and waypoint_changed.dtype == torch.bool
+        and isinstance(course_completed, torch.Tensor)
+        and course_completed.shape == (env.num_envs,)
+        and course_completed.device == device
+        and course_completed.dtype == torch.bool
     )

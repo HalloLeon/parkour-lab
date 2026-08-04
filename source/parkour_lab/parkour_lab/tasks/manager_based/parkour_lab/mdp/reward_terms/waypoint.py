@@ -24,11 +24,11 @@ def waypoint_heading_alignment_exp(
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Reward alignment with the active waypoint using a positive kernel.
+    """Reward alignment while advancing toward the active waypoint.
 
-    Unlike a misalignment penalty, this term supplies useful positive return
-    before the policy has acquired forward locomotion.  The exponential follows
-    the heading reward used by Extreme Parkour and remains bounded in ``(0, 1]``.
+    The exponential heading kernel is multiplied by the fraction of commanded
+    forward speed, so alignment alone cannot earn return while standing still.
+    The term remains bounded in ``[0, 1]``.
 
     The action preceding a waypoint transition targeted the old waypoint, so
     that single retarget sample is masked rather than credited against the new
@@ -43,7 +43,22 @@ def waypoint_heading_alignment_exp(
         waypoint_marker_cfg=waypoint_marker_cfg,
         asset_cfg=asset_cfg,
     )
-    reward = torch.exp(-torch.abs(heading_error))
+    velocity_along_waypoint = geometry._velocity_along_active_waypoint_xy(
+        env,
+        waypoint_marker_cfg=waypoint_marker_cfg,
+        asset_cfg=asset_cfg,
+    )
+    target_speed = get_target_speed(env).to(
+        device=velocity_along_waypoint.device,
+        dtype=velocity_along_waypoint.dtype,
+    )
+    advancing_gate = torch.clamp(
+        velocity_along_waypoint
+        / target_speed.clamp_min(torch.finfo(target_speed.dtype).eps),
+        min=0.0,
+        max=1.0,
+    )
+    reward = advancing_gate * torch.exp(-torch.abs(heading_error))
     return torch.where(
         route.active_waypoint_changed_this_step(env),
         torch.zeros_like(reward),
@@ -57,17 +72,16 @@ def waypoint_velocity_tracking_exp(
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Reward minimum waypoint-directed speed with an exponential kernel.
+    """Reward forward waypoint speed while suppressing lateral motion.
 
-    The longitudinal error is one-sided: motion faster than the commanded speed
-    in the waypoint direction receives no additional reward and no overspeed
-    penalty.  Lateral velocity is always part of the error.  This combines the
-    smooth positive acquisition signal of Isaac Lab's velocity tracking reward
-    with Extreme Parkour's capped forward-speed semantics::
+    Forward motion is normalized by the commanded speed and capped at one;
+    standing still and moving backward receive zero. Lateral velocity supplies
+    the exponential alignment factor::
 
-        exp(-(relu(target_speed - v_parallel)^2 + ||v_perpendicular||^2) / std^2)
+        clamp(v_parallel / target_speed, 0, 1)
+        * exp(-||v_perpendicular||^2 / std^2)
 
-    The term is bounded in ``(0, 1]`` and masks the one sample on which the route
+    The term is bounded in ``[0, 1]`` and masks the one sample on which the route
     switches to a waypoint that did not produce the current action.
 
     Returns:
@@ -96,12 +110,16 @@ def waypoint_velocity_tracking_exp(
         device=root_velocity_xy.device,
         dtype=root_velocity_xy.dtype,
     )
-    speed_deficit = torch.clamp(target_speed - velocity_along_waypoint, min=0.0)
-    squared_velocity_error = speed_deficit.square() + torch.sum(
-        lateral_velocity_xy.square(),
-        dim=-1,
+    forward_fraction = torch.clamp(
+        velocity_along_waypoint
+        / target_speed.clamp_min(torch.finfo(target_speed.dtype).eps),
+        min=0.0,
+        max=1.0,
     )
-    reward = torch.exp(-squared_velocity_error / float(std) ** 2)
+    lateral_alignment = torch.exp(
+        -torch.sum(lateral_velocity_xy.square(), dim=-1) / float(std) ** 2
+    )
+    reward = forward_fraction * lateral_alignment
     return torch.where(
         route.active_waypoint_changed_this_step(env),
         torch.zeros_like(reward),
@@ -283,10 +301,10 @@ def completed_course_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
         [num_envs]
     """
 
-    # ManagerBasedRLEnv computes and stores terminations before rewards. Isaac
-    # Lab then multiplies reward terms by ``env.step_dt``, so divide this
-    # one-step event here to retain the exact configured completion bonus.
-    completed = env.termination_manager.get_term("success")
+    # The success termination updates route state before rewards are evaluated.
+    # Isaac Lab then multiplies reward terms by ``env.step_dt``, so divide this
+    # explicit one-step event here to retain the exact configured bonus.
+    completed = route.course_completed_this_step(env)
     return completed.float() / float(env.step_dt)
 
 

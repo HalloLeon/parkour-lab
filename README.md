@@ -66,8 +66,8 @@ environment and update, 20-second episodes, a discount factor of 0.995, and
 checkpoints every 100 iterations. The longer rollout and horizon preserve more
 approach-to-landing credit than the former short smoke-test settings.
 `--max_iterations` can still override the budget for diagnostics. Action noise
-starts at 1.0, is bounded to 0.15–1.0, and uses an entropy coefficient of 0.01
-while the deterministic motor policy acquires its gait.
+starts at 0.8, is bounded to 0.10–0.80, and has no permanent entropy bonus, so
+PPO can reduce exploration once the deterministic motor acquires its gait.
 
 New checkpoints store the per-environment curriculum frontier, rolling evidence,
 and demotion grace alongside RSL-RL's learner state. `--resume` restores that
@@ -199,14 +199,15 @@ post-promotion grace counters. Static thresholds remain in
 `ParkourCurriculumCfg`; the episode row selected by frontier/replay sampling
 remains authoritative in `TerrainImporter.terrain_levels`.
 
-Dense acquisition uses a positive exponential reward for reaching the target
-speed toward the active waypoint while suppressing lateral velocity. Forward
-overspeed is capped rather than punished. A second positive exponential rewards
-heading alignment. Both are suppressed on the exact retarget step so a marker
-jump is not mistaken for robot motion. Flat terrain also receives stronger
-feet-air-time shaping and disables obstacle-only leg, edge, and stumble
-penalties; those terms activate after promotion. Low-clearance error remains
-normalized to `[0, 1]` before its squared penalty.
+Dense acquisition scales positive forward speed up to the active course target
+and exponentially suppresses lateral velocity. Standing still, moving backward,
+and forward overspeed receive zero, zero, and capped reward respectively. The
+positive heading kernel is gated by the same forward-speed fraction, so facing
+the target while stationary earns nothing. Both terms are suppressed on the
+exact retarget step so a marker jump is not mistaken for robot motion. Flat
+terrain also receives stronger feet-air-time shaping and disables obstacle-only
+leg, edge, and stumble penalties; those terms activate after promotion.
+Low-clearance error remains normalized to `[0, 1]` before its squared penalty.
 
 The teacher-interface manifest is version 13. Version 4 introduced complete
 declarative terrain courses because physical support segmentation changes the
