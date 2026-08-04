@@ -363,11 +363,13 @@ python scripts/rsl_rl/play.py \
   --video
 ```
 
-`--all_courses` creates all 24 independent reports; it cannot be combined with
-the two single-cell selectors. Evaluation reports success, maximum course
-progress, trunk contact, timeout, return, episode length, forward speed,
-overspeed, vertical-velocity RMS, and all-feet-airborne fraction for each
-selected matrix cell. It writes
+`--all_courses` creates all 24 independent reports, starting a fresh Isaac Sim
+process for every cell so simulation state cannot leak between courses. The
+expected application restarts are printed as sweep progress. This option cannot
+be combined with the two single-cell selectors. Evaluation reports success,
+maximum course progress, trunk contact, timeout, return, episode length,
+forward speed, overspeed, vertical-velocity RMS, and all-feet-airborne fraction
+for each selected matrix cell. It writes
 `metrics.json` plus the optional MP4 beneath
 `<run>/evaluation/<checkpoint>-<hash>/family_<family>/level_<n>/seed_<seed>/`, separated
 into `metrics/episodes_<n>/` and `video/episodes_<n>-steps_<length>/`.

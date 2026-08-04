@@ -8,10 +8,44 @@
 # Launch Isaac Sim before importing modules that depend on it.
 
 import argparse
+import json
+import os
+import subprocess
 import sys
+import tempfile
 
 import cli_args
 from isaaclab.app import AppLauncher
+
+
+def _run_isolated_course_matrix(cli_arguments: list[str]) -> None:
+    """Resolve the configured matrix, then evaluate each cell in a fresh process."""
+
+    script_path = os.path.abspath(__file__)
+    evaluation_arguments = [argument for argument in cli_arguments if argument != "--all_courses"]
+    with tempfile.TemporaryDirectory(prefix="parkour_lab_courses_") as temporary_directory:
+        manifest_path = os.path.join(temporary_directory, "courses.json")
+        print("[INFO] Resolving the configured evaluation course matrix...", flush=True)
+        subprocess.run(
+            [sys.executable, script_path, *cli_arguments, f"--_course_manifest={manifest_path}"],
+            check=True,
+        )
+        with open(manifest_path, encoding="utf-8") as manifest_file:
+            courses = json.load(manifest_file)
+
+    for index, (family, level) in enumerate(courses, start=1):
+        print(f"[INFO] Evaluating course {index}/{len(courses)}: {family} level {level}", flush=True)
+        subprocess.run(
+            [
+                sys.executable,
+                script_path,
+                *evaluation_arguments,
+                f"--terrain_family={family}",
+                f"--difficulty_level={level}",
+            ],
+            check=True,
+        )
+
 
 # Define evaluation arguments.
 parser = argparse.ArgumentParser(description="Evaluate an RSL-RL checkpoint.")
@@ -34,6 +68,7 @@ parser.add_argument(
     default=False,
     help="Evaluate every configured obstacle-family and difficulty combination.",
 )
+parser.add_argument("--_course_manifest", type=str, default=None, help=argparse.SUPPRESS)
 parser.add_argument(
     "--difficulty_level",
     type=int,
@@ -85,6 +120,7 @@ cli_args.add_rsl_rl_checkpoint_args(parser)
 # Add Isaac Lab application arguments.
 AppLauncher.add_app_launcher_args(parser)
 # Split recognized CLI options from the remaining Hydra configuration overrides.
+cli_arguments = sys.argv[1:]
 args_cli, hydra_args = parser.parse_known_args()
 for argument_name in ("video_length", "eval_episodes"):
     argument_value = getattr(args_cli, argument_name)
@@ -92,6 +128,9 @@ for argument_name in ("video_length", "eval_episodes"):
         parser.error(f"--{argument_name} must be a positive integer.")
 if args_cli.all_courses and (args_cli.terrain_family is not None or args_cli.difficulty_level is not None):
     parser.error("--all_courses cannot be combined with --terrain_family or --difficulty_level.")
+if args_cli.all_courses and args_cli._course_manifest is None:
+    _run_isolated_course_matrix(cli_arguments)
+    raise SystemExit(0)
 # Enable cameras when recording video.
 if args_cli.video:
     args_cli.enable_cameras = True
@@ -107,11 +146,8 @@ simulation_app = app_launcher.app
 
 # The remaining imports require the running simulation application.
 
-import json
-import os
 import time
 from collections.abc import Callable
-from copy import deepcopy
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -352,9 +388,22 @@ def main(
     agent_cfg: RslRlBaseRunnerCfg,
 ) -> None:
     """Evaluate a checkpoint on one course or the complete course matrix."""
+    _run_requested_action(env_cfg, agent_cfg)
+
+
+def _run_requested_action(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    agent_cfg: RslRlBaseRunnerCfg,
+) -> None:
+    """Write a matrix manifest or evaluate the requested single course."""
+
+    if args_cli._course_manifest is not None:
+        _write_course_manifest(env_cfg, args_cli._course_manifest)
+        return
+
     agent_cfg = _apply_cli_overrides(env_cfg, agent_cfg)
     checkpoint = _resolve_checkpoint(agent_cfg)
-    _evaluate_requested_courses(env_cfg, agent_cfg, checkpoint)
+    _evaluate_requested_course(env_cfg, agent_cfg, checkpoint)
 
 
 def _build_evaluation_report(
@@ -571,13 +620,10 @@ def _evaluate_course(
     return report, report_path
 
 
-def _resolve_evaluation_courses(
+def _configured_evaluation_courses(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
 ) -> tuple[tuple[str | None, int | None], ...]:
-    """Resolve the CLI selection to one course or every configured matrix cell."""
-
-    if not args_cli.all_courses:
-        return ((args_cli.terrain_family, args_cli.difficulty_level),)
+    """Return every cell in the Hydra-resolved parkour course matrix."""
 
     set_course = getattr(env_cfg, "set_evaluation_course", None)
     curriculum_cfg = getattr(env_cfg, "parkour_curriculum", None)
@@ -602,6 +648,16 @@ def _resolve_evaluation_courses(
     return tuple(
         (family_name, difficulty_level) for family_name in family_names for difficulty_level in range(num_difficulties)
     )
+
+
+def _write_course_manifest(
+    env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
+    manifest_path: str,
+) -> None:
+    """Write the Hydra-resolved course matrix for the process coordinator."""
+
+    with open(manifest_path, "w", encoding="utf-8") as manifest_file:
+        json.dump(_configured_evaluation_courses(env_cfg), manifest_file)
 
 
 def _load_inference_policy(
@@ -777,26 +833,21 @@ def _read_gait_step_metrics(base_env: ManagerBasedRLEnv | DirectRLEnv) -> dict[s
     }
 
 
-def _evaluate_requested_courses(
+def _evaluate_requested_course(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     agent_cfg: RslRlBaseRunnerCfg,
     checkpoint: _CheckpointInfo,
 ) -> None:
-    """Evaluate each CLI-selected course with an isolated environment config."""
+    """Evaluate the one course assigned to this Isaac Sim process."""
 
-    for requested_family, requested_level in _resolve_evaluation_courses(env_cfg):
-        # Environment construction resolves manager terms and scene entities.
-        # Give every sweep cell a fresh config so those runtime changes and the
-        # fixed terrain selection cannot leak into the next evaluation.
-        course_env_cfg = deepcopy(env_cfg)
-        report, report_path = _evaluate_course(
-            course_env_cfg,
-            agent_cfg,
-            checkpoint,
-            requested_family,
-            requested_level,
-        )
-        _print_evaluation_summary(report, report_path)
+    report, report_path = _evaluate_course(
+        env_cfg,
+        agent_cfg,
+        checkpoint,
+        args_cli.terrain_family,
+        args_cli.difficulty_level,
+    )
+    _print_evaluation_summary(report, report_path)
 
 
 def _read_termination_outcomes(
