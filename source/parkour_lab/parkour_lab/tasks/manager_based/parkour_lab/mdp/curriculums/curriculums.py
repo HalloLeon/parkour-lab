@@ -228,7 +228,8 @@ class ParkourTerrainCurriculum(ManagerTermBase):
             new_frontiers,
             state.demotion_grace_episodes_remaining[env_ids],
             changed,
-            replay_probability=curriculum_cfg.predecessor_replay_probability,
+            bootstrap_replay_probability=curriculum_cfg.bootstrap_replay_probability,
+            predecessor_replay_probability=curriculum_cfg.predecessor_replay_probability,
         )
         _set_terrain_levels(terrain, env_ids, next_levels)
 
@@ -329,12 +330,14 @@ def _curriculum_metrics(
 
     frontier_attempts = batch.frontier_attempt.to(dtype=torch.float32)
     frontier_attempt_count = frontier_attempts.sum().clamp_min(1.0)
+    bootstrap_replay = (population_frontier_levels > 0) & (population_sampled_levels == 0)
 
     stats = {
         "frontier/mean": population_frontier_levels.float().mean(),
         "frontier/top_fraction": (population_frontier_levels == curriculum_cfg.max_level).float().mean(),
         "sampled/mean": population_sampled_levels.float().mean(),
         "sampled/replay_fraction": (population_sampled_levels < population_frontier_levels).float().mean(),
+        "sampled/bootstrap_replay_fraction": bootstrap_replay.float().mean(),
         "frontier_episode/mean_normalized_progress": (batch.normalized_progress.float() * frontier_attempts).sum()
         / frontier_attempt_count,
         "frontier_episode/stalled_failure_rate": (batch.stalled_failure.float() * frontier_attempts).sum()
@@ -506,17 +509,19 @@ def _sample_episode_levels(
     grace_remaining: torch.Tensor,
     frontier_changed: torch.Tensor,
     *,
-    replay_probability: float,
+    bootstrap_replay_probability: float,
+    predecessor_replay_probability: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample the frontier or its immediate predecessor for the next episode."""
+    """Sample the bootstrap, immediate predecessor, or frontier."""
 
-    replay = (
-        (frontier_levels > 0)
-        & (~frontier_changed)
-        & (grace_remaining == 0)
-        & (torch.rand_like(frontier_levels, dtype=torch.float32) < replay_probability)
+    replay_eligible = (frontier_levels > 0) & (~frontier_changed) & (grace_remaining == 0)
+    draw = torch.rand_like(frontier_levels, dtype=torch.float32)
+    replay = replay_eligible & (
+        draw < bootstrap_replay_probability + predecessor_replay_probability
     )
-    return torch.where(replay, frontier_levels - 1, frontier_levels), replay
+    bootstrap_replay = replay & (draw < bootstrap_replay_probability)
+    levels = torch.where(replay, frontier_levels - 1, frontier_levels)
+    return torch.where(bootstrap_replay, torch.zeros_like(levels), levels), replay
 
 
 def _terminal_event_masks(

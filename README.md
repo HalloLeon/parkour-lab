@@ -75,6 +75,9 @@ memory and starts fresh episodes sampled from the restored frontier. Checkpoints
 created before this state was added remain compatible and conservatively use the
 configured bootstrap rows. Fixed `Parkour-Lab-Play-v0` evaluation remains pinned
 to its requested matrix cell and is not changed by this training behavior.
+After promotion grace, training keeps 75% of eligible environments at their
+frontier, replays its immediate predecessor in 15%, and anchors the shared flat
+bootstrap in 10%. At frontier one, both replay choices resolve to level zero.
 
 ### Staged domain randomization
 

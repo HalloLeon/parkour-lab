@@ -135,9 +135,12 @@ class ParkourCurriculumCfg:
     # A failed frontier attempt is stalled when it completes less than this
     # fraction of its route. Replay episodes do not contribute transition
     # evidence, and the first episode after promotion is protected from demotion.
+    # Keep the total replay budget at 25% while retaining both the shared flat
+    # bootstrap and the frontier's immediate predecessor.
     demotion_progress_fraction: float = 0.60
     post_promotion_grace_episodes: int = 1
-    predecessor_replay_probability: float = 0.25
+    bootstrap_replay_probability: float = 0.10
+    predecessor_replay_probability: float = 0.15
 
     base_contact_threshold: float = 1.0
 
@@ -317,11 +320,14 @@ class ParkourCurriculumCfg:
                 "post_promotion_grace_episodes must be a non-negative integer."
             )
 
-        if (
-            not np.isfinite(self.predecessor_replay_probability)
-            or not 0.0 <= self.predecessor_replay_probability < 1.0
+        for field_name, probability in (
+            ("bootstrap_replay_probability", self.bootstrap_replay_probability),
+            ("predecessor_replay_probability", self.predecessor_replay_probability),
         ):
-            raise ValueError("predecessor_replay_probability must be in [0, 1).")
+            if not np.isfinite(probability) or not 0.0 <= probability < 1.0:
+                raise ValueError(f"{field_name} must be in [0, 1).")
+        if self.bootstrap_replay_probability + self.predecessor_replay_probability >= 1.0:
+            raise ValueError("Replay probabilities must sum to less than 1.")
 
         if self.base_contact_threshold < 0.0:
             raise ValueError("base_contact_threshold must be non-negative.")
