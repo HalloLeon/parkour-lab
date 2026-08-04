@@ -30,10 +30,10 @@ class PrivilegedTeacherActorCriticCfg(RslRlPpoActorCriticCfg):
     # proprioception/action history.
     history_encoder_hidden_dims: list[int] = [256, 128]
 
-    # Bound learned exploration so entropy optimization cannot produce invalid
-    # or physically meaningless action distributions during long runs.
+    # Keep exploration large enough to discover motion without letting sampled
+    # actions mask a stationary deterministic policy.
     min_noise_std: float = 0.05
-    max_noise_std: float = 1.5
+    max_noise_std: float = 0.6
 
 
 @configclass
@@ -119,7 +119,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     policy = PrivilegedTeacherActorCriticCfg(
         # Initial standard deviation of the Gaussian action distribution. This
         # controls exploration before the standard deviation is learned.
-        init_noise_std=1.0,
+        init_noise_std=0.5,
         # Keep the direct parameter used by existing checkpoints and their Adam
         # state; the custom actor projects it into positive safe bounds.
         noise_std_type="scalar",
@@ -147,8 +147,9 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # Maximum probability-ratio deviation allowed by the PPO surrogate
         # objective during one update.
         clip_param=0.2,
-        # Weight of the entropy bonus that encourages action exploration.
-        entropy_coef=0.001,
+        # Bounded Gaussian noise supplies exploration without rewarding the
+        # policy for retaining a stochasticity-dependent solution.
+        entropy_coef=0.0,
         # Number of passes over each collected rollout.
         num_learning_epochs=5,
         # Number of minibatches used for every learning epoch.

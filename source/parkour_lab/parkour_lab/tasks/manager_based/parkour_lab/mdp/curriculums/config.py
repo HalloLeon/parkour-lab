@@ -125,18 +125,19 @@ class ParkourCurriculumCfg:
     # and safe base clearance, but no dwell.
     waypoint_reach_threshold: float = 0.20
 
-    # A single safe completion is enough to leave the shared obstacle-free
-    # bootstrap row. Obstacle rows still require repeated mastery at the final
-    # waypoint; a terminal failure clears the per-environment streak.
-    bootstrap_promotion_successes_required: int = 1
-    promotion_successes_required: int = 2
+    # Rolling evidence tolerates occasional exploration failures without letting
+    # one lucky completion advance an unmastered policy.
+    promotion_window: int = 5
+    promotion_successes_required: int = 3
+    demotion_window: int = 3
+    demotion_failures_required: int = 2
 
-    # Demotion uses safe normalized route progress so the threshold has the
-    # same meaning for every family and course length. Newly promoted
-    # environments receive a short grace period before poor failures can count.
-    demotion_failures_required: int = 4
-    demotion_progress_fraction: float = 0.40
-    post_promotion_grace_episodes: int = 3
+    # A failed frontier attempt is stalled when it completes less than this
+    # fraction of its route. Replay episodes do not contribute transition
+    # evidence, and the first episode after promotion is protected from demotion.
+    demotion_progress_fraction: float = 0.60
+    post_promotion_grace_episodes: int = 1
+    predecessor_replay_probability: float = 0.25
 
     base_contact_threshold: float = 1.0
 
@@ -287,28 +288,19 @@ class ParkourCurriculumCfg:
         ):
             raise ValueError("waypoint_reach_threshold must be positive.")
 
-        if (
-            isinstance(self.bootstrap_promotion_successes_required, bool)
-            or not isinstance(self.bootstrap_promotion_successes_required, int)
-            or self.bootstrap_promotion_successes_required <= 0
+        for field_name in (
+            "promotion_window",
+            "promotion_successes_required",
+            "demotion_window",
+            "demotion_failures_required",
         ):
-            raise ValueError(
-                "bootstrap_promotion_successes_required must be a positive integer."
-            )
-
-        if (
-            isinstance(self.promotion_successes_required, bool)
-            or not isinstance(self.promotion_successes_required, int)
-            or self.promotion_successes_required <= 0
-        ):
-            raise ValueError("promotion_successes_required must be a positive integer.")
-
-        if (
-            isinstance(self.demotion_failures_required, bool)
-            or not isinstance(self.demotion_failures_required, int)
-            or self.demotion_failures_required <= 0
-        ):
-            raise ValueError("demotion_failures_required must be a positive integer.")
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ValueError(f"{field_name} must be a positive integer.")
+        if self.promotion_successes_required > self.promotion_window:
+            raise ValueError("promotion_successes_required must not exceed promotion_window.")
+        if self.demotion_failures_required > self.demotion_window:
+            raise ValueError("demotion_failures_required must not exceed demotion_window.")
 
         if (
             not np.isfinite(self.demotion_progress_fraction)
@@ -324,6 +316,12 @@ class ParkourCurriculumCfg:
             raise ValueError(
                 "post_promotion_grace_episodes must be a non-negative integer."
             )
+
+        if (
+            not np.isfinite(self.predecessor_replay_probability)
+            or not 0.0 <= self.predecessor_replay_probability < 1.0
+        ):
+            raise ValueError("predecessor_replay_probability must be in [0, 1).")
 
         if self.base_contact_threshold < 0.0:
             raise ValueError("base_contact_threshold must be non-negative.")

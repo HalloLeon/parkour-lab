@@ -121,42 +121,46 @@ torch.backends.cudnn.deterministic = False
 # one for each input shape.
 torch.backends.cudnn.benchmark = False
 
+_CURRICULUM_STATE_KEY = "parkour_curriculum"
 
-def _configure_resumed_parkour_curriculum(
-    env_cfg: object,
-    resume: bool,
-) -> bool:
-    """Detect resumed adaptive training without widening its startup rows.
 
-    RSL-RL checkpoints restore the optimizer, policy, and runner state, but the
-    per-environment terrain level and mastery/demotion streaks live in the
-    environment. They therefore do not exist yet when a new process resumes.
-    Reuse the explicitly configured ``initial_level`` and startup-distribution
-    policy. Silently expanding that frontier to ``max_level`` can place an early
-    checkpoint on courses it has never mastered and destabilize the resumed
-    optimizer. Users can still set a known frontier explicitly with a Hydra
-    override.
+def _parkour_curriculum_term(env: object):
+    """Return the stateful parkour curriculum term when one is active."""
 
-    Fixed evaluation has no adaptive curriculum and is intentionally left
-    untouched. Returning whether runtime curriculum state is being recreated
-    keeps this helper pure enough for simulator-free tests and lets the caller
-    explain the behavior.
-    """
+    manager_cfg = getattr(getattr(env, "curriculum_manager", None), "cfg", None)
+    term_cfg = (
+        manager_cfg.get("terrain_levels")
+        if isinstance(manager_cfg, dict)
+        else getattr(manager_cfg, "terrain_levels", None)
+    )
+    term = getattr(term_cfg, "func", None)
+    if callable(getattr(term, "state_dict", None)) and callable(getattr(term, "load_state_dict", None)):
+        return term
+    return None
 
-    if not resume:
+
+class ParkourOnPolicyRunner(OnPolicyRunner):
+    """Store adaptive parkour curriculum memory with ordinary PPO checkpoints."""
+
+    def save(self, path: str, infos: dict | None = None) -> None:
+        checkpoint_infos = dict(infos or {})
+        term = _parkour_curriculum_term(getattr(self.env, "unwrapped", self.env))
+        if term is not None:
+            checkpoint_infos[_CURRICULUM_STATE_KEY] = term.state_dict()
+        super().save(path, checkpoint_infos)
+
+
+def _restore_parkour_curriculum(env: object, infos: object) -> bool:
+    """Restore curriculum memory and begin fresh episodes at that frontier."""
+
+    term = _parkour_curriculum_term(getattr(env, "unwrapped", env))
+    if term is None or not isinstance(infos, dict) or _CURRICULUM_STATE_KEY not in infos:
         return False
-
-    adaptive_term = getattr(env_cfg, "curriculum", None)
-    curriculum_cfg = getattr(env_cfg, "parkour_curriculum", None)
-    synchronize = getattr(env_cfg, "synchronize_curriculum_config", None)
-    if adaptive_term is None or curriculum_cfg is None or not callable(synchronize):
-        return False
-    if (
-        getattr(env_cfg, "evaluation_family", None) is not None
-        or getattr(env_cfg, "evaluation_level", None) is not None
-    ):
-        return False
-
+    state = infos[_CURRICULUM_STATE_KEY]
+    if not isinstance(state, dict):
+        raise TypeError("Checkpoint parkour curriculum state must be a dictionary.")
+    term.load_state_dict(state)
+    env.reset()
     return True
 
 
@@ -177,19 +181,9 @@ def main(
     )
     # Apply this after Hydra so an explicit CLI stage has final precedence.
     cli_args.apply_domain_randomization_stage(env_cfg, args_cli)
-    resumed_curriculum_replay = _configure_resumed_parkour_curriculum(
-        env_cfg,
-        agent_cfg.resume,
-    )
     synchronize_curriculum = getattr(env_cfg, "synchronize_curriculum_config", None)
     if callable(synchronize_curriculum):
         synchronize_curriculum()
-    if resumed_curriculum_replay:
-        print(
-            "[INFO] Resumed adaptive curriculum is initialized anew over its "
-            "configured startup rows; per-environment levels and curriculum "
-            "memory are not stored in RSL-RL checkpoints."
-        )
     synchronize_randomization = getattr(
         env_cfg,
         "synchronize_domain_randomization_config",
@@ -303,14 +297,18 @@ def main(
     if agent_cfg.class_name != "OnPolicyRunner":
         raise ValueError("train.py supports only OnPolicyRunner; use distill.py for student distillation.")
     register_rsl_rl_teacher_actor_critic()
-    runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    runner = ParkourOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     # Record the Git commit and local code changes that produced this run so the
     # training result can be traced back to its exact repository state.
     runner.add_git_repo_to_log(__file__)
     # Load the selected checkpoint when continuing an existing run.
     if agent_cfg.resume:
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        runner.load(resume_path)
+        checkpoint_infos = runner.load(resume_path)
+        if _restore_parkour_curriculum(env, checkpoint_infos):
+            print("[INFO] Restored adaptive parkour curriculum state.")
+        elif _parkour_curriculum_term(env.unwrapped) is not None:
+            print("[WARNING] Checkpoint has no parkour curriculum state; using the configured bootstrap rows.")
 
     # Save the resolved configurations with the checkpoints.
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

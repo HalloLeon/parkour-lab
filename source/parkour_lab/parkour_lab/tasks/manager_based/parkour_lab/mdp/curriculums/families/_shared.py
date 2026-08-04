@@ -22,58 +22,25 @@ TERRAIN_Y_RANGE_M = (-2.0, 2.0)
 # Every family has five obstacle-bearing rows after the shared flat bootstrap.
 NUM_OBSTACLE_STAGES = 5
 
-_ROUTE_AND_SPEED_BY_FAMILY = {
-    "gap": (
-        (
-            (1.25, 0.0, 0.01),
-            (2.50, 0.0, 0.01),
-            (3.80, 0.0, 0.01),
-        ),
-        0.60,
-    ),
-    "high_step": (
-        (
-            (1.25, 0.0, 0.01),
-            (2.50, 0.35, 0.01),
-            (3.80, 0.65, 0.01),
-        ),
-        0.55,
-    ),
-    "hurdle": (
-        (
-            (1.25, 0.0, 0.01),
-            (2.50, -0.35, 0.01),
-            (3.80, -0.65, 0.01),
-        ),
-        0.65,
-    ),
-    "tilted_ramps": (
-        (
-            (1.00, 0.0, 0.01),
-            (1.90, 0.45, 0.01),
-            (2.90, -0.40, 0.01),
-            (3.80, 0.0, 0.01),
-        ),
-        0.60,
-    ),
-}
+_SUPPORTED_OBSTACLE_FAMILIES = frozenset({"gap", "high_step", "hurdle", "tilted_ramps"})
+_BOOTSTRAP_ROUTE = (
+    (1.25, 0.0, 0.01),
+    (2.50, 0.0, 0.01),
+    (3.80, 0.0, 0.01),
+)
+_BOOTSTRAP_TARGET_SPEED = 0.55
 
 
 def build_bootstrap_level(obstacle_family: str) -> ParkourLevelCfg:
     """Create the obstacle-free row-zero course for one eventual family.
 
-    Every terrain column retains its assigned family while row zero shares the
-    same flat support geometry. The family cohorts use complementary routes and
-    modest target speeds so the bootstrap collectively teaches straight travel,
-    gentle turns, and repeated retargeting before obstacles are introduced.
-    Promotion still moves an environment into the easiest course of its
-    existing family instead of resampling obstacle type.
+    Every terrain column retains its assigned family while row zero shares one
+    flat route and target speed. This keeps the acquisition task identical
+    across cohorts before promotion introduces family-specific obstacles.
     """
 
-    try:
-        route, target_speed = _ROUTE_AND_SPEED_BY_FAMILY[obstacle_family]
-    except KeyError as error:
-        raise ValueError(f"Unsupported flat-bootstrap family: {obstacle_family!r}.") from error
+    if obstacle_family not in _SUPPORTED_OBSTACLE_FAMILIES:
+        raise ValueError(f"Unsupported flat-bootstrap family: {obstacle_family!r}.")
 
     return ParkourLevelCfg(
         name=f"{obstacle_family}_flat_entry",
@@ -81,9 +48,9 @@ def build_bootstrap_level(obstacle_family: str) -> ParkourLevelCfg:
         waypoints=tuple(
             ParkourWaypointCfg(
                 position=position,
-                support_region_name=("ground" if index == len(route) - 1 else None),
+                support_region_name=("ground" if index == len(_BOOTSTRAP_ROUTE) - 1 else None),
             )
-            for index, position in enumerate(route)
+            for index, position in enumerate(_BOOTSTRAP_ROUTE)
         ),
         structures=(),
         support_regions=(
@@ -95,7 +62,7 @@ def build_bootstrap_level(obstacle_family: str) -> ParkourLevelCfg:
                 surface_z=0.0,
             ),
         ),
-        target_speed=target_speed,
+        target_speed=_BOOTSTRAP_TARGET_SPEED,
         min_clearance=0.24,
         difficulty=ParkourDifficultyCfg(order=0.0, parameters={}),
     )

@@ -9,7 +9,7 @@ from isaaclab.terrains import TerrainImporter
 from .._shared.runtime import _all_env_ids
 from ..navigation import route
 from . import config
-
+from .state import ParkourCurriculumState
 
 # Startup lifecycle.
 
@@ -57,14 +57,7 @@ def initialize_parkour_terrain_levels(
         initial_level_override,
     )
 
-    terrain.terrain_levels[env_ids] = levels
-    # terrain_origins has shape [num_levels, num_terrain_types, 3] and is the
-    # generated-tile lookup table (difficulty row, terrain column/type, XYZ).
-    # env_origins has shape [num_envs, 3] and stores the selected tile origin
-    # for each environment.
-    terrain.env_origins[env_ids] = terrain.terrain_origins[
-        levels, terrain.terrain_types[env_ids]
-    ]
+    _set_terrain_levels(terrain, env_ids, levels)
 
 
 # Curriculum update lifecycle.
@@ -72,42 +65,45 @@ def initialize_parkour_terrain_levels(
 
 @dataclass(frozen=True, slots=True)
 class CurriculumBatch:
-    """Transient reset-batch evidence; ``completed`` selects valid outcomes."""
+    """Transient reset-batch evidence for curriculum metrics."""
 
     # Outcome masks.
-    completed: torch.Tensor
-    poor_failure: torch.Tensor
+    frontier_attempt: torch.Tensor
+    stalled_failure: torch.Tensor
     success: torch.Tensor
 
     # Numeric outcomes.
-    level_change: torch.Tensor
+    frontier_change: torch.Tensor
     normalized_progress: torch.Tensor
 
 
 class ParkourTerrainCurriculum(ManagerTermBase):
-    """Update terrain difficulty while owning its per-environment memory."""
+    """Apply terrain-difficulty transitions to grouped curriculum state."""
 
     def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv) -> None:
         super().__init__(cfg, env)
-        # These are the only values that must survive between episodes.
-        # Family, level, progress, and outcomes remain derivable from their
-        # authoritative terrain, route, and termination owners.
-        self.consecutive_successes = torch.zeros(
+        curriculum_cfg: config.ParkourCurriculumCfg = cfg.params["curriculum_cfg"]
+        self.state = ParkourCurriculumState.allocate(
             env.num_envs,
-            device=env.device,
-            dtype=torch.long,
+            env.device,
+            curriculum_cfg,
         )
-        self.consecutive_poor_failures = torch.zeros_like(self.consecutive_successes)
-        self.demotion_grace_episodes_remaining = torch.zeros_like(
-            self.consecutive_successes
-        )
+
+    def state_dict(self) -> dict[str, object]:
+        """Return portable curriculum memory for a training checkpoint."""
+
+        return self.state.state_dict(self.cfg.params["curriculum_cfg"])
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        """Restore curriculum memory after validating its runtime layout."""
+
+        self.state.load_state_dict(state, self.cfg.params["curriculum_cfg"])
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         """Preserve curriculum evidence across ordinary episode resets."""
 
-        # CurriculumManager invokes this immediately after every curriculum
-        # computation. Streaks and grace intentionally span episodes, so only
-        # constructing a new term should clear them.
+        # CurriculumManager invokes this after every curriculum computation.
+        # Frontier state and rolling evidence intentionally span episodes.
         pass
 
     def __call__(
@@ -121,6 +117,7 @@ class ParkourTerrainCurriculum(ManagerTermBase):
 
         env_ids = _all_env_ids(env, env_ids)
         terrain: TerrainImporter = env.scene.terrain
+        state = self.state
         population_env_ids = torch.arange(
             env.num_envs,
             device=env.device,
@@ -132,17 +129,23 @@ class ParkourTerrainCurriculum(ManagerTermBase):
             population_env_ids,
             terrain_layout,
         )
+        population_frontiers = torch.where(
+            state.frontier_levels >= 0,
+            state.frontier_levels,
+            terrain.terrain_levels,
+        )
 
         if env_ids.numel() == 0:
             empty_bool = torch.empty(0, device=env.device, dtype=torch.bool)
             return _curriculum_metrics(
+                population_frontiers,
                 terrain.terrain_levels,
                 population_family_indices,
                 CurriculumBatch(
-                    completed=empty_bool,
-                    poor_failure=empty_bool,
+                    frontier_attempt=empty_bool,
+                    stalled_failure=empty_bool,
                     success=empty_bool,
-                    level_change=torch.empty(
+                    frontier_change=torch.empty(
                         0,
                         device=env.device,
                         dtype=torch.long,
@@ -156,78 +159,94 @@ class ParkourTerrainCurriculum(ManagerTermBase):
                 curriculum_cfg,
             )
 
+        attempted_levels = terrain.terrain_levels[env_ids].clone()
+        uninitialized = state.frontier_levels[env_ids] < 0
+        state.frontier_levels[env_ids] = torch.where(
+            uninitialized,
+            attempted_levels,
+            state.frontier_levels[env_ids],
+        )
+        old_frontiers = state.frontier_levels[env_ids].clone()
+
         success_event, terminal_event, failure_event = _terminal_event_masks(
             env,
             env_ids,
         )
-        old_levels = terrain.terrain_levels[env_ids].clone()
-        required_successes = torch.where(
-            old_levels == 0,
-            curriculum_cfg.bootstrap_promotion_successes_required,
-            curriculum_cfg.promotion_successes_required,
-        )
-
-        updated_successes, promotion_ready = _success_streak_transition(
-            self.consecutive_successes[env_ids],
-            success_event,
-            failure_event,
-            required_successes=required_successes,
-        )
-        self.consecutive_successes[env_ids] = updated_successes
-
         # Read progress before changing terrain rows: route state still points
         # at the course whose episode just ended, and its length is therefore
         # the correct denominator for this terminal outcome.
         normalized_progress = route.normalized_course_progress(env, env_ids)
-        poor_failure_event = _demotion_transition_mask(
+        stalled_failure_event = _demotion_transition_mask(
             normalized_progress,
             failure_event,
             demotion_progress_fraction=curriculum_cfg.demotion_progress_fraction,
         )
+        frontier_attempt = terminal_event & (attempted_levels == old_frontiers)
         updated_grace, demotion_eligible = _demotion_grace_transition(
-            self.demotion_grace_episodes_remaining[env_ids],
-            terminal_event,
+            state.demotion_grace_episodes_remaining[env_ids],
+            frontier_attempt,
         )
-        self.demotion_grace_episodes_remaining[env_ids] = updated_grace
-        poor_failure_eligible = poor_failure_event & demotion_eligible
-        # Flat terrain has no lower row. Do not accumulate a stale demotion
-        # streak that cannot yet produce a level change.
-        poor_failure_eligible = poor_failure_eligible & (old_levels > 0)
-        updated_poor_failures, demotion_ready = _demotion_streak_transition(
-            self.consecutive_poor_failures[env_ids],
-            poor_failure_eligible,
-            terminal_event,
-            required_failures=curriculum_cfg.demotion_failures_required,
-        )
-        self.consecutive_poor_failures[env_ids] = updated_poor_failures
+        state.demotion_grace_episodes_remaining[env_ids] = updated_grace
 
-        move_up = promotion_ready & (old_levels < curriculum_cfg.max_level)
-        move_down = demotion_ready & (old_levels > 0) & (~move_up)
-
-        # TerrainImporter updates both authoritative row indices and origins.
-        terrain.update_env_origins(
-            env_ids=env_ids,
-            move_up=move_up,
-            move_down=move_down,
+        success_history = _rolling_evidence_transition(
+            state.success_history[env_ids],
+            success_event,
+            frontier_attempt,
         )
-
-        level_change = terrain.terrain_levels[env_ids] - old_levels
-        changed_env_ids = env_ids[level_change != 0]
-        self.consecutive_successes[changed_env_ids] = 0
-        self.consecutive_poor_failures[changed_env_ids] = 0
-        self.demotion_grace_episodes_remaining[env_ids[level_change > 0]] = (
-            curriculum_cfg.post_promotion_grace_episodes
+        stalled_history = _rolling_evidence_transition(
+            state.stalled_history[env_ids],
+            stalled_failure_event,
+            demotion_eligible,
         )
-        self.demotion_grace_episodes_remaining[env_ids[level_change < 0]] = 0
+        state.success_history[env_ids] = success_history
+        state.stalled_history[env_ids] = stalled_history
+
+        move_up, move_down = _frontier_transition_masks(
+            old_frontiers,
+            success_history,
+            stalled_history,
+            success_event,
+            stalled_failure_event,
+            frontier_attempt,
+            demotion_eligible,
+            max_level=curriculum_cfg.max_level,
+            required_successes=curriculum_cfg.promotion_successes_required,
+            required_stalled_failures=curriculum_cfg.demotion_failures_required,
+        )
+        frontier_change = move_up.to(dtype=torch.long) - move_down.to(dtype=torch.long)
+        new_frontiers = old_frontiers + frontier_change
+        state.frontier_levels[env_ids] = new_frontiers
+
+        changed = frontier_change != 0
+        changed_env_ids = env_ids[changed]
+        state.success_history[changed_env_ids] = False
+        state.stalled_history[changed_env_ids] = False
+        state.demotion_grace_episodes_remaining[env_ids[move_up]] = curriculum_cfg.post_promotion_grace_episodes
+        state.demotion_grace_episodes_remaining[env_ids[move_down]] = 0
+
+        next_levels, _ = _sample_episode_levels(
+            new_frontiers,
+            state.demotion_grace_episodes_remaining[env_ids],
+            changed,
+            replay_probability=curriculum_cfg.predecessor_replay_probability,
+        )
+        _set_terrain_levels(terrain, env_ids, next_levels)
+
+        population_frontiers = torch.where(
+            state.frontier_levels >= 0,
+            state.frontier_levels,
+            terrain.terrain_levels,
+        )
 
         return _curriculum_metrics(
+            population_frontiers,
             terrain.terrain_levels,
             population_family_indices,
             CurriculumBatch(
-                completed=terminal_event,
-                poor_failure=poor_failure_event,
+                frontier_attempt=frontier_attempt,
+                stalled_failure=stalled_failure_event,
                 success=success_event,
-                level_change=level_change,
+                frontier_change=frontier_change,
                 normalized_progress=normalized_progress,
             ),
             curriculum_cfg,
@@ -295,47 +314,59 @@ def reset_routes(
 
 
 def _curriculum_metrics(
-    population_levels: torch.Tensor,
+    population_frontier_levels: torch.Tensor,
+    population_sampled_levels: torch.Tensor,
     population_family_indices: torch.Tensor,
     batch: CurriculumBatch,
     curriculum_cfg: config.ParkourCurriculumCfg,
 ) -> dict[str, torch.Tensor]:
     """Build a compact curriculum health summary for experiment logging.
 
-    Population metrics use every parallel environment. Episode and transition
-    metrics are conditional on completed episodes, so initial and manual resets
-    do not masquerade as failed or zero-progress episodes.
+    Population metrics use every parallel environment. Outcome and transition
+    metrics use only frontier attempts, so replay episodes cannot overstate
+    competence and manual resets remain neutral.
     """
 
-    completed = batch.completed.to(dtype=torch.float32)
-    completed_count = completed.sum().clamp_min(1.0)
+    frontier_attempts = batch.frontier_attempt.to(dtype=torch.float32)
+    frontier_attempt_count = frontier_attempts.sum().clamp_min(1.0)
 
     stats = {
-        "level/mean": population_levels.float().mean(),
-        "level/top_fraction": (population_levels == curriculum_cfg.max_level)
-        .float()
-        .mean(),
-        "episode/mean_normalized_progress": (
-            batch.normalized_progress.float() * completed
-        ).sum()
-        / completed_count,
-        "episode/poor_failure_rate": batch.poor_failure.float().sum() / completed_count,
-        "episode/success_rate": batch.success.float().sum() / completed_count,
-        "transition/demotion_rate": (batch.level_change < 0).float().sum()
-        / completed_count,
-        "transition/promotion_rate": (batch.level_change > 0).float().sum()
-        / completed_count,
+        "frontier/mean": population_frontier_levels.float().mean(),
+        "frontier/top_fraction": (population_frontier_levels == curriculum_cfg.max_level).float().mean(),
+        "sampled/mean": population_sampled_levels.float().mean(),
+        "sampled/replay_fraction": (population_sampled_levels < population_frontier_levels).float().mean(),
+        "frontier_episode/mean_normalized_progress": (batch.normalized_progress.float() * frontier_attempts).sum()
+        / frontier_attempt_count,
+        "frontier_episode/stalled_failure_rate": (batch.stalled_failure.float() * frontier_attempts).sum()
+        / frontier_attempt_count,
+        "frontier_episode/success_rate": (batch.success.float() * frontier_attempts).sum() / frontier_attempt_count,
+        "transition/demotion_rate": (batch.frontier_change < 0).float().sum() / frontier_attempt_count,
+        "transition/promotion_rate": (batch.frontier_change > 0).float().sum() / frontier_attempt_count,
     }
     for family_index, family_name in enumerate(curriculum_cfg.family_names):
         family_weights = (population_family_indices == family_index).float()
         family_count = family_weights.sum().clamp_min(1.0)
-        stats[f"family/{family_name}/mean_level"] = (
-            population_levels.float() * family_weights
+        stats[f"family/{family_name}/mean_frontier"] = (
+            population_frontier_levels.float() * family_weights
         ).sum() / family_count
     return stats
 
 
 # Terrain-selection helpers.
+
+
+def _set_terrain_levels(
+    terrain: TerrainImporter,
+    env_ids: torch.Tensor,
+    levels: torch.Tensor,
+) -> None:
+    """Assign exact terrain rows and their matching environment origins."""
+
+    terrain.terrain_levels[env_ids] = levels
+    terrain.env_origins[env_ids] = terrain.terrain_origins[
+        levels,
+        terrain.terrain_types[env_ids],
+    ]
 
 
 def _family_indices_for_terrain_columns(
@@ -393,52 +424,34 @@ def _initial_level_indices(
 
 def _demotion_grace_transition(
     grace_remaining: torch.Tensor,
-    terminal_event: torch.Tensor,
+    frontier_attempt: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Consume grace on completed episodes and return demotion eligibility.
+    """Consume grace on completed frontier attempts and return eligibility.
 
-    Eligibility is based on the value at the start of the completed episode,
-    so a grace value of three excludes exactly three terminal outcomes. Manual
-    and initial resets do not consume the allowance.
+    Eligibility uses the value at the start of the episode, so a grace value of
+    one excludes exactly the first harder attempt. Replay and manual resets do
+    not consume the allowance.
     """
 
     updated_grace = torch.where(
-        terminal_event,
+        frontier_attempt,
         torch.clamp(grace_remaining - 1, min=0),
         grace_remaining,
     )
-    demotion_eligible = terminal_event & (grace_remaining == 0)
+    demotion_eligible = frontier_attempt & (grace_remaining == 0)
     return updated_grace, demotion_eligible
 
 
-def _demotion_streak_transition(
-    demotion_streaks: torch.Tensor,
-    poor_failure_event: torch.Tensor,
-    terminal_event: torch.Tensor,
-    *,
-    required_failures: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Update poor-failure counts and return demotion readiness.
+def _rolling_evidence_transition(
+    history: torch.Tensor,
+    evidence: torch.Tensor,
+    append_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Append one Boolean observation to the selected histories."""
 
-    Only a terminal failure below the progress threshold increments the streak.
-    Any other completed episode clears it, while initial and manual resets
-    preserve it because they provide no outcome evidence.
-    """
-
-    incremented = torch.clamp(demotion_streaks + 1, max=required_failures)
-    updated_streaks = torch.where(
-        poor_failure_event,
-        incremented,
-        demotion_streaks,
-    )
-    completed_without_poor_failure = terminal_event & (~poor_failure_event)
-    updated_streaks = torch.where(
-        completed_without_poor_failure,
-        torch.zeros_like(demotion_streaks),
-        updated_streaks,
-    )
-    demotion_ready = poor_failure_event & (updated_streaks >= required_failures)
-    return updated_streaks, demotion_ready
+    shifted = torch.roll(history, shifts=-1, dims=1)
+    shifted[:, -1] = evidence
+    return torch.where(append_mask[:, None], shifted, history)
 
 
 def _demotion_transition_mask(
@@ -447,7 +460,7 @@ def _demotion_transition_mask(
     *,
     demotion_progress_fraction: float,
 ) -> torch.Tensor:
-    """Return failed episodes that completed too little of their route.
+    """Return stalled failures that completed too little of their route.
 
     The strict comparison leaves exact-threshold outcomes unchanged. Successful
     completions, initial resets, and manual resets remain ineligible.
@@ -456,29 +469,54 @@ def _demotion_transition_mask(
     return failure_event & (normalized_progress < demotion_progress_fraction)
 
 
-def _success_streak_transition(
-    success_streaks: torch.Tensor,
+def _frontier_transition_masks(
+    frontier_levels: torch.Tensor,
+    success_history: torch.Tensor,
+    stalled_history: torch.Tensor,
     success_event: torch.Tensor,
-    failure_event: torch.Tensor,
+    stalled_failure_event: torch.Tensor,
+    frontier_attempt: torch.Tensor,
+    demotion_eligible: torch.Tensor,
     *,
-    required_successes: int | torch.Tensor,
+    max_level: int,
+    required_successes: int,
+    required_stalled_failures: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Update consecutive-success counts and return promotion readiness.
+    """Return mutually exclusive mastery promotion and stalled demotion masks."""
 
-    Manual resets preserve the current streak because they are neither success
-    nor failure outcomes. Successful completions increment and saturate at the
-    per-environment requirement; any terminal failure clears the streak.
-    """
-
-    incremented = torch.clamp(success_streaks + 1, max=required_successes)
-    updated_streaks = torch.where(success_event, incremented, success_streaks)
-    updated_streaks = torch.where(
-        failure_event,
-        torch.zeros_like(success_streaks),
-        updated_streaks,
+    move_up = (
+        frontier_attempt
+        & success_event
+        & (torch.sum(success_history, dim=-1) >= required_successes)
+        & (frontier_levels < max_level)
     )
-    promotion_ready = success_event & (updated_streaks >= required_successes)
-    return updated_streaks, promotion_ready
+    move_down = (
+        frontier_attempt
+        & stalled_failure_event
+        & demotion_eligible
+        & (torch.sum(stalled_history, dim=-1) >= required_stalled_failures)
+        & (frontier_levels > 0)
+        & (~move_up)
+    )
+    return move_up, move_down
+
+
+def _sample_episode_levels(
+    frontier_levels: torch.Tensor,
+    grace_remaining: torch.Tensor,
+    frontier_changed: torch.Tensor,
+    *,
+    replay_probability: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Sample the frontier or its immediate predecessor for the next episode."""
+
+    replay = (
+        (frontier_levels > 0)
+        & (~frontier_changed)
+        & (grace_remaining == 0)
+        & (torch.rand_like(frontier_levels, dtype=torch.float32) < replay_probability)
+    )
+    return torch.where(replay, frontier_levels - 1, frontier_levels), replay
 
 
 def _terminal_event_masks(
@@ -545,9 +583,7 @@ def _validate_terrain_layout(
     """
 
     if terrain is None or terrain.terrain_origins is None:
-        raise RuntimeError(
-            "The parkour curriculum requires TerrainImporterCfg with terrain_type='generator'."
-        )
+        raise RuntimeError("The parkour curriculum requires TerrainImporterCfg with terrain_type='generator'.")
 
     terrain_layout.validate_grid(
         curriculum_difficulties=curriculum_cfg.num_difficulties,

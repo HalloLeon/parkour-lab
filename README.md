@@ -65,17 +65,15 @@ The default teacher budget is 1,000 PPO iterations with 48 control steps per
 environment and update, a discount factor of 0.995, and checkpoints every 100
 iterations. The longer rollout and horizon preserve more approach-to-landing
 credit than the former short smoke-test settings. `--max_iterations` can still
-override the budget for diagnostics.
+override the budget for diagnostics. Action noise starts at 0.5, is bounded to
+0.05–0.6, and receives no entropy bonus.
 
-Resuming restores RSL-RL's policy, optimizer, and runner state from the selected
-checkpoint. Per-environment curriculum rows and promotion/demotion memory are
-runtime-only state, so recreating the simulator cannot resume them exactly.
-Instead, `--resume` on the adaptive `Parkour-Lab-v0` task
-deterministically distributes environment IDs across every curriculum row from
-0 through the configured maximum before constructing the environment. This
-balanced replay retains easy-course samples while immediately revisiting harder
-courses. Fixed `Parkour-Lab-Play-v0` evaluation remains pinned to its requested
-matrix cell and is not changed by this training behavior.
+New checkpoints store the per-environment curriculum frontier, rolling evidence,
+and demotion grace alongside RSL-RL's learner state. `--resume` restores that
+memory and starts fresh episodes sampled from the restored frontier. Checkpoints
+created before this state was added remain compatible and conservatively use the
+configured bootstrap rows. Fixed `Parkour-Lab-Play-v0` evaluation remains pinned
+to its requested matrix cell and is not changed by this training behavior.
 
 ### Staged domain randomization
 
@@ -107,9 +105,8 @@ CLI option takes precedence.
 ## Declarative course configuration
 
 Each curriculum matrix cell is a reusable course description rather than a
-special case in the runtime. Terrain row 0 shares obstacle-free support geometry
-but uses complementary family routes: straight travel, gentle left and right
-turns, and an S-shaped multi-retarget route. Rows 1 through 5 contain the five
+special case in the runtime. Terrain row 0 gives every family cohort the same
+straight obstacle-free route at 0.55 m/s. Rows 1 through 5 contain the five
 obstacle difficulties. Equal column blocks retain their future gap, high-step,
 hurdle, or tilted-ramp family even on the flat row, so each environment advances
 from flat ground into one stable family without resampling its obstacle type.
@@ -186,13 +183,19 @@ otherwise occur on the same step.
 Maximum progress is projected onto the active route segment only inside its
 lateral corridor, remains monotonic within an episode, and does not increase
 during trunk contact. Demotion therefore compares comparable route fractions
-instead of commanded speed times episode duration. Terminal episodes promote
-only after two consecutive successful completions at the current row.
+instead of commanded speed times episode duration. Three successes in the last
+five frontier attempts promote one row. Two stalled failures in the last three
+eligible frontier attempts, each below 60% normalized route progress, demote one
+row. The first harder attempt is protected from demotion, and 25% of later
+episodes replay the immediate predecessor without altering frontier evidence.
 Promotion changes only future course sampling and pays no additional reward
-because completion already receives `+10`. Four consecutive failed episodes
-below 40% normalized route progress demote one row; promotion grants three grace
-episodes before poor failures can accumulate. A success or a failure with
-meaningful progress clears the demotion streak.
+because completion already receives `+10`.
+
+`ParkourCurriculumState` is the complete mutable curriculum-buffer inventory:
+per-environment frontier levels, promotion histories, demotion histories, and
+post-promotion grace counters. Static thresholds remain in
+`ParkourCurriculumCfg`; the episode row selected by frontier/replay sampling
+remains authoritative in `TerrainImporter.terrain_levels`.
 
 The dense velocity signal is the signed world-frame projection toward the active
 waypoint, normalized by the command and clamped to `[-1, 1]`; moving backward is

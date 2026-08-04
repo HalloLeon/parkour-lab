@@ -158,6 +158,22 @@ class PrivilegedTeacherActorCritic(ActorCritic):
             self._bounded_action_std(mean),
         )
         return self.distribution.sample()
+    
+
+    def act_inference_from_history(
+        self,
+        obs: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Return deterministic actions without using privileged dynamics."""
+
+        terrain_scan = obs[PRIVILEGED_TERRAIN_GROUP] if PRIVILEGED_TERRAIN_GROUP in self.obs_groups["policy"] else None
+        return self.actor.forward_from_history(
+            obs[TEACHER_OBSERVATION_GROUPS[0]],
+            obs[TEACHER_OBSERVATION_GROUPS[1]],
+            terrain_scan,
+            obs[ADAPTATION_HISTORY_GROUP],
+        )
+
 
     def enforce_action_std_bounds_(self) -> None:
         """Project the learned noise parameter into its configured safe range."""
@@ -187,20 +203,6 @@ class PrivilegedTeacherActorCritic(ActorCritic):
         result = super().load_state_dict(state_dict, strict=strict)
         self.enforce_action_std_bounds_()
         return result
-
-    def act_inference_from_history(
-        self,
-        obs: Mapping[str, torch.Tensor],
-    ) -> torch.Tensor:
-        """Return deterministic actions without using privileged dynamics."""
-
-        terrain_scan = obs[PRIVILEGED_TERRAIN_GROUP] if PRIVILEGED_TERRAIN_GROUP in self.obs_groups["policy"] else None
-        return self.actor.forward_from_history(
-            obs[TEACHER_OBSERVATION_GROUPS[0]],
-            obs[TEACHER_OBSERVATION_GROUPS[1]],
-            terrain_scan,
-            obs[ADAPTATION_HISTORY_GROUP],
-        )
 
     def _bounded_action_std(self, mean: torch.Tensor) -> torch.Tensor:
         """Return the bounded positive per-action standard deviation."""
