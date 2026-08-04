@@ -481,10 +481,10 @@ class RewardsCfg:
 
     flat_overspeed = RewTerm(
         func=mdp.flat_waypoint_overspeed_l2,
-        weight=-0.25,
+        weight=-0.5,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "max_excess_ratio": 2.0,
+            "max_excess_ratio": 4.0,
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
         },
     )
