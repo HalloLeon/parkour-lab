@@ -62,11 +62,12 @@ checkpoints (`model_*.pt`), the resolved environment and agent configurations in
 `params/`, TensorBoard data, and optional clips in `videos/train/`.
 
 The default teacher budget is 1,000 PPO iterations with 48 control steps per
-environment and update, a discount factor of 0.995, and checkpoints every 100
-iterations. The longer rollout and horizon preserve more approach-to-landing
-credit than the former short smoke-test settings. `--max_iterations` can still
-override the budget for diagnostics. Action noise starts at 0.5, is bounded to
-0.05–0.6, and receives no entropy bonus.
+environment and update, 20-second episodes, a discount factor of 0.995, and
+checkpoints every 100 iterations. The longer rollout and horizon preserve more
+approach-to-landing credit than the former short smoke-test settings.
+`--max_iterations` can still override the budget for diagnostics. Action noise
+starts at 1.0, is bounded to 0.15–1.0, and uses an entropy coefficient of 0.01
+while the deterministic motor policy acquires its gait.
 
 New checkpoints store the per-environment curriculum frontier, rolling evidence,
 and demotion grace alongside RSL-RL's learner state. `--resume` restores that
@@ -169,16 +170,17 @@ Both cases immediately retarget the marker, oracle heading, critic distance,
 and directional reward without teaching the robot to dwell at control markers.
 
 Only explicitly marked physical milestones split a one-shot `+2` shaping budget
-across the course; approach and alignment markers do not pay, and adding them
-cannot increase the available reward. Intermediate waypoints still do not end
-an episode or count as curriculum success. The final waypoint ignores plane
-crossing and pays `+10` only after the robot reaches its radius with a foot on
-the named support, sufficient base clearance, low vertical speed and tilt, and
-no trunk contact. Event rewards are divided by the control timestep before
-Isaac Lab's reward integration, making these configured amounts the exact
-per-event bonuses. The terminating trunk-contact penalty uses the same rule for
-an exact `-10`; a trunk crash takes precedence if crash and success would
-otherwise occur on the same step.
+across the course. The flat bootstrap's two intermediate ground targets each
+receive `+1`; obstacle approach and alignment guides do not pay, and adding
+control markers cannot increase the available budget. Intermediate waypoints
+still do not end an episode or count as curriculum success. The final waypoint
+ignores plane crossing and pays `+10` only after the robot reaches its radius
+with a foot on the named support, sufficient base clearance, low vertical speed
+and tilt, and no trunk contact. Event rewards are divided by the control
+timestep before Isaac Lab's reward integration, making these configured amounts
+the exact per-event bonuses. The terminating trunk-contact penalty uses the same
+rule for an exact `-10`; a trunk crash takes precedence if crash and success
+would otherwise occur on the same step.
 
 Maximum progress is projected onto the active route segment only inside its
 lateral corridor, remains monotonic within an episode, and does not increase
@@ -197,12 +199,14 @@ post-promotion grace counters. Static thresholds remain in
 `ParkourCurriculumCfg`; the episode row selected by frontier/replay sampling
 remains authoritative in `TerrainImporter.terrain_levels`.
 
-The dense velocity signal is the signed world-frame projection toward the active
-waypoint, normalized by the command and clamped to `[-1, 1]`; moving backward is
-penalized and overspeed cannot dominate the sparse events. Velocity and heading
-shaping are suppressed on the exact retarget step so a marker jump is not
-mistaken for robot motion. Low-clearance error is likewise normalized to
-`[0, 1]` before its squared penalty.
+Dense acquisition uses a positive exponential reward for reaching the target
+speed toward the active waypoint while suppressing lateral velocity. Forward
+overspeed is capped rather than punished. A second positive exponential rewards
+heading alignment. Both are suppressed on the exact retarget step so a marker
+jump is not mistaken for robot motion. Flat terrain also receives stronger
+feet-air-time shaping and disables obstacle-only leg, edge, and stumble
+penalties; those terms activate after promotion. Low-clearance error remains
+normalized to `[0, 1]` before its squared penalty.
 
 The teacher-interface manifest is version 13. Version 4 introduced complete
 declarative terrain courses because physical support segmentation changes the

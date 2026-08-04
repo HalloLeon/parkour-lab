@@ -32,8 +32,8 @@ class PrivilegedTeacherActorCriticCfg(RslRlPpoActorCriticCfg):
 
     # Keep exploration large enough to discover motion without letting sampled
     # actions mask a stationary deterministic policy.
-    min_noise_std: float = 0.05
-    max_noise_std: float = 0.6
+    min_noise_std: float = 0.15
+    max_noise_std: float = 1.0
 
 
 @configclass
@@ -119,7 +119,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     policy = PrivilegedTeacherActorCriticCfg(
         # Initial standard deviation of the Gaussian action distribution. This
         # controls exploration before the standard deviation is learned.
-        init_noise_std=0.5,
+        init_noise_std=1.0,
         # Keep the direct parameter used by existing checkpoints and their Adam
         # state; the custom actor projects it into positive safe bounds.
         noise_std_type="scalar",
@@ -147,9 +147,10 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # Maximum probability-ratio deviation allowed by the PPO surrogate
         # objective during one update.
         clip_param=0.2,
-        # Bounded Gaussian noise supplies exploration without rewarding the
-        # policy for retaining a stochasticity-dependent solution.
-        entropy_coef=0.0,
+        # Preserve broad exploration while the deterministic motor policy
+        # acquires its initial gait. Deterministic evaluation remains the
+        # acceptance gate, so sampled actions cannot mask a stationary mean.
+        entropy_coef=0.01,
         # Number of passes over each collected rollout.
         num_learning_epochs=5,
         # Number of minibatches used for every learning epoch.

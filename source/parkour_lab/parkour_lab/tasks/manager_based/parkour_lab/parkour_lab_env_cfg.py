@@ -469,43 +469,52 @@ class RewardsCfg:
     """
     Task, safety, and motion-quality rewards for parkour locomotion.
 
-    Normalized world-frame velocity toward the active waypoint is the dense
-    progress signal. One-shot physical-milestone and completion bonuses make
-    discrete progress unambiguous without rewarding proximity every step.
-    Safety remains separate so low clearance or recovery does not erase the
-    directional learning signal. Flight and absolute roll/pitch are not
-    penalized directly because both can be necessary on parkour terrain.
+    Positive target-speed and heading tracking provide the dense acquisition
+    signal. One-shot physical-milestone and completion bonuses make discrete
+    progress unambiguous without rewarding proximity every step. Safety remains
+    separate, while level-aware contact shaping keeps the flat bootstrap from
+    penalizing the foot motion needed to discover a gait.
     """
 
     # Active-waypoint task.
-    velocity_along_waypoint_xy = RewTerm(
-        func=mdp.velocity_along_waypoint_xy_capped,
-        weight=1.0,
+    waypoint_velocity_tracking = RewTerm(
+        func=mdp.waypoint_velocity_tracking_exp,
+        weight=1.5,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
+            "std": 0.5,
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
         },
     )
 
-    waypoint_heading_misalignment = RewTerm(
-        func=mdp.waypoint_heading_misalignment_l2,
-        weight=-0.1,
+    waypoint_heading_alignment = RewTerm(
+        func=mdp.waypoint_heading_alignment_exp,
+        weight=0.5,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "heading_cfg": mdp.config.WaypointHeadingCfg(
-                max_heading_error=1.0, min_forward_speed=0.1, full_forward_speed=0.5
-            ),
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
         },
     )
 
     # Explicit physical milestones split one conservative +2 shaping budget;
-    # approach and alignment-only route markers do not receive a bonus.
+    # this includes the two supported flat-bootstrap progress targets.
     completed_course = RewTerm(func=mdp.completed_course_reward, weight=10.0)
 
     intermediate_milestone = RewTerm(
         func=mdp.intermediate_milestone_reward,
         weight=2.0,
+    )
+
+    feet_air_time = RewTerm(
+        func=mdp.feet_air_time,
+        weight=1.0,
+        params={
+            "curriculum_cfg": PARKOUR_CURRICULUM,
+            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+            "threshold": 0.5,
+            "flat_weight": 0.25,
+            "obstacle_weight": 0.01,
+        },
     )
 
     # Safety.
@@ -526,9 +535,13 @@ class RewardsCfg:
     )
 
     leg_contact = RewTerm(
-        func=mdp.undesired_contacts,
+        func=mdp.obstacle_only_undesired_contacts,
         weight=-0.5,
-        params={"sensor_cfg": SceneEntityCfg("leg_contact"), "threshold": 1.0},
+        params={
+            "curriculum_cfg": PARKOUR_CURRICULUM,
+            "sensor_cfg": SceneEntityCfg("leg_contact"),
+            "threshold": 1.0,
+        },
     )
 
     # Motion quality and regularization.
@@ -547,7 +560,7 @@ class RewardsCfg:
 
     # Foot-placement quality.
     feet_edge = RewTerm(
-        func=mdp.feet_edge,
+        func=mdp.obstacle_only_feet_edge,
         weight=-1.0,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
@@ -557,18 +570,22 @@ class RewardsCfg:
     )
 
     feet_slide = RewTerm(
-        func=mdp.feet_slide,
+        func=mdp.level_scaled_feet_slide,
         weight=-0.05,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "curriculum_cfg": PARKOUR_CURRICULUM,
+            "flat_scale": 0.5,
+            "obstacle_scale": 1.0,
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
         },
     )
 
     feet_stumble = RewTerm(
-        func=mdp.feet_stumble,
+        func=mdp.obstacle_only_feet_stumble,
         weight=-0.5,
         params={
+            "curriculum_cfg": PARKOUR_CURRICULUM,
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
             "stumble_cfg": mdp.config.FeetStumbleCfg(
                 lateral_to_vertical_force_ratio=4.0,
@@ -664,7 +681,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         # decimation = 4 means the policy acts every 4 physics steps.
         # So the policy/control rate is 50 Hz.
         self.decimation = 4
-        self.episode_length_s = 10.0
+        self.episode_length_s = 20.0
 
         self.sim.dt = 0.005
         self.sim.render_interval = self.decimation
@@ -879,9 +896,16 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
             curriculum_cfg.base_contact_threshold
         )
 
-        # Keep the contact-gated edge penalty tied to the same authoritative
-        # level geometry and metric thresholds as terrain generation.
-        self.rewards.feet_edge.params["curriculum_cfg"] = curriculum_cfg
+        # Keep every level-aware reward tied to the same authoritative matrix
+        # used by terrain generation and route state.
+        for term_name in (
+            "feet_air_time",
+            "leg_contact",
+            "feet_edge",
+            "feet_slide",
+            "feet_stumble",
+        ):
+            getattr(self.rewards, term_name).params["curriculum_cfg"] = curriculum_cfg
 
     def synchronize_domain_randomization_config(self) -> None:
         """Propagate the selected randomization stage to all manager terms.
