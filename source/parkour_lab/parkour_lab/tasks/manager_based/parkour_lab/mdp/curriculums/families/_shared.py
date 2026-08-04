@@ -48,7 +48,11 @@ def build_bootstrap_level(obstacle_family: str) -> ParkourLevelCfg:
         waypoints=tuple(
             ParkourWaypointCfg(
                 position=position,
-                support_region_name=("ground" if index == len(_BOOTSTRAP_ROUTE) - 1 else None),
+                support_region_name="ground",
+                # Split the existing intermediate-milestone budget across the
+                # two supported acquisition checkpoints.  The final waypoint
+                # retains the separate course-completion bonus.
+                is_rewarded_milestone=index < len(_BOOTSTRAP_ROUTE) - 1,
             )
             for index, position in enumerate(_BOOTSTRAP_ROUTE)
         ),

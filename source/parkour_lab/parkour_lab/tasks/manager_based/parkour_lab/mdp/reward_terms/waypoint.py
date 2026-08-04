@@ -19,6 +19,96 @@ from ..terrain import queries
 # Dense waypoint-progress shaping.
 
 
+def waypoint_heading_alignment_exp(
+    env: ManagerBasedRLEnv,
+    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward alignment with the active waypoint using a positive kernel.
+
+    Unlike a misalignment penalty, this term supplies useful positive return
+    before the policy has acquired forward locomotion.  The exponential follows
+    the heading reward used by Extreme Parkour and remains bounded in ``(0, 1]``.
+
+    The action preceding a waypoint transition targeted the old waypoint, so
+    that single retarget sample is masked rather than credited against the new
+    heading.
+
+    Returns:
+        Tensor with shape ``(num_envs,)``.
+    """
+
+    heading_error = geometry._heading_error_to_active_waypoint_xy(
+        env,
+        waypoint_marker_cfg=waypoint_marker_cfg,
+        asset_cfg=asset_cfg,
+    )
+    reward = torch.exp(-torch.abs(heading_error))
+    return torch.where(
+        route.active_waypoint_changed_this_step(env),
+        torch.zeros_like(reward),
+        reward,
+    )
+
+
+def waypoint_velocity_tracking_exp(
+    env: ManagerBasedRLEnv,
+    std: float = 0.5,
+    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Reward minimum waypoint-directed speed with an exponential kernel.
+
+    The longitudinal error is one-sided: motion faster than the commanded speed
+    in the waypoint direction receives no additional reward and no overspeed
+    penalty.  Lateral velocity is always part of the error.  This combines the
+    smooth positive acquisition signal of Isaac Lab's velocity tracking reward
+    with Extreme Parkour's capped forward-speed semantics::
+
+        exp(-(relu(target_speed - v_parallel)^2 + ||v_perpendicular||^2) / std^2)
+
+    The term is bounded in ``(0, 1]`` and masks the one sample on which the route
+    switches to a waypoint that did not produce the current action.
+
+    Returns:
+        Tensor with shape ``(num_envs,)``.
+    """
+
+    if std <= 0.0:
+        raise ValueError("std must be positive.")
+
+    waypoint_direction_xy = geometry._active_waypoint_direction_xy(
+        env,
+        waypoint_marker_cfg=waypoint_marker_cfg,
+        asset_cfg=asset_cfg,
+    )
+    root_velocity_xy = robot._root_lin_vel_xy(env, asset_cfg=asset_cfg)
+    velocity_along_waypoint = torch.sum(
+        root_velocity_xy * waypoint_direction_xy,
+        dim=-1,
+    )
+    lateral_velocity_xy = (
+        root_velocity_xy
+        - velocity_along_waypoint.unsqueeze(-1) * waypoint_direction_xy
+    )
+
+    target_speed = get_target_speed(env).to(
+        device=root_velocity_xy.device,
+        dtype=root_velocity_xy.dtype,
+    )
+    speed_deficit = torch.clamp(target_speed - velocity_along_waypoint, min=0.0)
+    squared_velocity_error = speed_deficit.square() + torch.sum(
+        lateral_velocity_xy.square(),
+        dim=-1,
+    )
+    reward = torch.exp(-squared_velocity_error / float(std) ** 2)
+    return torch.where(
+        route.active_waypoint_changed_this_step(env),
+        torch.zeros_like(reward),
+        reward,
+    )
+
+
 def waypoint_heading_misalignment_l2(
     env: ManagerBasedRLEnv,
     heading_cfg: config.WaypointHeadingCfg = config.DEFAULT_WAYPOINT_HEADING,
