@@ -278,9 +278,10 @@ class ParkourWaypointCfg:
     """One ordered course waypoint in terrain-local XYZ coordinates.
 
     ``support_region_name`` distinguishes an immediate route-control target
-    from a physical target that must be reached with a contacted foot on one
-    exact configured support. This keeps landing semantics declarative and
-    independent of obstacle-family labels.
+    from a physical target that requires both root proximity and a contacted
+    foot on one exact configured support. ``root_reach_radius`` overrides the
+    curriculum default for this waypoint only. This keeps landing semantics
+    declarative and independent of obstacle-family labels.
 
     ``is_rewarded_milestone`` distinguishes physical obstacle progress from a
     waypoint used only to align or redirect the route. Final waypoints must
@@ -290,6 +291,7 @@ class ParkourWaypointCfg:
     position: tuple[float, float, float]
     support_region_name: str | None = None
     is_rewarded_milestone: bool = False
+    root_reach_radius: float | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -304,6 +306,14 @@ class ParkourWaypointCfg:
             )
         if not isinstance(self.is_rewarded_milestone, bool):
             raise TypeError("is_rewarded_milestone must be a Boolean.")
+        if self.root_reach_radius is not None:
+            root_reach_radius = _float_value(
+                self.root_reach_radius,
+                field_name="waypoint root_reach_radius",
+            )
+            if root_reach_radius <= 0.0:
+                raise ValueError("waypoint root_reach_radius must be positive.")
+            object.__setattr__(self, "root_reach_radius", root_reach_radius)
 
     def metadata(self) -> dict[str, object]:
         """Return a JSON-compatible description of this waypoint."""
@@ -312,6 +322,7 @@ class ParkourWaypointCfg:
             "position": list(self.position),
             "support_region_name": self.support_region_name,
             "is_rewarded_milestone": self.is_rewarded_milestone,
+            "root_reach_radius": self.root_reach_radius,
         }
 
 
@@ -817,6 +828,10 @@ def coerce_waypoint_cfg(
         is_rewarded_milestone=cast(
             bool,
             waypoint.get("is_rewarded_milestone", False),
+        ),
+        root_reach_radius=cast(
+            float | None,
+            waypoint.get("root_reach_radius"),
         ),
     )
 

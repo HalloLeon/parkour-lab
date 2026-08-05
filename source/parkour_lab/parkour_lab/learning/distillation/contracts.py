@@ -187,9 +187,11 @@ def build_teacher_interface(
             # Ordered routes are recorded by ``terrain_curriculum.matrix``.
             "oracle_heading_source": {
                 "kind": "active_course_waypoint",
-                "reach_threshold_m": float(curriculum_cfg.waypoint_reach_threshold),
+                "default_root_reach_radius_m": float(curriculum_cfg.waypoint_reach_threshold),
+                "root_reach_radius_override_source": "terrain_curriculum.matrix.waypoints",
+                "route_plane_lateral_tolerance_m": float(curriculum_cfg.waypoint_reach_threshold),
                 "control_waypoint_transition": "radius_or_true_route_plane_crossing",
-                "physical_waypoint_transition": "supported_foot_radius_and_named_support_contact",
+                "physical_waypoint_transition": "root_radius_and_named_support_contact",
                 "support_contact_threshold_n": float(success_params["contact_threshold"]),
                 "support_margin_m": float(success_params["support_margin"]),
                 "support_plane_tolerance_m": float(success_params["support_plane_tolerance"]),

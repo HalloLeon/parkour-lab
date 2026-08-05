@@ -120,10 +120,11 @@ class ParkourCurriculumCfg:
     initial_level: int = 0
     max_level: int = 5
 
-    # Control targets advance when the root enters this XY radius or crosses the
-    # route plane inside the same corridor. Intermediate physical targets use a
-    # supported foot inside the radius. Final completion retains root proximity
-    # and safe whole-body state, but no dwell.
+    # Default root XY radius for waypoint transitions. Control targets may also
+    # cross their route plane inside this global corridor; physical targets
+    # additionally require named-support contact. Individual waypoints may
+    # override only the root radius. Final completion also requires safe
+    # whole-body state, but no dwell.
     waypoint_reach_threshold: float = 0.20
 
     # Rolling evidence tolerates occasional exploration failures without letting

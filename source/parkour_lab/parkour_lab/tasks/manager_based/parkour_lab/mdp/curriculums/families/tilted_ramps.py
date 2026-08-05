@@ -36,6 +36,11 @@ _APPROACH_END_X_M = 0.55
 # top-centerline endpoints, keeping targets away from exact support edges.
 _WAYPOINT_INSET_M = 0.14
 
+# A ramp-entry target is near an elevated support edge, so the robot root can
+# remain behind its leading contacting foot. This modest root-radius override
+# makes the intended transition reachable without weakening other waypoints.
+_ENTRY_ROOT_REACH_RADIUS_M = 0.40
+
 
 # Specification models
 
@@ -225,9 +230,9 @@ def build_level(
     )
 
     waypoints: list[ParkourWaypointCfg] = []
-    # Every ramp receives supported entry and exit targets. The first entry
-    # replaces the former flat control target but remains unrewarded, preserving
-    # both the waypoint count and milestone budget.
+    # Every ramp receives a supported acquisition gate and a rewarded exit.
+    # Entry gates steer contact onto the ramp without paying sparse progress;
+    # the normalized milestone budget is distributed across completed exits.
     for index, (ramp, support) in enumerate(zip(ramps, ramp_supports)):
         direction_x, direction_y = ramp.travel_direction_xy
         start = ramp.centerline_start
@@ -240,7 +245,7 @@ def build_level(
                     ramp.top_center_z + marker_offset_z,
                 ),
                 support_region_name=support.name,
-                is_rewarded_milestone=index > 0,
+                root_reach_radius=_ENTRY_ROOT_REACH_RADIUS_M,
             ),
             ParkourWaypointCfg(
                 position=(

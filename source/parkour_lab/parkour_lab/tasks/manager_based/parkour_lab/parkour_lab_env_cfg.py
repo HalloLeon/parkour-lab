@@ -833,8 +833,8 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         initial_level = curriculum_cfg.initial_level if self.evaluation_level is None else self.evaluation_level
         self.scene.ground.max_init_terrain_level = initial_level
 
-        # Keep the visible marker footprint consistent with the configured XY
-        # radius used by the waypoint transition condition.
+        # The static marker visualizes the default root radius. Per-waypoint
+        # overrides remain runtime metadata and do not resize the USD object.
         self.scene.waypoint_marker.spawn.radius = curriculum_cfg.waypoint_reach_threshold
 
         # Pass the same curriculum object to reset events so initial terrain

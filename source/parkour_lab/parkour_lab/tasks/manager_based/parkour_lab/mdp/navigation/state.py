@@ -33,6 +33,7 @@ class CourseTables:
     cumulative_distances_m: torch.Tensor
     waypoint_counts: torch.Tensor
     waypoints: torch.Tensor
+    root_reach_radii: torch.Tensor
 
     # Reward metadata.
     milestone_reward_fractions: torch.Tensor
@@ -170,6 +171,11 @@ def _build_course_tables(
         device=env.device,
         dtype=dtype,
     )
+    root_reach_radii = torch.empty(
+        (len(routes), max_waypoints),
+        device=env.device,
+        dtype=dtype,
+    )
     milestone_reward_fractions = torch.zeros(
         (len(routes), max_waypoints),
         device=env.device,
@@ -199,6 +205,19 @@ def _build_course_tables(
         # authoritative, so a route cursor cannot intentionally enter them.
         waypoints[course_index, waypoint_count:] = route_tensor[-1]
         waypoint_counts[course_index] = waypoint_count
+
+        course_root_reach_radii = torch.tensor(
+            [
+                waypoint.root_reach_radius
+                if waypoint.root_reach_radius is not None
+                else curriculum_cfg.waypoint_reach_threshold
+                for waypoint in course.waypoints
+            ],
+            device=env.device,
+            dtype=dtype,
+        )
+        root_reach_radii[course_index, :waypoint_count] = course_root_reach_radii
+        root_reach_radii[course_index, waypoint_count:] = course_root_reach_radii[-1]
 
         rewarded_milestones = tuple(
             waypoint.is_rewarded_milestone for waypoint in course.waypoints[:-1]
@@ -260,6 +279,7 @@ def _build_course_tables(
         cumulative_distances_m=cumulative_distances_m,
         waypoint_counts=waypoint_counts,
         waypoints=waypoints,
+        root_reach_radii=root_reach_radii,
         milestone_reward_fractions=milestone_reward_fractions,
         support_normals=support_normals,
         support_vertex_counts=support_vertex_counts,
@@ -338,11 +358,16 @@ def _runtime_matches(
     device = torch.device(env.device)
     waypoint_changed = getattr(route, "waypoint_changed", None)
     course_completed = getattr(route, "course_completed", None)
+    root_reach_radii = getattr(courses, "root_reach_radii", None)
     return (
         courses.num_difficulties == curriculum_cfg.num_difficulties
         and courses.waypoints.shape[0] == len(curriculum_cfg.courses)
         and courses.waypoints.device == device
         and courses.waypoints.dtype == dtype
+        and isinstance(root_reach_radii, torch.Tensor)
+        and root_reach_radii.shape == courses.waypoints.shape[:2]
+        and root_reach_radii.device == device
+        and root_reach_radii.dtype == dtype
         and route.course_indices.shape == (env.num_envs,)
         and route.course_indices.device == device
         and route.previous_root_xy.shape == (env.num_envs, 2)
