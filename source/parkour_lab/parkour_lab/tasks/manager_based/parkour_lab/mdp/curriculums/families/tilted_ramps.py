@@ -224,49 +224,24 @@ def build_level(
         )
     )
 
-    anchor_ramp = ramps[0]
-    anchor_direction_x, anchor_direction_y = anchor_ramp.travel_direction_xy
-    anchor_start = anchor_ramp.centerline_start
-
-    # The 0.25 m value is a fixed route-design offset, not a quantity derived
-    # from the ramp dimensions. Moving opposite the anchor ramp's unit travel
-    # direction places the initial target on flat approach ground, giving the
-    # route time to align with the ramp yaw before the robot reaches its edge.
-    # The support-region check below rejects layouts for which that assumption
-    # does not hold.
-    waypoints = [
-        ParkourWaypointCfg(
-            position=(
-                anchor_start[0] - 0.25 * anchor_direction_x,
-                anchor_start[1] - 0.25 * anchor_direction_y,
-                marker_offset_z,
-            )
-        )
-    ]
-    if not approach_region.supports_waypoint(waypoints[0].position):
-        raise ValueError("The initial tilted-ramp waypoint must lie on approach ground.")
-
-    # The initial approach waypoint already aligns the route with ramp one.
-    # Every later ramp receives an entry waypoint so a gap or direction change
-    # is explicit, and every ramp receives an inset exit waypoint.
+    waypoints: list[ParkourWaypointCfg] = []
+    # Every ramp receives supported entry and exit targets. The first entry
+    # replaces the former flat control target but remains unrewarded, preserving
+    # both the waypoint count and milestone budget.
     for index, (ramp, support) in enumerate(zip(ramps, ramp_supports)):
         direction_x, direction_y = ramp.travel_direction_xy
-        ramp_waypoints: list[ParkourWaypointCfg] = []
-        if index > 0:
-            start = ramp.centerline_start
-            ramp_waypoints.append(
-                ParkourWaypointCfg(
-                    position=(
-                        start[0] + _WAYPOINT_INSET_M * direction_x,
-                        start[1] + _WAYPOINT_INSET_M * direction_y,
-                        ramp.top_center_z + marker_offset_z,
-                    ),
-                    support_region_name=support.name,
-                    is_rewarded_milestone=True,
-                )
-            )
+        start = ramp.centerline_start
         end = ramp.centerline_end
-        ramp_waypoints.append(
+        ramp_waypoints = (
+            ParkourWaypointCfg(
+                position=(
+                    start[0] + _WAYPOINT_INSET_M * direction_x,
+                    start[1] + _WAYPOINT_INSET_M * direction_y,
+                    ramp.top_center_z + marker_offset_z,
+                ),
+                support_region_name=support.name,
+                is_rewarded_milestone=index > 0,
+            ),
             ParkourWaypointCfg(
                 position=(
                     end[0] - _WAYPOINT_INSET_M * direction_x,
@@ -275,7 +250,7 @@ def build_level(
                 ),
                 support_region_name=support.name,
                 is_rewarded_milestone=True,
-            )
+            ),
         )
         if not all(support.supports_waypoint(waypoint.position) for waypoint in ramp_waypoints):
             raise ValueError(f"Ramp {index + 1} waypoints must lie on its top surface.")
