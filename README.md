@@ -193,8 +193,9 @@ during trunk contact. Demotion therefore compares comparable route fractions
 instead of commanded speed times episode duration. Three successes in the last
 five frontier attempts promote one row. Two stalled failures in the last three
 eligible frontier attempts, each below 60% normalized route progress, demote one
-row. The first harder attempt is protected from demotion, and 25% of later
-episodes replay the immediate predecessor without altering frontier evidence.
+row. The first harder attempt is protected from demotion. Later episodes use a
+10% flat anchor and 15% immediate-predecessor replay without altering frontier
+evidence.
 Promotion changes only future course sampling and pays no additional reward
 because completion already receives `+10`.
 
@@ -204,15 +205,17 @@ post-promotion grace counters. Static thresholds remain in
 `ParkourCurriculumCfg`; the episode row selected by frontier/replay sampling
 remains authoritative in `TerrainImporter.terrain_levels`.
 
-Dense acquisition scales positive forward speed up to the active course target
-and suppresses lateral velocity; faster motion earns no extra dense reward but
-remains available for obstacle takeoff. On the flat bootstrap only, a bounded
-overspeed penalty and the heading gate discourage sprinting, while a small
-no-feet-contact penalty discourages repeated hopping. Standing still and moving
-backward receive zero. Reward samples on the exact retarget step are masked so
-a marker jump is not mistaken for robot motion. Flat terrain disables
-feet-air-time shaping and obstacle-only leg, edge, and stumble penalties; small
-air-time shaping and the contact penalties activate after promotion.
+Dense velocity shaping tracks the target symmetrically on the flat bootstrap
+and preserves capped positive acquisition on obstacle rows, while suppressing
+lateral motion in both cases. Faster obstacle motion remains available for
+takeoff. On the flat, a bounded overspeed penalty and the heading gate further
+discourage sprinting, while a small no-feet-contact penalty discourages repeated
+hopping. Standing still and moving backward receive negligible flat tracking
+reward and zero obstacle acquisition reward. Reward samples on the exact
+retarget step are masked so a marker jump is not mistaken for robot motion.
+Flat terrain disables feet-air-time shaping and obstacle-only leg, edge, and
+stumble penalties; small air-time shaping and the contact penalties activate
+after promotion.
 Low-clearance error remains normalized to `[0, 1]` before its squared penalty.
 
 The teacher-interface manifest is version 13. Version 4 introduced complete

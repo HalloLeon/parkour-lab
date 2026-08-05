@@ -523,9 +523,10 @@ DEFAULT_STAGE_SPECS = (
         landing_y_range=(-1.0, 1.20),
     ),
     # Obstacle stage 4 / curriculum row 5: combine narrow supports, stronger
-    # opposing banks, a larger gap, and a sharper redirection.
+    # opposing banks, a larger gap, and a sharper inter-ramp redirection. Keep
+    # the first approach aligned with the successful preceding row.
     TiltedRampStageSpec(
-        sequence_anchor_xy=(1.15, -0.45),
+        sequence_anchor_xy=(1.15, 0.0),
         ramps=(
             RampSpec(
                 length=1.10,

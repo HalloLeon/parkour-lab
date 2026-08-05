@@ -461,9 +461,9 @@ class RewardsCfg:
     """
     Task, safety, and motion-quality rewards for parkour locomotion.
 
-    Capped forward acquisition remains available on every course. Flat-only
-    overspeed, heading, and flight shaping encourage a walking bootstrap
-    without suppressing the faster takeoff motions needed by obstacles.
+    Flat rows track the commanded speed, while obstacle rows retain capped
+    forward acquisition. Flat-only overspeed, heading, and flight shaping
+    encourage a walking bootstrap without suppressing obstacle takeoff.
     One-shot physical milestones and completion bonuses make discrete progress
     unambiguous, while safety remains separate.
     """
@@ -474,6 +474,7 @@ class RewardsCfg:
         weight=1.5,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
+            "flat_speed_std": 0.25,
             "std": 0.5,
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
         },

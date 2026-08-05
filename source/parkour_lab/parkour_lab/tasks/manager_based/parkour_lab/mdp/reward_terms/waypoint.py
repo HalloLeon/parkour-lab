@@ -92,15 +92,16 @@ def waypoint_velocity_tracking_exp(
     std: float = 0.5,
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    flat_speed_std: float = 0.25,
 ) -> torch.Tensor:
-    """Reward capped forward acquisition while suppressing lateral motion.
+    """Track flat target speed while preserving obstacle-speed acquisition.
 
-    Forward motion receives a linear acquisition signal up to the commanded
-    speed. Faster motion earns no additional dense reward, but remains
-    available for obstacle takeoff. Standing still and moving backward receive
-    zero::
+    Flat rows use symmetric exponential tracking so the commanded speed is the
+    unique optimum. Obstacle rows retain the capped acquisition signal that
+    permits faster takeoff motion::
 
-        clamp(v_parallel / target_speed, 0, 1)
+        where(flat, exp(-(v_parallel - target_speed)^2 / flat_speed_std^2),
+                    clamp(v_parallel / target_speed, 0, 1))
         * exp(-||v_perpendicular||^2 / std^2)
 
     The term is bounded in ``[0, 1]`` and masks the one sample on which the route
@@ -110,8 +111,8 @@ def waypoint_velocity_tracking_exp(
         Tensor with shape ``(num_envs,)``.
     """
 
-    if std <= 0.0:
-        raise ValueError("std must be positive.")
+    if std <= 0.0 or flat_speed_std <= 0.0:
+        raise ValueError("std and flat_speed_std must be positive.")
 
     waypoint_direction_xy = geometry._active_waypoint_direction_xy(
         env,
@@ -134,10 +135,16 @@ def waypoint_velocity_tracking_exp(
         min=0.0,
         max=1.0,
     )
+    flat_tracking = torch.exp(-(velocity_along_waypoint - target_speed).square() / float(flat_speed_std) ** 2)
+    forward_reward = torch.where(
+        route.active_difficulty_indices(env) == 0,
+        flat_tracking,
+        forward_fraction,
+    )
     lateral_alignment = torch.exp(-torch.sum(lateral_velocity_xy.square(), dim=-1) / float(std) ** 2)
     return _mask_waypoint_change(
         env,
-        forward_fraction * lateral_alignment,
+        forward_reward * lateral_alignment,
     )
 
 
