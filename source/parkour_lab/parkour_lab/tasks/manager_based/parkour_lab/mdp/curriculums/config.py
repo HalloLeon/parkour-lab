@@ -120,9 +120,10 @@ class ParkourCurriculumCfg:
     initial_level: int = 0
     max_level: int = 5
 
-    # Intermediate routing targets advance on radius entry or a route-plane
-    # crossing inside this XY corridor. Final completion requires radius entry
-    # and safe base clearance, but no dwell.
+    # Control targets advance when the root enters this XY radius or crosses the
+    # route plane inside the same corridor. Intermediate physical targets use a
+    # supported foot inside the radius. Final completion retains root proximity
+    # and safe whole-body state, but no dwell.
     waypoint_reach_threshold: float = 0.20
 
     # Rolling evidence tolerates occasional exploration failures without letting

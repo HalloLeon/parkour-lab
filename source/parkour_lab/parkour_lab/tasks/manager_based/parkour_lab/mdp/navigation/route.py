@@ -300,7 +300,7 @@ def advance_active_waypoints(
         robot_pos[:, :2] - active_positions[:, :2],
         dim=-1,
     )
-    within_radius = distance_xy < reach_threshold
+    root_within_radius = distance_xy < reach_threshold
     previous_robot_xy = route_state.previous_root_xy.clone()
     passed_waypoint_plane = _active_waypoint_plane_passed(
         env,
@@ -317,8 +317,10 @@ def advance_active_waypoints(
         ]
         > 0
     )
-    supported = _active_waypoint_supported(
+    supported, supported_waypoint_contact = _active_waypoint_support(
         env,
+        active_positions=active_positions,
+        reach_threshold=reach_threshold,
         feet_asset_cfg=feet_asset_cfg,
         feet_contact_cfg=feet_contact_cfg,
         contact_threshold=contact_threshold,
@@ -368,10 +370,10 @@ def advance_active_waypoints(
     next_indices, completed_course = _advance_route_state(
         active_indices,
         waypoint_counts,
-        within_radius,
+        root_within_radius,
         passed_waypoint_plane,
         support_required,
-        supported,
+        supported_waypoint_contact,
         ~trunk_contact,
         final_waypoint_eligible,
     )
@@ -568,16 +570,22 @@ def _active_waypoint_plane_passed(
     return valid_segment & crossed_forward & (lateral_distance <= lateral_tolerance)
 
 
-def _active_waypoint_supported(
+def _active_waypoint_support(
     env: ManagerBasedRLEnv,
     *,
+    active_positions: torch.Tensor,
+    reach_threshold: float,
     feet_asset_cfg: SceneEntityCfg,
     feet_contact_cfg: SceneEntityCfg,
     contact_threshold: float,
     support_margin: float,
     support_plane_tolerance: float,
-) -> torch.Tensor:
-    """Return whether a recently contacted foot is on the intended support."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Report active-support contact globally and near the waypoint.
+
+    The second mask keeps support, recent contact, and waypoint proximity tied
+    to the same foot.
+    """
 
     import torch
 
@@ -659,44 +667,53 @@ def _active_waypoint_supported(
     )
     # A foot supports the waypoint only if it contacts inside and near its plane.
     near_plane = torch.abs(signed_plane_distance) <= support_plane_tolerance
-    supported_feet = recent_contact & inside_polygon & near_plane
-    # The environment passes when support is required and at least one foot has it.
-    return support_required & torch.any(supported_feet, dim=-1)
+    supported_feet = support_required[:, None] & recent_contact & inside_polygon & near_plane
+    supported = torch.any(supported_feet, dim=-1)
+    foot_distance_xy = torch.linalg.norm(
+        foot_positions[..., :2] - active_positions[:, None, :2],
+        dim=-1,
+    )
+    supported_waypoint_contact = torch.any(
+        supported_feet & (foot_distance_xy < reach_threshold),
+        dim=-1,
+    )
+    return supported, supported_waypoint_contact
 
 
 def _advance_route_state(
     active_indices: torch.Tensor,
     waypoint_counts: torch.Tensor,
-    within_radius: torch.Tensor,
+    root_within_radius: torch.Tensor,
     passed_waypoint_plane: torch.Tensor,
     support_required: torch.Tensor,
-    supported: torch.Tensor,
+    supported_waypoint_contact: torch.Tensor,
     route_state_eligible: torch.Tensor,
     final_waypoint_eligible: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Advance independently reached cursors without exceeding route lengths.
 
-    Intermediate routing points advance immediately from proximity or a safe
-    crossing of their route-normal plane. Final completion instead requires
-    proximity and ``final_waypoint_eligible``.
+    Control targets advance from root proximity or a safe route-plane crossing.
+    Intermediate physical targets advance from waypoint-local foot support.
+    Final completion requires root proximity and ``final_waypoint_eligible``.
 
     Args:
         active_indices: Current waypoint index for each parallel environment.
             Each value is a cursor into that environment's configured route.
         waypoint_counts: Number of valid waypoints in each environment's route.
-        within_radius: Whether each environment is currently close enough to
-            its active waypoint.
+        root_within_radius: Whether each robot root is currently close enough
+            to its active waypoint.
         passed_waypoint_plane: Whether each environment passed its active
             waypoint along the current route segment while remaining inside
             the configured lateral corridor.
         support_required: Whether the active waypoint identifies a physical
             support instead of serving only as a route-control target.
-        supported: Whether a recently contacted foot is currently on the
-            active waypoint's intended support polygon.
+        supported_waypoint_contact: Whether a recently contacted foot is on the
+            active waypoint's intended support and inside its reach radius.
         route_state_eligible: Whether the robot may advance route state. A
             trunk-contacting robot is ineligible.
-        final_waypoint_eligible: Whether each environment satisfies the extra
-            completion condition required at its final waypoint.
+        final_waypoint_eligible: Whether each environment has named-support
+            contact and satisfies the whole-body stability conditions required
+            at its final waypoint.
 
     Returns:
         The next active indices and completed-course mask.
@@ -706,14 +723,21 @@ def _advance_route_state(
     # its final index from its own waypoint count rather than a shared constant.
     final_waypoint = active_indices == waypoint_counts - 1
 
-    # Control targets retarget immediately from proximity or one genuine plane
-    # crossing. A physical waypoint instead represents a landing and advances
-    # only while the root is nearby and a contacted foot is on its support.
-    control_reached = (~support_required) & (within_radius | passed_waypoint_plane)
-    physical_reached = support_required & within_radius & supported
+    # Control targets use root proximity or one genuine plane crossing. An
+    # intermediate physical target represents a foot landing at that waypoint.
+    # Final completion deliberately retains root proximity and the stricter
+    # stability conditions collected in ``final_waypoint_eligible``.
+    control_reached = (~support_required) & (root_within_radius | passed_waypoint_plane)
+    physical_reached = support_required & supported_waypoint_contact
     advance_cursor = (~final_waypoint) & route_state_eligible & (control_reached | physical_reached)
 
-    completed_course = final_waypoint & physical_reached & route_state_eligible & final_waypoint_eligible
+    completed_course = (
+        final_waypoint
+        & support_required
+        & root_within_radius
+        & route_state_eligible
+        & final_waypoint_eligible
+    )
 
     # Adding a Boolean tensor increments selected cursors by exactly one. Final
     # cursors are excluded above, so no index can exceed its route length.
