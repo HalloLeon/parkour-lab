@@ -67,38 +67,12 @@ def active_waypoint_changed_this_step(env: ManagerBasedRLEnv) -> torch.Tensor:
     return runtime.route.waypoint_changed
 
 
-def active_waypoint_indices(
-    env: ManagerBasedRLEnv,
-    env_ids: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Return the active route cursor for each selected environment.
+def active_waypoint_indices(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return each environment's active route cursor."""
 
-    The cursor also equals the number of waypoints already reached, except on
-    the completion step where the final waypoint is still active. Evaluation
-    code can combine this query with the success event to count that final
-    waypoint without maintaining a second navigation state.
-    """
-
-    from .._shared.runtime import _all_env_ids
     from .state import _parkour_runtime
 
-    env_ids = _all_env_ids(env, env_ids)
-    return _parkour_runtime(env).route.active_waypoint_indices[env_ids]
-
-
-def active_waypoint_counts(
-    env: ManagerBasedRLEnv,
-    env_ids: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Return the configured route length for each selected environment."""
-
-    from .._shared.runtime import _all_env_ids
-    from .state import _parkour_runtime
-
-    env_ids = _all_env_ids(env, env_ids)
-    runtime = _parkour_runtime(env)
-    course_indices = runtime.route.course_indices[env_ids]
-    return runtime.courses.waypoint_counts[course_indices]
+    return _parkour_runtime(env).route.active_waypoint_indices.clone()
 
 
 def course_completed_this_step(env: ManagerBasedRLEnv) -> torch.Tensor:
