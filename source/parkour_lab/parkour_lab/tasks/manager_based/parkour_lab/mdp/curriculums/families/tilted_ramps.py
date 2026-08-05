@@ -36,10 +36,10 @@ _APPROACH_END_X_M = 0.55
 # top-centerline endpoints, keeping targets away from exact support edges.
 _WAYPOINT_INSET_M = 0.14
 
-# A ramp-entry target is near an elevated support edge, so the robot root can
-# remain behind its leading contacting foot. This modest root-radius override
-# makes the intended transition reachable without weakening other waypoints.
-_ENTRY_ROOT_REACH_RADIUS_M = 0.40
+# On a banked ramp the robot root can trail a leading contacting foot at either
+# acquisition or exit. Keep that allowance local to ramp-supported targets so
+# flat and other obstacle checkpoints retain the stricter curriculum default.
+_RAMP_ROOT_REACH_RADIUS_M = 0.40
 
 
 # Specification models
@@ -245,7 +245,7 @@ def build_level(
                     ramp.top_center_z + marker_offset_z,
                 ),
                 support_region_name=support.name,
-                root_reach_radius=_ENTRY_ROOT_REACH_RADIUS_M,
+                root_reach_radius=_RAMP_ROOT_REACH_RADIUS_M,
             ),
             ParkourWaypointCfg(
                 position=(
@@ -255,6 +255,7 @@ def build_level(
                 ),
                 support_region_name=support.name,
                 is_rewarded_milestone=True,
+                root_reach_radius=_RAMP_ROOT_REACH_RADIUS_M,
             ),
         )
         if not all(support.supports_waypoint(waypoint.position) for waypoint in ramp_waypoints):
