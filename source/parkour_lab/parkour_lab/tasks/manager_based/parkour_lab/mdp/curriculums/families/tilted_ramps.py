@@ -190,6 +190,26 @@ def build_level(
         and landing_region.y_range[1] <= _shared.TERRAIN_Y_RANGE_M[1]
     ):
         raise ValueError("The final ramp landing must fit inside the terrain tile.")
+    final_ramp = ramps[-1]
+    ray_entry = 0.0
+    ray_exit = math.inf
+    for origin, direction, bounds in zip(
+        final_ramp.centerline_end[:2],
+        final_ramp.travel_direction_xy,
+        (landing_region.x_range, landing_region.y_range),
+    ):
+        if math.isclose(direction, 0.0, abs_tol=1.0e-12):
+            if not bounds[0] <= origin <= bounds[1]:
+                raise ValueError("The final ramp centerline must point into the landing.")
+            continue
+        distances = (
+            (bounds[0] - origin) / direction,
+            (bounds[1] - origin) / direction,
+        )
+        ray_entry = max(ray_entry, min(distances))
+        ray_exit = min(ray_exit, max(distances))
+    if ray_entry > ray_exit:
+        raise ValueError("The final ramp centerline must point into the landing.")
 
     structures = tuple(_ramp_structure(f"tilted_ramp_{index}", ramp) for index, ramp in enumerate(ramps, start=1))
     ramp_supports = tuple(
@@ -548,6 +568,9 @@ DEFAULT_STAGE_SPECS = (
             ),
         ),
         landing_start_x=3.10,
-        landing_y_range=(-1.0, 1.0),
+        # Follow ramp two's redirected exit while retaining a margin from the
+        # terrain boundary. The previous centered landing forced an almost
+        # right-angle turn after the ramp and only touched one of its corners.
+        landing_y_range=(0.40, 1.80),
     ),
 )
