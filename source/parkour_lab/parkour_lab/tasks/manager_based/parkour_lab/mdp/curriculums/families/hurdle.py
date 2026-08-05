@@ -7,6 +7,8 @@ from . import _shared
 
 # Required ground distance from a hurdle's rear face to its landing waypoint.
 LANDING_MARGIN_M = 0.8
+APPROACH_MARGIN_M = 0.5
+FINAL_EXIT_X_M = 3.8
 
 
 def build_default_levels() -> tuple[ParkourLevelCfg, ...]:
@@ -49,17 +51,25 @@ def build_level(
         obstacle_depth=obstacle_depth,
         obstacle_position_xy=obstacle_position_xy,
     )
+    approach_x = hurdle_x_range[0] - APPROACH_MARGIN_M
     landing_x = hurdle_x_range[1] + LANDING_MARGIN_M
     landing_y = obstacle_position_xy[1]
 
     return ParkourLevelCfg(
         name=name,
         obstacle_family="hurdle",
-        # The only target is on ground beyond the rear face. Unlike the high
-        # step, the hurdle top is never declared as a traversable support.
+        # The hurdle top is never declared as traversable support. The landing
+        # event provides credit for clearing it; completion remains farther
+        # down-course so contact with the front face is a genuine stalled run.
         waypoints=(
+            ParkourWaypointCfg(position=(approach_x, landing_y, 0.01)),
             ParkourWaypointCfg(
                 position=(landing_x, landing_y, 0.01),
+                support_region_name="ground",
+                is_rewarded_milestone=True,
+            ),
+            ParkourWaypointCfg(
+                position=(FINAL_EXIT_X_M, landing_y, 0.01),
                 support_region_name="ground",
             ),
         ),

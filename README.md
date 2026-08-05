@@ -129,14 +129,15 @@ Terrain generation still iterates configured structures generically; it does
 not branch on a level number or obstacle family.
 
 The high-step family uses 1.6 m deep elevated platforms with vertical,
-ground-mounted front faces. Each final waypoint lies inside the annotated top
-surface, so completing the course means climbing and landing on the platform.
+ground-mounted front faces. A supported center-top waypoint credits the climb
+and landing, followed by a final target near the rear of the annotated top
+surface so completion also requires stable platform traversal.
 The hurdle family uses 0.18 m deep barriers spanning the full 4.0 m tile width,
 blocking every lateral path around an exposed end while the robot remains
 inside its assigned tile. Base-ground support remains continuous beneath and
-beyond each barrier, its top is not declared traversable, and its waypoint is
-on ground after the rear face. Heights increase within each family while
-remaining below the 0.5 m maximum.
+beyond each barrier, its top is not declared traversable, and a supported
+post-hurdle landing milestone precedes a later ground exit. Heights increase
+within each family while remaining below the 0.5 m maximum.
 
 Gap widths increase from 0.10 m to 0.50 m. Approach and landing supports stop
 at opposite gap lips, and the ordered route directs the robot onto the landing
@@ -208,13 +209,12 @@ remains authoritative in `TerrainImporter.terrain_levels`.
 Dense velocity shaping tracks the target symmetrically on the flat bootstrap
 and preserves capped positive acquisition on obstacle rows, while suppressing
 lateral motion in both cases. Faster obstacle motion remains available for
-takeoff. On the flat, a bounded overspeed penalty and the heading gate further
-discourage sprinting, while a small no-feet-contact penalty discourages repeated
-hopping. Standing still and moving backward receive negligible flat tracking
-reward and zero obstacle acquisition reward. Reward samples on the exact
-retarget step are masked so a marker jump is not mistaken for robot motion.
-Flat terrain disables feet-air-time shaping and obstacle-only leg, edge, and
-stumble penalties; small air-time shaping and the contact penalties activate
+takeoff. The symmetric speed kernel and heading gate discourage flat sprinting,
+while a small flat-only no-feet-contact penalty discourages repeated hopping.
+Standing still and moving backward receive negligible flat tracking reward and
+zero obstacle acquisition reward. Reward samples on the exact retarget step are
+masked so a marker jump is not mistaken for robot motion. Positive air-time
+shaping is disabled; obstacle-only leg, edge, and stumble penalties activate
 after promotion.
 Low-clearance error remains normalized to `[0, 1]` before its squared penalty.
 

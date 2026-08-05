@@ -462,8 +462,8 @@ class RewardsCfg:
     Task, safety, and motion-quality rewards for parkour locomotion.
 
     Flat rows track the commanded speed, while obstacle rows retain capped
-    forward acquisition. Flat-only overspeed, heading, and flight shaping
-    encourage a walking bootstrap without suppressing obstacle takeoff.
+    forward acquisition. Heading and a flat-only flight penalty encourage a
+    walking bootstrap without suppressing obstacle takeoff.
     One-shot physical milestones and completion bonuses make discrete progress
     unambiguous, while safety remains separate.
     """
@@ -476,16 +476,6 @@ class RewardsCfg:
             "asset_cfg": SceneEntityCfg("robot"),
             "flat_speed_std": 0.25,
             "std": 0.5,
-            "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
-        },
-    )
-
-    flat_overspeed = RewTerm(
-        func=mdp.flat_waypoint_overspeed_l2,
-        weight=-0.5,
-        params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "max_excess_ratio": 4.0,
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
         },
     )
@@ -507,17 +497,6 @@ class RewardsCfg:
     intermediate_milestone = RewTerm(
         func=mdp.intermediate_milestone_reward,
         weight=2.0,
-    )
-
-    feet_air_time = RewTerm(
-        func=mdp.feet_air_time,
-        weight=1.0,
-        params={
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
-            "threshold": 0.5,
-            "flat_weight": 0.0,
-            "obstacle_weight": 0.01,
-        },
     )
 
     flat_no_feet_contact = RewTerm(
@@ -561,13 +540,6 @@ class RewardsCfg:
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
     joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.0002)
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
-
-    # Posture regularization.
-    hip_deviation = RewTerm(
-        func=mdp.joint_deviation_l2,
-        weight=-0.002,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_hip_joint")},
-    )
 
     # Foot-placement quality.
     feet_edge = RewTerm(

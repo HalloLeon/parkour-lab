@@ -5,6 +5,10 @@ from __future__ import annotations
 from ..levels import ParkourDifficultyCfg, ParkourLevelCfg, ParkourSupportRegionCfg, ParkourWaypointCfg
 from . import _shared
 
+# Keep the final target safely inside the rear platform edge while extending
+# the route beyond the first supported landing.
+PLATFORM_EXIT_INSET_M = 0.15
+
 
 def build_default_levels() -> tuple[ParkourLevelCfg, ...]:
     """Build the flat bootstrap and all default high-step stages."""
@@ -46,17 +50,28 @@ def build_level(
     )
     platform_center_x, platform_center_y = obstacle_position_xy
     approach_x = platform_x_range[0] - 0.5
+    platform_exit_inset = min(PLATFORM_EXIT_INSET_M, 0.25 * obstacle_depth)
+    platform_exit_x = platform_x_range[1] - platform_exit_inset
 
     return ParkourLevelCfg(
         name=name,
         obstacle_family="high_step",
         waypoints=(
             ParkourWaypointCfg(position=(approach_x, platform_center_y, 0.01)),
-            # The final target lies well inside the top footprint. Reaching it
-            # requires climbing the front face and landing on the platform.
             ParkourWaypointCfg(
                 position=(
                     platform_center_x,
+                    platform_center_y,
+                    obstacle_height + 0.01,
+                ),
+                support_region_name="platform_top",
+                is_rewarded_milestone=True,
+            ),
+            # Completion lies later on the same support. This separates credit
+            # for the difficult climb/landing from stable platform traversal.
+            ParkourWaypointCfg(
+                position=(
+                    platform_exit_x,
                     platform_center_y,
                     obstacle_height + 0.01,
                 ),
