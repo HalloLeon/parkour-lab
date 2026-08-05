@@ -7,7 +7,7 @@
 
 Training records the observation, network, terrain, action, and timing metadata
 that determines teacher inference. Playback and distillation rebuild and
-compare that compact manifest before loading the checkpoint.
+compare the checkpoint-facing subset before loading the checkpoint.
 
 Only checkpoint-facing semantics are frozen. Critic inputs, unused observation
 groups, source code, and framework versions may change independently.
@@ -87,10 +87,19 @@ class TeacherCheckpoint:
         return asdict(self)
 
 
-def assert_teacher_interface_matches(expected: dict[str, object], actual: dict[str, object], *, context: str) -> None:
-    """Raise a readable error when a checkpoint-facing interface changed."""
+def _inference_interface(interface: dict[str, object]) -> dict[str, object]:
+    """Exclude exact course geometry from checkpoint compatibility."""
 
-    differences = _find_differences(expected, actual)
+    return {key: value for key, value in interface.items() if key != "terrain_curriculum"}
+
+
+def assert_teacher_interface_matches(expected: dict[str, object], actual: dict[str, object], *, context: str) -> None:
+    """Raise when the checkpoint-facing subset of the interface changed."""
+
+    differences = _find_differences(
+        _inference_interface(expected),
+        _inference_interface(actual),
+    )
     if not differences:
         return
 
@@ -108,7 +117,7 @@ def build_teacher_interface(
     observations: TensorDict,
     agent_cfg: RslRlBaseRunnerCfg,
 ) -> dict[str, object]:
-    """Describe only the inputs and outputs that determine teacher inference."""
+    """Describe the inputs, outputs, and training terrain of the teacher."""
 
     # RSL-RL concatenates these groups in order, so reordering equal-width
     # groups still changes the checkpoint interface.
@@ -175,7 +184,7 @@ def build_teacher_interface(
             "deployable_history_group": ADAPTATION_HISTORY_GROUP,
             "oracle_heading_group": ORACLE_HEADING_GROUP,
             "heading_representation": "yaw_aligned_unit_xy",
-            # Ordered routes are already frozen by ``terrain_curriculum.matrix``.
+            # Ordered routes are recorded by ``terrain_curriculum.matrix``.
             "oracle_heading_source": {
                 "kind": "active_course_waypoint",
                 "reach_threshold_m": float(curriculum_cfg.waypoint_reach_threshold),
@@ -236,7 +245,9 @@ def build_teacher_interface(
             "max_distance_m": float(scanner_cfg.max_distance),
             "update_period_s": float(scanner_cfg.update_period),
         },
-        # Support patches affect both collision geometry and privileged ray values.
+        # Keep the exact training domain for provenance. Compatibility checks
+        # intentionally exclude this field so the same policy can be evaluated
+        # on corrected or new course geometry.
         "terrain_curriculum": {
             "tile_size_m": _simple_value(terrain_generator_cfg.size),
             "ground_thickness_m": ground_thickness_m,

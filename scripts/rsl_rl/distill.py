@@ -247,6 +247,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
             runtime_teacher_interface,
             context="Online-distillation runtime",
         )
+        runtime_teacher_interface_hash = interface_sha256(runtime_teacher_interface)
+        if teacher_checkpoint.teacher_interface_sha256 != runtime_teacher_interface_hash:
+            print(
+                "[DISTILL] WARNING: Runtime terrain provenance differs from the teacher's "
+                "training domain; teacher labels are out-of-distribution."
+            )
         required_groups = tuple(
             dict.fromkeys((*TEACHER_OBSERVATION_GROUPS, *STUDENT_OBSERVATION_GROUPS))
         )
@@ -393,9 +399,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg) -> None:
                     "num_mini_batches": args_cli.num_mini_batches,
                 },
                 "training_scope": training_scope,
-                "teacher_runtime_interface_sha256": interface_sha256(
-                    runtime_teacher_interface
-                ),
+                "teacher_runtime_interface_sha256": runtime_teacher_interface_hash,
             },
         )
         dump_yaml(os.path.join(log_dir, "env.yaml"), env_cfg)

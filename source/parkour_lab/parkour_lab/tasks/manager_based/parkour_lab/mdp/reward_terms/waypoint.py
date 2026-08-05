@@ -97,15 +97,16 @@ def waypoint_velocity_tracking_exp(
     """Track flat target speed while preserving obstacle-speed acquisition.
 
     Flat rows use symmetric exponential tracking so the commanded speed is the
-    unique optimum. Obstacle rows retain the capped acquisition signal that
-    permits faster takeoff motion::
+    unique optimum. Obstacle rows retain a signed, capped acquisition signal:
+    faster takeoff motion is permitted, while motion away from the waypoint is
+    penalized instead of receiving zero reward::
 
         where(flat, exp(-(v_parallel - target_speed)^2 / flat_speed_std^2),
-                    clamp(v_parallel / target_speed, 0, 1))
+                    clamp(v_parallel / target_speed, -1, 1))
         * exp(-||v_perpendicular||^2 / std^2)
 
-    The term is bounded in ``[0, 1]`` and masks the one sample on which the route
-    switches to a waypoint that did not produce the current action.
+    The term is bounded in ``[-1, 1]`` and masks the one sample on which the
+    route switches to a waypoint that did not produce the current action.
 
     Returns:
         Tensor with shape ``(num_envs,)``.
@@ -132,7 +133,7 @@ def waypoint_velocity_tracking_exp(
     )
     forward_fraction = torch.clamp(
         velocity_along_waypoint / target_speed.clamp_min(torch.finfo(target_speed.dtype).eps),
-        min=0.0,
+        min=-1.0,
         max=1.0,
     )
     flat_tracking = torch.exp(-(velocity_along_waypoint - target_speed).square() / float(flat_speed_std) ** 2)

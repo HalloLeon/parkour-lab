@@ -71,10 +71,12 @@ PPO can reduce exploration once the deterministic motor acquires its gait.
 
 New checkpoints store the per-environment curriculum frontier, rolling evidence,
 and demotion grace alongside RSL-RL's learner state. `--resume` restores that
-memory and starts fresh episodes sampled from the restored frontier. Checkpoints
-created before this state was added remain compatible and conservatively use the
-configured bootstrap rows. Fixed `Parkour-Lab-Play-v0` evaluation remains pinned
-to its requested matrix cell and is not changed by this training behavior.
+memory only when the checkpoint and runtime full teacher-interface hashes match,
+then starts fresh episodes sampled from the restored frontier. Changed geometry
+still permits weight/optimizer fine-tuning but restarts curriculum memory from
+the configured bootstrap rows. Checkpoints created before curriculum state was
+added use the same conservative fallback. Fixed `Parkour-Lab-Play-v0`
+evaluation remains pinned to its requested matrix cell.
 After promotion grace, training keeps 75% of eligible environments at their
 frontier, replays its immediate predecessor in 15%, and anchors the shared flat
 bootstrap in 10%. At frontier one, both replay choices resolve to level zero.
@@ -222,8 +224,8 @@ The teacher-interface manifest is version 13. Version 4 introduced complete
 declarative terrain courses because physical support segmentation changes the
 privileged ray values seen by the teacher. Version 5 replaces horizontal-only
 support metadata with ordered planar XYZ boundaries, making the banked ramp
-surfaces and their safety edges part of the frozen checkpoint interface.
-Version 6 freezes the complete obstacle-family by difficulty matrix. Version 7
+surfaces and their safety edges part of the recorded training provenance.
+Version 6 records the complete obstacle-family by difficulty matrix. Version 7
 separates training-only noise, delay, and corruption switches from the
 deterministic checkpoint inference interface. Version 8 records the modular
 privileged scan encoder, fixed terrain latent, transferable motor actor, and
@@ -236,7 +238,12 @@ radius-or-plane transitions, and the former final-only proximity dwell. Version
 12 removes that dwell and standardizes navigation names around active and final
 waypoints. Version 13 records fixed per-term observation scaling, named support
 targets with contact-gated physical milestones, stable crash-free completion,
-and the revised flat and tilted-ramp curriculum geometry.
+and the revised flat and tilted-ramp curriculum geometry. The complete v13
+manifest and its hash remain the exact training provenance. Playback and
+distillation compare a projected inference contract that ignores only
+`terrain_curriculum`: observation, scanner, network, action, waypoint-protocol,
+and timing mismatches remain fatal, while course-geometry changes emit an
+out-of-distribution warning without making compatible weights unloadable.
 
 ## Phase 1 observation architecture
 
@@ -392,11 +399,13 @@ The distillation pipeline accepts the exact teacher checkpoint directly.
 Teacher training writes the compact `params/teacher_interface.json` manifest
 beside its checkpoints. Distillation hashes the requested checkpoint, validates
 that manifest, and reconstructs the runtime interface before loading the
-policy. The manifest covers only checkpoint-facing semantics: actor observation
-order and dimensions, normalization, terrain preprocessing, action order and
-scaling, and control timing. It deliberately excludes critic details, unused
-observation groups, framework versions, and source-code hashes so unrelated
-extensions and behavior-preserving refactors do not invalidate a teacher.
+policy. The complete manifest retains the exact terrain curriculum as training
+provenance. Its hard compatibility projection ignores only
+`terrain_curriculum`; a changed course therefore emits an out-of-distribution
+warning while actor observation order and dimensions, normalization,
+terrain-scan encoding, action order and scaling, waypoint protocol, and control
+timing remain strict. Critic details, unused observation groups, framework
+versions, and source-code hashes remain outside the contract.
 
 Use `play.py` independently to compare promising checkpoints under identical
 fixed evaluation conditions. After choosing one from those results, pass its

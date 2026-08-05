@@ -183,10 +183,7 @@ from parkour_lab.learning.distillation.teacher.rsl_rl import (
     register_rsl_rl_teacher_actor_critic,
 )
 from parkour_lab.tasks.manager_based.parkour_lab.mdp.commands import get_target_speed
-from parkour_lab.tasks.manager_based.parkour_lab.mdp.navigation import geometry
-from parkour_lab.tasks.manager_based.parkour_lab.mdp.navigation.route import (
-    last_episode_max_course_progress_m,
-)
+from parkour_lab.tasks.manager_based.parkour_lab.mdp.navigation import geometry, route
 from rsl_rl.runners import OnPolicyRunner
 from tensordict import TensorDict
 
@@ -202,10 +199,14 @@ class _EvaluationSummary(TypedDict):
     mean_episode_length_steps: float | None
     mean_episode_length_seconds: float | None
     mean_max_course_progress_m: float | None
+    mean_max_waypoints_reached: float | None
+    mean_max_waypoint_fraction: float | None
     mean_forward_speed_m_s: float | None
     mean_overspeed_ratio: float | None
     rms_vertical_velocity_m_s: float | None
     all_feet_airborne_fraction: float | None
+    mean_feet_edge_contacts_per_step: float | None
+    mean_undesired_leg_contacts_per_step: float | None
 
 
 class _EvaluationReport(TypedDict):
@@ -309,10 +310,14 @@ class _RolloutResult:
     fell_below_course_count: int = 0
     timeout_count: int = 0
     max_course_progress_m_sum: float = 0.0
+    max_waypoints_reached_sum: float = 0.0
+    max_waypoint_fraction_sum: float = 0.0
     forward_speed_m_s_sum: float = 0.0
     overspeed_ratio_sum: float = 0.0
     vertical_velocity_squared_m2_s2_sum: float = 0.0
     all_feet_airborne_sum: float = 0.0
+    feet_edge_contacts_sum: float = 0.0
+    undesired_leg_contacts_sum: float = 0.0
 
     def record_completed(
         self,
@@ -322,6 +327,8 @@ class _RolloutResult:
         episode_lengths: torch.Tensor,
         outcomes: dict[str, torch.Tensor],
         episode_max_course_progress_m: torch.Tensor,
+        episode_max_waypoints_reached: torch.Tensor,
+        episode_waypoint_counts: torch.Tensor,
         episode_gait_sums: dict[str, torch.Tensor],
     ) -> None:
         """Accumulate newly completed episodes, capped at the requested total."""
@@ -339,12 +346,22 @@ class _RolloutResult:
         self.fell_below_course_count += int(outcomes["fell_below_course"][completed_indices].sum().item())
         self.timeout_count += int(outcomes["timeout"][completed_indices].sum().item())
         self.max_course_progress_m_sum += float(episode_max_course_progress_m[completed_indices].sum().item())
+        reached = episode_max_waypoints_reached[completed_indices]
+        waypoint_counts = episode_waypoint_counts[completed_indices]
+        self.max_waypoints_reached_sum += float(reached.sum().item())
+        self.max_waypoint_fraction_sum += float((reached / waypoint_counts).sum().item())
         self.forward_speed_m_s_sum += float(episode_gait_sums["forward_speed_m_s"][completed_indices].sum().item())
         self.overspeed_ratio_sum += float(episode_gait_sums["overspeed_ratio"][completed_indices].sum().item())
         self.vertical_velocity_squared_m2_s2_sum += float(
             episode_gait_sums["vertical_velocity_squared_m2_s2"][completed_indices].sum().item()
         )
         self.all_feet_airborne_sum += float(episode_gait_sums["all_feet_airborne"][completed_indices].sum().item())
+        self.feet_edge_contacts_sum += float(
+            episode_gait_sums["feet_edge_contacts"][completed_indices].sum().item()
+        )
+        self.undesired_leg_contacts_sum += float(
+            episode_gait_sums["undesired_leg_contacts"][completed_indices].sum().item()
+        )
 
     def summary(self, step_dt: float) -> _EvaluationSummary:
         """Return aggregate means and rates for the completed episodes."""
@@ -359,10 +376,14 @@ class _RolloutResult:
                 "mean_episode_length_steps": None,
                 "mean_episode_length_seconds": None,
                 "mean_max_course_progress_m": None,
+                "mean_max_waypoints_reached": None,
+                "mean_max_waypoint_fraction": None,
                 "mean_forward_speed_m_s": None,
                 "mean_overspeed_ratio": None,
                 "rms_vertical_velocity_m_s": None,
                 "all_feet_airborne_fraction": None,
+                "mean_feet_edge_contacts_per_step": None,
+                "mean_undesired_leg_contacts_per_step": None,
             }
 
         count = self.completed_episodes
@@ -377,10 +398,14 @@ class _RolloutResult:
             "mean_episode_length_steps": mean_length_steps,
             "mean_episode_length_seconds": mean_length_steps * step_dt,
             "mean_max_course_progress_m": self.max_course_progress_m_sum / count,
+            "mean_max_waypoints_reached": self.max_waypoints_reached_sum / count,
+            "mean_max_waypoint_fraction": self.max_waypoint_fraction_sum / count,
             "mean_forward_speed_m_s": self.forward_speed_m_s_sum / step_count,
             "mean_overspeed_ratio": self.overspeed_ratio_sum / step_count,
             "rms_vertical_velocity_m_s": (self.vertical_velocity_squared_m2_s2_sum / step_count) ** 0.5,
             "all_feet_airborne_fraction": self.all_feet_airborne_sum / step_count,
+            "mean_feet_edge_contacts_per_step": self.feet_edge_contacts_sum / step_count,
+            "mean_undesired_leg_contacts_per_step": self.undesired_leg_contacts_sum / step_count,
         }
 
 
@@ -726,11 +751,18 @@ def _print_evaluation_summary(report: _EvaluationReport, report_path: str) -> No
     print(f"  Mean episode length (steps): {format_metric(summary['mean_episode_length_steps'])}")
     print(f"  Mean episode length (seconds): {format_metric(summary['mean_episode_length_seconds'])}")
     print(f"  Mean maximum course progress (m): {format_metric(summary['mean_max_course_progress_m'])}")
+    print(f"  Mean maximum waypoints reached: {format_metric(summary['mean_max_waypoints_reached'])}")
+    print(f"  Mean maximum waypoint fraction: {format_metric(summary['mean_max_waypoint_fraction'], rate=True)}")
     print(f"  Mean forward speed (m/s): {format_metric(summary['mean_forward_speed_m_s'])}")
     print(f"  Mean overspeed ratio: {format_metric(summary['mean_overspeed_ratio'], rate=True)}")
     print(f"  RMS vertical velocity (m/s): {format_metric(summary['rms_vertical_velocity_m_s'])}")
     airborne_fraction = format_metric(summary["all_feet_airborne_fraction"], rate=True)
     print(f"  All-feet-airborne fraction: {airborne_fraction}")
+    print(f"  Mean feet-edge contacts per step: {format_metric(summary['mean_feet_edge_contacts_per_step'])}")
+    print(
+        "  Mean undesired-leg contacts per step: "
+        f"{format_metric(summary['mean_undesired_leg_contacts_per_step'])}"
+    )
     print(f"  Metrics: {report_path}")
 
 
@@ -767,6 +799,12 @@ def _collect_rollout_statistics(
     step_dt = env.unwrapped.step_dt
     episode_returns = torch.zeros(env.num_envs, device=env.unwrapped.device, dtype=torch.float32)
     episode_lengths = torch.zeros(env.num_envs, device=env.unwrapped.device, dtype=torch.long)
+    episode_max_waypoints_reached = torch.zeros(
+        env.num_envs,
+        device=env.unwrapped.device,
+        dtype=torch.long,
+    )
+    episode_waypoint_counts = route.active_waypoint_counts(env.unwrapped)
     episode_gait_sums = {
         name: torch.zeros_like(episode_returns)
         for name in (
@@ -774,6 +812,8 @@ def _collect_rollout_statistics(
             "overspeed_ratio",
             "vertical_velocity_squared_m2_s2",
             "all_feet_airborne",
+            "feet_edge_contacts",
+            "undesired_leg_contacts",
         )
     }
     rollout = _RolloutResult()
@@ -782,7 +822,14 @@ def _collect_rollout_statistics(
         start_time = time.time()
         with torch.inference_mode():
             actions = policy(observations)
+            active_waypoint_indices = route.active_waypoint_indices(env.unwrapped)
+            episode_waypoint_counts = route.active_waypoint_counts(env.unwrapped)
+            episode_max_waypoints_reached = torch.maximum(
+                episode_max_waypoints_reached,
+                active_waypoint_indices,
+            )
             gait_step = _read_gait_step_metrics(env.unwrapped)
+            contact_step = _read_contact_step_metrics(env.unwrapped)
             # Advance every parallel environment and return its next observations,
             # per-environment reward, episode-completion flags, and auxiliary data.
             observations, rewards, dones, _ = env.step(actions)
@@ -794,8 +841,15 @@ def _collect_rollout_statistics(
         episode_lengths += 1
         for name, values in gait_step.items():
             episode_gait_sums[name] += values
+        for name, values in contact_step.items():
+            episode_gait_sums[name] += values
         outcomes = _read_termination_outcomes(env.unwrapped, done_mask)
-        episode_max_course_progress_m = last_episode_max_course_progress_m(env.unwrapped)
+        episode_max_waypoints_reached = torch.where(
+            outcomes["success"],
+            episode_waypoint_counts,
+            episode_max_waypoints_reached,
+        )
+        episode_max_course_progress_m = route.last_episode_max_course_progress_m(env.unwrapped)
         rollout.record_completed(
             args_cli.eval_episodes,
             done_mask,
@@ -803,10 +857,13 @@ def _collect_rollout_statistics(
             episode_lengths,
             outcomes,
             episode_max_course_progress_m,
+            episode_max_waypoints_reached,
+            episode_waypoint_counts,
             episode_gait_sums,
         )
         episode_returns[done_mask] = 0.0
         episode_lengths[done_mask] = 0
+        episode_max_waypoints_reached[done_mask] = 0
         for values in episode_gait_sums.values():
             values[done_mask] = 0.0
 
@@ -836,6 +893,25 @@ def _read_gait_step_metrics(base_env: ManagerBasedRLEnv | DirectRLEnv) -> dict[s
         / target_speed.clamp_min(torch.finfo(target_speed.dtype).eps),
         "vertical_velocity_squared_m2_s2": vertical_velocity.square(),
         "all_feet_airborne": all_feet_airborne.to(dtype=forward_speed.dtype),
+    }
+
+
+def _read_contact_step_metrics(base_env: ManagerBasedRLEnv | DirectRLEnv) -> dict[str, torch.Tensor]:
+    """Read raw diagnostic contact counts using the active reward configuration."""
+
+    if not isinstance(base_env, ManagerBasedRLEnv):
+        raise TypeError("Parkour contact metrics require a ManagerBasedRLEnv.")
+
+    def raw_reward_term(name: str) -> torch.Tensor:
+        term_cfg = base_env.reward_manager.get_term_cfg(name)
+        values = term_cfg.func(base_env, **term_cfg.params)
+        if values.shape != (base_env.num_envs,):
+            raise ValueError(f"Reward term '{name}' must return one value per environment.")
+        return values
+
+    return {
+        "feet_edge_contacts": raw_reward_term("feet_edge"),
+        "undesired_leg_contacts": raw_reward_term("leg_contact"),
     }
 
 
@@ -941,6 +1017,11 @@ def _validate_teacher_interface(
         teacher_interface,
         context="Fixed-evaluation runtime",
     )
+    if teacher_checkpoint.teacher_interface_sha256 != teacher_interface_hash:
+        print(
+            "[WARNING] Evaluation terrain provenance differs from the teacher's training domain; "
+            "loading is safe, but the result is out-of-distribution."
+        )
     return _InterfaceInfo(teacher_interface, teacher_interface_hash)
 
 

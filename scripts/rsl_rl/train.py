@@ -97,8 +97,10 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 from parkour_lab.learning.distillation.contracts import (
     TEACHER_OBSERVATION_GROUPS,
+    assert_teacher_interface_matches,
     build_teacher_interface,
     interface_sha256,
+    load_teacher_checkpoint,
     write_json,
 )
 from parkour_lab.learning.distillation.teacher.rsl_rl import (
@@ -278,9 +280,8 @@ def main(
         clip_actions=agent_cfg.clip_actions,
     )
 
-    # Record the compact actor interface needed to load future teacher
-    # checkpoints safely. Unused environment details remain intentionally
-    # outside this manifest so the codebase can evolve independently.
+    # Record the actor interface and exact training terrain in one manifest.
+    teacher_interface = None
     if tuple(agent_cfg.obs_groups.get("policy", ())) == TEACHER_OBSERVATION_GROUPS:
         teacher_interface = build_teacher_interface(env.unwrapped, env.get_observations(), agent_cfg)
         write_json(
@@ -289,6 +290,18 @@ def main(
                 "teacher_interface": teacher_interface,
                 "teacher_interface_sha256": interface_sha256(teacher_interface),
             },
+        )
+
+    resume_manifest_matches = True
+    if agent_cfg.resume and teacher_interface is not None:
+        resume_checkpoint = load_teacher_checkpoint(resume_path)
+        assert_teacher_interface_matches(
+            resume_checkpoint.teacher_interface,
+            teacher_interface,
+            context="PPO resume runtime",
+        )
+        resume_manifest_matches = (
+            resume_checkpoint.teacher_interface_sha256 == interface_sha256(teacher_interface)
         )
 
     # This script trains PPO teachers. The task-specific student uses
@@ -305,10 +318,13 @@ def main(
     if agent_cfg.resume:
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         checkpoint_infos = runner.load(resume_path)
-        if _restore_parkour_curriculum(env, checkpoint_infos):
+        if resume_manifest_matches and _restore_parkour_curriculum(env, checkpoint_infos):
             print("[INFO] Restored adaptive parkour curriculum state.")
         elif _parkour_curriculum_term(env.unwrapped) is not None:
-            print("[WARNING] Checkpoint has no parkour curriculum state; using the configured bootstrap rows.")
+            print(
+                "[WARNING] Checkpoint curriculum is missing or belongs to a different terrain; "
+                "using the configured bootstrap rows."
+            )
 
     # Save the resolved configurations with the checkpoints.
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

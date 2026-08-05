@@ -227,6 +227,8 @@ def build_level(
     anchor_ramp = ramps[0]
     anchor_direction_x, anchor_direction_y = anchor_ramp.travel_direction_xy
     anchor_start = anchor_ramp.centerline_start
+    if anchor_start[0] <= _APPROACH_END_X_M:
+        raise ValueError("The first ramp centerline must begin beyond approach ground.")
 
     # The 0.25 m value is a fixed route-design offset, not a quantity derived
     # from the ramp dimensions. Moving opposite the anchor ramp's unit travel
@@ -367,6 +369,12 @@ def _difficulty_parameters(
     frame, not the endpoints' Euclidean distance or the minimum clearance
     between the rotated collision meshes. The perpendicular projection in that
     same local frame is reported as ``lateral_offset_from_previous_m``.
+
+    ``ramp_1_entry_lip_height_m`` is the highest point on the first ramp's
+    leading top edge. ``ramp_1_approach_overlap_m`` records how far that edge
+    extends back over the approach patch in world X. Together these values
+    make the asymmetric first contact of a banked, yawed ramp explicit in
+    evaluation metadata.
     """
 
     parameters: dict[str, float] = {}
@@ -404,6 +412,20 @@ def _difficulty_parameters(
                 delta_x * previous_left_x + delta_y * previous_left_y,
                 12,
             )
+
+    first_entry_edge = (ramps[0].top_corners[0], ramps[0].top_corners[-1])
+    parameters.update(
+        {
+            "ramp_1_entry_lip_height_m": round(
+                max(corner[2] for corner in first_entry_edge),
+                12,
+            ),
+            "ramp_1_approach_overlap_m": round(
+                max(0.0, _APPROACH_END_X_M - min(corner[0] for corner in first_entry_edge)),
+                12,
+            ),
+        }
+    )
 
     landing_x_min, landing_x_max = landing_x_range
     landing_y_min, landing_y_max = landing_y_range
@@ -489,47 +511,21 @@ DEFAULT_STAGE_SPECS = (
         landing_start_x=2.60,
         landing_y_range=(-1.0, 1.0),
     ),
-    # Obstacle stage 2 / curriculum row 3: preserve the aligned geometry while
-    # introducing an inter-ramp gap.
-    TiltedRampStageSpec(
-        sequence_anchor_xy=(1.05, 0.0),
-        ramps=(
-            RampSpec(
-                length=0.90,
-                width=1.60,
-                incline_degrees=3.0,
-                yaw_degrees=0.0,
-            ),
-            RampSpec(
-                length=1.10,
-                width=1.60,
-                incline_degrees=3.0,
-                yaw_degrees=0.0,
-            ),
-        ),
-        transitions=(
-            RampTransitionSpec(
-                gap=0.12,
-                lateral_offset=0.0,
-            ),
-        ),
-        landing_start_x=2.72,
-        landing_y_range=(-1.0, 1.0),
-    ),
-    # Obstacle stage 3 / curriculum row 4: add yaw and lateral redirection.
+    # Obstacle stage 2 / curriculum row 3: introduce a mild opposing bank,
+    # inter-ramp gap, and lateral redirection together at wide support width.
     TiltedRampStageSpec(
         sequence_anchor_xy=(1.05, -0.15),
         ramps=(
             RampSpec(
                 length=0.90,
                 width=1.60,
-                incline_degrees=3.0,
+                incline_degrees=4.0,
                 yaw_degrees=4.0,
             ),
             RampSpec(
                 length=1.10,
                 width=1.60,
-                incline_degrees=3.0,
+                incline_degrees=-4.0,
                 yaw_degrees=14.0,
             ),
         ),
@@ -541,6 +537,34 @@ DEFAULT_STAGE_SPECS = (
         ),
         landing_start_x=2.72,
         landing_y_range=(-1.0, 1.20),
+    ),
+    # Obstacle stage 3 / curriculum row 4: bridge the wide mild row to the
+    # hardest row by increasing the opposing banks and redirection while only
+    # moderately narrowing both supports.
+    TiltedRampStageSpec(
+        sequence_anchor_xy=(1.10, -0.10),
+        ramps=(
+            RampSpec(
+                length=0.90,
+                width=1.25,
+                incline_degrees=7.0,
+                yaw_degrees=7.0,
+            ),
+            RampSpec(
+                length=1.10,
+                width=1.25,
+                incline_degrees=-7.0,
+                yaw_degrees=23.0,
+            ),
+        ),
+        transitions=(
+            RampTransitionSpec(
+                gap=0.16,
+                lateral_offset=0.28,
+            ),
+        ),
+        landing_start_x=2.88,
+        landing_y_range=(0.0, 1.60),
     ),
     # Obstacle stage 4 / curriculum row 5: combine narrow supports, stronger
     # opposing banks, a larger gap, and a sharper inter-ramp redirection. Keep
