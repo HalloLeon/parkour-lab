@@ -499,15 +499,6 @@ class RewardsCfg:
         weight=2.0,
     )
 
-    no_feet_contact = RewTerm(
-        func=mdp.desired_contacts,
-        weight=-0.05,
-        params={
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
-            "threshold": 1.0,
-        },
-    )
-
     # Safety.
     base_clearance_below = RewTerm(
         func=mdp.base_clearance_below_l2,

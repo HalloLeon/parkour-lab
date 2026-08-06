@@ -212,13 +212,12 @@ Dense velocity shaping tracks the target symmetrically on the flat bootstrap
 and preserves capped positive acquisition on obstacle rows, while suppressing
 lateral motion in both cases. Faster obstacle motion remains available for
 takeoff. The symmetric speed kernel and heading gate discourage flat sprinting,
-while a light global no-feet-contact penalty discourages gratuitous flight
-without making takeoff prohibitively expensive.
+without constraining the airborne phases needed to clear obstacles.
 Standing still and moving backward receive negligible flat tracking reward and
 zero obstacle acquisition reward. Reward samples on the exact retarget step are
 masked so a marker jump is not mistaken for robot motion. Positive air-time
-shaping is disabled; leg-contact, edge, slide, and stumble penalties use the
-same semantics on every terrain row.
+and no-feet-contact shaping are disabled; leg-contact, edge, slide, and stumble
+penalties use the same semantics on every terrain row.
 Low-clearance error remains normalized to `[0, 1]` before its squared penalty.
 
 The teacher-interface manifest is version 13. Version 4 introduced complete
