@@ -46,7 +46,7 @@ def _obstacle_speed_cap(
     waypoint_marker_cfg: SceneEntityCfg,
     asset_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
-    """Return a phase-local obstacle speed ceiling above the base command."""
+    """Return the phase-local obstacle acquisition target and ceiling."""
 
     waypoint_distance = geometry._active_waypoint_distance_xy(
         env,
@@ -144,18 +144,17 @@ def waypoint_velocity_tracking_exp(
     """Track cruise speed while allowing bounded obstacle-speed adaptation.
 
     Flat rows use symmetric exponential tracking around the base command. On
-    obstacle rows, the same command remains the preferred cruise speed while a
-    ceiling ramps up near an approach waypoint, stays active while a rewarded
-    landing milestone is targeted, and returns to the command after supported
-    landing. Speed inside this envelope receives no extra dense reward;
-    normalized excess above the applicable ceiling is subtracted::
+    obstacle rows, the acquisition target ramps above that command near an
+    approach waypoint, stays active while a rewarded landing milestone is
+    targeted, and returns to the command after supported landing. The same
+    phase-local value caps overspeed::
 
         flat = exp(-(v_parallel - command)^2 / flat_speed_std^2)
                * exp(-||v_perpendicular||^2 / std^2)
                - relu((v_parallel - command) / command)^2
-        obstacle = clamp(v_parallel / command, -1, 1)
+        obstacle = clamp(v_parallel / phase_target, -1, 1)
                    * exp(-||v_perpendicular||^2 / std^2)
-                   - relu((v_parallel - speed_cap) / command)^2
+                   - relu((v_parallel - phase_target) / command)^2
 
     Normalized overspeed is capped only as a numerical guard, leaving the term
     bounded in ``[-16, 1]`` without making ordinary sprinting saturate at the
@@ -190,11 +189,6 @@ def waypoint_velocity_tracking_exp(
         dtype=root_velocity_xy.dtype,
     )
     normalization_speed = target_speed.clamp_min(torch.finfo(target_speed.dtype).eps)
-    forward_fraction = torch.clamp(
-        velocity_along_waypoint / normalization_speed,
-        min=-1.0,
-        max=1.0,
-    )
     flat_tracking = torch.exp(-(velocity_along_waypoint - target_speed).square() / float(flat_speed_std) ** 2)
     lateral_alignment = torch.exp(-torch.sum(lateral_velocity_xy.square(), dim=-1) / float(std) ** 2)
     obstacle_mask = route.active_difficulty_indices(env) > 0
@@ -207,13 +201,18 @@ def waypoint_velocity_tracking_exp(
         waypoint_marker_cfg=waypoint_marker_cfg,
         asset_cfg=asset_cfg,
     )
+    obstacle_forward_fraction = torch.clamp(
+        velocity_along_waypoint / speed_cap.clamp_min(torch.finfo(speed_cap.dtype).eps),
+        min=-1.0,
+        max=1.0,
+    )
     normalized_overspeed = torch.clamp(
         torch.relu(velocity_along_waypoint - speed_cap) / normalization_speed,
         max=_MAX_NORMALIZED_OVERSPEED,
     )
     tracking = torch.where(
         obstacle_mask,
-        forward_fraction * lateral_alignment,
+        obstacle_forward_fraction * lateral_alignment,
         flat_tracking * lateral_alignment,
     )
     return _mask_waypoint_change(

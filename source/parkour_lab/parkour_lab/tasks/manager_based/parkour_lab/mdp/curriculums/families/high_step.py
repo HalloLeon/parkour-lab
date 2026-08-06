@@ -17,7 +17,10 @@ def build_default_levels() -> tuple[ParkourLevelCfg, ...]:
         build_level(
             name=f"high_step_difficulty_{obstacle_stage_index}",
             difficulty_order=float(obstacle_stage_index + 1),
-            obstacle_height=round(0.08 + 0.04 * obstacle_stage_index, 2),
+            # Begin below ordinary swing clearance so accidental early
+            # successes can teach progressively higher foot placement while
+            # retaining the original 0.24 m final difficulty.
+            obstacle_height=round(0.04 + 0.05 * obstacle_stage_index, 2),
             obstacle_width=1.8,
             obstacle_depth=1.6,
             obstacle_position_xy=(2.8, 0.0),

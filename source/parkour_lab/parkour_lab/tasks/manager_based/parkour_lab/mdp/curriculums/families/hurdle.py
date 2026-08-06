@@ -18,7 +18,9 @@ def build_default_levels() -> tuple[ParkourLevelCfg, ...]:
         build_level(
             name=f"hurdle_difficulty_{obstacle_stage_index}",
             difficulty_order=float(obstacle_stage_index + 1),
-            obstacle_height=round(0.06 + 0.03 * obstacle_stage_index, 2),
+            # Start with a barrier that the bootstrap gait can discover, then
+            # retain the original 0.18 m final difficulty.
+            obstacle_height=round(0.03 + 0.0375 * obstacle_stage_index, 2),
             # Span the full tile so a policy cannot walk around either end while
             # remaining inside its assigned course tile.
             obstacle_width=_shared.TERRAIN_Y_RANGE_M[1] - _shared.TERRAIN_Y_RANGE_M[0],
