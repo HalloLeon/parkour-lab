@@ -360,8 +360,9 @@ class ParkourLevelCfg:
     # of existing structure geometry and may be inclined convex polygons.
     support_regions: tuple[ParkourSupportRegionCfg, ...]
 
-    # Desired velocity toward the active waypoint in meters per second. It is
-    # exposed as a command and normalizes waypoint-directed velocity reward.
+    # Nominal desired velocity in meters per second. Adaptive training samples
+    # its live command independently; fixed evaluation retains this value when
+    # no explicit speed override is supplied.
     target_speed: float
 
     # Required robot-base clearance above the terrain in meters. Safety,

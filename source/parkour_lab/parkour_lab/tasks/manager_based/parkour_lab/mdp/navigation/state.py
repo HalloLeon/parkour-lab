@@ -44,9 +44,8 @@ class CourseTables:
     support_vertex_counts: torch.Tensor
     support_vertices: torch.Tensor
 
-    # Course commands.
+    # Course constraints.
     min_clearances: torch.Tensor
-    target_speeds: torch.Tensor
 
 
 @dataclass(slots=True)
@@ -64,6 +63,9 @@ class RouteState:
     # valid cursor range.
     course_indices: torch.Tensor
     active_waypoint_indices: torch.Tensor
+
+    # Episode command sampled independently of the selected course.
+    target_speeds: torch.Tensor
 
     # Cross-step crossing and progress history.
     previous_root_xy: torch.Tensor
@@ -93,6 +95,7 @@ def _ensure_parkour_runtime(
     curriculum_cfg: ParkourCurriculumCfg,
     *,
     dtype: torch.dtype,
+    initial_target_speed: float,
 ) -> ParkourRuntime:
     """Build the grouped runtime once and rebuild it only for a stale layout."""
 
@@ -110,7 +113,11 @@ def _ensure_parkour_runtime(
         curriculum_cfg,
         dtype=dtype,
     )
-    route = _build_route_state(env, dtype=dtype)
+    route = _build_route_state(
+        env,
+        dtype=dtype,
+        initial_target_speed=initial_target_speed,
+    )
     runtime = ParkourRuntime(courses=courses, route=route)
 
     # Assign the sole environment-level navigation attribute last. A failed
@@ -298,11 +305,6 @@ def _build_course_tables(
             device=env.device,
             dtype=dtype,
         ),
-        target_speeds=torch.tensor(
-            [course.target_speed for course in courses],
-            device=env.device,
-            dtype=dtype,
-        ),
     )
 
 
@@ -310,6 +312,7 @@ def _build_route_state(
     env: ManagerBasedRLEnv,
     *,
     dtype: torch.dtype,
+    initial_target_speed: float,
 ) -> RouteState:
     """Allocate fresh mutable route state for every environment."""
 
@@ -328,6 +331,12 @@ def _build_route_state(
     return RouteState(
         course_indices=integer_zeros,
         active_waypoint_indices=integer_zeros.clone(),
+        target_speeds=torch.full(
+            (env.num_envs,),
+            initial_target_speed,
+            device=env.device,
+            dtype=dtype,
+        ),
         previous_root_xy=torch.zeros(
             (env.num_envs, 2),
             device=env.device,
@@ -367,6 +376,7 @@ def _runtime_matches(
     device = torch.device(env.device)
     waypoint_changed = getattr(route, "waypoint_changed", None)
     course_completed = getattr(route, "course_completed", None)
+    target_speeds = getattr(route, "target_speeds", None)
     root_reach_radii = getattr(courses, "root_reach_radii", None)
     terminal_landing_masks = getattr(courses, "terminal_landing_masks", None)
     return (
@@ -384,6 +394,10 @@ def _runtime_matches(
         and terminal_landing_masks.dtype == torch.bool
         and route.course_indices.shape == (env.num_envs,)
         and route.course_indices.device == device
+        and isinstance(target_speeds, torch.Tensor)
+        and target_speeds.shape == (env.num_envs,)
+        and target_speeds.device == device
+        and target_speeds.dtype == dtype
         and route.previous_root_xy.shape == (env.num_envs, 2)
         and route.previous_root_xy.device == device
         and route.previous_root_xy.dtype == dtype

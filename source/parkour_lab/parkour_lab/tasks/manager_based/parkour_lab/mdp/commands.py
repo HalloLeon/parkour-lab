@@ -17,6 +17,6 @@ def get_target_speed(
     env: ManagerBasedRLEnv,
     default: float = 0.70,
 ) -> torch.Tensor:
-    """Return the active course's target speed for every environment."""
+    """Return the episode's desired speed for every environment."""
 
     return route.current_target_speeds(env, default=default)

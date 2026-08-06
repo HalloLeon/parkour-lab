@@ -28,6 +28,7 @@ def reset_routes(
     curriculum_cfg: curriculums_config.ParkourCurriculumCfg = curriculums_config.DEFAULT_PARKOUR_CURRICULUM,
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_speed_range: tuple[float, float] = (0.45, 0.70),
 ) -> None:
     curriculums.reset_routes(
         env=env,
@@ -36,4 +37,5 @@ def reset_routes(
         curriculum_cfg=curriculum_cfg,
         waypoint_marker_cfg=waypoint_marker_cfg,
         asset_cfg=asset_cfg,
+        target_speed_range=target_speed_range,
     )

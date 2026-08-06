@@ -4,6 +4,8 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import math
+
 import isaaclab.sim as sim_utils
 from isaaclab.assets import ArticulationCfg, AssetBaseCfg, RigidObjectCfg
 from isaaclab.envs import ManagerBasedRLEnvCfg, ViewerCfg
@@ -422,6 +424,7 @@ class EventsCfg:
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "curriculum_cfg": PARKOUR_CURRICULUM,
+            "target_speed_range": (0.45, 0.70),
             "terrain_layout": DEFAULT_TERRAIN_LAYOUT,
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
         },
@@ -629,6 +632,10 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
     # ``wide`` perturbations on resumed runs.
     domain_randomization: mdp.DomainRandomizationCfg = mdp.DomainRandomizationCfg()
 
+    # Sample one deployable scalar speed command at each episode reset. This
+    # distribution is deliberately independent of terrain family and level.
+    desired_speed_range: tuple[float, float] = (0.45, 0.70)
+
     # Scene settings.
     scene: ParkourLabSceneCfg = ParkourLabSceneCfg(num_envs=4096, env_spacing=8.0)
     viewer: ViewerCfg = ViewerCfg(
@@ -651,6 +658,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
     # None during adaptive training; fixed evaluation selects both matrix axes.
     evaluation_family: str | None = None
     evaluation_level: int | None = None
+    evaluation_desired_speed: float | None = None
 
     # Post initialization.
     def __post_init__(self) -> None:
@@ -749,6 +757,25 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         self.synchronize_curriculum_config()
         self.synchronize_domain_randomization_config()
 
+    def set_evaluation_speed(self, speed: float) -> None:
+        """Set one deterministic desired speed for fixed-course evaluation."""
+
+        speed = float(speed)
+        if not math.isfinite(speed) or speed <= 0.0:
+            raise ValueError("evaluation desired speed must be finite and positive.")
+        self.evaluation_desired_speed = speed
+        self.synchronize_curriculum_config()
+
+    def resolved_evaluation_speed(self) -> float | None:
+        """Return the explicit override or the selected course's nominal speed."""
+
+        if self.evaluation_family is None or self.evaluation_level is None:
+            return None
+        if self.evaluation_desired_speed is not None:
+            return self.evaluation_desired_speed
+        family_index = self.parkour_curriculum.family_index(self.evaluation_family)
+        return self.parkour_curriculum.course(family_index, self.evaluation_level).target_speed
+
     def set_evaluation_reset_profile(self, profile: str) -> None:
         """Select exact resets or isolated narrow initial-state jitter."""
 
@@ -782,6 +809,19 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
 
         curriculum_cfg = self.parkour_curriculum
         curriculum_cfg.validate_configuration()
+
+        try:
+            min_speed, max_speed = (float(value) for value in self.desired_speed_range)
+        except (TypeError, ValueError) as error:
+            raise ValueError("desired_speed_range must contain exactly two finite positive values.") from error
+        if not math.isfinite(min_speed) or not math.isfinite(max_speed) or min_speed <= 0.0 or max_speed < min_speed:
+            raise ValueError("desired_speed_range must contain finite positive bounds in ascending order.")
+        self.desired_speed_range = (min_speed, max_speed)
+        if self.evaluation_desired_speed is not None:
+            evaluation_speed = float(self.evaluation_desired_speed)
+            if not math.isfinite(evaluation_speed) or evaluation_speed <= 0.0:
+                raise ValueError("evaluation_desired_speed must be finite and positive.")
+            self.evaluation_desired_speed = evaluation_speed
 
         terrain_generator = self.scene.ground.terrain_generator
         if terrain_generator is None:
@@ -836,6 +876,10 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         self.events.initialize_terrain_levels.params["initial_level_override"] = self.evaluation_level
         self.events.reset_routes.params["curriculum_cfg"] = curriculum_cfg
         self.events.reset_routes.params["terrain_layout"] = terrain_layout
+        evaluation_speed = self.resolved_evaluation_speed()
+        self.events.reset_routes.params["target_speed_range"] = (
+            self.desired_speed_range if evaluation_speed is None else (evaluation_speed, evaluation_speed)
+        )
 
         # The fixed evaluation configuration disables adaptive curriculum
         # updates, so synchronize this term only when it is present.

@@ -112,17 +112,18 @@ CLI option takes precedence.
 
 Each curriculum matrix cell is a reusable course description rather than a
 special case in the runtime. Terrain row 0 gives every family cohort the same
-straight obstacle-free route at 0.55 m/s. Rows 1 through 6 contain the six
-obstacle difficulties. Equal column blocks retain their future gap, high-step,
-hurdle, or tilted-ramp family even on the flat row, so each environment advances
-from flat ground into one stable family without resampling its obstacle type.
-Each course records ordered terrain-local waypoints, named mesh structures and
-their factory arguments, planar support polygons, target speed and clearance,
-and explicit difficulty metadata. Obstacle rows keep each family's target speed
-fixed and use a common 0.24 m minimum clearance, preventing harder geometry from
-being confounded with a faster command or stricter clearance requirement.
-Forward reward saturates at the command while a waypoint-local ceiling permits
-the policy to acquire extra traversal speed without rewarding it for doing so.
+straight obstacle-free route. Rows 1 through 6 contain the six obstacle
+difficulties. Equal column blocks retain their future gap, high-step, hurdle,
+or tilted-ramp family even on the flat row, so each environment advances from
+flat ground into one stable family without resampling its obstacle type. Each
+course records ordered terrain-local waypoints, named mesh structures and their
+factory arguments, planar support polygons, nominal speed metadata, clearance,
+and explicit difficulty metadata. At reset, the live desired-speed command is
+sampled independently from 0.45 to 0.70 m/s, so obstacle geometry is not
+confounded with a family-specific command. Obstacle rows use a common 0.24 m
+minimum clearance. Forward reward saturates at the sampled command while a
+waypoint-local 1.5x ceiling permits the policy to acquire extra traversal speed
+without rewarding it for doing so.
 Factory arguments are passed directly to each structure factory. A support
 region either refers to the generated base ground or names the structure whose
 surface it describes. Base-ground regions are authoritative physical patches:
@@ -211,11 +212,12 @@ post-promotion grace counters. Static thresholds remain in
 `ParkourCurriculumCfg`; the episode row selected by frontier/replay sampling
 remains authoritative in `TerrainImporter.terrain_levels`.
 
-Dense velocity shaping tracks the target symmetrically on the flat bootstrap
-and preserves capped positive acquisition on obstacle rows, while suppressing
-lateral motion in both cases. Faster obstacle motion remains available for
-takeoff. The symmetric speed kernel and heading gate discourage flat sprinting,
-without constraining the airborne phases needed to clear obstacles.
+Dense velocity shaping tracks the episode command symmetrically on the flat
+bootstrap and preserves capped positive acquisition on obstacle rows, while
+suppressing lateral motion in both cases. Faster obstacle motion remains
+available for takeoff. The symmetric speed kernel and heading gate discourage
+flat sprinting without constraining the airborne phases needed to clear
+obstacles.
 Standing still and moving backward receive negligible flat tracking reward and
 zero obstacle acquisition reward. Reward samples on the exact retarget step are
 masked so a marker jump is not mistaken for robot motion. Positive air-time
@@ -352,6 +354,7 @@ python scripts/rsl_rl/play.py \
   --task=Parkour-Lab-Play-v0 \
   --checkpoint=/absolute/path/to/model_1000.pt \
   --all_courses \
+  --desired_speed=0.55 \
   --eval_episodes=20 \
   --headless
 ```
@@ -364,6 +367,7 @@ python scripts/rsl_rl/play.py \
   --checkpoint=/absolute/path/to/model_1000.pt \
   --terrain_family=gap \
   --difficulty_level=1 \
+  --desired_speed=0.55 \
   --eval_episodes=20 \
   --headless
 ```
@@ -377,12 +381,17 @@ python scripts/rsl_rl/play.py \
   --checkpoint=/absolute/path/to/model_1000.pt \
   --terrain_family=gap \
   --difficulty_level=1 \
+  --desired_speed=0.55 \
   --eval_episodes=1 \
   --headless \
   --video
 ```
 
-`--all_courses` creates all 28 independent reports, starting a fresh Isaac Sim
+`--desired_speed` fixes the scalar command for every reset. When omitted, the
+selected course's nominal speed is retained for backward-compatible evaluation.
+Run the same matrix at 0.45, 0.55, and 0.70 m/s to measure command conditioning
+separately from terrain difficulty. `--all_courses` creates all 28 independent
+reports, starting a fresh Isaac Sim
 process for every cell so simulation state cannot leak between courses. The
 expected application restarts are printed as sweep progress. This option cannot
 be combined with the two single-cell selectors. Evaluation reports success,
@@ -390,7 +399,7 @@ maximum course progress, trunk contact, below-course falls, timeout, return,
 episode length, forward speed, overspeed, vertical-velocity RMS, and
 all-feet-airborne fraction for each selected matrix cell. It writes
 `metrics.json` plus the optional MP4 beneath
-`<run>/evaluation/<checkpoint>-<hash>/family_<family>/level_<n>/seed_<seed>/`, separated
+`<run>/evaluation/<checkpoint>-<hash>/family_<family>/level_<n>/speed_<m_s>/seed_<seed>/`, separated
 into `metrics/episodes_<n>/` and `video/episodes_<n>-steps_<length>/`.
 Each invocation gets a timestamped `run_*` leaf so before/after results are not
 overwritten. Use `--video_output_dir` to choose another artifact root. Omit

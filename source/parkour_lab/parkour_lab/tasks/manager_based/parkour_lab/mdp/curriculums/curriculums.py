@@ -264,6 +264,7 @@ def reset_routes(
     curriculum_cfg: config.ParkourCurriculumCfg = config.DEFAULT_PARKOUR_CURRICULUM,
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_speed_range: tuple[float, float] = (0.45, 0.70),
 ) -> None:
     """Reset the route cursor and waypoint marker for new episodes.
 
@@ -282,6 +283,8 @@ def reset_routes(
         waypoint_marker_cfg: Scene-entity selection for the visible marker.
         asset_cfg: Scene-entity selection whose post-reset root position seeds
             route crossing history.
+        target_speed_range: Bounds for the family-independent episode speed
+            command. Equal bounds produce deterministic evaluation commands.
     """
 
     env_ids = _all_env_ids(env, env_ids)
@@ -308,6 +311,7 @@ def reset_routes(
         curriculum_cfg=curriculum_cfg,
         waypoint_marker_cfg=waypoint_marker_cfg,
         asset_cfg=asset_cfg,
+        target_speed_range=target_speed_range,
     )
 
 

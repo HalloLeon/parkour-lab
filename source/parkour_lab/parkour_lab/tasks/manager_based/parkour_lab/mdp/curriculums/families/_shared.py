@@ -35,8 +35,9 @@ def build_bootstrap_level(obstacle_family: str) -> ParkourLevelCfg:
     """Create the obstacle-free row-zero course for one eventual family.
 
     Every terrain column retains its assigned family while row zero shares one
-    flat route and target speed. This keeps the acquisition task identical
-    across cohorts before promotion introduces family-specific obstacles.
+    flat route and nominal evaluation speed. This keeps the acquisition task
+    identical across cohorts before promotion introduces family-specific
+    obstacles.
     """
 
     if obstacle_family not in _SUPPORTED_OBSTACLE_FAMILIES:

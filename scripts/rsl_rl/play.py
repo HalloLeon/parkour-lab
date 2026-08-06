@@ -9,6 +9,7 @@
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -82,6 +83,12 @@ parser.add_argument(
     help="Fixed obstacle family. Supported environments provide their configured default when omitted.",
 )
 parser.add_argument(
+    "--desired_speed",
+    type=float,
+    default=None,
+    help="Fixed desired speed in m/s. Supported environments use their selected course default when omitted.",
+)
+parser.add_argument(
     "--eval_episodes",
     type=int,
     default=10,
@@ -126,6 +133,8 @@ for argument_name in ("video_length", "eval_episodes"):
     argument_value = getattr(args_cli, argument_name)
     if argument_value is not None and argument_value <= 0:
         parser.error(f"--{argument_name} must be a positive integer.")
+if args_cli.desired_speed is not None and (not math.isfinite(args_cli.desired_speed) or args_cli.desired_speed <= 0.0):
+    parser.error("--desired_speed must be finite and positive.")
 if args_cli.all_courses and (args_cli.terrain_family is not None or args_cli.difficulty_level is not None):
     parser.error("--all_courses cannot be combined with --terrain_family or --difficulty_level.")
 if args_cli.all_courses and args_cli._course_manifest is None:
@@ -239,6 +248,9 @@ class _EvaluationReport(TypedDict):
 
     # Fixed curriculum level selected for this evaluation, when supported.
     difficulty_level: int | None
+
+    # Deterministic scalar command used for every episode in this report.
+    desired_speed_m_s: float | None
 
     # Task-specific description of the selected family/difficulty matrix cell.
     difficulty_metadata: dict[str, object]
@@ -420,6 +432,7 @@ def _build_evaluation_report(
     interface: _InterfaceInfo,
     evaluation_family: str | None,
     evaluation_level: int | None,
+    desired_speed: float | None,
     level_metadata: dict[str, object],
     num_envs: int,
     step_dt: float,
@@ -441,6 +454,7 @@ def _build_evaluation_report(
         "training_config": _training_config_provenance(checkpoint.log_dir),
         "terrain_family": evaluation_family,
         "difficulty_level": evaluation_level,
+        "desired_speed_m_s": desired_speed,
         "difficulty_metadata": level_metadata,
         "num_envs": num_envs,
         "requested_episodes": args_cli.eval_episodes,
@@ -453,21 +467,27 @@ def _configure_evaluation_course(
     env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     requested_family: str | None,
     requested_level: int | None,
-) -> tuple[str | None, int | None, dict[str, object]]:
+    requested_speed: float | None,
+) -> tuple[str | None, int | None, float | None, dict[str, object]]:
     """Freeze the config to one course and return its resolved metadata."""
 
     set_course = getattr(env_cfg, "set_evaluation_course", None)
     if not callable(set_course):
-        if requested_family is not None or requested_level is not None:
+        if requested_family is not None or requested_level is not None or requested_speed is not None:
             raise ValueError(
-                f"Task '{args_cli.task}' does not support fixed parkour matrix selection because its "
-                "environment config does not define set_evaluation_course()."
+                f"Task '{args_cli.task}' does not support fixed parkour evaluation because its environment "
+                "config does not define set_evaluation_course()."
             )
-        return None, None, {}
+        return None, None, None, {}
 
     # None lets the task select its own default family and maximum difficulty
     # after Hydra overrides have been synchronized.
     set_course(requested_family, requested_level, seed=env_cfg.seed)
+    if requested_speed is not None:
+        set_speed = getattr(env_cfg, "set_evaluation_speed", None)
+        if not callable(set_speed):
+            raise ValueError(f"Task '{args_cli.task}' does not support --desired_speed.")
+        set_speed(requested_speed)
     if args_cli.reset_profile != "canonical":
         set_reset_profile = getattr(env_cfg, "set_evaluation_reset_profile", None)
         if not callable(set_reset_profile):
@@ -475,10 +495,14 @@ def _configure_evaluation_course(
         set_reset_profile(args_cli.reset_profile)
     effective_family = getattr(env_cfg, "evaluation_family", requested_family)
     effective_level = getattr(env_cfg, "evaluation_level", requested_level)
+    resolved_speed = getattr(env_cfg, "resolved_evaluation_speed", None)
+    effective_speed = (
+        resolved_speed() if callable(resolved_speed) else getattr(env_cfg, "evaluation_desired_speed", requested_speed)
+    )
 
     metadata_fn = getattr(env_cfg, "evaluation_course_metadata", None)
     metadata = metadata_fn() if callable(metadata_fn) else {}
-    return effective_family, effective_level, metadata
+    return effective_family, effective_level, effective_speed, metadata
 
 
 def _apply_cli_overrides(
@@ -501,11 +525,14 @@ def _prepare_evaluation_artifacts(
     evaluation_family: str | None,
     evaluation_level: int | None,
     seed: int | None,
+    *,
+    desired_speed: float | None = None,
 ) -> _ArtifactInfo:
     """Create one output directory and derive its video filename prefix."""
 
     family_component = _path_component(evaluation_family, "default")
     level_component = _path_component(evaluation_level, "default")
+    speed_component = _path_component(desired_speed, "default")
     seed_component = _path_component(seed, "default")
     evaluation_kind = "video" if args_cli.video else "metrics"
     evaluation_settings = f"{args_cli.policy_mode}-{args_cli.reset_profile}-episodes_{args_cli.eval_episodes}"
@@ -525,6 +552,7 @@ def _prepare_evaluation_artifacts(
         f"{checkpoint.stem}-{checkpoint.sha256[:8]}",
         f"family_{family_component}",
         f"level_{level_component}",
+        f"speed_{speed_component}",
         f"seed_{seed_component}",
         evaluation_kind,
         evaluation_settings,
@@ -535,7 +563,7 @@ def _prepare_evaluation_artifacts(
         directory=directory,
         video_name_prefix=(
             f"{checkpoint.stem}-{args_cli.policy_mode}-{args_cli.reset_profile}-"
-            f"family_{family_component}-level_{level_component}-seed_{seed_component}"
+            f"family_{family_component}-level_{level_component}-speed_{speed_component}-seed_{seed_component}"
         ),
     )
 
@@ -583,16 +611,18 @@ def _evaluate_course(
 ) -> tuple[_EvaluationReport, str]:
     """Evaluate one fixed course, finalize its video, and write its report."""
 
-    evaluation_family, evaluation_level, level_metadata = _configure_evaluation_course(
+    evaluation_family, evaluation_level, desired_speed, level_metadata = _configure_evaluation_course(
         env_cfg,
         requested_family,
         requested_level,
+        args_cli.desired_speed,
     )
     artifacts = _prepare_evaluation_artifacts(
         checkpoint,
         evaluation_family,
         evaluation_level,
         env_cfg.seed,
+        desired_speed=desired_speed,
     )
     env = _create_evaluation_environment(env_cfg, agent_cfg, artifacts)
     num_envs = env.num_envs
@@ -618,6 +648,7 @@ def _evaluate_course(
         interface=interface,
         evaluation_family=evaluation_family,
         evaluation_level=evaluation_level,
+        desired_speed=desired_speed,
         level_metadata=level_metadata,
         num_envs=num_envs,
         step_dt=step_dt,
@@ -719,6 +750,7 @@ def _print_evaluation_summary(report: _EvaluationReport, report_path: str) -> No
     print(f"  Reset profile: {report['reset_profile']}")
     print(f"  Terrain family: {report['terrain_family'] or 'n/a'}")
     print(f"  Difficulty level: {report['difficulty_level']}")
+    print(f"  Desired speed (m/s): {format_metric(report['desired_speed_m_s'])}")
     print(f"  Episodes: {report['completed_episodes']}/{report['requested_episodes']}")
     print(f"  Success rate: {format_metric(summary['success_rate'], rate=True)}")
     print(f"  Trunk-contact rate: {format_metric(summary['trunk_contact_rate'], rate=True)}")

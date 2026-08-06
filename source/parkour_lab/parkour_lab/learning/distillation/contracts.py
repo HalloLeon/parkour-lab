@@ -253,6 +253,7 @@ def build_teacher_interface(
         "terrain_curriculum": {
             "tile_size_m": _simple_value(terrain_generator_cfg.size),
             "ground_thickness_m": ground_thickness_m,
+            "desired_speed_range_m_s": _simple_value(base_env.cfg.desired_speed_range),
             "matrix": curriculum_cfg.metadata(),
         },
         "action": {

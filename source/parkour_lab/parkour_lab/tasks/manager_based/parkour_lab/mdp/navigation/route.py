@@ -11,6 +11,7 @@ transition can also be exercised by dependency-light NumPy tests.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -181,7 +182,7 @@ def current_target_speeds(
     env: ManagerBasedRLEnv,
     default: float = 0.70,
 ) -> torch.Tensor:
-    """Return per-environment speed targets without materializing copies."""
+    """Return the episode speed command for every environment."""
 
     import torch
 
@@ -195,7 +196,7 @@ def current_target_speeds(
             device=env.device,
             dtype=torch.float32,
         )
-    return runtime.courses.target_speeds[runtime.route.course_indices]
+    return runtime.route.target_speeds
 
 
 def last_episode_max_course_progress_m(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -466,6 +467,7 @@ def reset_routes(
     curriculum_cfg: ParkourCurriculumCfg,
     waypoint_marker_cfg: SceneEntityCfg,
     asset_cfg: SceneEntityCfg,
+    target_speed_range: tuple[float, float] = (0.45, 0.70),
 ) -> torch.Tensor:
     """Reset selected environments to the first waypoint of their new routes.
 
@@ -486,6 +488,9 @@ def reset_routes(
             marker.
         asset_cfg: Robot scene entity whose post-reset terrain-local root
             position seeds genuine route-plane crossing detection.
+        target_speed_range: Bounds for the per-episode speed command.
+            Sampling is independent of obstacle family and difficulty. Equal
+            bounds select a deterministic command for evaluation.
 
     Returns:
         Flattened family-major course index for each reset environment. The
@@ -504,9 +509,26 @@ def reset_routes(
     if family_indices.shape != env_ids.shape or difficulty_indices.shape != env_ids.shape:
         raise ValueError("family_indices and difficulty_indices must contain one value per reset environment.")
 
+    try:
+        min_target_speed, max_target_speed = (float(value) for value in target_speed_range)
+    except (TypeError, ValueError) as error:
+        raise ValueError("target_speed_range must contain exactly two finite positive values.") from error
+    if (
+        not math.isfinite(min_target_speed)
+        or not math.isfinite(max_target_speed)
+        or min_target_speed <= 0.0
+        or max_target_speed < min_target_speed
+    ):
+        raise ValueError("target_speed_range must contain finite positive bounds in ascending order.")
+
     waypoint_marker = env.scene[waypoint_marker_cfg.name]
     dtype = waypoint_marker.data.default_root_state.dtype
-    runtime = _ensure_parkour_runtime(env, curriculum_cfg, dtype=dtype)
+    runtime = _ensure_parkour_runtime(
+        env,
+        curriculum_cfg,
+        dtype=dtype,
+        initial_target_speed=0.5 * (min_target_speed + max_target_speed),
+    )
 
     if torch.any((family_indices < 0) | (family_indices >= len(curriculum_cfg.families))):
         raise ValueError("family_indices contains an out-of-range obstacle family.")
@@ -519,6 +541,14 @@ def reset_routes(
     route_state.maximum_progress_m[env_ids] = 0.0
     route_state.course_indices[env_ids] = course_indices
     route_state.active_waypoint_indices[env_ids] = 0
+    if min_target_speed == max_target_speed:
+        route_state.target_speeds[env_ids] = min_target_speed
+    else:
+        route_state.target_speeds[env_ids] = torch.empty(
+            env_ids.shape,
+            device=env.device,
+            dtype=dtype,
+        ).uniform_(min_target_speed, max_target_speed)
     route_state.waypoint_changed[env_ids] = False
     route_state.course_completed[env_ids] = False
     route_state.previous_root_xy[env_ids] = robot._root_pos_env(
