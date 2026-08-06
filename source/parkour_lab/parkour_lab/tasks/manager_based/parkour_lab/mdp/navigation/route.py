@@ -75,6 +75,55 @@ def active_waypoint_indices(env: ManagerBasedRLEnv) -> torch.Tensor:
     return _parkour_runtime(env).route.active_waypoint_indices.clone()
 
 
+def active_waypoint_root_reach_radii(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return the configured root-reach radius of each active waypoint."""
+
+    from .state import _parkour_runtime
+
+    runtime = _parkour_runtime(env)
+    return runtime.courses.root_reach_radii[
+        runtime.route.course_indices,
+        runtime.route.active_waypoint_indices,
+    ]
+
+
+def active_waypoint_is_rewarded_milestone(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return whether each active waypoint is a rewarded physical milestone."""
+
+    from .state import _parkour_runtime
+
+    runtime = _parkour_runtime(env)
+    return (
+        runtime.courses.milestone_reward_fractions[
+            runtime.route.course_indices,
+            runtime.route.active_waypoint_indices,
+        ]
+        > 0.0
+    )
+
+
+def active_waypoint_is_final(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return whether each active waypoint is the course's final target."""
+
+    from .state import _parkour_runtime
+
+    runtime = _parkour_runtime(env)
+    course_indices = runtime.route.course_indices
+    return runtime.route.active_waypoint_indices == runtime.courses.waypoint_counts[course_indices] - 1
+
+
+def active_waypoint_is_terminal_landing(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return whether each active target is itself the final landing."""
+
+    from .state import _parkour_runtime
+
+    runtime = _parkour_runtime(env)
+    return runtime.courses.terminal_landing_masks[
+        runtime.route.course_indices,
+        runtime.route.active_waypoint_indices,
+    ]
+
+
 def course_completed_this_step(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Return which environments safely completed a course this step."""
 
@@ -718,12 +767,7 @@ def _advance_route_state(
     physical_reached = support_required & root_within_radius & supported
     advance_cursor = (~final_waypoint) & route_state_eligible & (control_reached | physical_reached)
 
-    completed_course = (
-        final_waypoint
-        & physical_reached
-        & route_state_eligible
-        & final_waypoint_eligible
-    )
+    completed_course = final_waypoint & physical_reached & route_state_eligible & final_waypoint_eligible
 
     # Adding a Boolean tensor increments selected cursors by exactly one. Final
     # cursors are excluded above, so no index can exceed its route length.

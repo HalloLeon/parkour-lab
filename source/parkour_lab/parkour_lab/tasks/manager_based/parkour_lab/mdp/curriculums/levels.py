@@ -286,11 +286,15 @@ class ParkourWaypointCfg:
     ``is_rewarded_milestone`` distinguishes physical obstacle progress from a
     waypoint used only to align or redirect the route. Final waypoints must
     leave it false because safe course completion has its own reward.
+
+    ``is_terminal_landing`` marks the exceptional case where the final target
+    is itself the obstacle landing rather than a post-landing exit target.
     """
 
     position: tuple[float, float, float]
     support_region_name: str | None = None
     is_rewarded_milestone: bool = False
+    is_terminal_landing: bool = False
     root_reach_radius: float | None = None
 
     def __post_init__(self) -> None:
@@ -306,6 +310,8 @@ class ParkourWaypointCfg:
             )
         if not isinstance(self.is_rewarded_milestone, bool):
             raise TypeError("is_rewarded_milestone must be a Boolean.")
+        if not isinstance(self.is_terminal_landing, bool):
+            raise TypeError("is_terminal_landing must be a Boolean.")
         if self.root_reach_radius is not None:
             root_reach_radius = _float_value(
                 self.root_reach_radius,
@@ -322,6 +328,7 @@ class ParkourWaypointCfg:
             "position": list(self.position),
             "support_region_name": self.support_region_name,
             "is_rewarded_milestone": self.is_rewarded_milestone,
+            "is_terminal_landing": self.is_terminal_landing,
             "root_reach_radius": self.root_reach_radius,
         }
 
@@ -471,6 +478,8 @@ class ParkourLevelCfg:
     def _validate_final_waypoint(self) -> None:
         """Require the final waypoint to identify its intended support."""
 
+        if any(waypoint.is_terminal_landing for waypoint in self.waypoints[:-1]):
+            raise ValueError(f"{self.name}: only the final waypoint may be marked as a terminal landing.")
         if self.waypoints[-1].is_rewarded_milestone:
             raise ValueError(
                 f"{self.name}: the final waypoint uses the course-completion "
@@ -519,9 +528,7 @@ class ParkourLevelCfg:
             waypoint_label = "final waypoint" if index == len(self.waypoints) - 1 else f"waypoint {index}"
             support = support_by_name.get(support_name)
             if support is None:
-                raise ValueError(
-                    f"{self.name}: {waypoint_label} refers to unknown support region {support_name!r}."
-                )
+                raise ValueError(f"{self.name}: {waypoint_label} refers to unknown support region {support_name!r}.")
             if not support.supports_waypoint(waypoint.position):
                 raise ValueError(
                     f"{self.name}: {waypoint_label} must lie on its intended support region {support_name!r}."
@@ -828,6 +835,10 @@ def coerce_waypoint_cfg(
         is_rewarded_milestone=cast(
             bool,
             waypoint.get("is_rewarded_milestone", False),
+        ),
+        is_terminal_landing=cast(
+            bool,
+            waypoint.get("is_terminal_landing", False),
         ),
         root_reach_radius=cast(
             float | None,

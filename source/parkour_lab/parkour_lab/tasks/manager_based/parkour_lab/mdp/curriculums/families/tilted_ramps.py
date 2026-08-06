@@ -269,6 +269,7 @@ def build_level(
             marker_offset_z,
         ),
         support_region_name=landing_region.name,
+        is_terminal_landing=True,
     )
     if not landing_region.supports_waypoint(final_waypoint.position):
         raise ValueError("The final tilted-ramp waypoint must lie on its landing.")

@@ -34,6 +34,7 @@ class CourseTables:
     waypoint_counts: torch.Tensor
     waypoints: torch.Tensor
     root_reach_radii: torch.Tensor
+    terminal_landing_masks: torch.Tensor
 
     # Reward metadata.
     milestone_reward_fractions: torch.Tensor
@@ -148,13 +149,9 @@ def _build_course_tables(
     import torch
 
     courses = curriculum_cfg.courses
-    routes = tuple(
-        tuple(waypoint.position for waypoint in course.waypoints) for course in courses
-    )
+    routes = tuple(tuple(waypoint.position for waypoint in course.waypoints) for course in courses)
     max_waypoints = max(len(route) for route in routes)
-    max_support_vertices = max(
-        len(region.vertices) for course in courses for region in course.support_regions
-    )
+    max_support_vertices = max(len(region.vertices) for course in courses for region in course.support_regions)
 
     cumulative_distances_m = torch.zeros(
         (len(routes), max_waypoints),
@@ -175,6 +172,11 @@ def _build_course_tables(
         (len(routes), max_waypoints),
         device=env.device,
         dtype=dtype,
+    )
+    terminal_landing_masks = torch.zeros(
+        (len(routes), max_waypoints),
+        device=env.device,
+        dtype=torch.bool,
     )
     milestone_reward_fractions = torch.zeros(
         (len(routes), max_waypoints),
@@ -208,9 +210,11 @@ def _build_course_tables(
 
         course_root_reach_radii = torch.tensor(
             [
-                waypoint.root_reach_radius
-                if waypoint.root_reach_radius is not None
-                else curriculum_cfg.waypoint_reach_threshold
+                (
+                    waypoint.root_reach_radius
+                    if waypoint.root_reach_radius is not None
+                    else curriculum_cfg.waypoint_reach_threshold
+                )
                 for waypoint in course.waypoints
             ],
             device=env.device,
@@ -218,10 +222,14 @@ def _build_course_tables(
         )
         root_reach_radii[course_index, :waypoint_count] = course_root_reach_radii
         root_reach_radii[course_index, waypoint_count:] = course_root_reach_radii[-1]
-
-        rewarded_milestones = tuple(
-            waypoint.is_rewarded_milestone for waypoint in course.waypoints[:-1]
+        terminal_landing_masks[course_index, :waypoint_count] = torch.tensor(
+            [waypoint.is_terminal_landing for waypoint in course.waypoints],
+            device=env.device,
+            dtype=torch.bool,
         )
+        terminal_landing_masks[course_index, waypoint_count:] = course.waypoints[-1].is_terminal_landing
+
+        rewarded_milestones = tuple(waypoint.is_rewarded_milestone for waypoint in course.waypoints[:-1])
         rewarded_milestone_count = sum(rewarded_milestones)
         if rewarded_milestone_count > 0:
             milestone_reward_fractions[
@@ -280,6 +288,7 @@ def _build_course_tables(
         waypoint_counts=waypoint_counts,
         waypoints=waypoints,
         root_reach_radii=root_reach_radii,
+        terminal_landing_masks=terminal_landing_masks,
         milestone_reward_fractions=milestone_reward_fractions,
         support_normals=support_normals,
         support_vertex_counts=support_vertex_counts,
@@ -359,6 +368,7 @@ def _runtime_matches(
     waypoint_changed = getattr(route, "waypoint_changed", None)
     course_completed = getattr(route, "course_completed", None)
     root_reach_radii = getattr(courses, "root_reach_radii", None)
+    terminal_landing_masks = getattr(courses, "terminal_landing_masks", None)
     return (
         courses.num_difficulties == curriculum_cfg.num_difficulties
         and courses.waypoints.shape[0] == len(curriculum_cfg.courses)
@@ -368,6 +378,10 @@ def _runtime_matches(
         and root_reach_radii.shape == courses.waypoints.shape[:2]
         and root_reach_radii.device == device
         and root_reach_radii.dtype == dtype
+        and isinstance(terminal_landing_masks, torch.Tensor)
+        and terminal_landing_masks.shape == courses.waypoints.shape[:2]
+        and terminal_landing_masks.device == device
+        and terminal_landing_masks.dtype == torch.bool
         and route.course_indices.shape == (env.num_envs,)
         and route.course_indices.device == device
         and route.previous_root_xy.shape == (env.num_envs, 2)

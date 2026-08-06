@@ -461,9 +461,10 @@ class RewardsCfg:
     """
     Task, safety, and motion-quality rewards for parkour locomotion.
 
-    Flat rows track the commanded speed, while obstacle rows retain capped
-    forward acquisition. Heading provides directional guidance without
-    prescribing a terrain-specific gait.
+    Flat rows track the commanded speed. Obstacle rows retain forward
+    acquisition inside a bounded approach-and-traversal speed envelope.
+    Heading provides directional guidance without prescribing a
+    terrain-specific gait.
     One-shot physical milestones and completion bonuses make discrete progress
     unambiguous, while safety remains separate.
     """
@@ -473,8 +474,10 @@ class RewardsCfg:
         func=mdp.waypoint_velocity_tracking_exp,
         weight=1.5,
         params={
+            "approach_allowance_distance_m": 0.6,
             "asset_cfg": SceneEntityCfg("robot"),
             "flat_speed_std": 0.25,
+            "obstacle_speed_cap_multiplier": 1.5,
             "std": 0.5,
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
         },

@@ -21,7 +21,6 @@ from .reward_terms.root_motion import root_chatter_l2
 from .reward_terms.safety import base_clearance_below_l2, base_contact
 from .reward_terms.waypoint import (
     completed_course_reward,
-    flat_waypoint_overspeed_l2,
     intermediate_milestone_reward,
     velocity_along_waypoint_xy_capped,
     velocity_along_waypoint_xy_clearance_capped,
@@ -34,7 +33,6 @@ from .reward_terms.waypoint import (
 __all__ = [
     # Active-waypoint task terms.
     "completed_course_reward",
-    "flat_waypoint_overspeed_l2",
     "intermediate_milestone_reward",
     "velocity_along_waypoint_xy_capped",
     "velocity_along_waypoint_xy_clearance_capped",

@@ -5,6 +5,8 @@
 
 """Active-waypoint task rewards."""
 
+import math
+
 import torch
 from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
@@ -15,6 +17,8 @@ from .._shared import robot, runtime
 from ..commands import get_min_clearance, get_target_speed
 from ..navigation import geometry, route
 from ..terrain import queries
+
+_MAX_NORMALIZED_OVERSPEED = 4.0
 
 # Dense waypoint-progress shaping.
 
@@ -30,6 +34,47 @@ def _mask_waypoint_change(
         torch.zeros_like(values),
         values,
     )
+
+
+def _obstacle_speed_cap(
+    env: ManagerBasedRLEnv,
+    *,
+    target_speed: torch.Tensor,
+    obstacle_mask: torch.Tensor,
+    cap_multiplier: float,
+    approach_allowance_distance_m: float,
+    waypoint_marker_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Return a phase-local obstacle speed ceiling above the base command."""
+
+    waypoint_distance = geometry._active_waypoint_distance_xy(
+        env,
+        waypoint_marker_cfg=waypoint_marker_cfg,
+        asset_cfg=asset_cfg,
+    )
+    reach_radius = route.active_waypoint_root_reach_radii(env).to(
+        device=target_speed.device,
+        dtype=target_speed.dtype,
+    )
+    approach_allowance = torch.clamp(
+        (reach_radius + approach_allowance_distance_m - waypoint_distance) / approach_allowance_distance_m,
+        min=0.0,
+        max=1.0,
+    )
+    terminal_landing = route.active_waypoint_is_terminal_landing(env)
+    traversal_allowance = torch.where(
+        route.active_waypoint_is_rewarded_milestone(env) | terminal_landing,
+        torch.ones_like(approach_allowance),
+        approach_allowance,
+    )
+    traversal_allowance = torch.where(
+        route.active_waypoint_is_final(env) & ~terminal_landing,
+        torch.zeros_like(traversal_allowance),
+        traversal_allowance,
+    )
+    traversal_allowance *= obstacle_mask.to(dtype=traversal_allowance.dtype)
+    return target_speed * (1.0 + (cap_multiplier - 1.0) * traversal_allowance)
 
 
 def waypoint_heading_alignment_exp(
@@ -93,27 +138,40 @@ def waypoint_velocity_tracking_exp(
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     flat_speed_std: float = 0.25,
+    obstacle_speed_cap_multiplier: float = 1.5,
+    approach_allowance_distance_m: float = 0.6,
 ) -> torch.Tensor:
-    """Track flat target speed while preserving obstacle-speed acquisition.
+    """Track cruise speed while allowing bounded obstacle-speed adaptation.
 
-    Flat rows use symmetric exponential tracking so the commanded speed is the
-    unique optimum. Obstacle rows retain a signed, capped acquisition signal:
-    faster takeoff motion is permitted, while motion away from the waypoint is
-    penalized instead of receiving zero reward::
+    Flat rows use symmetric exponential tracking around the base command. On
+    obstacle rows, the same command remains the preferred cruise speed while a
+    ceiling ramps up near an approach waypoint, stays active while a rewarded
+    landing milestone is targeted, and returns to the command after supported
+    landing. Speed inside this envelope receives no extra dense reward;
+    normalized excess above the applicable ceiling is subtracted::
 
-        where(flat, exp(-(v_parallel - target_speed)^2 / flat_speed_std^2),
-                    clamp(v_parallel / target_speed, -1, 1))
-        * exp(-||v_perpendicular||^2 / std^2)
+        flat = exp(-(v_parallel - command)^2 / flat_speed_std^2)
+               * exp(-||v_perpendicular||^2 / std^2)
+               - relu((v_parallel - command) / command)^2
+        obstacle = clamp(v_parallel / command, -1, 1)
+                   * exp(-||v_perpendicular||^2 / std^2)
+                   - relu((v_parallel - speed_cap) / command)^2
 
-    The term is bounded in ``[-1, 1]`` and masks the one sample on which the
-    route switches to a waypoint that did not produce the current action.
+    Normalized overspeed is capped only as a numerical guard, leaving the term
+    bounded in ``[-16, 1]`` without making ordinary sprinting saturate at the
+    same value. The one sample on which the route switches to a waypoint is
+    masked because the preceding action targeted the old waypoint.
 
     Returns:
         Tensor with shape ``(num_envs,)``.
     """
 
-    if std <= 0.0 or flat_speed_std <= 0.0:
-        raise ValueError("std and flat_speed_std must be positive.")
+    if not math.isfinite(std) or not math.isfinite(flat_speed_std) or std <= 0.0 or flat_speed_std <= 0.0:
+        raise ValueError("std and flat_speed_std must be finite and positive.")
+    if not math.isfinite(obstacle_speed_cap_multiplier) or obstacle_speed_cap_multiplier < 1.0:
+        raise ValueError("obstacle_speed_cap_multiplier must be finite and at least 1.0.")
+    if not math.isfinite(approach_allowance_distance_m) or approach_allowance_distance_m <= 0.0:
+        raise ValueError("approach_allowance_distance_m must be finite and positive.")
 
     waypoint_direction_xy = geometry._active_waypoint_direction_xy(
         env,
@@ -131,55 +189,37 @@ def waypoint_velocity_tracking_exp(
         device=root_velocity_xy.device,
         dtype=root_velocity_xy.dtype,
     )
+    normalization_speed = target_speed.clamp_min(torch.finfo(target_speed.dtype).eps)
     forward_fraction = torch.clamp(
-        velocity_along_waypoint / target_speed.clamp_min(torch.finfo(target_speed.dtype).eps),
+        velocity_along_waypoint / normalization_speed,
         min=-1.0,
         max=1.0,
     )
     flat_tracking = torch.exp(-(velocity_along_waypoint - target_speed).square() / float(flat_speed_std) ** 2)
-    forward_reward = torch.where(
-        route.active_difficulty_indices(env) == 0,
-        flat_tracking,
-        forward_fraction,
-    )
     lateral_alignment = torch.exp(-torch.sum(lateral_velocity_xy.square(), dim=-1) / float(std) ** 2)
-    return _mask_waypoint_change(
+    obstacle_mask = route.active_difficulty_indices(env) > 0
+    speed_cap = _obstacle_speed_cap(
         env,
-        forward_reward * lateral_alignment,
-    )
-
-
-def flat_waypoint_overspeed_l2(
-    env: ManagerBasedRLEnv,
-    max_excess_ratio: float = 2.0,
-    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """Penalize normalized overspeed only on the flat bootstrap.
-
-    The quadratic remains corrective throughout the expected speed range and
-    is capped before squaring to bound collision outliers. Configure this term
-    with a negative weight.
-    """
-
-    if max_excess_ratio <= 0.0:
-        raise ValueError("max_excess_ratio must be positive.")
-
-    velocity_along_waypoint = geometry._velocity_along_active_waypoint_xy(
-        env,
+        target_speed=target_speed,
+        obstacle_mask=obstacle_mask,
+        cap_multiplier=obstacle_speed_cap_multiplier,
+        approach_allowance_distance_m=approach_allowance_distance_m,
         waypoint_marker_cfg=waypoint_marker_cfg,
         asset_cfg=asset_cfg,
     )
-    target_speed = get_target_speed(env).to(
-        device=velocity_along_waypoint.device,
-        dtype=velocity_along_waypoint.dtype,
+    normalized_overspeed = torch.clamp(
+        torch.relu(velocity_along_waypoint - speed_cap) / normalization_speed,
+        max=_MAX_NORMALIZED_OVERSPEED,
     )
-    excess_ratio = torch.relu(velocity_along_waypoint - target_speed) / target_speed.clamp_min(
-        torch.finfo(target_speed.dtype).eps
+    tracking = torch.where(
+        obstacle_mask,
+        forward_fraction * lateral_alignment,
+        flat_tracking * lateral_alignment,
     )
-    penalty = torch.clamp(excess_ratio, max=max_excess_ratio).square()
-    penalty *= (route.active_difficulty_indices(env) == 0).to(dtype=penalty.dtype)
-    return _mask_waypoint_change(env, penalty)
+    return _mask_waypoint_change(
+        env,
+        tracking - normalized_overspeed.square(),
+    )
 
 
 def waypoint_heading_misalignment_l2(
