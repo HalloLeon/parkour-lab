@@ -40,8 +40,8 @@ class ParkourTerrainLayout:
 
     Keeping both parts in one value object makes the complete grid contract
     explicit wherever terrain generation and runtime indexing are connected.
-    For example, a six-difficulty, four-family training layout with 40 columns
-    has six rows and a mapping containing ten copies of each family index.
+    For example, a seven-difficulty, four-family training layout with 40 columns
+    has seven rows and a mapping containing ten copies of each family index.
     Fixed-family evaluation instead maps every column to the selected family
     while retaining the same row-to-difficulty relationship.
 
@@ -118,7 +118,7 @@ class ParkourCurriculumCfg:
     # asynchronously into the easiest family-specific courses.
     distribute_initial_levels: bool = True
     initial_level: int = 0
-    max_level: int = 5
+    max_level: int = 6
 
     # Default root XY radius for waypoint transitions. Control targets may also
     # cross their route plane inside this global corridor; physical targets

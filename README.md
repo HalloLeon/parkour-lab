@@ -112,7 +112,7 @@ CLI option takes precedence.
 
 Each curriculum matrix cell is a reusable course description rather than a
 special case in the runtime. Terrain row 0 gives every family cohort the same
-straight obstacle-free route at 0.55 m/s. Rows 1 through 5 contain the five
+straight obstacle-free route at 0.55 m/s. Rows 1 through 6 contain the six
 obstacle difficulties. Equal column blocks retain their future gap, high-step,
 hurdle, or tilted-ramp family even on the flat row, so each environment advances
 from flat ground into one stable family without resampling its obstacle type.
@@ -121,6 +121,8 @@ their factory arguments, planar support polygons, target speed and clearance,
 and explicit difficulty metadata. Obstacle rows keep each family's target speed
 fixed and use a common 0.24 m minimum clearance, preventing harder geometry from
 being confounded with a faster command or stricter clearance requirement.
+Forward reward saturates at the command while a waypoint-local ceiling permits
+the policy to acquire extra traversal speed without rewarding it for doing so.
 Factory arguments are passed directly to each structure factory. A support
 region either refers to the generated base ground or names the structure whose
 surface it describes. Base-ground regions are authoritative physical patches:
@@ -150,8 +152,9 @@ physical milestone.
 The tilted-ramp family uses an acquisition ladder instead of introducing the
 complete compound obstacle at once. Its first obstacle row contains one wide,
 straight, gently banked slab. Later rows add a contiguous second slab, then an
-inter-ramp gap, then yaw and lateral offset. Only the hardest row narrows the
-slabs and combines opposite 12-degree banks with yaws of 10 and 32 degrees.
+inter-ramp gap, then yaw and lateral offset. A dedicated bridge row interpolates
+the support width, banks, redirection, and spacing before the hardest row
+combines opposite 12-degree banks with yaws of 10 and 32 degrees.
 Each slab's local X axis is its travel direction; signed roll banks its surface
 across the width and yaw rotates its travel direction in terrain-local XY.
 Ordered waypoints align the approach, mark supported ramp entries and exits,
@@ -342,7 +345,7 @@ training and playback.
 
 Evaluate a checkpoint across the complete fixed matrix with one command.
 Families are `gap`, `high_step`, `hurdle`, and `tilted_ramps`; difficulty
-levels are zero-based from `0` (shared flat bootstrap) through `5` (hardest).
+levels are zero-based from `0` (shared flat bootstrap) through `6` (hardest).
 
 ```bash
 python scripts/rsl_rl/play.py \
@@ -379,7 +382,7 @@ python scripts/rsl_rl/play.py \
   --video
 ```
 
-`--all_courses` creates all 24 independent reports, starting a fresh Isaac Sim
+`--all_courses` creates all 28 independent reports, starting a fresh Isaac Sim
 process for every cell so simulation state cannot leak between courses. The
 expected application restarts are printed as sweep progress. This option cannot
 be combined with the two single-cell selectors. Evaluation reports success,
@@ -484,7 +487,7 @@ Treat success rate and failure outcomes over multiple episodes as the primary
 comparison; use video to understand *why* behavior changed. For fair before/after
 comparisons:
 
-- evaluate each promising checkpoint on all 24 family/difficulty cells;
+- evaluate each promising checkpoint on all 28 family/difficulty cells;
 - keep the seed, number of episodes, and environment count unchanged;
 - do not enable the adaptive training curriculum during evaluation;
 - compare the same metrics before selecting representative clips;

@@ -108,7 +108,7 @@ def build_default_level(
     :data:`DEFAULT_STAGE_SPECS`; it is not the physical terrain-row index used
     at runtime. Curriculum row zero is the shared flat bootstrap, so obstacle
     stage ``n`` becomes terrain row and difficulty order ``n + 1``. For the
-    default five-stage ladder, indices 0 through 4 map to rows 1 through 5.
+    default six-stage ladder, indices 0 through 5 map to rows 1 through 6.
 
     All default stages are constructed once while the curriculum configuration
     initializes. Runtime promotion selects one of these prebuilt terrain rows;
@@ -496,9 +496,8 @@ DEFAULT_STAGE_SPECS = (
         landing_start_x=2.72,
         landing_y_range=(-1.0, 1.20),
     ),
-    # Obstacle stage 3 / curriculum row 4: bridge the wide mild row to the
-    # hardest row by increasing the opposing banks and redirection while only
-    # moderately narrowing both supports.
+    # Obstacle stage 3 / curriculum row 4: increase the opposing banks and
+    # redirection while only moderately narrowing both supports.
     _paired_stage(
         sequence_anchor_xy=(1.10, -0.10),
         width=1.25,
@@ -509,7 +508,20 @@ DEFAULT_STAGE_SPECS = (
         landing_start_x=2.88,
         landing_y_range=(0.0, 1.60),
     ),
-    # Obstacle stage 4 / curriculum row 5: combine narrow supports, stronger
+    # Obstacle stage 4 / curriculum row 5: bridge the successful preceding row
+    # to the hardest geometry without changing every dimension at once.
+    _paired_stage(
+        sequence_anchor_xy=(1.125, -0.05),
+        lengths=(1.00, 1.20),
+        width=1.125,
+        incline_degrees=(9.5, -9.5),
+        yaw_degrees=(8.5, 27.5),
+        gap=0.18,
+        lateral_offset=0.34,
+        landing_start_x=2.99,
+        landing_y_range=(0.20, 1.70),
+    ),
+    # Obstacle stage 5 / curriculum row 6: combine narrow supports, stronger
     # opposing banks, a larger gap, and a sharper inter-ramp redirection. Keep
     # the first approach aligned with the successful preceding row.
     _paired_stage(

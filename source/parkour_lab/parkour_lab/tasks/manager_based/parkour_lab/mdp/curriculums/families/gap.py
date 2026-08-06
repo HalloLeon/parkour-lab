@@ -10,6 +10,8 @@ from . import _shared
 # Terrain-local X coordinate around which each physical gap expands
 # symmetrically as its curriculum-controlled width changes.
 _GAP_CENTER_X_M = 2.0
+_MIN_GAP_WIDTH_M = 0.10
+_MAX_GAP_WIDTH_M = 0.50
 
 
 def build_default_levels() -> tuple[ParkourLevelCfg, ...]:
@@ -19,7 +21,11 @@ def build_default_levels() -> tuple[ParkourLevelCfg, ...]:
         build_level(
             name=f"gap_difficulty_{obstacle_stage_index}",
             difficulty_order=float(obstacle_stage_index + 1),
-            gap_width=round(0.10 + 0.10 * obstacle_stage_index, 2),
+            gap_width=round(
+                _MIN_GAP_WIDTH_M
+                + (_MAX_GAP_WIDTH_M - _MIN_GAP_WIDTH_M) * obstacle_stage_index / (_shared.NUM_OBSTACLE_STAGES - 1),
+                2,
+            ),
             target_speed=0.60,
             min_clearance=0.24,
         )

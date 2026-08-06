@@ -461,8 +461,8 @@ class RewardsCfg:
     """
     Task, safety, and motion-quality rewards for parkour locomotion.
 
-    Flat rows track the commanded speed. Obstacle rows use a bounded,
-    phase-local acquisition target during approach and traversal.
+    Flat rows track the commanded speed. Obstacle rows saturate forward reward
+    at that command while a phase-local ceiling permits traversal speedups.
     Heading provides directional guidance without prescribing a
     terrain-specific gait.
     One-shot physical milestones and completion bonuses make discrete progress

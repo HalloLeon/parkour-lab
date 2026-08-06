@@ -46,7 +46,7 @@ def _obstacle_speed_cap(
     waypoint_marker_cfg: SceneEntityCfg,
     asset_cfg: SceneEntityCfg,
 ) -> torch.Tensor:
-    """Return the phase-local obstacle acquisition target and ceiling."""
+    """Return the phase-local obstacle speed ceiling."""
 
     waypoint_distance = geometry._active_waypoint_distance_xy(
         env,
@@ -144,17 +144,16 @@ def waypoint_velocity_tracking_exp(
     """Track cruise speed while allowing bounded obstacle-speed adaptation.
 
     Flat rows use symmetric exponential tracking around the base command. On
-    obstacle rows, the acquisition target ramps above that command near an
-    approach waypoint, stays active while a rewarded landing milestone is
-    targeted, and returns to the command after supported landing. The same
-    phase-local value caps overspeed::
+    obstacle rows, forward reward saturates at that command while a phase-local
+    ceiling permits bounded speed adaptation near an approach waypoint and
+    during traversal::
 
         flat = exp(-(v_parallel - command)^2 / flat_speed_std^2)
                * exp(-||v_perpendicular||^2 / std^2)
                - relu((v_parallel - command) / command)^2
-        obstacle = clamp(v_parallel / phase_target, -1, 1)
+        obstacle = clamp(v_parallel / command, -1, 1)
                    * exp(-||v_perpendicular||^2 / std^2)
-                   - relu((v_parallel - phase_target) / command)^2
+                   - relu((v_parallel - phase_ceiling) / command)^2
 
     Normalized overspeed is capped only as a numerical guard, leaving the term
     bounded in ``[-16, 1]`` without making ordinary sprinting saturate at the
@@ -202,7 +201,7 @@ def waypoint_velocity_tracking_exp(
         asset_cfg=asset_cfg,
     )
     obstacle_forward_fraction = torch.clamp(
-        velocity_along_waypoint / speed_cap.clamp_min(torch.finfo(speed_cap.dtype).eps),
+        velocity_along_waypoint / normalization_speed,
         min=-1.0,
         max=1.0,
     )

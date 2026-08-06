@@ -19,8 +19,8 @@ from ..levels import (
 TERRAIN_X_RANGE_M = (-4.0, 4.0)
 TERRAIN_Y_RANGE_M = (-2.0, 2.0)
 
-# Every family has five obstacle-bearing rows after the shared flat bootstrap.
-NUM_OBSTACLE_STAGES = 5
+# Every family has six obstacle-bearing rows after the shared flat bootstrap.
+NUM_OBSTACLE_STAGES = 6
 
 _SUPPORTED_OBSTACLE_FAMILIES = frozenset({"gap", "high_step", "hurdle", "tilted_ramps"})
 _BOOTSTRAP_ROUTE = (

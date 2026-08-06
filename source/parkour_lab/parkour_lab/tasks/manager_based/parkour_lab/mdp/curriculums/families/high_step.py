@@ -8,6 +8,8 @@ from . import _shared
 # Keep the final target safely inside the rear platform edge while extending
 # the route beyond the first supported landing.
 PLATFORM_EXIT_INSET_M = 0.15
+_MIN_OBSTACLE_HEIGHT_M = 0.04
+_MAX_OBSTACLE_HEIGHT_M = 0.24
 
 
 def build_default_levels() -> tuple[ParkourLevelCfg, ...]:
@@ -18,9 +20,14 @@ def build_default_levels() -> tuple[ParkourLevelCfg, ...]:
             name=f"high_step_difficulty_{obstacle_stage_index}",
             difficulty_order=float(obstacle_stage_index + 1),
             # Begin below ordinary swing clearance so accidental early
-            # successes can teach progressively higher foot placement while
-            # retaining the original 0.24 m final difficulty.
-            obstacle_height=round(0.04 + 0.05 * obstacle_stage_index, 2),
+            # successes teach progressively higher foot placement.
+            obstacle_height=round(
+                _MIN_OBSTACLE_HEIGHT_M
+                + (_MAX_OBSTACLE_HEIGHT_M - _MIN_OBSTACLE_HEIGHT_M)
+                * obstacle_stage_index
+                / (_shared.NUM_OBSTACLE_STAGES - 1),
+                2,
+            ),
             obstacle_width=1.8,
             obstacle_depth=1.6,
             obstacle_position_xy=(2.8, 0.0),
