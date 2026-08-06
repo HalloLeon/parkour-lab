@@ -462,8 +462,8 @@ class RewardsCfg:
     Task, safety, and motion-quality rewards for parkour locomotion.
 
     Flat rows track the commanded speed, while obstacle rows retain capped
-    forward acquisition. Heading and a flat-only flight penalty encourage a
-    walking bootstrap without suppressing obstacle takeoff.
+    forward acquisition. Heading provides directional guidance without
+    prescribing a terrain-specific gait.
     One-shot physical milestones and completion bonuses make discrete progress
     unambiguous, while safety remains separate.
     """
@@ -492,16 +492,16 @@ class RewardsCfg:
 
     # Explicit physical milestones split one conservative +2 shaping budget;
     # this includes the two supported flat-bootstrap progress targets.
-    completed_course = RewTerm(func=mdp.completed_course_reward, weight=10.0)
+    completed_course = RewTerm(func=mdp.completed_course_reward, weight=4.0)
 
     intermediate_milestone = RewTerm(
         func=mdp.intermediate_milestone_reward,
         weight=2.0,
     )
 
-    flat_no_feet_contact = RewTerm(
-        func=mdp.flat_only_no_feet_contact,
-        weight=-0.2,
+    no_feet_contact = RewTerm(
+        func=mdp.desired_contacts,
+        weight=-0.05,
         params={
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
             "threshold": 1.0,
@@ -526,7 +526,7 @@ class RewardsCfg:
     )
 
     leg_contact = RewTerm(
-        func=mdp.obstacle_only_undesired_contacts,
+        func=mdp.undesired_contacts,
         weight=-0.5,
         params={
             "sensor_cfg": SceneEntityCfg("leg_contact"),
@@ -543,7 +543,7 @@ class RewardsCfg:
 
     # Foot-placement quality.
     feet_edge = RewTerm(
-        func=mdp.obstacle_only_feet_edge,
+        func=mdp.feet_edge,
         weight=-1.0,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
@@ -553,18 +553,16 @@ class RewardsCfg:
     )
 
     feet_slide = RewTerm(
-        func=mdp.level_scaled_feet_slide,
-        weight=-0.05,
+        func=mdp.feet_slide,
+        weight=-0.025,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
-            "flat_scale": 0.5,
-            "obstacle_scale": 1.0,
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
         },
     )
 
     feet_stumble = RewTerm(
-        func=mdp.obstacle_only_feet_stumble,
+        func=mdp.feet_stumble,
         weight=-0.5,
         params={
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),

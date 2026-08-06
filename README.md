@@ -180,7 +180,7 @@ across the course. The flat bootstrap's two intermediate ground targets each
 receive `+1`; obstacle approach and alignment guides do not pay, and adding
 control markers cannot increase the available budget. Intermediate waypoints
 still do not end an episode or count as curriculum success. The final waypoint
-ignores plane crossing and pays `+10` only after the robot reaches its radius
+ignores plane crossing and pays `+4` only after the robot reaches its radius
 with a foot on the named support, sufficient base clearance, low vertical speed
 and tilt, and no trunk contact. Event rewards are divided by the control
 timestep before Isaac Lab's reward integration, making these configured amounts
@@ -200,7 +200,7 @@ row. The first harder attempt is protected from demotion. Later episodes use a
 10% flat anchor and 15% immediate-predecessor replay without altering frontier
 evidence.
 Promotion changes only future course sampling and pays no additional reward
-because completion already receives `+10`.
+because completion already receives an explicit `+4` event.
 
 `ParkourCurriculumState` is the complete mutable curriculum-buffer inventory:
 per-environment frontier levels, promotion histories, demotion histories, and
@@ -212,12 +212,13 @@ Dense velocity shaping tracks the target symmetrically on the flat bootstrap
 and preserves capped positive acquisition on obstacle rows, while suppressing
 lateral motion in both cases. Faster obstacle motion remains available for
 takeoff. The symmetric speed kernel and heading gate discourage flat sprinting,
-while a small flat-only no-feet-contact penalty discourages repeated hopping.
+while a light global no-feet-contact penalty discourages gratuitous flight
+without making takeoff prohibitively expensive.
 Standing still and moving backward receive negligible flat tracking reward and
 zero obstacle acquisition reward. Reward samples on the exact retarget step are
 masked so a marker jump is not mistaken for robot motion. Positive air-time
-shaping is disabled; obstacle-only leg, edge, and stumble penalties activate
-after promotion.
+shaping is disabled; leg-contact, edge, slide, and stumble penalties use the
+same semantics on every terrain row.
 Low-clearance error remains normalized to `[0, 1]` before its squared penalty.
 
 The teacher-interface manifest is version 13. Version 4 introduced complete

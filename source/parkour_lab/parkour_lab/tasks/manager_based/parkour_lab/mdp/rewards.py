@@ -12,16 +12,9 @@ to work.
 """
 
 from .reward_terms.limb import (
-    feet_air_time,
     feet_edge,
     feet_stumble,
-    flat_only_no_feet_contact,
     joint_deviation_l2,
-    level_scaled_feet_slide,
-    no_feet_contact,
-    obstacle_only_feet_edge,
-    obstacle_only_feet_stumble,
-    obstacle_only_undesired_contacts,
     rapid_feet_motion_l2,
 )
 from .reward_terms.root_motion import root_chatter_l2
@@ -53,16 +46,9 @@ __all__ = [
     "base_contact",
     "base_clearance_below_l2",
     # Limb regularizers.
-    "feet_air_time",
     "joint_deviation_l2",
     "feet_edge",
     "feet_stumble",
-    "flat_only_no_feet_contact",
-    "level_scaled_feet_slide",
-    "no_feet_contact",
-    "obstacle_only_feet_edge",
-    "obstacle_only_feet_stumble",
-    "obstacle_only_undesired_contacts",
     "rapid_feet_motion_l2",
     # Stateful root-motion regularization.
     "root_chatter_l2",
