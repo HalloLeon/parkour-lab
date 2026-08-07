@@ -539,6 +539,17 @@ class RewardsCfg:
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
 
     # Foot-placement quality.
+    flat_foot_clearance = RewTerm(
+        func=mdp.flat_foot_clearance_exp,
+        weight=0.1,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "std": 0.04,
+            "tanh_mult": 2.0,
+            "target_height": 0.08,
+        },
+    )
+
     feet_edge = RewTerm(
         func=mdp.feet_edge,
         weight=-1.0,

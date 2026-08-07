@@ -14,6 +14,7 @@ to work.
 from .reward_terms.limb import (
     feet_edge,
     feet_stumble,
+    flat_foot_clearance_exp,
     joint_deviation_l2,
     rapid_feet_motion_l2,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "base_contact",
     "base_clearance_below_l2",
     # Limb regularizers.
+    "flat_foot_clearance_exp",
     "joint_deviation_l2",
     "feet_edge",
     "feet_stumble",

@@ -3,7 +3,9 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Limb-level joint, contact, and motion regularizers."""
+"""Limb-level joint, contact, and motion rewards."""
+
+import math
 
 import torch
 from isaaclab.envs import ManagerBasedRLEnv
@@ -12,7 +14,42 @@ from isaaclab.managers import SceneEntityCfg
 from .. import config
 from .._shared import contact, robot, runtime
 from ..curriculums.config import DEFAULT_PARKOUR_CURRICULUM, ParkourCurriculumCfg
+from ..navigation import route
 from ..terrain import edges
+
+
+def flat_foot_clearance_exp(
+    env: ManagerBasedRLEnv,
+    target_height: float = 0.08,
+    std: float = 0.04,
+    tanh_mult: float = 2.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=".*_foot"),
+) -> torch.Tensor:
+    """Reward moving feet near a target height on the flat bootstrap.
+
+    Horizontal foot speed gates the height kernel, so stationary feet earn
+    nothing. Obstacle rows receive zero to leave takeoff and landing mechanics
+    unconstrained.
+
+    Returns:
+        Floating tensor with shape ``(num_envs,)`` in ``[0, 1]``.
+    """
+
+    if not math.isfinite(target_height) or target_height < 0.0:
+        raise ValueError("target_height must be finite and non-negative.")
+    if not math.isfinite(std) or std <= 0.0:
+        raise ValueError("std must be finite and positive.")
+    if not math.isfinite(tanh_mult) or tanh_mult <= 0.0:
+        raise ValueError("tanh_mult must be finite and positive.")
+
+    foot_position = robot._selected_body_pos_env(env, asset_cfg)
+    foot_velocity = robot._selected_body_lin_vel_w(env, asset_cfg)
+    horizontal_speed = torch.linalg.norm(foot_velocity[..., :2], dim=-1)
+    moving_gate = torch.tanh(float(tanh_mult) * horizontal_speed)
+    height_kernel = torch.exp(-((foot_position[..., 2] - float(target_height)) / float(std)).square())
+    reward = (moving_gate * height_kernel).mean(dim=-1)
+    flat_mask = route.active_difficulty_indices(env) == 0
+    return reward * flat_mask.to(dtype=reward.dtype)
 
 
 def feet_edge(
