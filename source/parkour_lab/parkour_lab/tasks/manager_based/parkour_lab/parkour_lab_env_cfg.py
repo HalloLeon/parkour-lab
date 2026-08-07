@@ -504,6 +504,8 @@ class RewardsCfg:
     at that command while a phase-local ceiling permits traversal speedups.
     Heading provides directional guidance without prescribing a
     terrain-specific gait.
+    A mild upright prior discourages persistent trunk lean while preserving
+    the attitude changes needed for obstacle traversal.
     One-shot physical milestones and completion bonuses make discrete progress
     unambiguous, while safety remains separate.
     """
@@ -571,6 +573,7 @@ class RewardsCfg:
     # Keep vertical motion affordable enough for deliberate takeoff and landing.
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.1)
     joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.0002)
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
 
@@ -587,7 +590,7 @@ class RewardsCfg:
             "contact_sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
             "contact_threshold": 1.0,
             "sensor_names": FOOT_SURFACE_SCANNER_NAMES,
-            "target_clearance": 0.05,
+            "target_clearance": 0.04,
             "velocity_scale": 2.0,
         },
     )

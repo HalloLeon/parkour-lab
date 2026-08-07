@@ -215,6 +215,9 @@ def build_level(
         ray_exit = min(ray_exit, max(distances))
     if ray_entry > ray_exit:
         raise ValueError("The final ramp centerline must point into the landing.")
+    terminal_distance = ray_exit - _WAYPOINT_INSET_M
+    if terminal_distance <= ray_entry:
+        raise ValueError("The final ramp path through the landing must exceed the waypoint inset.")
 
     structures = tuple(_ramp_structure(f"tilted_ramp_{index}", ramp) for index, ramp in enumerate(ramps, start=1))
     ramp_supports = tuple(
@@ -264,8 +267,8 @@ def build_level(
 
     final_waypoint = ParkourWaypointCfg(
         position=(
-            0.5 * (landing_region.x_range[0] + landing_region.x_range[1]),
-            0.5 * (landing_region.y_range[0] + landing_region.y_range[1]),
+            final_ramp.centerline_end[0] + terminal_distance * final_ramp.travel_direction_xy[0],
+            final_ramp.centerline_end[1] + terminal_distance * final_ramp.travel_direction_xy[1],
             marker_offset_z,
         ),
         support_region_name=landing_region.name,
