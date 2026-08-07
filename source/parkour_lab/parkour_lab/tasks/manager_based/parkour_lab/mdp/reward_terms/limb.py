@@ -145,7 +145,7 @@ def terrain_relative_foot_clearance(
     contact_sensor_cfg: SceneEntityCfg,
     sensor_names: tuple[str, ...],
     contact_threshold: float = 1.0,
-    target_clearance: float = 0.04,
+    target_clearance: float = 0.05,
     velocity_scale: float = 2.0,
 ) -> torch.Tensor:
     """Reward moving feet for reaching terrain-relative swing clearance.

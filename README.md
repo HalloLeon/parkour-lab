@@ -224,7 +224,7 @@ masked so a marker jump is not mistaken for robot motion. Positive air-time
 and no-feet-contact shaping are disabled. Four reward-only downward foot rays
 provide terrain-relative clearance on flat ground, ramps, and elevated support.
 A single bounded term rewards horizontally moving foot-link origins up to
-0.04 m clearance (about 0.02 m sole clearance), saturates above that target,
+0.05 m clearance (about 0.03 m sole clearance), saturates above that target,
 and assigns zero to stationary feet, missing terrain hits, or unsupported flight
 phases. Leg-contact, edge, slide, and stumble penalties use the same semantics
 on every terrain row.

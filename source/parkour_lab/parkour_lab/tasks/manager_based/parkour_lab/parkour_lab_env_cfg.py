@@ -573,7 +573,7 @@ class RewardsCfg:
     # Keep vertical motion affordable enough for deliberate takeoff and landing.
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.1)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.05)
     joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.0002)
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
 
@@ -590,7 +590,7 @@ class RewardsCfg:
             "contact_sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
             "contact_threshold": 1.0,
             "sensor_names": FOOT_SURFACE_SCANNER_NAMES,
-            "target_clearance": 0.04,
+            "target_clearance": 0.05,
             "velocity_scale": 2.0,
         },
     )
