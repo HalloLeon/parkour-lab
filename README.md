@@ -221,10 +221,12 @@ obstacles.
 Standing still and moving backward receive negligible flat tracking reward and
 zero obstacle acquisition reward. Reward samples on the exact retarget step are
 masked so a marker jump is not mistaken for robot motion. Positive air-time
-and no-feet-contact shaping are disabled. A single bounded flat-bootstrap term
-rewards horizontally moving feet near 0.08 m environment-local height; it is
-zero for stationary feet and on every obstacle row, leaving traversal mechanics
-emergent. Leg-contact, edge, slide, and stumble penalties use the same semantics
+and no-feet-contact shaping are disabled. Four reward-only downward foot rays
+provide terrain-relative clearance on flat ground, ramps, and elevated support.
+A single bounded term rewards horizontally moving foot-link origins up to
+0.05 m clearance (about 0.03 m sole clearance), saturates above that target,
+and assigns zero to stationary feet, missing terrain hits, or unsupported flight
+phases. Leg-contact, edge, slide, and stumble penalties use the same semantics
 on every terrain row.
 Low-clearance error remains normalized to `[0, 1]` before its squared penalty.
 

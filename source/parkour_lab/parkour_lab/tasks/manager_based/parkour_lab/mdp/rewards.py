@@ -14,9 +14,9 @@ to work.
 from .reward_terms.limb import (
     feet_edge,
     feet_stumble,
-    flat_foot_clearance_exp,
     joint_deviation_l2,
     rapid_feet_motion_l2,
+    terrain_relative_foot_clearance,
 )
 from .reward_terms.root_motion import root_chatter_l2
 from .reward_terms.safety import base_clearance_below_l2, base_contact
@@ -42,14 +42,14 @@ __all__ = [
     "waypoint_progress_xy_stable",
     "waypoint_velocity_tracking_exp",
     # Safety and clearance penalties.
-    "base_contact",
     "base_clearance_below_l2",
-    # Limb regularizers.
-    "flat_foot_clearance_exp",
-    "joint_deviation_l2",
+    "base_contact",
+    # Limb rewards and regularizers.
     "feet_edge",
     "feet_stumble",
+    "joint_deviation_l2",
     "rapid_feet_motion_l2",
+    "terrain_relative_foot_clearance",
     # Stateful root-motion regularization.
     "root_chatter_l2",
 ]
