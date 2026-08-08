@@ -208,10 +208,20 @@ def _selected_body_pos_env(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) ->
         Positions with shape ``[num_envs, num_bodies, 3]``.
     """
 
+    return _selected_body_pos_w(env, asset_cfg) - env.scene.env_origins[:, None, :]
+
+
+def _selected_body_pos_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Return selected body positions in world frame.
+
+    Returns:
+        Positions with shape ``[num_envs, num_bodies, 3]``.
+    """
+
     _require_body_ids(asset_cfg, role="body position selection")
 
     asset: Articulation = env.scene[asset_cfg.name]
-    return asset.data.body_pos_w[:, asset_cfg.body_ids, :] - env.scene.env_origins[:, None, :]
+    return asset.data.body_pos_w[:, asset_cfg.body_ids, :]
 
 
 def _selected_body_speed_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:

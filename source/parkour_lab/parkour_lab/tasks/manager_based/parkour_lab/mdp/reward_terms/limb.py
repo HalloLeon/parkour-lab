@@ -152,8 +152,8 @@ def terrain_relative_foot_clearance(
 
     One downward ray per foot supplies the underlying surface height. The
     clearance score saturates at the target, so the extra lift required by an
-    obstacle is never penalized. Stationary feet, missing terrain hits, and
-    unsupported flight phases earn nothing.
+    obstacle is never penalized. Contacted or stationary feet, missing terrain
+    hits, and unsupported flight phases earn nothing.
 
     Returns:
         Floating tensor with shape ``(num_envs,)`` in ``[0, 1]``.
@@ -168,7 +168,6 @@ def terrain_relative_foot_clearance(
     if not math.isfinite(velocity_scale) or velocity_scale <= 0.0:
         raise ValueError("velocity_scale must be finite and positive.")
 
-    foot_heights = []
     surface_heights = []
     valid_hits = []
     for sensor_name in sensor_names:
@@ -182,23 +181,24 @@ def terrain_relative_foot_clearance(
             raise RuntimeError(
                 f"'{sensor_name}' must contain exactly one downward ray."
             )
-        if data.pos_w.ndim != 2 or data.pos_w.shape[-1] != 3:
-            raise RuntimeError(
-                f"'{sensor_name}' position must have shape [num_envs, 3]."
-            )
-        foot_heights.append(data.pos_w[:, 2])
         surface_heights.append(data.ray_hits_w[:, 0, 2])
         valid_hits.append(torch.isfinite(data.ray_hits_w[:, 0, :]).all(dim=-1))
 
-    foot_height = torch.stack(foot_heights, dim=-1)
+    foot_height = robot._selected_body_pos_w(env, asset_cfg)[..., 2]
     surface_height = torch.stack(surface_heights, dim=-1)
     valid_hit = torch.stack(valid_hits, dim=-1)
     foot_velocity = robot._selected_body_lin_vel_w(env, asset_cfg)
     horizontal_speed = torch.linalg.norm(foot_velocity[..., :2], dim=-1)
     runtime._validate_matching_shape(
         foot_height,
+        surface_height,
+        lhs_name="foot body height",
+        rhs_name="foot surface height",
+    )
+    runtime._validate_matching_shape(
+        foot_height,
         horizontal_speed,
-        lhs_name="foot ray height",
+        lhs_name="foot body height",
         rhs_name="foot horizontal speed",
     )
 
@@ -214,7 +214,15 @@ def terrain_relative_foot_clearance(
     current_force_norm = contact._force_norm_mask(env, sensor_cfg=contact_sensor_cfg)[
         :, -1
     ]
-    has_support = torch.any(current_force_norm > contact_threshold, dim=-1)
-    return (moving_gate * clearance_score).mean(dim=-1) * has_support.to(
+    in_contact = current_force_norm > contact_threshold
+    runtime._validate_matching_shape(
+        foot_height,
+        in_contact,
+        lhs_name="foot body height",
+        rhs_name="foot contact mask",
+    )
+    has_support = torch.any(in_contact, dim=-1)
+    swing_score = moving_gate * clearance_score * (~in_contact).to(
         dtype=foot_height.dtype
     )
+    return swing_score.mean(dim=-1) * has_support.to(dtype=foot_height.dtype)

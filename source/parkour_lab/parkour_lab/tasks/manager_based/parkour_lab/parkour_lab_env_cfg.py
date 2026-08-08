@@ -587,7 +587,11 @@ class RewardsCfg:
                 body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
                 preserve_order=True,
             ),
-            "contact_sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+            "contact_sensor_cfg": SceneEntityCfg(
+                "feet_contact",
+                body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+                preserve_order=True,
+            ),
             "contact_threshold": 1.0,
             "sensor_names": FOOT_SURFACE_SCANNER_NAMES,
             "target_clearance": 0.05,
@@ -607,7 +611,7 @@ class RewardsCfg:
 
     feet_slide = RewTerm(
         func=mdp.feet_slide,
-        weight=-0.025,
+        weight=-0.05,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
