@@ -57,9 +57,9 @@ class RegularizedPPOCfg(RslRlPpoAlgorithmCfg):
     privileged_regularization_warmup_iterations: int = 200
     privileged_regularization_ramp_iterations: int = 300
 
-    # The stock adaptive schedule may otherwise increase the shared optimizer
-    # rate to 1e-2, including for the adaptation encoders.
-    max_learning_rate: float = 1.0e-3
+    # Do not let the adaptive schedule raise the shared optimizer above its
+    # initial rate during long runs, including for the adaptation encoders.
+    max_learning_rate: float = 3.0e-4
 
 
 @configclass
