@@ -68,7 +68,7 @@ def build_bootstrap_level(obstacle_family: str) -> ParkourLevelCfg:
             ),
         ),
         target_speed=_BOOTSTRAP_TARGET_SPEED,
-        min_clearance=0.28,
+        min_clearance=0.24,
         difficulty=ParkourDifficultyCfg(order=0.0, parameters={}),
     )
 
