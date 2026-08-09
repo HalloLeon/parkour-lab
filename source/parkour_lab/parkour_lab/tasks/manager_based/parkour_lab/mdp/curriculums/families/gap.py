@@ -27,7 +27,7 @@ def build_default_levels() -> tuple[ParkourLevelCfg, ...]:
                 2,
             ),
             target_speed=0.60,
-            min_clearance=0.24,
+            min_clearance=0.28,
         )
         for obstacle_stage_index in range(_shared.NUM_OBSTACLE_STAGES)
     )
