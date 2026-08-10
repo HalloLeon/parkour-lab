@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from ..levels import ParkourDifficultyCfg, ParkourLevelCfg, ParkourSupportRegionCfg, ParkourWaypointCfg
+from ..levels import (
+    ParkourDifficultyCfg,
+    ParkourLevelCfg,
+    ParkourSupportRegionCfg,
+    ParkourWaypointCfg,
+)
 from . import _shared
 
 # Keep the final target safely inside the rear platform edge while extending
@@ -12,25 +17,39 @@ _MIN_OBSTACLE_HEIGHT_M = 0.04
 _MAX_OBSTACLE_HEIGHT_M = 0.24
 
 
-def build_default_levels() -> tuple[ParkourLevelCfg, ...]:
-    """Build the flat bootstrap and all default high-step stages."""
+def build_default_levels(
+    geometry_variant_index: int = 0,
+) -> tuple[ParkourLevelCfg, ...]:
+    """Build the flat bootstrap and one deterministic high-step ladder."""
+
+    variant_offset = _shared.geometry_variant_offset(geometry_variant_index)
 
     return (_shared.build_bootstrap_level("high_step"),) + tuple(
         build_level(
-            name=f"high_step_difficulty_{obstacle_stage_index}",
-            difficulty_order=float(obstacle_stage_index + 1),
+            name=(
+                f"high_step_difficulty_{obstacle_stage_index}"
+                if geometry_variant_index == 0
+                else f"high_step_variant_{geometry_variant_index}_difficulty_{obstacle_stage_index}"
+            ),
+            difficulty_order=_shared.normalized_level_difficulty(obstacle_stage_index + 1)
+            * _shared.NUM_OBSTACLE_STAGES,
             # Begin below ordinary swing clearance so accidental early
             # successes teach progressively higher foot placement.
             obstacle_height=round(
-                _MIN_OBSTACLE_HEIGHT_M
-                + (_MAX_OBSTACLE_HEIGHT_M - _MIN_OBSTACLE_HEIGHT_M)
-                * obstacle_stage_index
-                / (_shared.NUM_OBSTACLE_STAGES - 1),
-                2,
+                _shared.lerp(
+                    _MIN_OBSTACLE_HEIGHT_M,
+                    _MAX_OBSTACLE_HEIGHT_M,
+                    _shared.obstacle_progress(_shared.normalized_level_difficulty(obstacle_stage_index + 1)),
+                )
+                * (1.0 + 0.05 * variant_offset),
+                4,
             ),
             obstacle_width=1.8,
-            obstacle_depth=1.6,
-            obstacle_position_xy=(2.8, 0.0),
+            obstacle_depth=1.6 * (1.0 + 0.03 * variant_offset),
+            obstacle_position_xy=(
+                2.8 - 0.04 * variant_offset,
+                0.03 * variant_offset,
+            ),
             target_speed=0.55,
             min_clearance=0.24,
         )
@@ -116,4 +135,12 @@ def build_level(
                 obstacle_position_xy=obstacle_position_xy,
             ),
         ),
+    )
+
+
+def build_level_variants() -> tuple[tuple[ParkourLevelCfg, ...], ...]:
+    """Build the non-canonical deterministic training ladders."""
+
+    return tuple(
+        build_default_levels(variant_index) for variant_index in range(1, len(_shared.GEOMETRY_VARIANT_OFFSETS))
     )

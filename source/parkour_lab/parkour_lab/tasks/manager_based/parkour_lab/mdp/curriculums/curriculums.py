@@ -276,8 +276,8 @@ def reset_routes(
             waypoint-marker state.
         env_ids: Environments beginning a new episode, or ``None`` for all
             environments.
-        terrain_layout: Mapping from physical terrain columns to obstacle
-            families.
+        terrain_layout: Mapping from physical terrain columns to exact
+            obstacle-family geometry variants.
         curriculum_cfg: Course matrix used to resolve the selected family and
             difficulty into route geometry.
         waypoint_marker_cfg: Scene-entity selection for the visible marker.
@@ -300,6 +300,12 @@ def reset_routes(
         env_ids,
         terrain_layout,
     )
+    geometry_variant_indices = _geometry_variant_indices_for_terrain_columns(
+        env,
+        terrain,
+        env_ids,
+        terrain_layout,
+    )
 
     # Curriculum updates run before reset events, so ``difficulty_indices``
     # already contains any promotion or demotion selected for this new episode.
@@ -312,6 +318,7 @@ def reset_routes(
         waypoint_marker_cfg=waypoint_marker_cfg,
         asset_cfg=asset_cfg,
         target_speed_range=target_speed_range,
+        geometry_variant_indices=geometry_variant_indices,
     )
 
 
@@ -362,20 +369,6 @@ def _curriculum_metrics(
 # Terrain-selection helpers.
 
 
-def _set_terrain_levels(
-    terrain: TerrainImporter,
-    env_ids: torch.Tensor,
-    levels: torch.Tensor,
-) -> None:
-    """Assign exact terrain rows and their matching environment origins."""
-
-    terrain.terrain_levels[env_ids] = levels
-    terrain.env_origins[env_ids] = terrain.terrain_origins[
-        levels,
-        terrain.terrain_types[env_ids],
-    ]
-
-
 def _family_indices_for_terrain_columns(
     env: ManagerBasedRLEnv,
     terrain: TerrainImporter,
@@ -398,6 +391,22 @@ def _family_indices_for_terrain_columns(
         dtype=torch.long,
     )
     return family_by_column[terrain.terrain_types[env_ids]]
+
+
+def _geometry_variant_indices_for_terrain_columns(
+    env: ManagerBasedRLEnv,
+    terrain: TerrainImporter,
+    env_ids: torch.Tensor,
+    terrain_layout: config.ParkourTerrainLayout,
+) -> torch.Tensor:
+    """Resolve selected environments' columns to exact geometry variants."""
+
+    variant_by_column = torch.as_tensor(
+        terrain_layout.geometry_variant_index_by_column,
+        device=env.device,
+        dtype=torch.long,
+    )
+    return variant_by_column[terrain.terrain_types[env_ids]]
 
 
 def _initial_level_indices(
@@ -424,6 +433,20 @@ def _initial_level_indices(
         # TerrainImporter's random 0..max initialization.
         return torch.remainder(env_ids, curriculum_cfg.initial_level + 1)
     return torch.full_like(env_ids, curriculum_cfg.initial_level)
+
+
+def _set_terrain_levels(
+    terrain: TerrainImporter,
+    env_ids: torch.Tensor,
+    levels: torch.Tensor,
+) -> None:
+    """Assign exact terrain rows and their matching environment origins."""
+
+    terrain.terrain_levels[env_ids] = levels
+    terrain.env_origins[env_ids] = terrain.terrain_origins[
+        levels,
+        terrain.terrain_types[env_ids],
+    ]
 
 
 # Pure curriculum transitions.
@@ -593,9 +616,10 @@ def _validate_terrain_layout(
     generated difficulty and one physical column for each terrain sampling
     slot. ``ParkourTerrainLayout`` supplies the semantic interpretation that
     Isaac Lab itself does not store: row indices are curriculum difficulty
-    indices, while each column maps to one obstacle-family index. Checking the
-    complete relationship once during startup prevents mesh generation, route
-    lookup, and per-environment family state from silently disagreeing.
+    indices, while each column maps to one obstacle-family and geometry-variant
+    pair. Checking the complete relationship once during startup prevents mesh
+    generation, route lookup, and per-environment family state from silently
+    disagreeing.
     """
 
     if terrain is None or terrain.terrain_origins is None:
@@ -604,6 +628,7 @@ def _validate_terrain_layout(
     terrain_layout.validate_grid(
         curriculum_difficulties=curriculum_cfg.num_difficulties,
         curriculum_families=len(curriculum_cfg.families),
+        curriculum_geometry_variants=curriculum_cfg.num_geometry_variants,
         terrain_columns=int(terrain.terrain_origins.shape[1]),
         terrain_rows=int(terrain.terrain_origins.shape[0]),
     )

@@ -33,17 +33,16 @@ class ParkourTerrainLayout:
     * Physical row ``r`` represents curriculum difficulty ``r``. There must be
       exactly one row for every shared difficulty in the curriculum.
     * Physical columns are sampling slots rather than unique obstacle
-      families. Multiple columns can contain the same family so training can
-      allocate an equal number of environments to every family.
-      ``family_index_by_column[c]`` identifies which curriculum family is
-      generated in physical column ``c``.
+      families. ``family_index_by_column[c]`` and
+      ``geometry_variant_index_by_column[c]`` jointly identify the exact
+      prebuilt course ladder generated in column ``c``.
 
     Keeping both parts in one value object makes the complete grid contract
     explicit wherever terrain generation and runtime indexing are connected.
     For example, a seven-difficulty, four-family training layout with 40 columns
-    has seven rows and a mapping containing ten copies of each family index.
-    Fixed-family evaluation instead maps every column to the selected family
-    while retaining the same row-to-difficulty relationship.
+    has seven rows, ten columns per family, and two columns per one of five
+    geometry variants. Fixed-family evaluation instead maps every column to the
+    selected family's canonical variant while retaining the same rows.
 
     The layout is a mutable configclass because it is stored in an event term's
     ``params`` mapping. Isaac Lab's Hydra bridge reconstructs that mapping by
@@ -54,10 +53,13 @@ class ParkourTerrainLayout:
             number of shared curriculum difficulties.
         family_index_by_column: One curriculum-family index for every physical
             terrain column, ordered by column index.
+        geometry_variant_index_by_column: One deterministic within-family
+            geometry-variant index for every physical terrain column.
     """
 
     num_difficulty_rows: int = MISSING
     family_index_by_column: tuple[int, ...] = MISSING
+    geometry_variant_index_by_column: tuple[int, ...] = MISSING
 
     @property
     def num_columns(self) -> int:
@@ -70,6 +72,7 @@ class ParkourTerrainLayout:
         *,
         curriculum_difficulties: int,
         curriculum_families: int,
+        curriculum_geometry_variants: int,
         terrain_columns: int,
         terrain_rows: int,
     ) -> None:
@@ -93,18 +96,20 @@ class ParkourTerrainLayout:
                 f"column: got {self.num_columns} indices and "
                 f"{terrain_columns} columns."
             )
+        if len(self.geometry_variant_index_by_column) != self.num_columns:
+            raise ValueError("The terrain layout must contain one geometry variant index per physical column.")
+        if any(family_index < 0 or family_index >= curriculum_families for family_index in self.family_index_by_column):
+            raise ValueError("The terrain layout contains an out-of-range family index.")
         if any(
-            family_index < 0 or family_index >= curriculum_families
-            for family_index in self.family_index_by_column
+            variant_index < 0 or variant_index >= curriculum_geometry_variants
+            for variant_index in self.geometry_variant_index_by_column
         ):
-            raise ValueError(
-                "The terrain layout contains an out-of-range family index."
-            )
+            raise ValueError("The terrain layout contains an out-of-range geometry variant index.")
 
 
 @configclass
 class ParkourCurriculumCfg:
-    """Balanced obstacle-family by difficulty curriculum matrix.
+    """Balanced family-variant-difficulty curriculum matrix.
 
     Terrain rows are shared difficulty indices. Terrain columns are split
     equally among ``families`` so PPO receives the same number of samples from
@@ -154,26 +159,40 @@ class ParkourCurriculumCfg:
     def __post_init__(self) -> None:
         self.validate_configuration()
 
-    def course(self, family_index: int, difficulty_index: int) -> ParkourLevelCfg:
-        """Return one cell of the family-by-difficulty matrix."""
+    def course(
+        self,
+        family_index: int,
+        difficulty_index: int,
+        geometry_variant_index: int = 0,
+    ) -> ParkourLevelCfg:
+        """Return one exact cell of the family-variant-difficulty matrix."""
 
         if not 0 <= family_index < len(self.families):
             raise IndexError("family_index is out of range.")
         if not 0 <= difficulty_index < self.num_difficulties:
             raise IndexError("difficulty_index is out of range.")
-        return self.families[family_index].levels[difficulty_index]
+        if not 0 <= geometry_variant_index < self.num_geometry_variants:
+            raise IndexError("geometry_variant_index is out of range.")
+        return self.families[family_index].all_level_variants[geometry_variant_index][difficulty_index]
 
-    def course_index(self, family_index: int, difficulty_index: int) -> int:
+    def course_index(
+        self,
+        family_index: int,
+        difficulty_index: int,
+        geometry_variant_index: int = 0,
+    ) -> int:
         """Flatten one matrix cell for vectorized runtime table indexing."""
 
-        self.course(family_index, difficulty_index)
-        return family_index * self.num_difficulties + difficulty_index
+        self.course(family_index, difficulty_index, geometry_variant_index)
+        return (
+            family_index * self.num_geometry_variants + geometry_variant_index
+        ) * self.num_difficulties + difficulty_index
 
     @property
     def courses(self) -> tuple[ParkourLevelCfg, ...]:
-        """Return family-major matrix cells for runtime lookup tables."""
+        """Return family-then-variant-major cells for runtime lookup tables."""
 
-        return tuple(level for family in self.families for level in family.levels)
+        return tuple(level for family in self.families for variant in family.all_level_variants for level in variant)
 
     def family_index(self, family_name: str) -> int:
         """Return the stable index of a configured obstacle family."""
@@ -197,6 +216,7 @@ class ParkourCurriculumCfg:
         return {
             "family_order": list(self.family_names),
             "num_difficulties": self.num_difficulties,
+            "num_geometry_variants": self.num_geometry_variants,
             "families": [family.metadata() for family in self.families],
         }
 
@@ -206,6 +226,12 @@ class ParkourCurriculumCfg:
 
         return len(self.families[0].levels)
 
+    @property
+    def num_geometry_variants(self) -> int:
+        """Return the shared number of deterministic geometry variants."""
+
+        return len(self.families[0].all_level_variants)
+
     def terrain_layout(
         self,
         num_columns: int,
@@ -214,22 +240,21 @@ class ParkourCurriculumCfg:
     ) -> ParkourTerrainLayout:
         """Describe how physical terrain rows and columns encode the matrix.
 
-        Training divides columns equally into contiguous family blocks,
-        matching Isaac Lab's equal-proportion sub-terrain layout. Supplying
-        ``family_name`` instead maps every column to that family for fixed
+        Training divides columns into contiguous family blocks and then into
+        near-balanced contiguous variant blocks. Supplying ``family_name``
+        instead maps every column to that family's canonical variant for fixed
         evaluation. Rows always retain their one-to-one correspondence with
         the shared curriculum difficulties.
         """
 
-        if (
-            isinstance(num_columns, bool)
-            or not isinstance(num_columns, int)
-            or num_columns <= 0
-        ):
+        if isinstance(num_columns, bool) or not isinstance(num_columns, int) or num_columns <= 0:
             raise ValueError("num_columns must be a positive integer.")
 
         if family_name is not None:
             family_index_by_column = (self.family_index(family_name),) * num_columns
+            # Fixed evaluation stays nominal and directly comparable across
+            # runs; training is what spreads deterministic variants by column.
+            geometry_variant_index_by_column = (0,) * num_columns
         else:
             num_families = len(self.families)
             if num_columns % num_families != 0:
@@ -238,13 +263,19 @@ class ParkourCurriculumCfg:
                     f"divisible by the {num_families} obstacle families."
                 )
             columns_per_family = num_columns // num_families
-            family_index_by_column = tuple(
-                column // columns_per_family for column in range(num_columns)
+            family_index_by_column = tuple(column // columns_per_family for column in range(num_columns))
+            geometry_variant_index_by_column = tuple(
+                min(
+                    (column % columns_per_family) * self.num_geometry_variants // columns_per_family,
+                    self.num_geometry_variants - 1,
+                )
+                for column in range(num_columns)
             )
 
         return ParkourTerrainLayout(
             num_difficulty_rows=self.num_difficulties,
             family_index_by_column=family_index_by_column,
+            geometry_variant_index_by_column=geometry_variant_index_by_column,
         )
 
     def validate_configuration(self) -> None:
@@ -262,35 +293,26 @@ class ParkourCurriculumCfg:
 
         difficulty_counts = {len(family.levels) for family in self.families}
         if len(difficulty_counts) != 1:
-            raise ValueError(
-                "Every obstacle family must define the same difficulty rows."
-            )
+            raise ValueError("Every obstacle family must define the same difficulty rows.")
 
-        difficulty_orders = tuple(
-            level.difficulty.order for level in self.families[0].levels
-        )
+        variant_counts = {len(family.all_level_variants) for family in self.families}
+        if len(variant_counts) != 1:
+            raise ValueError("Every obstacle family must define the same number of geometry variants.")
+
+        difficulty_orders = tuple(level.difficulty.order for level in self.families[0].levels)
         if any(
-            tuple(level.difficulty.order for level in family.levels)
-            != difficulty_orders
+            tuple(level.difficulty.order for level in family.levels) != difficulty_orders
             for family in self.families[1:]
         ):
-            raise ValueError(
-                "Every obstacle family must use the same difficulty ranks by row."
-            )
+            raise ValueError("Every obstacle family must use the same difficulty ranks by row.")
 
         if self.initial_level < 0 or self.initial_level >= self.num_difficulties:
             raise ValueError("initial_level is out of range.")
 
-        if (
-            self.max_level < self.initial_level
-            or self.max_level >= self.num_difficulties
-        ):
+        if self.max_level < self.initial_level or self.max_level >= self.num_difficulties:
             raise ValueError("max_level is out of range.")
 
-        if (
-            not np.isfinite(self.waypoint_reach_threshold)
-            or self.waypoint_reach_threshold <= 0.0
-        ):
+        if not np.isfinite(self.waypoint_reach_threshold) or self.waypoint_reach_threshold <= 0.0:
             raise ValueError("waypoint_reach_threshold must be positive.")
 
         for field_name in (
@@ -350,9 +372,7 @@ class ParkourCurriculumCfg:
 DEFAULT_PARKOUR_CURRICULUM = ParkourCurriculumCfg()
 
 
-def parkour_terrain(
-    difficulty: float, cfg: ParkourTerrainCfg
-) -> tuple[list[trimesh.Trimesh], np.ndarray]:
+def parkour_terrain(difficulty: float, cfg: ParkourTerrainCfg) -> tuple[list[trimesh.Trimesh], np.ndarray]:
     """Generate a terrain tile from base-support patches and structures."""
 
     levels = cfg.levels
@@ -381,6 +401,36 @@ class ParkourTerrainCfg(SubTerrainBaseCfg):
     levels: tuple[ParkourLevelCfg, ...] = DEFAULT_PARKOUR_CURRICULUM.families[0].levels
 
     ground_thickness: float = 0.05
+
+
+def parkour_sub_terrains(
+    curriculum_cfg: ParkourCurriculumCfg,
+    terrain_layout: ParkourTerrainLayout,
+    *,
+    ground_thickness: float = 0.05,
+) -> dict[str, ParkourTerrainCfg]:
+    """Build exact sub-terrain ladders in physical column-block order."""
+
+    column_pairs = tuple(
+        zip(
+            terrain_layout.family_index_by_column,
+            terrain_layout.geometry_variant_index_by_column,
+            strict=True,
+        )
+    )
+    ordered_pairs = tuple(dict.fromkeys(column_pairs))
+    reconstructed = tuple(pair for pair in ordered_pairs for _ in range(column_pairs.count(pair)))
+    if reconstructed != column_pairs:
+        raise ValueError("Each family-variant terrain selection must occupy one contiguous column block.")
+
+    return {
+        f"{curriculum_cfg.families[family_index].name}_variant_{variant_index}": ParkourTerrainCfg(
+            proportion=column_pairs.count((family_index, variant_index)) / terrain_layout.num_columns,
+            levels=curriculum_cfg.families[family_index].all_level_variants[variant_index],
+            ground_thickness=ground_thickness,
+        )
+        for family_index, variant_index in ordered_pairs
+    }
 
 
 PARKOUR_TERRAIN_GENERATOR_CFG = TerrainGeneratorCfg(
@@ -421,16 +471,11 @@ PARKOUR_TERRAIN_GENERATOR_CFG = TerrainGeneratorCfg(
     # changes take effect immediately.
     use_cache=False,
     # Isaac Lab assigns sub-terrain types to contiguous column blocks in this
-    # stable dictionary order. Equal proportions and 40 divisible columns give
-    # every family exactly ten columns at every difficulty row.
-    sub_terrains={
-        family.name: ParkourTerrainCfg(
-            proportion=1.0 / len(DEFAULT_PARKOUR_CURRICULUM.families),
-            levels=family.levels,
-            ground_thickness=0.05,
-        )
-        for family in DEFAULT_PARKOUR_CURRICULUM.families
-    },
+    # stable dictionary order. Every block owns one exact family/variant ladder.
+    sub_terrains=parkour_sub_terrains(
+        DEFAULT_PARKOUR_CURRICULUM,
+        DEFAULT_PARKOUR_CURRICULUM.terrain_layout(40),
+    ),
 )
 
 
@@ -460,14 +505,10 @@ def _normalize_mesh_result(result: object, factory: object) -> list[trimesh.Trim
 
     # Report the factory as well as the accepted return types to make malformed
     # custom structure factories straightforward to identify.
-    raise TypeError(
-        f"Mesh factory {factory!r} must return a Trimesh, Scene, or iterable of Trimesh objects."
-    )
+    raise TypeError(f"Mesh factory {factory!r} must return a Trimesh, Scene, or iterable of Trimesh objects.")
 
 
-def _structure_meshes(
-    structure: ParkourStructureCfg, terrain_center: np.ndarray
-) -> list[trimesh.Trimesh]:
+def _structure_meshes(structure: ParkourStructureCfg, terrain_center: np.ndarray) -> list[trimesh.Trimesh]:
     """Create and rigidly transform all meshes produced by one structure."""
 
     # Call the configured factory with its declarative keyword arguments.

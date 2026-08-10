@@ -912,16 +912,10 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
             terrain_generator.num_cols,
             family_name=self.evaluation_family,
         )
-        generated_family_indices = tuple(dict.fromkeys(terrain_layout.family_index_by_column))
-        generated_families = tuple(curriculum_cfg.families[index] for index in generated_family_indices)
-        terrain_generator.sub_terrains = {
-            family.name: mdp.curriculums_config.ParkourTerrainCfg(
-                proportion=1.0 / len(generated_families),
-                levels=family.levels,
-                ground_thickness=0.05,
-            )
-            for family in generated_families
-        }
+        terrain_generator.sub_terrains = mdp.curriculums_config.parkour_sub_terrains(
+            curriculum_cfg,
+            terrain_layout,
+        )
 
         # Restrict training to the configured starting range; evaluation pins
         # startup to its requested difficulty row.

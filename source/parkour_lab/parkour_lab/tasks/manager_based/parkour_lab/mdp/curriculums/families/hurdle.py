@@ -2,38 +2,54 @@
 
 from __future__ import annotations
 
-from ..levels import ParkourDifficultyCfg, ParkourLevelCfg, ParkourSupportRegionCfg, ParkourWaypointCfg
+from ..levels import (
+    ParkourDifficultyCfg,
+    ParkourLevelCfg,
+    ParkourSupportRegionCfg,
+    ParkourWaypointCfg,
+)
 from . import _shared
 
-# Required ground distance from a hurdle's rear face to its landing waypoint.
-LANDING_MARGIN_M = 0.8
+# Required ground distances around the hurdle's crossing waypoints.
 APPROACH_MARGIN_M = 0.5
+LANDING_MARGIN_M = 0.8
 FINAL_EXIT_X_M = 3.8
 _MIN_OBSTACLE_HEIGHT_M = 0.03
 _MAX_OBSTACLE_HEIGHT_M = 0.18
 
 
-def build_default_levels() -> tuple[ParkourLevelCfg, ...]:
-    """Build the flat bootstrap and all default hurdle stages."""
+def build_default_levels(
+    geometry_variant_index: int = 0,
+) -> tuple[ParkourLevelCfg, ...]:
+    """Build the flat bootstrap and one deterministic hurdle ladder."""
+
+    variant_offset = _shared.geometry_variant_offset(geometry_variant_index)
 
     return (_shared.build_bootstrap_level("hurdle"),) + tuple(
         build_level(
-            name=f"hurdle_difficulty_{obstacle_stage_index}",
-            difficulty_order=float(obstacle_stage_index + 1),
+            name=(
+                f"hurdle_difficulty_{obstacle_stage_index}"
+                if geometry_variant_index == 0
+                else f"hurdle_variant_{geometry_variant_index}_difficulty_{obstacle_stage_index}"
+            ),
+            difficulty_order=_shared.normalized_level_difficulty(obstacle_stage_index + 1)
+            * _shared.NUM_OBSTACLE_STAGES,
             # Start with a barrier that the bootstrap gait can discover, then
             # increase its height uniformly through the final difficulty.
             obstacle_height=round(
-                _MIN_OBSTACLE_HEIGHT_M
-                + (_MAX_OBSTACLE_HEIGHT_M - _MIN_OBSTACLE_HEIGHT_M)
-                * obstacle_stage_index
-                / (_shared.NUM_OBSTACLE_STAGES - 1),
-                2,
+                _shared.lerp(
+                    _MIN_OBSTACLE_HEIGHT_M,
+                    _MAX_OBSTACLE_HEIGHT_M,
+                    _shared.obstacle_progress(_shared.normalized_level_difficulty(obstacle_stage_index + 1)),
+                )
+                * (1.0 + 0.05 * variant_offset),
+                4,
             ),
             # Span the full tile so a policy cannot walk around either end while
             # remaining inside its assigned course tile.
             obstacle_width=_shared.TERRAIN_Y_RANGE_M[1] - _shared.TERRAIN_Y_RANGE_M[0],
-            obstacle_depth=0.18,
-            obstacle_position_xy=(2.0, 0.0),
+            obstacle_depth=0.18 * (1.0 + 0.05 * variant_offset),
+            obstacle_position_xy=(2.0 - 0.05 * variant_offset, 0.0),
             target_speed=0.65,
             min_clearance=0.24,
         )
@@ -104,4 +120,12 @@ def build_level(
                 obstacle_position_xy=obstacle_position_xy,
             ),
         ),
+    )
+
+
+def build_level_variants() -> tuple[tuple[ParkourLevelCfg, ...], ...]:
+    """Build the non-canonical deterministic training ladders."""
+
+    return tuple(
+        build_default_levels(variant_index) for variant_index in range(1, len(_shared.GEOMETRY_VARIANT_OFFSETS))
     )

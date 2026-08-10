@@ -4,7 +4,12 @@ from __future__ import annotations
 
 import math
 
-from ..levels import ParkourDifficultyCfg, ParkourLevelCfg, ParkourSupportRegionCfg, ParkourWaypointCfg
+from ..levels import (
+    ParkourDifficultyCfg,
+    ParkourLevelCfg,
+    ParkourSupportRegionCfg,
+    ParkourWaypointCfg,
+)
 from . import _shared
 
 # Terrain-local X coordinate around which each physical gap expands
@@ -14,17 +19,31 @@ _MIN_GAP_WIDTH_M = 0.10
 _MAX_GAP_WIDTH_M = 0.50
 
 
-def build_default_levels() -> tuple[ParkourLevelCfg, ...]:
-    """Build the flat bootstrap and all default physical-gap stages."""
+def build_default_levels(
+    geometry_variant_index: int = 0,
+) -> tuple[ParkourLevelCfg, ...]:
+    """Build the flat bootstrap and one deterministic physical-gap ladder."""
+
+    variant_offset = _shared.geometry_variant_offset(geometry_variant_index)
 
     return (_shared.build_bootstrap_level("gap"),) + tuple(
         build_level(
-            name=f"gap_difficulty_{obstacle_stage_index}",
-            difficulty_order=float(obstacle_stage_index + 1),
+            name=(
+                f"gap_difficulty_{obstacle_stage_index}"
+                if geometry_variant_index == 0
+                else f"gap_variant_{geometry_variant_index}_difficulty_{obstacle_stage_index}"
+            ),
+            difficulty_order=_shared.normalized_level_difficulty(obstacle_stage_index + 1)
+            * _shared.NUM_OBSTACLE_STAGES,
+            gap_center_x=_GAP_CENTER_X_M + 0.05 * variant_offset,
             gap_width=round(
-                _MIN_GAP_WIDTH_M
-                + (_MAX_GAP_WIDTH_M - _MIN_GAP_WIDTH_M) * obstacle_stage_index / (_shared.NUM_OBSTACLE_STAGES - 1),
-                2,
+                _shared.lerp(
+                    _MIN_GAP_WIDTH_M,
+                    _MAX_GAP_WIDTH_M,
+                    _shared.obstacle_progress(_shared.normalized_level_difficulty(obstacle_stage_index + 1)),
+                )
+                * (1.0 + 0.05 * variant_offset),
+                4,
             ),
             target_speed=0.60,
             min_clearance=0.24,
@@ -38,6 +57,7 @@ def build_level(
     name: str,
     difficulty_order: float,
     gap_width: float,
+    gap_center_x: float = _GAP_CENTER_X_M,
     target_speed: float,
     min_clearance: float,
 ) -> ParkourLevelCfg:
@@ -45,10 +65,9 @@ def build_level(
 
     if not math.isfinite(gap_width) or gap_width <= 0.0:
         raise ValueError("Gap width must be positive and finite.")
-    gap_x_range = (
-        _GAP_CENTER_X_M - 0.5 * gap_width,
-        _GAP_CENTER_X_M + 0.5 * gap_width,
-    )
+    if not math.isfinite(gap_center_x):
+        raise ValueError("Gap center must be finite.")
+    gap_x_range = (gap_center_x - 0.5 * gap_width, gap_center_x + 0.5 * gap_width)
 
     return ParkourLevelCfg(
         name=name,
@@ -86,6 +105,17 @@ def build_level(
         min_clearance=min_clearance,
         difficulty=ParkourDifficultyCfg(
             order=difficulty_order,
-            parameters={"gap_width_m": gap_width},
+            parameters={
+                "gap_center_x_m": gap_center_x,
+                "gap_width_m": gap_width,
+            },
         ),
+    )
+
+
+def build_level_variants() -> tuple[tuple[ParkourLevelCfg, ...], ...]:
+    """Build the non-canonical deterministic training ladders."""
+
+    return tuple(
+        build_default_levels(variant_index) for variant_index in range(1, len(_shared.GEOMETRY_VARIANT_OFFSETS))
     )

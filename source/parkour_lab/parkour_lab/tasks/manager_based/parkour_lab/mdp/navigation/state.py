@@ -26,25 +26,47 @@ class CourseTables:
     routes with more control points cannot gain a larger reward budget.
     """
 
-    # Course-matrix metadata.
+    # Family-variant-difficulty matrix metadata.
+    # Number of difficulty rows per family/variant ladder. Runtime queries use
+    # it to recover a difficulty row from a flattened course index.
     num_difficulties: int
 
     # Route geometry.
+    # [course, waypoint]: XY route length from the tile-local origin through
+    # this waypoint. The padded suffix repeats the complete course length.
     cumulative_distances_m: torch.Tensor
+    # [course]: number of valid waypoints before padding; bounds the route
+    # cursor and identifies the final target.
     waypoint_counts: torch.Tensor
+    # [course, waypoint, xyz]: terrain-local target positions. Padded entries
+    # repeat the final waypoint to keep vectorized indexing safe.
     waypoints: torch.Tensor
+    # [course, waypoint]: maximum root-to-target XY distance accepted for each
+    # waypoint, after resolving per-waypoint overrides and the global default.
     root_reach_radii: torch.Tensor
+    # [course, waypoint]: marks targets declared as terminal landings so speed
+    # shaping can distinguish a landing target from an ordinary final exit.
     terminal_landing_masks: torch.Tensor
 
     # Reward metadata.
+    # [course, waypoint]: normalized one-shot milestone credit. Rewarded
+    # intermediate waypoints share a total budget of one; all others are zero.
     milestone_reward_fractions: torch.Tensor
 
     # Support geometry.
+    # [course, waypoint, xyz]: normal of the required support plane, or zero
+    # when the waypoint has no support-contact requirement.
     support_normals: torch.Tensor
+    # [course, waypoint]: number of valid polygon vertices. Zero means that
+    # route advancement does not require contact with a named support.
     support_vertex_counts: torch.Tensor
+    # [course, waypoint, vertex, xyz]: terrain-local support polygons used for
+    # contact containment and edge queries; padded suffixes repeat vertex zero.
     support_vertices: torch.Tensor
 
     # Course constraints.
+    # [course]: minimum terrain-relative base clearance used by safety shaping
+    # and the stable final-waypoint completion gate.
     min_clearances: torch.Tensor
 
 
@@ -61,21 +83,36 @@ class RouteState:
 
     # Selected course and active cursor. The selected course determines the
     # valid cursor range.
+    # [environment]: flattened family-variant-difficulty course-table row. It
+    # remains unchanged at termination until reset consumes episode metrics.
     course_indices: torch.Tensor
+    # [environment]: index of the waypoint currently targeted in that course.
     active_waypoint_indices: torch.Tensor
 
     # Episode command sampled independently of the selected course.
+    # [environment]: desired forward speed sampled at reset and held constant
+    # for the complete episode.
     target_speeds: torch.Tensor
 
     # Cross-step crossing and progress history.
+    # [environment, xy]: root position from the preceding route update, used
+    # with the current position to detect genuine waypoint-plane crossings.
     previous_root_xy: torch.Tensor
+    # [environment]: furthest safe route-projected distance reached in the
+    # current episode; monotonic and not advanced during trunk contact.
     maximum_progress_m: torch.Tensor
 
     # Completed-episode evaluation snapshot.
+    # [environment]: previous value of ``maximum_progress_m``, copied during
+    # reset before the current episode accumulator is cleared.
     previous_episode_maximum_progress_m: torch.Tensor
 
     # One-step route-transition events.
+    # [environment]: true on the step that the active cursor advances. Rewards
+    # use it for milestone credit and to ignore the retargeting distance jump.
     waypoint_changed: torch.Tensor
+    # [environment]: true on the step that the final waypoint passes all
+    # support, clearance, tilt, contact, and vertical-speed completion gates.
     course_completed: torch.Tensor
 
 

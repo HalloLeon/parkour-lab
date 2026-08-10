@@ -29,7 +29,7 @@ def active_course_indices(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Return selected family-major course indices."""
+    """Return selected family-then-variant-major course indices."""
 
     from .._shared.runtime import _all_env_ids
     from .state import _parkour_runtime
@@ -468,6 +468,7 @@ def reset_routes(
     waypoint_marker_cfg: SceneEntityCfg,
     asset_cfg: SceneEntityCfg,
     target_speed_range: tuple[float, float] = (0.45, 0.70),
+    geometry_variant_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Reset selected environments to the first waypoint of their new routes.
 
@@ -491,10 +492,14 @@ def reset_routes(
         target_speed_range: Bounds for the per-episode speed command.
             Sampling is independent of obstacle family and difficulty. Equal
             bounds select a deterministic command for evaluation.
+        geometry_variant_indices: Deterministic geometry variant selected by
+            each environment's physical terrain column. ``None`` selects the
+            canonical variant for backward-compatible direct callers.
 
     Returns:
-        Flattened family-major course index for each reset environment. The
-        returned tensor is also stored in the authoritative grouped route state.
+        Flattened family-then-variant-major course index for each reset
+        environment. The returned tensor is also stored in the authoritative
+        grouped route state.
     """
 
     import torch
@@ -506,8 +511,24 @@ def reset_routes(
     env_ids = _all_env_ids(env, env_ids)
     family_indices = family_indices.to(device=env.device, dtype=torch.long)
     difficulty_indices = difficulty_indices.to(device=env.device, dtype=torch.long)
-    if family_indices.shape != env_ids.shape or difficulty_indices.shape != env_ids.shape:
-        raise ValueError("family_indices and difficulty_indices must contain one value per reset environment.")
+    if geometry_variant_indices is None:
+        geometry_variant_indices = torch.zeros_like(env_ids)
+    else:
+        geometry_variant_indices = geometry_variant_indices.to(
+            device=env.device,
+            dtype=torch.long,
+        )
+    if any(
+        indices.shape != env_ids.shape
+        for indices in (
+            family_indices,
+            difficulty_indices,
+            geometry_variant_indices,
+        )
+    ):
+        raise ValueError(
+            "family, geometry variant, and difficulty indices must contain one value per reset environment."
+        )
 
     try:
         min_target_speed, max_target_speed = (float(value) for value in target_speed_range)
@@ -534,8 +555,12 @@ def reset_routes(
         raise ValueError("family_indices contains an out-of-range obstacle family.")
     if torch.any((difficulty_indices < 0) | (difficulty_indices >= curriculum_cfg.num_difficulties)):
         raise ValueError("difficulty_indices contains an out-of-range difficulty.")
+    if torch.any((geometry_variant_indices < 0) | (geometry_variant_indices >= curriculum_cfg.num_geometry_variants)):
+        raise ValueError("geometry_variant_indices contains an out-of-range variant.")
 
-    course_indices = family_indices * curriculum_cfg.num_difficulties + difficulty_indices
+    course_indices = (
+        family_indices * curriculum_cfg.num_geometry_variants + geometry_variant_indices
+    ) * curriculum_cfg.num_difficulties + difficulty_indices
     route_state = runtime.route
     route_state.previous_episode_maximum_progress_m[env_ids] = route_state.maximum_progress_m[env_ids]
     route_state.maximum_progress_m[env_ids] = 0.0

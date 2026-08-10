@@ -22,13 +22,64 @@ TERRAIN_Y_RANGE_M = (-2.0, 2.0)
 # Every family has six obstacle-bearing rows after the shared flat bootstrap.
 NUM_OBSTACLE_STAGES = 6
 
-_SUPPORTED_OBSTACLE_FAMILIES = frozenset({"gap", "high_step", "hurdle", "tilted_ramps"})
+# Variant zero is the nominal course used for fixed evaluation. The remaining
+# zero-mean offsets create a small deterministic geometry distribution across
+# training columns without consuming Isaac Lab's unretained within-row random
+# difficulty value.
+GEOMETRY_VARIANT_OFFSETS = (0.0, -1.0, -0.5, 0.5, 1.0)
+
 _BOOTSTRAP_ROUTE = (
     (1.25, 0.0, 0.01),
     (2.50, 0.0, 0.01),
     (3.80, 0.0, 0.01),
 )
 _BOOTSTRAP_TARGET_SPEED = 0.55
+_SUPPORTED_OBSTACLE_FAMILIES = frozenset({"gap", "high_step", "hurdle", "tilted_ramps"})
+
+
+# Curriculum-scalar helpers.
+
+
+def geometry_variant_offset(variant_index: int) -> float:
+    """Return the bounded severity offset for one deterministic variant."""
+
+    if (
+        isinstance(variant_index, bool)
+        or not isinstance(variant_index, int)
+        or not 0 <= variant_index < len(GEOMETRY_VARIANT_OFFSETS)
+    ):
+        raise ValueError("variant_index must select a configured geometry variant.")
+    return GEOMETRY_VARIANT_OFFSETS[variant_index]
+
+
+def lerp(start: float, end: float, fraction: float) -> float:
+    """Linearly interpolate finite endpoints with a normalized fraction."""
+
+    values = (float(start), float(end), float(fraction))
+    if any(not math.isfinite(value) for value in values) or not 0.0 <= values[2] <= 1.0:
+        raise ValueError("Interpolation requires finite endpoints and a fraction in [0, 1].")
+    return values[0] + (values[1] - values[0]) * values[2]
+
+
+def normalized_level_difficulty(level_index: int) -> float:
+    """Map the flat-plus-obstacle row index onto the public ``[0, 1]`` scale."""
+
+    if isinstance(level_index, bool) or not isinstance(level_index, int) or not 0 <= level_index <= NUM_OBSTACLE_STAGES:
+        raise ValueError("level_index must select the flat row or an obstacle stage.")
+    return level_index / NUM_OBSTACLE_STAGES
+
+
+def obstacle_progress(normalized_difficulty: float) -> float:
+    """Normalize obstacle rows 1..N to interpolation progress 0..1."""
+
+    normalized_difficulty = float(normalized_difficulty)
+    first_obstacle = 1.0 / NUM_OBSTACLE_STAGES
+    if not math.isfinite(normalized_difficulty) or not first_obstacle <= normalized_difficulty <= 1.0:
+        raise ValueError("normalized_difficulty must select an obstacle-bearing row.")
+    return (normalized_difficulty - first_obstacle) / (1.0 - first_obstacle)
+
+
+# Shared course builders.
 
 
 def build_bootstrap_level(obstacle_family: str) -> ParkourLevelCfg:
@@ -119,6 +170,9 @@ def build_box_obstacle(
         x_range,
         y_range,
     )
+
+
+# Course metadata helpers.
 
 
 def box_difficulty_parameters(

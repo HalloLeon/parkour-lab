@@ -101,6 +101,7 @@ class TiltedRampStageSpec:
 
 def build_default_level(
     obstacle_stage_index: int,
+    geometry_variant_index: int = 0,
 ) -> ParkourLevelCfg:
     """Create one non-flat stage of the default tilted-ramp curriculum.
 
@@ -118,11 +119,20 @@ def build_default_level(
     if not 0 <= obstacle_stage_index < len(DEFAULT_STAGE_SPECS):
         raise ValueError("Tilted-ramp obstacle index must select one configured obstacle row.")
 
-    stage_spec = DEFAULT_STAGE_SPECS[obstacle_stage_index]
+    normalized_difficulty = _shared.normalized_level_difficulty(obstacle_stage_index + 1)
+    variant_offset = _shared.geometry_variant_offset(geometry_variant_index)
+    stage_spec = _variant_stage_spec(
+        _default_stage_spec_at(normalized_difficulty),
+        variant_offset,
+    )
     ramps = build_ramp_sequence(stage_spec)
     return build_level(
-        name=f"tilted_ramps_difficulty_{obstacle_stage_index}",
-        difficulty_order=float(obstacle_stage_index + 1),
+        name=(
+            f"tilted_ramps_difficulty_{obstacle_stage_index}"
+            if geometry_variant_index == 0
+            else f"tilted_ramps_variant_{geometry_variant_index}_difficulty_{obstacle_stage_index}"
+        ),
+        difficulty_order=normalized_difficulty * _shared.NUM_OBSTACLE_STAGES,
         ramps=ramps,
         landing_x_range=(stage_spec.landing_start_x, _shared.TERRAIN_X_RANGE_M[1]),
         landing_y_range=stage_spec.landing_y_range,
@@ -131,14 +141,17 @@ def build_default_level(
     )
 
 
-def build_default_levels() -> tuple[ParkourLevelCfg, ...]:
-    """Build the flat bootstrap and all default tilted-ramp stages."""
+def build_default_levels(
+    geometry_variant_index: int = 0,
+) -> tuple[ParkourLevelCfg, ...]:
+    """Build the flat bootstrap and one deterministic tilted-ramp ladder."""
 
     if len(DEFAULT_STAGE_SPECS) != _shared.NUM_OBSTACLE_STAGES:
         raise ValueError("The tilted-ramp family must define the shared number of obstacle stages.")
 
     return (_shared.build_bootstrap_level("tilted_ramps"),) + tuple(
-        build_default_level(obstacle_stage_index) for obstacle_stage_index in range(len(DEFAULT_STAGE_SPECS))
+        build_default_level(obstacle_stage_index, geometry_variant_index)
+        for obstacle_stage_index in range(len(DEFAULT_STAGE_SPECS))
     )
 
 
@@ -300,6 +313,14 @@ def build_level(
                 landing_y_range=landing_y_range,
             ),
         ),
+    )
+
+
+def build_level_variants() -> tuple[tuple[ParkourLevelCfg, ...], ...]:
+    """Build the non-canonical deterministic training ladders."""
+
+    return tuple(
+        build_default_levels(variant_index) for variant_index in range(1, len(_shared.GEOMETRY_VARIANT_OFFSETS))
     )
 
 
@@ -542,3 +563,53 @@ DEFAULT_STAGE_SPECS = (
         landing_y_range=(0.40, 1.80),
     ),
 )
+
+DEFAULT_STAGE_DIFFICULTIES = tuple(
+    _shared.normalized_level_difficulty(stage_index + 1) for stage_index in range(_shared.NUM_OBSTACLE_STAGES)
+)
+
+
+def _default_stage_spec_at(normalized_difficulty: float) -> TiltedRampStageSpec:
+    """Return the proven tilted-ramp keyframe at one normalized row."""
+
+    for keyframe, stage_spec in zip(
+        DEFAULT_STAGE_DIFFICULTIES,
+        DEFAULT_STAGE_SPECS,
+        strict=True,
+    ):
+        if math.isclose(normalized_difficulty, keyframe, abs_tol=1.0e-12):
+            return stage_spec
+    raise ValueError("Tilted-ramp difficulty must select a configured normalized keyframe.")
+
+
+def _variant_stage_spec(
+    stage_spec: TiltedRampStageSpec,
+    variant_offset: float,
+) -> TiltedRampStageSpec:
+    """Apply one conservative severity offset to a complete ramp stage."""
+
+    if variant_offset == 0.0:
+        return stage_spec
+    scale = 1.0 + 0.05 * variant_offset
+    return TiltedRampStageSpec(
+        sequence_anchor_xy=stage_spec.sequence_anchor_xy,
+        ramps=tuple(
+            RampSpec(
+                length=ramp.length,
+                width=ramp.width,
+                incline_degrees=ramp.incline_degrees * scale,
+                yaw_degrees=ramp.yaw_degrees * scale,
+                thickness=ramp.thickness,
+            )
+            for ramp in stage_spec.ramps
+        ),
+        transitions=tuple(
+            RampTransitionSpec(
+                gap=transition.gap * scale,
+                lateral_offset=transition.lateral_offset * scale,
+            )
+            for transition in stage_spec.transitions
+        ),
+        landing_start_x=stage_spec.landing_start_x,
+        landing_y_range=stage_spec.landing_y_range,
+    )
