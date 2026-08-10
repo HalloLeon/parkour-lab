@@ -238,6 +238,7 @@ class ParkourTerrainCurriculum(ManagerTermBase):
             new_frontiers,
             state.demotion_grace_episodes_remaining[env_ids],
             changed,
+            max_level=curriculum_cfg.max_level,
             bootstrap_replay_probability=curriculum_cfg.bootstrap_replay_probability,
             predecessor_replay_probability=curriculum_cfg.predecessor_replay_probability,
         )
@@ -553,19 +554,36 @@ def _sample_episode_levels(
     grace_remaining: torch.Tensor,
     frontier_changed: torch.Tensor,
     *,
+    max_level: int,
     bootstrap_replay_probability: float,
     predecessor_replay_probability: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample the bootstrap, immediate predecessor, or frontier."""
+    """Sample retained rows without increasing the configured replay budget.
+
+    Below the ceiling, replay keeps the bootstrap and immediate predecessor.
+    At the ceiling, their combined probability is distributed uniformly over
+    every lower row so early obstacle skills remain represented.
+    """
 
     replay_eligible = (frontier_levels > 0) & (~frontier_changed) & (grace_remaining == 0)
     draw = torch.rand_like(frontier_levels, dtype=torch.float32)
-    replay = replay_eligible & (
-        draw < bootstrap_replay_probability + predecessor_replay_probability
-    )
+    replay_probability = bootstrap_replay_probability + predecessor_replay_probability
+    replay = replay_eligible & (draw < replay_probability)
     bootstrap_replay = replay & (draw < bootstrap_replay_probability)
     levels = torch.where(replay, frontier_levels - 1, frontier_levels)
-    return torch.where(bootstrap_replay, torch.zeros_like(levels), levels), replay
+    levels = torch.where(bootstrap_replay, torch.zeros_like(levels), levels)
+
+    if max_level > 0 and replay_probability > 0.0:
+        lower_level = torch.zeros_like(frontier_levels)
+        for level in range(1, max_level):
+            lower_level = torch.where(
+                draw >= replay_probability * level / max_level,
+                torch.full_like(frontier_levels, level),
+                lower_level,
+            )
+        full_ladder_replay = replay & (frontier_levels == max_level)
+        levels = torch.where(full_ladder_replay, lower_level, levels)
+    return levels, replay
 
 
 def _terminal_event_masks(

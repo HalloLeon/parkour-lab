@@ -139,11 +139,14 @@ class ParkourCurriculumCfg:
     demotion_window: int = 3
     demotion_failures_required: int = 2
 
-    # A failed frontier attempt is stalled when it completes less than this
-    # fraction of its route. Replay episodes do not contribute transition
-    # evidence, and the first episode after promotion is protected from demotion.
-    # Keep the total replay budget at 25% while retaining both the shared flat
-    # bootstrap and the frontier's immediate predecessor.
+    # A failed frontier attempt is stalled when it verifies less than this
+    # fraction of its physical milestones. Replay episodes do not contribute
+    # transition evidence, and the first episode after promotion is protected
+    # from demotion.
+    # Below the ceiling, keep the total replay budget at 25% while retaining
+    # both the shared flat bootstrap and the frontier's immediate predecessor.
+    # At the ceiling the combined budget is spread uniformly over every lower
+    # row, maintaining the whole acquired ladder without increasing replay.
     demotion_progress_fraction: float = 0.60
     post_promotion_grace_episodes: int = 1
     bootstrap_replay_probability: float = 0.10
@@ -329,10 +332,7 @@ class ParkourCurriculumCfg:
         if self.demotion_failures_required > self.demotion_window:
             raise ValueError("demotion_failures_required must not exceed demotion_window.")
 
-        if (
-            not np.isfinite(self.demotion_progress_fraction)
-            or not 0.0 < self.demotion_progress_fraction <= 1.0
-        ):
+        if not np.isfinite(self.demotion_progress_fraction) or not 0.0 < self.demotion_progress_fraction <= 1.0:
             raise ValueError("demotion_progress_fraction must be in (0, 1].")
 
         if (
@@ -340,9 +340,7 @@ class ParkourCurriculumCfg:
             or not isinstance(self.post_promotion_grace_episodes, int)
             or self.post_promotion_grace_episodes < 0
         ):
-            raise ValueError(
-                "post_promotion_grace_episodes must be a non-negative integer."
-            )
+            raise ValueError("post_promotion_grace_episodes must be a non-negative integer.")
 
         for field_name, probability in (
             ("bootstrap_replay_probability", self.bootstrap_replay_probability),
@@ -356,16 +354,10 @@ class ParkourCurriculumCfg:
         if self.base_contact_threshold < 0.0:
             raise ValueError("base_contact_threshold must be non-negative.")
 
-        if (
-            not np.isfinite(self.edge_width_threshold)
-            or self.edge_width_threshold <= 0.0
-        ):
+        if not np.isfinite(self.edge_width_threshold) or self.edge_width_threshold <= 0.0:
             raise ValueError("edge_width_threshold must be positive.")
 
-        if (
-            not np.isfinite(self.foot_edge_contact_threshold)
-            or self.foot_edge_contact_threshold < 0.0
-        ):
+        if not np.isfinite(self.foot_edge_contact_threshold) or self.foot_edge_contact_threshold < 0.0:
             raise ValueError("foot_edge_contact_threshold must be non-negative.")
 
 
