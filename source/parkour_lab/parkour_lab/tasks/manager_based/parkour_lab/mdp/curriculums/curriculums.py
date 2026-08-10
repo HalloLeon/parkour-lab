@@ -74,7 +74,8 @@ class CurriculumBatch:
 
     # Numeric outcomes.
     frontier_change: torch.Tensor
-    normalized_progress: torch.Tensor
+    normalized_geometric_progress: torch.Tensor
+    normalized_verified_progress: torch.Tensor
 
 
 class ParkourTerrainCurriculum(ManagerTermBase):
@@ -150,7 +151,12 @@ class ParkourTerrainCurriculum(ManagerTermBase):
                         device=env.device,
                         dtype=torch.long,
                     ),
-                    normalized_progress=torch.empty(
+                    normalized_geometric_progress=torch.empty(
+                        0,
+                        device=env.device,
+                        dtype=torch.float32,
+                    ),
+                    normalized_verified_progress=torch.empty(
                         0,
                         device=env.device,
                         dtype=torch.float32,
@@ -172,12 +178,16 @@ class ParkourTerrainCurriculum(ManagerTermBase):
             env,
             env_ids,
         )
-        # Read progress before changing terrain rows: route state still points
-        # at the course whose episode just ended, and its length is therefore
-        # the correct denominator for this terminal outcome.
-        normalized_progress = route.normalized_course_progress(env, env_ids)
+        # Read both signals before changing terrain rows: route state still
+        # points at the course whose episode just ended. Geometric progress is
+        # retained for diagnosis; support-verified progress drives demotion.
+        normalized_geometric_progress = route.normalized_course_progress(env, env_ids)
+        normalized_verified_progress = route.normalized_verified_course_progress(
+            env,
+            env_ids,
+        )
         stalled_failure_event = _demotion_transition_mask(
-            normalized_progress,
+            normalized_verified_progress,
             failure_event,
             demotion_progress_fraction=curriculum_cfg.demotion_progress_fraction,
         )
@@ -248,7 +258,8 @@ class ParkourTerrainCurriculum(ManagerTermBase):
                 stalled_failure=stalled_failure_event,
                 success=success_event,
                 frontier_change=frontier_change,
-                normalized_progress=normalized_progress,
+                normalized_geometric_progress=normalized_geometric_progress,
+                normalized_verified_progress=normalized_verified_progress,
             ),
             curriculum_cfg,
         )
@@ -349,7 +360,13 @@ def _curriculum_metrics(
         "sampled/mean": population_sampled_levels.float().mean(),
         "sampled/replay_fraction": (population_sampled_levels < population_frontier_levels).float().mean(),
         "sampled/bootstrap_replay_fraction": bootstrap_replay.float().mean(),
-        "frontier_episode/mean_normalized_progress": (batch.normalized_progress.float() * frontier_attempts).sum()
+        "frontier_episode/mean_geometric_progress": (
+            batch.normalized_geometric_progress.float() * frontier_attempts
+        ).sum()
+        / frontier_attempt_count,
+        "frontier_episode/mean_verified_progress": (
+            batch.normalized_verified_progress.float() * frontier_attempts
+        ).sum()
         / frontier_attempt_count,
         "frontier_episode/stalled_failure_rate": (batch.stalled_failure.float() * frontier_attempts).sum()
         / frontier_attempt_count,
@@ -472,31 +489,19 @@ def _demotion_grace_transition(
     return updated_grace, demotion_eligible
 
 
-def _rolling_evidence_transition(
-    history: torch.Tensor,
-    evidence: torch.Tensor,
-    append_mask: torch.Tensor,
-) -> torch.Tensor:
-    """Append one Boolean observation to the selected histories."""
-
-    shifted = torch.roll(history, shifts=-1, dims=1)
-    shifted[:, -1] = evidence
-    return torch.where(append_mask[:, None], shifted, history)
-
-
 def _demotion_transition_mask(
-    normalized_progress: torch.Tensor,
+    normalized_verified_progress: torch.Tensor,
     failure_event: torch.Tensor,
     *,
     demotion_progress_fraction: float,
 ) -> torch.Tensor:
-    """Return stalled failures that completed too little of their route.
+    """Return stalled failures that verified too few physical milestones.
 
     The strict comparison leaves exact-threshold outcomes unchanged. Successful
     completions, initial resets, and manual resets remain ineligible.
     """
 
-    return failure_event & (normalized_progress < demotion_progress_fraction)
+    return failure_event & (normalized_verified_progress < demotion_progress_fraction)
 
 
 def _frontier_transition_masks(
@@ -529,6 +534,18 @@ def _frontier_transition_masks(
         & (~move_up)
     )
     return move_up, move_down
+
+
+def _rolling_evidence_transition(
+    history: torch.Tensor,
+    evidence: torch.Tensor,
+    append_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Append one Boolean observation to the selected histories."""
+
+    shifted = torch.roll(history, shifts=-1, dims=1)
+    shifted[:, -1] = evidence
+    return torch.where(append_mask[:, None], shifted, history)
 
 
 def _sample_episode_levels(

@@ -240,6 +240,50 @@ def normalized_course_progress(
     ).clamp(min=0.0, max=1.0)
 
 
+def normalized_verified_course_progress(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return progress backed by reached, support-verified milestones.
+
+    Geometric route projection remains useful as a dense diagnostic, but it
+    can advance while a robot falls past an obstacle. Rewarded milestones are
+    required by configuration validation to name physical support, so summing
+    their normalized fractions gives demotion logic a conservative traversal
+    signal without introducing additional mutable state.
+    """
+
+    import torch
+
+    from .._shared.runtime import _all_env_ids
+    from .state import _parkour_runtime_or_none
+
+    env_ids = _all_env_ids(env, env_ids)
+    runtime = _parkour_runtime_or_none(env)
+    if runtime is None:
+        return torch.zeros(
+            env_ids.numel(),
+            device=env.device,
+            dtype=torch.float32,
+        )
+
+    route_state = runtime.route
+    course_indices = route_state.course_indices[env_ids]
+    fractions = runtime.courses.milestone_reward_fractions[course_indices]
+    waypoint_indices = torch.arange(
+        fractions.shape[1],
+        device=env.device,
+        dtype=torch.long,
+    )
+    reached = waypoint_indices[None, :] < route_state.active_waypoint_indices[env_ids, None]
+    progress = (fractions * reached.to(dtype=fractions.dtype)).sum(dim=-1)
+    return torch.where(
+        route_state.course_completed[env_ids],
+        torch.ones_like(progress),
+        progress,
+    ).clamp(min=0.0, max=1.0)
+
+
 def reached_milestone_reward_fractions(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Return the normalized one-step milestone reward for each environment."""
 
