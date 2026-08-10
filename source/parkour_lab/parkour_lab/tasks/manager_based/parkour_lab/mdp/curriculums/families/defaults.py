@@ -2,8 +2,25 @@
 
 from __future__ import annotations
 
-from ..levels import ParkourFamilyCfg
-from . import gap, high_step, hurdle, tilted_ramps
+from collections.abc import Callable
+
+from ..levels import (
+    ParkourFamilyCfg,
+    ParkourGeometryVariantCfg,
+    ParkourLevelCfg,
+)
+from . import _shared, gap, high_step, hurdle, tilted_ramps
+
+
+def _geometry_variants(
+    build_levels: Callable[[int], tuple[ParkourLevelCfg, ...]],
+) -> tuple[ParkourGeometryVariantCfg, ...]:
+    """Build and wrap every deterministic ladder for Hydra serialization."""
+
+    return tuple(
+        ParkourGeometryVariantCfg(levels=build_levels(variant_index))
+        for variant_index in range(len(_shared.GEOMETRY_VARIANT_OFFSETS))
+    )
 
 
 def build_default_families() -> tuple[ParkourFamilyCfg, ...]:
@@ -12,22 +29,18 @@ def build_default_families() -> tuple[ParkourFamilyCfg, ...]:
     return (
         ParkourFamilyCfg(
             name="gap",
-            levels=gap.build_default_levels(),
-            level_variants=gap.build_level_variants(),
+            geometry_variants=_geometry_variants(gap.build_default_levels),
         ),
         ParkourFamilyCfg(
             name="high_step",
-            levels=high_step.build_default_levels(),
-            level_variants=high_step.build_level_variants(),
+            geometry_variants=_geometry_variants(high_step.build_default_levels),
         ),
         ParkourFamilyCfg(
             name="hurdle",
-            levels=hurdle.build_default_levels(),
-            level_variants=hurdle.build_level_variants(),
+            geometry_variants=_geometry_variants(hurdle.build_default_levels),
         ),
         ParkourFamilyCfg(
             name="tilted_ramps",
-            levels=tilted_ramps.build_default_levels(),
-            level_variants=tilted_ramps.build_level_variants(),
+            geometry_variants=_geometry_variants(tilted_ramps.build_default_levels),
         ),
     )

@@ -553,90 +553,116 @@ class ParkourLevelCfg:
 
 
 @dataclass(frozen=True)
+class ParkourGeometryVariantCfg:
+    """One deterministic geometry variant across all difficulty rows.
+
+    Isaac Lab's configuration serializer descends through one sequence layer
+    at a time. Wrapping each ladder in a dataclass keeps its levels visible to
+    that serializer instead of leaving raw dataclasses inside a tuple-of-tuples
+    for OmegaConf to interpret as structured config.
+    """
+
+    levels: tuple[ParkourLevelCfg, ...]
+
+    def __post_init__(self) -> None:
+        levels = tuple(self.levels)
+        _validate_typed_sequence(
+            levels,
+            ParkourLevelCfg,
+            owner="Parkour geometry variant",
+            item_name="level",
+            required=True,
+        )
+        object.__setattr__(self, "levels", levels)
+
+
+@dataclass(frozen=True)
 class ParkourFamilyCfg:
     """One obstacle family sampled independently across difficulty rows.
 
-    Every entry in ``levels`` describes the same obstacle family. Its tuple
-    position is the terrain-row difficulty index, so row changes make that
-    family harder without silently changing the kind of obstacle.
+    Each geometry variant contains the same ordered difficulty ladder. Variant
+    zero is canonical and is used for fixed evaluation; the remaining variants
+    broaden the deterministic training distribution without duplicating the
+    canonical ladder as separate family state.
     """
 
     # Stable public identifier used by terrain columns, fixed-evaluation CLI
     # selection, metadata, and runtime family lookup.
     name: str
 
-    # Ordered easiest-to-hardest courses generated down this family's terrain
-    # columns, one entry for every shared difficulty row.
-    levels: tuple[ParkourLevelCfg, ...]
-
-    # Deterministic alternatives to the canonical ladder above. Each variant
-    # contains the same logical rows and training targets, but may perturb the
-    # physical geometry. Keeping the canonical ladder separate preserves the
-    # existing public configuration and gives fixed evaluation an unambiguous
-    # nominal course.
-    level_variants: tuple[tuple[ParkourLevelCfg, ...], ...] = ()
+    # Ordered deterministic ladders. Entry zero is the canonical ladder and
+    # every wrapper keeps its nested levels compatible with Hydra serialization.
+    geometry_variants: tuple[ParkourGeometryVariantCfg, ...]
 
     def __post_init__(self) -> None:
         _validate_name(self.name, field_name="obstacle-family name")
-        levels = tuple(self.levels)
+        geometry_variants = tuple(self.geometry_variants)
         _validate_typed_sequence(
-            levels,
-            ParkourLevelCfg,
+            geometry_variants,
+            ParkourGeometryVariantCfg,
             owner=f"Obstacle family {self.name!r}",
-            item_name="level",
+            item_name="geometry variant",
             required=True,
         )
-
-        variants = tuple(tuple(variant) for variant in self.level_variants)
-        for variant_index, variant in enumerate((levels, *variants)):
-            _validate_typed_sequence(
-                variant,
-                ParkourLevelCfg,
-                owner=f"Obstacle family {self.name!r} variant {variant_index}",
-                item_name="level",
-                required=True,
-            )
-            names = [level.name for level in variant]
+        for geometry_variant in geometry_variants:
+            levels = geometry_variant.levels
+            names = [level.name for level in levels]
             if len(names) != len(set(names)):
-                raise ValueError("Parkour curriculum level names must be unique within each geometry variant.")
-            if any(level.obstacle_family != self.name for level in variant):
+                raise ValueError(
+                    "Parkour curriculum level names must be unique within each geometry variant."
+                )
+            if any(level.obstacle_family != self.name for level in levels):
                 raise ValueError(
                     f"Obstacle family {self.name!r} may contain only levels whose obstacle_family has the same name."
                 )
             for field_name, values in (
-                ("difficulty", [level.difficulty.order for level in variant]),
-                ("target speed", [level.target_speed for level in variant]),
-                ("minimum clearance", [level.min_clearance for level in variant]),
+                ("difficulty", [level.difficulty.order for level in levels]),
+                ("minimum clearance", [level.min_clearance for level in levels]),
+                ("target speed", [level.target_speed for level in levels]),
             ):
-                if any(current > following for current, following in zip(values, values[1:])):
-                    raise ValueError(f"Parkour curriculum {field_name} must be non-decreasing.")
+                if any(
+                    current > following
+                    for current, following in zip(values, values[1:])
+                ):
+                    raise ValueError(
+                        f"Parkour curriculum {field_name} must be non-decreasing."
+                    )
 
+        canonical_levels = geometry_variants[0].levels
         canonical_contract = tuple(
-            (level.difficulty.order, level.target_speed, level.min_clearance) for level in levels
+            (level.difficulty.order, level.target_speed, level.min_clearance)
+            for level in canonical_levels
         )
         if any(
-            len(variant) != len(levels)
-            or tuple((level.difficulty.order, level.target_speed, level.min_clearance) for level in variant)
+            len(variant.levels) != len(canonical_levels)
+            or tuple(
+                (level.difficulty.order, level.target_speed, level.min_clearance)
+                for level in variant.levels
+            )
             != canonical_contract
-            for variant in variants
+            for variant in geometry_variants[1:]
         ):
-            raise ValueError("Every geometry variant must preserve the canonical difficulty rows and training targets.")
-        object.__setattr__(self, "levels", levels)
-        object.__setattr__(self, "level_variants", variants)
+            raise ValueError(
+                "Every geometry variant must preserve the canonical difficulty rows and training targets."
+            )
+        object.__setattr__(self, "geometry_variants", geometry_variants)
 
     @property
-    def all_level_variants(self) -> tuple[tuple[ParkourLevelCfg, ...], ...]:
-        """Return the canonical ladder followed by its geometry variants."""
+    def canonical_levels(self) -> tuple[ParkourLevelCfg, ...]:
+        """Return the variant-zero ladder used for fixed evaluation."""
 
-        return (self.levels, *self.level_variants)
+        return self.geometry_variants[0].levels
 
     def metadata(self) -> dict[str, object]:
         """Return a JSON-compatible description of this obstacle family."""
 
         return {
             "name": self.name,
-            "levels": [level.metadata() for level in self.levels],
-            "level_variants": [[level.metadata() for level in variant] for variant in self.level_variants],
+            "levels": [level.metadata() for level in self.canonical_levels],
+            "level_variants": [
+                [level.metadata() for level in variant.levels]
+                for variant in self.geometry_variants[1:]
+            ],
         }
 
 
@@ -724,25 +750,55 @@ def coerce_family_cfg(
         return family
     if not isinstance(family, Mapping):
         raise TypeError("Obstacle family must be a ParkourFamilyCfg or mapping.")
-    missing_fields = {"name", "levels"}.difference(family)
-    if missing_fields:
-        raise ValueError(f"Obstacle family is missing fields: {', '.join(sorted(missing_fields))}.")
+    if "name" not in family:
+        raise ValueError("Obstacle family is missing field: name.")
+
+    if "geometry_variants" in family:
+        geometry_variants = tuple(
+            coerce_geometry_variant_cfg(variant)
+            for variant in _sequence_value(
+                family["geometry_variants"],
+                field_name="family geometry variants",
+            )
+        )
+    elif "levels" in family:
+        geometry_variants = (
+            coerce_geometry_variant_cfg(family["levels"]),
+            *(
+                coerce_geometry_variant_cfg(variant)
+                for variant in _sequence_value(
+                    family.get("level_variants", ()),
+                    field_name="family level variants",
+                )
+            ),
+        )
+    else:
+        raise ValueError(
+            "Obstacle family must define geometry_variants or legacy levels."
+        )
+
     return ParkourFamilyCfg(
         name=cast(str, family["name"]),
+        geometry_variants=geometry_variants,
+    )
+
+
+def coerce_geometry_variant_cfg(variant: object) -> ParkourGeometryVariantCfg:
+    """Return one typed geometry variant from Hydra or legacy metadata."""
+
+    if isinstance(variant, ParkourGeometryVariantCfg):
+        return variant
+    levels = variant.get("levels") if isinstance(variant, Mapping) else variant
+    if levels is None:
+        raise ValueError("Geometry variant is missing its levels.")
+    return ParkourGeometryVariantCfg(
         levels=tuple(
             coerce_level_cfg(level)
             for level in _sequence_value(
-                family["levels"],
-                field_name="family levels",
+                levels,
+                field_name="family level variant",
             )
-        ),
-        level_variants=tuple(
-            tuple(coerce_level_cfg(level) for level in _sequence_value(variant, field_name="family level variant"))
-            for variant in _sequence_value(
-                family.get("level_variants", ()),
-                field_name="family level variants",
-            )
-        ),
+        )
     )
 
 

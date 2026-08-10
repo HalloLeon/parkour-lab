@@ -176,7 +176,11 @@ class ParkourCurriculumCfg:
             raise IndexError("difficulty_index is out of range.")
         if not 0 <= geometry_variant_index < self.num_geometry_variants:
             raise IndexError("geometry_variant_index is out of range.")
-        return self.families[family_index].all_level_variants[geometry_variant_index][difficulty_index]
+        return (
+            self.families[family_index]
+            .geometry_variants[geometry_variant_index]
+            .levels[difficulty_index]
+        )
 
     def course_index(
         self,
@@ -195,7 +199,12 @@ class ParkourCurriculumCfg:
     def courses(self) -> tuple[ParkourLevelCfg, ...]:
         """Return family-then-variant-major cells for runtime lookup tables."""
 
-        return tuple(level for family in self.families for variant in family.all_level_variants for level in variant)
+        return tuple(
+            level
+            for family in self.families
+            for variant in family.geometry_variants
+            for level in variant.levels
+        )
 
     def family_index(self, family_name: str) -> int:
         """Return the stable index of a configured obstacle family."""
@@ -227,13 +236,13 @@ class ParkourCurriculumCfg:
     def num_difficulties(self) -> int:
         """Return the shared number of terrain difficulty rows."""
 
-        return len(self.families[0].levels)
+        return len(self.families[0].canonical_levels)
 
     @property
     def num_geometry_variants(self) -> int:
         """Return the shared number of deterministic geometry variants."""
 
-        return len(self.families[0].all_level_variants)
+        return len(self.families[0].geometry_variants)
 
     def terrain_layout(
         self,
@@ -294,17 +303,20 @@ class ParkourCurriculumCfg:
         if len(family_names) != len(set(family_names)):
             raise ValueError("Parkour curriculum family names must be unique.")
 
-        difficulty_counts = {len(family.levels) for family in self.families}
+        difficulty_counts = {len(family.canonical_levels) for family in self.families}
         if len(difficulty_counts) != 1:
             raise ValueError("Every obstacle family must define the same difficulty rows.")
 
-        variant_counts = {len(family.all_level_variants) for family in self.families}
+        variant_counts = {len(family.geometry_variants) for family in self.families}
         if len(variant_counts) != 1:
             raise ValueError("Every obstacle family must define the same number of geometry variants.")
 
-        difficulty_orders = tuple(level.difficulty.order for level in self.families[0].levels)
+        difficulty_orders = tuple(
+            level.difficulty.order for level in self.families[0].canonical_levels
+        )
         if any(
-            tuple(level.difficulty.order for level in family.levels) != difficulty_orders
+            tuple(level.difficulty.order for level in family.canonical_levels)
+            != difficulty_orders
             for family in self.families[1:]
         ):
             raise ValueError("Every obstacle family must use the same difficulty ranks by row.")
@@ -390,7 +402,9 @@ class ParkourTerrainCfg(SubTerrainBaseCfg):
 
     function = parkour_terrain
 
-    levels: tuple[ParkourLevelCfg, ...] = DEFAULT_PARKOUR_CURRICULUM.families[0].levels
+    levels: tuple[ParkourLevelCfg, ...] = DEFAULT_PARKOUR_CURRICULUM.families[
+        0
+    ].canonical_levels
 
     ground_thickness: float = 0.05
 
@@ -418,7 +432,9 @@ def parkour_sub_terrains(
     return {
         f"{curriculum_cfg.families[family_index].name}_variant_{variant_index}": ParkourTerrainCfg(
             proportion=column_pairs.count((family_index, variant_index)) / terrain_layout.num_columns,
-            levels=curriculum_cfg.families[family_index].all_level_variants[variant_index],
+            levels=curriculum_cfg.families[family_index]
+            .geometry_variants[variant_index]
+            .levels,
             ground_thickness=ground_thickness,
         )
         for family_index, variant_index in ordered_pairs

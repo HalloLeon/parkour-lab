@@ -314,16 +314,6 @@ def build_level(
             ),
         ),
     )
-
-
-def build_level_variants() -> tuple[tuple[ParkourLevelCfg, ...], ...]:
-    """Build the non-canonical deterministic training ladders."""
-
-    return tuple(
-        build_default_levels(variant_index) for variant_index in range(1, len(_shared.GEOMETRY_VARIANT_OFFSETS))
-    )
-
-
 def build_ramp_sequence(
     stage_spec: TiltedRampStageSpec,
 ) -> tuple[TiltedRampGeometry, ...]:
