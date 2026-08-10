@@ -2,8 +2,9 @@
 
 Parkour Lab is an Isaac Lab reinforcement-learning environment for training a
 Unitree A1 to finish waypoint routes across progressively harder obstacles.
-Training uses a balanced obstacle-family by difficulty terrain matrix;
-evaluation freezes one matrix cell so policy changes can be compared and
+Training uses a balanced obstacle-family by difficulty terrain matrix with
+small deterministic geometry variants inside each cell; evaluation freezes the
+canonical variant of one matrix cell so policy changes can be compared and
 recorded under the same conditions.
 
 ## Setup
@@ -80,6 +81,8 @@ evaluation remains pinned to its requested matrix cell.
 After promotion grace, training keeps 75% of eligible environments at their
 frontier, replays its immediate predecessor in 15%, and anchors the shared flat
 bootstrap in 10%. At frontier one, both replay choices resolve to level zero.
+Once a family reaches the final row, the same combined 25% replay budget is
+distributed uniformly across all lower rows to retain the complete ladder.
 
 ### Staged domain randomization
 
@@ -116,7 +119,15 @@ straight obstacle-free route. Rows 1 through 6 contain the six obstacle
 difficulties. Equal column blocks retain their future gap, high-step, hurdle,
 or tilted-ramp family even on the flat row, so each environment advances from
 flat ground into one stable family without resampling its obstacle type. Each
-course records ordered terrain-local waypoints, named mesh structures and their
+family block is further divided into five deterministic, zero-mean geometry
+variants. Variant zero is the unchanged nominal ladder; the others perturb only
+bounded obstacle geometry by at most 5%. Every variant is a complete prebuilt
+course, so its mesh, route, support polygons, and edge geometry remain exact and
+synchronized. Isaac Lab's unretained random fraction within a terrain row is
+deliberately not used. Default builders use the shared normalized row scalar
+`s = row / 6`; simple obstacle dimensions interpolate from that scalar while
+the proven tilted-ramp stages remain explicit normalized keyframes. Each course
+records ordered terrain-local waypoints, named mesh structures and their
 factory arguments, planar support polygons, nominal speed metadata, clearance,
 and explicit difficulty metadata. At reset, the live desired-speed command is
 sampled independently from 0.45 to 0.70 m/s, so obstacle geometry is not
@@ -196,13 +207,16 @@ gap falls promptly without confusing elevated terrain with world height.
 
 Maximum progress is projected onto the active route segment only inside its
 lateral corridor, remains monotonic within an episode, and does not increase
-during trunk contact. Demotion therefore compares comparable route fractions
-instead of commanded speed times episode duration. Three successes in the last
-five frontier attempts promote one row. Two stalled failures in the last three
-eligible frontier attempts, each below 60% normalized route progress, demote one
-row. The first harder attempt is protected from demotion. Later episodes use a
-10% flat anchor and 15% immediate-predecessor replay without altering frontier
-evidence.
+during trunk contact. It remains a dense diagnostic. Demotion instead uses
+support-verified progress: only reached rewarded milestones count, and those
+milestones are required to name physical support. Falling geometrically past an
+uncleared obstacle therefore cannot hide a stalled attempt. Three successes in
+the last five frontier attempts promote one row. Two stalled failures in the
+last three eligible frontier attempts, each below 60% verified progress, demote
+one row. The first harder attempt is protected from demotion. Later episodes
+use a 10% flat anchor and 15% immediate-predecessor replay below the ceiling;
+at the ceiling their combined budget samples every lower row uniformly. Replay
+never alters frontier evidence.
 Promotion changes only future course sampling and pays no additional reward
 because completion already receives an explicit `+4` event.
 
