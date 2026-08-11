@@ -1,7 +1,7 @@
 # Parkour Lab
 
 Parkour Lab is an Isaac Lab reinforcement-learning environment for training a
-Unitree A1 to finish waypoint routes across progressively harder obstacles.
+Unitree Go2 to finish waypoint routes across progressively harder obstacles.
 Training uses a balanced obstacle-family by difficulty terrain matrix with
 small deterministic geometry variants inside each cell; evaluation freezes the
 canonical variant of one matrix cell so policy changes can be compared and
@@ -100,7 +100,7 @@ python scripts/rsl_rl/train.py \
 ```
 
 Replace `narrow` with `wide` for the final stage. The selected profile perturbs
-contact friction and restitution, trunk payload and center of mass, actuator
+contact friction and restitution, base payload and center of mass, actuator
 gains, initial pose and velocity, external pushes, control-step action latency,
 and delayed/noisy proprioception. The selected stage and configured ranges are
 stored in `params/env.yaml`. Action and observation widths do not change between
@@ -197,17 +197,17 @@ control markers cannot increase the available budget. Intermediate waypoints
 still do not end an episode or count as curriculum success. The final waypoint
 ignores plane crossing and pays `+4` only after the robot reaches its radius
 with a foot on the named support, sufficient base clearance, low vertical speed
-and tilt, and no trunk contact. Event rewards are divided by the control
+and tilt, and no base contact. Event rewards are divided by the control
 timestep before Isaac Lab's reward integration, making these configured amounts
-the exact per-event bonuses. The terminating trunk-contact penalty uses the same
-rule for an exact `-10`; a trunk crash takes precedence if crash and success
+the exact per-event bonuses. The terminating base-contact penalty uses the same
+rule for an exact `-10`; a base crash takes precedence if crash and success
 would otherwise occur on the same step. Falling more than 0.5 m below the
 environment-local course is also a terminal failure, which ends unrecoverable
 gap falls promptly without confusing elevated terrain with world height.
 
 Maximum progress is projected onto the active route segment only inside its
 lateral corridor, remains monotonic within an episode, and does not increase
-during trunk contact. It remains a dense diagnostic. Demotion instead uses
+during base contact. It remains a dense diagnostic. Demotion instead uses
 support-verified progress: only reached rewarded milestones count, and those
 milestones are required to name physical support. Falling geometrically past an
 uncleared obstacle therefore cannot hide a stalled attempt. Three successes in
@@ -242,11 +242,11 @@ A single bounded term rewards horizontally moving foot-link origins up to
 and assigns zero to contacted or stationary feet, missing terrain hits, or
 unsupported flight phases. Leg-contact, edge, slide, and stumble penalties use
 the same semantics on every terrain row.
-A mild absolute-orientation penalty discourages persistent trunk lean without
+A mild absolute-orientation penalty discourages persistent base lean without
 prescribing a gait. Low-clearance error remains normalized to `[0, 1]` before
 its squared penalty.
 
-The teacher-interface manifest is version 13. Version 4 introduced complete
+The teacher-interface manifest is version 14. Version 4 introduced complete
 declarative terrain courses because physical support segmentation changes the
 privileged ray values seen by the teacher. Version 5 replaces horizontal-only
 support metadata with ordered planar XYZ boundaries, making the banked ramp
@@ -264,12 +264,15 @@ radius-or-plane transitions, and the former final-only proximity dwell. Version
 12 removes that dwell and standardizes navigation names around active and final
 waypoints. Version 13 records fixed per-term observation scaling, named support
 targets with contact-gated physical milestones, stable crash-free completion,
-and the revised flat and tilted-ramp curriculum geometry. The complete v13
+and the revised flat and tilted-ramp curriculum geometry. Version 14 freezes
+the robot model and exact source asset path, intentionally rejecting older A1
+checkpoints despite their compatible action dimensions. The complete v14
 manifest and its hash remain the exact training provenance. Playback and
 distillation compare a projected inference contract that ignores only
-`terrain_curriculum`: observation, scanner, network, action, waypoint-protocol,
-and timing mismatches remain fatal, while course-geometry changes emit an
-out-of-distribution warning without making compatible weights unloadable.
+`terrain_curriculum`: robot asset, observation, scanner, network, action,
+waypoint-protocol, and timing mismatches remain fatal, while course-geometry
+changes emit an out-of-distribution warning without making compatible weights
+unloadable.
 
 ## Phase 1 observation architecture
 
@@ -293,10 +296,12 @@ and mask `0`, so a future gap cannot be confused with a valid surface.
 Exact active-waypoint distance, scaled base linear velocity and clearance, a
 two-component normalized route cursor/progress phase, and simulator-derived
 foot contacts are critic-only. In particular, foot contacts are not classified
-as deployable until equivalent hardware sensing is defined.
+as deployable until equivalent hardware sensing is defined. Go2's low-level
+`LowState` likewise does not provide base linear velocity, so simulator truth
+is excluded from the actor unless a deployment-equivalent estimator is added.
 
 The ray grid uses explicit `xy` flattening: longitudinal X changes fastest,
-then lateral Y. It has 12 longitudinal samples from -0.45 m behind the trunk to
+then lateral Y. It has 12 longitudinal samples from -0.45 m behind the base to
 1.20 m ahead and 11 lateral samples from -0.75 m to 0.75 m. A flattened height
 index is `lateral_index * 12 + longitudinal_index`; the validity mask uses the
 same index mapping. Isaac Lab preserves the configured term order, while the
@@ -319,7 +324,7 @@ obstacle dimensions. Its 32-D exteroception group is all zeros in this tutorial;
 it represents the fixed-width output contract of a later depth encoder, not a
 visual representation.
 
-Teacher and future student share one action contract: 12 Unitree A1 joint-position
+Teacher and future student share one action contract: 12 Unitree Go2 joint-position
 offsets, scale `0.25`, interpreted relative to default joint positions at the
 same 50 Hz control rate. Observation asymmetry therefore does not alter the
 low-level controller or action interface.
@@ -333,7 +338,7 @@ because it does not currently require a package of its own.
 
 The Phase-1 actor compresses the 264-D privileged height-and-validity scan to
 the fixed 32-D terrain latent. It separately compresses 31 actual randomized
-dynamics values—trunk mass and center of mass, mean contact material, and
+dynamics values—base mass and center of mass, mean contact material, and
 per-joint stiffness and damping ratios—to the 20-D adaptation latent. The
 motor therefore always receives the same 97 values: 43-D deployable state,
 2-D heading, 32-D terrain latent, and 20-D adaptation latent.
@@ -416,7 +421,7 @@ reports, starting a fresh Isaac Sim
 process for every cell so simulation state cannot leak between courses. The
 expected application restarts are printed as sweep progress. This option cannot
 be combined with the two single-cell selectors. Evaluation reports success,
-maximum course progress, trunk contact, below-course falls, timeout, return,
+maximum course progress, base contact, below-course falls, timeout, return,
 episode length, forward speed, overspeed, vertical-velocity RMS, and
 all-feet-airborne fraction for each selected matrix cell. It writes
 `metrics.json` plus the optional MP4 beneath
@@ -436,9 +441,9 @@ policy. The complete manifest retains the exact terrain curriculum as training
 provenance. Its hard compatibility projection ignores only
 `terrain_curriculum`; a changed course therefore emits an out-of-distribution
 warning while actor observation order and dimensions, normalization,
-terrain-scan encoding, action order and scaling, waypoint protocol, and control
-timing remain strict. Critic details, unused observation groups, framework
-versions, and source-code hashes remain outside the contract.
+terrain-scan encoding, robot asset identity, action order and scaling, waypoint
+protocol, and control timing remain strict. Critic details, unused observation
+groups, framework versions, and source-code hashes remain outside the contract.
 
 Use `play.py` independently to compare promising checkpoints under identical
 fixed evaluation conditions. After choosing one from those results, pass its
@@ -469,7 +474,7 @@ The distinct information sets are:
 | Deployable adaptation history | `[N, 430]` | Ten current-and-past samples of deployable proprioception, command state, and previous actions; flattened term-major from oldest to newest |
 | Privileged dynamics target | `[N, 31]` | Actual randomized physical properties used only to train the teacher's privileged encoder and supervise the history encoder |
 | Oracle heading target | `[N, 2]` | Yaw-aligned direction to the active course waypoint, `[forward, left] = [cos(Δψ), sin(Δψ)]`; teacher input and student supervision, never a student motor input |
-| Teacher motor-action target | `[N, 12]` | Frozen teacher's deterministic action-distribution mean in resolved A1 joint order; supervision only |
+| Teacher motor-action target | `[N, 12]` | Frozen teacher's deterministic action-distribution mean in resolved Go2 joint order; supervision only |
 
 The instantiated group dimensions and exact student group order are stored in
 `distillation_config.json`. Frames, units, normalization, and deployment status

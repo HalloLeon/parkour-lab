@@ -60,10 +60,10 @@ def base_clearance_below_l2(
 def base_contact(
     env: ManagerBasedRLEnv,
     threshold: float = 1.0,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("base_contact", body_names="trunk"),
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("base_contact", body_names="base"),
     timestep_independent: bool = False,
 ) -> torch.Tensor:
-    """Penalty signal for illegal trunk/base contact.
+    """Penalty signal for illegal base contact.
 
     Set ``timestep_independent`` when contact also terminates the episode. The
     one-step signal is then divided by the control timestep before Isaac Lab's

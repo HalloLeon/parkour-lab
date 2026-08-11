@@ -5,7 +5,7 @@
 
 """Teacher-checkpoint identity and inference-interface contracts.
 
-Training records the observation, network, terrain, action, and timing metadata
+Training records the robot, observation, network, terrain, action, and timing metadata
 that determines teacher inference. Playback and distillation rebuild and
 compare the checkpoint-facing subset before loading the checkpoint.
 
@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
     from tensordict import TensorDict
 
-TEACHER_INTERFACE_VERSION = 13
+TEACHER_INTERFACE_VERSION = 14
 
 ADAPTATION_HISTORY_GROUP = "adaptation_history"
 DEPLOYABLE_STATE_GROUP = "policy"
@@ -140,6 +140,7 @@ def build_teacher_interface(
     action_descriptor = action_manager.get_term("joint_pos").IO_descriptor
     height_obs_cfg = base_env.cfg.observations.terrain.height_scan.params["obs_cfg"]
     scanner_cfg = base_env.cfg.scene.height_scanner
+    robot_identity = _describe_robot_asset(base_env.cfg.scene.robot)
     curriculum_cfg = base_env.cfg.parkour_curriculum
     success_params = base_env.cfg.terminations.success.params
     terrain_generator_cfg = base_env.cfg.scene.ground.terrain_generator
@@ -178,6 +179,10 @@ def build_teacher_interface(
 
     return {
         "interface_version": TEACHER_INTERFACE_VERSION,
+        # A1 and Go2 expose compatible policy tensor widths and joint names but
+        # must not share checkpoints. Freeze source-asset identity independently
+        # of tensor shape; this identifies the path rather than hashing contents.
+        "robot": robot_identity,
         # Preserve the information boundary even though PPO concatenates all groups.
         "information_contract": {
             "deployable_state_group": DEPLOYABLE_STATE_GROUP,
@@ -196,7 +201,7 @@ def build_teacher_interface(
                 "support_margin_m": float(success_params["support_margin"]),
                 "support_plane_tolerance_m": float(success_params["support_plane_tolerance"]),
                 "final_transition": "root_radius_and_named_support_contact",
-                "final_requires_no_trunk_contact": True,
+                "final_requires_no_base_contact": True,
                 "final_requires_min_clearance": True,
                 "final_max_projected_gravity_xy_norm": float(success_params["max_completion_tilt"]),
                 "final_max_vertical_speed_m_s": float(success_params["max_completion_vertical_speed"]),
@@ -312,6 +317,12 @@ def load_teacher_checkpoint(
     teacher_interface = cast(dict[str, object], interface)
     if teacher_interface.get("interface_version") != TEACHER_INTERFACE_VERSION:
         raise ValueError("Teacher interface uses an unsupported serialization version: " f"{interface_path}")
+    robot_identity = teacher_interface.get("robot")
+    if not isinstance(robot_identity, dict) or any(
+        not isinstance(robot_identity.get(field), str) or not robot_identity[field]
+        for field in ("model", "asset_path")
+    ):
+        raise ValueError(f"Teacher interface robot identity is missing or invalid: {interface_path}")
     teacher_interface_hash = interface_sha256(teacher_interface)
     if payload.get("teacher_interface_sha256") != teacher_interface_hash:
         raise ValueError(f"Teacher interface hash is invalid: {interface_path}")
@@ -350,6 +361,35 @@ def _callable_name(value: Callable[..., object]) -> str:
     module = getattr(value, "__module__", type(value).__module__)
     qualname = getattr(value, "__qualname__", type(value).__qualname__)
     return f"{module}.{qualname}"
+
+
+def _describe_robot_asset(robot_cfg: object) -> dict[str, str]:
+    """Return the robot model and exact source-asset path identity."""
+
+    spawn_cfg = getattr(robot_cfg, "spawn", None)
+    asset_path: str | None = None
+    for attribute in ("usd_path", "asset_path"):
+        candidate = getattr(spawn_cfg, attribute, None)
+        if isinstance(candidate, (str, os.PathLike)) and candidate:
+            asset_path = os.fspath(candidate)
+            break
+
+    if asset_path is None:
+        raise InterfaceMismatchError(
+            "The teacher robot must expose a non-empty USD or URDF asset path."
+        )
+
+    # Official Unitree assets use model-specific filenames (``a1.usd``,
+    # ``go2.usd``). Strip a possible URI query while preserving the exact path
+    # separately for compatibility checks.
+    model = Path(asset_path.split("?", 1)[0]).stem.lower()
+    if not model:
+        raise InterfaceMismatchError(f"Cannot derive the teacher robot model from asset path {asset_path!r}.")
+
+    return {
+        "model": model,
+        "asset_path": asset_path,
+    }
 
 
 def _describe_observation_groups(

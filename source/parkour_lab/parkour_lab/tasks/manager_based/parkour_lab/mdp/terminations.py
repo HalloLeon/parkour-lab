@@ -9,9 +9,9 @@ from .navigation.route import advance_active_waypoints
 def base_contact_done(
     env: ManagerBasedRLEnv,
     threshold: float = 1.0,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("base_contact", body_names="trunk"),
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("base_contact", body_names="base"),
 ) -> torch.Tensor:
-    """Return which environments exceed the trunk-contact force threshold."""
+    """Return which environments exceed the base-contact force threshold."""
 
     return torch.any(
         contact._force_norm_mask(env, sensor_cfg=sensor_cfg) > threshold,
@@ -43,9 +43,9 @@ def completed_course_done(
         "feet_contact",
         body_names=".*_foot",
     ),
-    trunk_contact_cfg: SceneEntityCfg = SceneEntityCfg(
+    base_contact_cfg: SceneEntityCfg = SceneEntityCfg(
         "base_contact",
-        body_names="trunk",
+        body_names="base",
     ),
     contact_threshold: float = 1.0,
     max_completion_tilt: float = 0.5,
@@ -66,7 +66,7 @@ def completed_course_done(
         asset_cfg=asset_cfg,
         feet_asset_cfg=feet_asset_cfg,
         feet_contact_cfg=feet_contact_cfg,
-        trunk_contact_cfg=trunk_contact_cfg,
+        base_contact_cfg=base_contact_cfg,
         contact_threshold=contact_threshold,
         max_completion_tilt=max_completion_tilt,
         max_completion_vertical_speed=max_completion_vertical_speed,

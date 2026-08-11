@@ -42,10 +42,10 @@ class DomainRandomizationCfg:
     dynamic_friction_range: tuple[float, float] = (0.6, 1.2)
     restitution_range: tuple[float, float] = (0.0, 0.1)
 
-    added_trunk_mass_range_kg: tuple[float, float] = (-0.5, 1.0)
-    trunk_com_x_range_m: tuple[float, float] = (-0.02, 0.02)
-    trunk_com_y_range_m: tuple[float, float] = (-0.02, 0.02)
-    trunk_com_z_range_m: tuple[float, float] = (-0.01, 0.01)
+    added_base_mass_range_kg: tuple[float, float] = (-0.5, 1.0)
+    base_com_x_range_m: tuple[float, float] = (-0.02, 0.02)
+    base_com_y_range_m: tuple[float, float] = (-0.02, 0.02)
+    base_com_z_range_m: tuple[float, float] = (-0.01, 0.01)
     actuator_gain_scale_range: tuple[float, float] = (0.8, 1.2)
 
     initial_xy_range_m: tuple[float, float] = (-0.05, 0.05)
@@ -206,7 +206,7 @@ class RecordPrivilegedDynamics(ManagerTermBase):
         materials = self.asset.root_physx_view.get_material_properties().to(self.values)
         mean_material = materials.mean(dim=1)
 
-        # Explicit actuator models such as A1's DC motors keep their operative
+        # Explicit actuator models such as Unitree's DC motors keep their operative
         # gains on the actuator objects; the PhysX joint buffers remain zero.
         # Assemble the current global gain tensors from those actuator-local
         # values so this vector records the gains that actually produce torque.
@@ -282,10 +282,10 @@ def privileged_dynamics_component_names(
     """Return the stable semantic order of the privileged dynamics vector."""
 
     return (
-        "trunk_mass_ratio_minus_one",
-        "trunk_com_x",
-        "trunk_com_y",
-        "trunk_com_z",
+        "base_mass_ratio_minus_one",
+        "base_com_x",
+        "base_com_y",
+        "base_com_z",
         "mean_static_friction",
         "mean_dynamic_friction",
         "mean_restitution",

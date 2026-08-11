@@ -10,9 +10,9 @@ readme = "docs/README.md"
 title = "Parkour Lab"
 author = "Leon Yi Bai"
 maintainer = "Leon Yi Bai"
-description = "Adaptive parkour curriculum and reproducible evaluation for a Unitree A1 in Isaac Lab"
+description = "Adaptive parkour curriculum and reproducible evaluation for a Unitree Go2 in Isaac Lab"
 repository = "https://github.com/HalloLeon/parkour-lab.git"
-keywords = ["isaaclab", "reinforcement-learning", "parkour", "unitree-a1"]
+keywords = ["isaaclab", "reinforcement-learning", "parkour", "unitree-go2"]
 
 [dependencies]
 "isaaclab" = {}

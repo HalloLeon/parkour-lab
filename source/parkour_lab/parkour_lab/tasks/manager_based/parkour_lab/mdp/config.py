@@ -120,7 +120,7 @@ DEFAULT_WAYPOINT_HEADING = WaypointHeadingCfg()
 @configclass
 class RootMotionChatterCfg:
     """
-    Configuration for penalizing small, rapid root/trunk oscillations.
+    Configuration for penalizing small, rapid base oscillations.
 
     This targets:
       - small vertical bounces that quickly reverse,

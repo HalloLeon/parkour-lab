@@ -1,7 +1,7 @@
 # Parkour Lab
 
 Parkour Lab is an Isaac Lab reinforcement-learning environment for training a
-Unitree A1 with a balanced obstacle-family by difficulty curriculum. It also
+Unitree Go2 with a balanced obstacle-family by difficulty curriculum. It also
 provides fixed-cell, seeded evaluation with numerical metrics and optional
 video recording. The playback script can sweep the complete family/difficulty
 matrix with ``--all_courses`` or evaluate one explicitly selected cell.

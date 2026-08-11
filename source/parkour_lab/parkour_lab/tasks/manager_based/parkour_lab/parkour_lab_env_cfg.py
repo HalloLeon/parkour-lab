@@ -21,7 +21,7 @@ from isaaclab.sensors import ContactSensorCfg, RayCasterCfg, patterns
 from isaaclab.terrains import TerrainImporterCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import UniformNoiseCfg
-from isaaclab_assets.robots.unitree import UNITREE_A1_CFG
+from isaaclab_assets.robots.unitree import UNITREE_GO2_CFG
 from parkour_lab.learning.distillation.adaptation import (
     DEPLOYABLE_HISTORY_LENGTH,
 )
@@ -67,8 +67,8 @@ def _foot_surface_scanner_cfg(foot_name: str) -> RayCasterCfg:
 
     return RayCasterCfg(
         prim_path=f"{{ENV_REGEX_NS}}/Robot/{foot_name}",
-        # Start above the 0.02 m foot collision sphere so contact penetration
-        # cannot place the ray origin inside the supporting surface.
+        # Start above the foot collision geometry so contact penetration cannot
+        # place the ray origin inside the supporting surface.
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.10)),
         ray_alignment="yaw",
         pattern_cfg=patterns.GridPatternCfg(
@@ -117,10 +117,10 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     )
 
     # Robot.
-    robot: ArticulationCfg = UNITREE_A1_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
+    robot: ArticulationCfg = UNITREE_GO2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     # Contact sensors.
-    base_contact: ContactSensorCfg = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/trunk", history_length=3)
+    base_contact: ContactSensorCfg = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/base", history_length=3)
 
     feet_contact: ContactSensorCfg = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*_foot", history_length=3, track_air_time=True
@@ -132,16 +132,16 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     )
 
     # Ray sensors.
-    # One downward terrain ray at the trunk origin provides geometry-agnostic
+    # One downward terrain ray at the base origin provides geometry-agnostic
     # base clearance for flat ground, slopes, and arbitrary terrain meshes.
     base_height_scanner: RayCasterCfg = RayCasterCfg(
-        # Attach the sensor to the trunk so its ray origin follows the robot.
-        prim_path="{ENV_REGEX_NS}/Robot/trunk",
-        # Cast from the trunk origin: the measured hit is therefore the terrain
+        # Attach the sensor to the base so its ray origin follows the robot.
+        prim_path="{ENV_REGEX_NS}/Robot/base",
+        # Cast from the base origin: the measured hit is therefore the terrain
         # surface directly underneath the base, not a nearby grid sample.
         offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
         # Follow heading while ignoring roll and pitch, keeping the ray vertical
-        # even when the trunk tilts. Yaw has no effect on this centered ray.
+        # even when the base tilts. Yaw has no effect on this centered ray.
         ray_alignment="yaw",
         pattern_cfg=patterns.GridPatternCfg(
             # A zero-size grid contains exactly one ray. Resolution remains a
@@ -154,7 +154,7 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         # Generated terrain and all configured structures are combined under
         # /World/Ground, so the ray measures the real supporting surface.
         mesh_prim_paths=["/World/Ground"],
-        # The trunk normally remains well within five meters of the terrain.
+        # The base normally remains well within five meters of the terrain.
         max_distance=5.0,
         # Set debug_vis=True temporarily when inspecting ray placement. Keep it
         # disabled during training to avoid visualization overhead.
@@ -171,9 +171,9 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     # Dense, forward-looking terrain scan for the Phase 1 teacher actor. The
     # explicit RSL-RL routing supplies this independent terrain group to both
     # actor and critic. It samples a 2-D grid instead of the single point
-    # beneath the trunk.
+    # beneath the base.
     height_scanner: RayCasterCfg = RayCasterCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/trunk",
+        prim_path="{ENV_REGEX_NS}/Robot/base",
         # Shift the grid forward for upcoming-terrain coverage and start it high
         # enough that every downward ray begins above the course geometry.
         offset=RayCasterCfg.OffsetCfg(pos=(0.375, 0.0, 20.0)),
@@ -212,7 +212,7 @@ class ActionsCfg:
 
     # The policy outputs joint-position target offsets.
     #
-    # For Unitree A1 this controls the 12 leg joints.
+    # For Unitree Go2 this controls the 12 leg joints.
     # The action is interpreted roughly as:
     #
     # target_joint_pos = default_joint_pos + scale * policy_action
@@ -234,6 +234,10 @@ class ObservationsCfg:
     @configclass
     class DeployablePolicyCfg(ObsGroup):
         """Deployable proprioception and command state shared by both actors."""
+
+        # Go2 LowState does not expose base linear velocity during low-level
+        # control. Keep simulator truth out of the deployable actor; it remains
+        # available to the asymmetric critic below.
 
         # Body orientation and angular motion.
         base_ang_vel = ObsTerm(func=mdp.base_ang_vel, scale=0.25)
@@ -400,11 +404,11 @@ class EventsCfg:
 
     # Optional domain-randomization terms are populated from the selected
     # nominal, narrow, or wide stage before the environment is constructed.
-    add_trunk_mass: EventTerm | None = None
+    add_base_mass: EventTerm | None = None
     push_robot: EventTerm | None = None
     randomize_actuator_gains: EventTerm | None = None
+    randomize_base_com: EventTerm | None = None
     randomize_robot_material: EventTerm | None = None
-    randomize_trunk_com: EventTerm | None = None
 
     # Startup initialization.
     initialize_terrain_levels = EventTerm(
@@ -474,7 +478,7 @@ class EventsCfg:
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot",
-                body_names=["trunk"],
+                body_names=["base"],
                 joint_names=[".*"],
                 preserve_order=True,
             )
@@ -504,7 +508,7 @@ class RewardsCfg:
     at that command while a phase-local ceiling permits traversal speedups.
     Heading provides directional guidance without prescribing a
     terrain-specific gait.
-    A mild upright prior discourages persistent trunk lean while preserving
+    A mild upright prior discourages persistent base lean while preserving
     the attitude changes needed for obstacle traversal.
     One-shot physical milestones and completion bonuses make discrete progress
     unambiguous, while safety remains separate.
@@ -554,7 +558,7 @@ class RewardsCfg:
         func=mdp.base_contact,
         weight=-10.0,
         params={
-            "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk"),
+            "sensor_cfg": SceneEntityCfg("base_contact", body_names="base"),
             "threshold": PARKOUR_CURRICULUM.base_contact_threshold,
             "timestep_independent": True,
         },
@@ -646,9 +650,9 @@ class TerminationsCfg:
                 "feet_contact",
                 body_names=".*_foot",
             ),
-            "trunk_contact_cfg": SceneEntityCfg(
+            "base_contact_cfg": SceneEntityCfg(
                 "base_contact",
-                body_names="trunk",
+                body_names="base",
             ),
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
             "contact_threshold": PARKOUR_CURRICULUM.base_contact_threshold,
@@ -660,10 +664,10 @@ class TerminationsCfg:
         },
     )
 
-    trunk_contact = DoneTerm(
+    base_contact = DoneTerm(
         func=mdp.base_contact_done,
         params={
-            "sensor_cfg": SceneEntityCfg("base_contact", body_names="trunk"),
+            "sensor_cfg": SceneEntityCfg("base_contact", body_names="base"),
             "threshold": PARKOUR_CURRICULUM.base_contact_threshold,
         },
     )
@@ -950,9 +954,9 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         self.terminations.success.params["contact_threshold"] = curriculum_cfg.base_contact_threshold
 
         # Likewise, use one contact threshold for both the safety penalty and
-        # trunk-contact termination.
+        # base-contact termination.
         self.rewards.illegal_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
-        self.terminations.trunk_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
+        self.terminations.base_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
 
         # Edge geometry, unlike simple level gates, needs the full course table.
         self.rewards.feet_edge.params["curriculum_cfg"] = curriculum_cfg
@@ -1010,21 +1014,21 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         self._set_initial_state_randomization(scale)
 
         if not enabled:
-            self.events.add_trunk_mass = None
+            self.events.add_base_mass = None
             self.events.push_robot = None
             self.events.randomize_actuator_gains = None
+            self.events.randomize_base_com = None
             self.events.randomize_robot_material = None
-            self.events.randomize_trunk_com = None
             return
 
-        # Add a fixed per-environment trunk payload at simulator startup.
-        self.events.add_trunk_mass = EventTerm(
+        # Add a fixed per-environment base payload at simulator startup.
+        self.events.add_base_mass = EventTerm(
             func=mdp.randomize_rigid_body_mass,
             mode="startup",
             params={
-                "asset_cfg": SceneEntityCfg("robot", body_names="trunk"),
+                "asset_cfg": SceneEntityCfg("robot", body_names="base"),
                 "mass_distribution_params": mdp.scaled_range(
-                    cfg.added_trunk_mass_range_kg,
+                    cfg.added_base_mass_range_kg,
                     scale,
                 ),
                 "operation": "add",
@@ -1065,6 +1069,19 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
                 "operation": "scale",
             },
         )
+        # Shift the base center of mass to model uneven payload placement.
+        self.events.randomize_base_com = EventTerm(
+            func=mdp.randomize_rigid_body_com,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names="base"),
+                "com_range": {
+                    "x": mdp.scaled_range(cfg.base_com_x_range_m, scale),
+                    "y": mdp.scaled_range(cfg.base_com_y_range_m, scale),
+                    "z": mdp.scaled_range(cfg.base_com_z_range_m, scale),
+                },
+            },
+        )
         # Vary robot contact behavior through friction and restitution.
         self.events.randomize_robot_material = EventTerm(
             func=mdp.randomize_rigid_body_material,
@@ -1087,19 +1104,6 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
                 ),
                 "num_buckets": 64,  # Reuse 64 sampled material triples across shapes.
                 "make_consistent": True,  # Keep dynamic friction at most static friction.
-            },
-        )
-        # Shift the trunk center of mass to model uneven payload placement.
-        self.events.randomize_trunk_com = EventTerm(
-            func=mdp.randomize_rigid_body_com,
-            mode="startup",
-            params={
-                "asset_cfg": SceneEntityCfg("robot", body_names="trunk"),
-                "com_range": {
-                    "x": mdp.scaled_range(cfg.trunk_com_x_range_m, scale),
-                    "y": mdp.scaled_range(cfg.trunk_com_y_range_m, scale),
-                    "z": mdp.scaled_range(cfg.trunk_com_z_range_m, scale),
-                },
             },
         )
 

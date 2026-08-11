@@ -350,7 +350,7 @@ def advance_active_waypoints(
     asset_cfg: SceneEntityCfg,
     feet_asset_cfg: SceneEntityCfg,
     feet_contact_cfg: SceneEntityCfg,
-    trunk_contact_cfg: SceneEntityCfg,
+    base_contact_cfg: SceneEntityCfg,
     contact_threshold: float = 1.0,
     max_completion_tilt: float = 0.5,
     max_completion_vertical_speed: float = 0.5,
@@ -423,8 +423,8 @@ def advance_active_waypoints(
         support_margin=support_margin,
         support_plane_tolerance=support_plane_tolerance,
     )
-    trunk_contact = torch.any(
-        contact._force_norm_mask(env, sensor_cfg=trunk_contact_cfg) > contact_threshold,
+    base_contact = torch.any(
+        contact._force_norm_mask(env, sensor_cfg=base_contact_cfg) > contact_threshold,
         dim=(1, 2),
     )
 
@@ -435,7 +435,7 @@ def advance_active_waypoints(
     )
     final_waypoint_eligible = (
         supported
-        & (~trunk_contact)
+        & (~base_contact)
         & (clearance > min_clearance)
         & (torch.abs(robot._root_lin_vel_z(env, asset_cfg)) < max_completion_vertical_speed)
         & (
@@ -455,7 +455,7 @@ def advance_active_waypoints(
     # Progress can decrease if the robot backtracks. Preserve the furthest point
     # reached safely so a crash or off-route shortcut cannot drive curriculum.
     route_state.maximum_progress_m[:] = torch.where(
-        trunk_contact,
+        base_contact,
         route_state.maximum_progress_m,
         torch.maximum(
             route_state.maximum_progress_m,
@@ -470,7 +470,7 @@ def advance_active_waypoints(
         passed_waypoint_plane,
         support_required,
         supported,
-        ~trunk_contact,
+        ~base_contact,
         final_waypoint_eligible,
     )
 
@@ -845,7 +845,7 @@ def _advance_route_state(
         supported: Whether a recently contacted foot is on the active
             waypoint's intended support.
         route_state_eligible: Whether the robot may advance route state. A
-            trunk-contacting robot is ineligible.
+            base-contacting robot is ineligible.
         final_waypoint_eligible: Whether each environment has named-support
             contact and satisfies the whole-body stability conditions required
             at its final waypoint.
