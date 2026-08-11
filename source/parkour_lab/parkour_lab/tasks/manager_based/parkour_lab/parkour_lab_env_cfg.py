@@ -573,7 +573,7 @@ class RewardsCfg:
     # Keep vertical motion affordable enough for deliberate takeoff and landing.
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.125)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.1)
     joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.0002)
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
 
