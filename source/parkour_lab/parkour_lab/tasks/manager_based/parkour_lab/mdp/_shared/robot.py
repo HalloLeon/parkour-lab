@@ -5,7 +5,6 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply
 
 from .contact import _require_body_ids
-from .runtime import _get_or_init_env_buffer, _set_env_buffer
 
 
 def _root_forward_xy_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
@@ -144,63 +143,6 @@ def _root_projected_gravity_xy(
     return asset.data.projected_gravity_b[:, :2]
 
 
-def _root_roll_pitch_rate(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
-    """
-    Robot root roll/pitch angular velocity.
-
-    Returns:
-        [num_envs, 2]
-    """
-
-    asset: Articulation = env.scene[asset_cfg.name]
-
-    return asset.data.root_ang_vel_b[:, :2]
-
-
-def _root_xy_delta_from_previous(
-    env: ManagerBasedRLEnv,
-    *,
-    buffer_name: str,
-    reset_mask: torch.Tensor,
-    asset_cfg: SceneEntityCfg,
-) -> torch.Tensor:
-    """
-    Root XY displacement since the previous control step.
-
-    The previous-position buffer is always updated.
-
-    Returns:
-        [num_envs, 2]
-    """
-
-    current_root_xy = _root_pos_env(env, asset_cfg)[:, :2]
-
-    previous_root_xy = _get_or_init_env_buffer(env, name=buffer_name, value=current_root_xy)
-
-    root_delta_xy = current_root_xy - previous_root_xy
-
-    root_delta_xy = torch.where(reset_mask[:, None], torch.zeros_like(root_delta_xy), root_delta_xy)
-
-    _set_env_buffer(env, name=buffer_name, value=current_root_xy)
-
-    return root_delta_xy
-
-
-def _selected_body_lin_vel_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """
-    Linear velocity of selected articulation bodies in world frame.
-
-    Returns:
-        [num_envs, num_bodies, 3]
-    """
-
-    _require_body_ids(asset_cfg, role="body velocity selection")
-
-    asset: Articulation = env.scene[asset_cfg.name]
-
-    return asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :]
-
-
 def _selected_body_pos_env(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """Return selected body positions in each environment's local frame.
 
@@ -222,19 +164,6 @@ def _selected_body_pos_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> t
 
     asset: Articulation = env.scene[asset_cfg.name]
     return asset.data.body_pos_w[:, asset_cfg.body_ids, :]
-
-
-def _selected_body_speed_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """
-    Speed magnitude of selected articulation bodies in world frame.
-
-    Returns:
-        [num_envs, num_bodies]
-    """
-
-    body_lin_vel_w = _selected_body_lin_vel_w(env, asset_cfg)
-
-    return torch.linalg.norm(body_lin_vel_w, dim=-1)
 
 
 def _selected_joint_pos_error(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:

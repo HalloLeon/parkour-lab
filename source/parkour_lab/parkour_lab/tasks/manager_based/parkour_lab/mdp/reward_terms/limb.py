@@ -10,8 +10,7 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
-from .. import config
-from .._shared import contact, robot, runtime
+from .._shared import contact, robot
 from ..commands import get_target_speed
 from ..curriculums.config import DEFAULT_PARKOUR_CURRICULUM, ParkourCurriculumCfg
 from ..terrain import edges
@@ -42,7 +41,8 @@ def feet_edge(
 
 def feet_stumble(
     env: ManagerBasedRLEnv,
-    stumble_cfg: config.FeetStumbleCfg = config.DEFAULT_FEET_STUMBLE,
+    lateral_to_vertical_force_ratio: float = 1.0,
+    min_vertical_force: float = 0.5,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot"),
 ) -> torch.Tensor:
     """
@@ -62,11 +62,11 @@ def feet_stumble(
     lateral_force = torch.linalg.norm(contact_forces[..., :2], dim=-1)
     vertical_force = torch.abs(contact_forces[..., 2])
 
-    valid_vertical_contact = vertical_force > stumble_cfg.min_vertical_force
+    valid_vertical_contact = vertical_force > min_vertical_force
 
     stumble = torch.logical_and(
         valid_vertical_contact,
-        lateral_force > stumble_cfg.lateral_to_vertical_force_ratio * vertical_force,
+        lateral_force > lateral_to_vertical_force_ratio * vertical_force,
     )
 
     return torch.any(stumble, dim=(1, 2)).float()
@@ -87,62 +87,9 @@ def joint_deviation_l2(
     return torch.sum(joint_error.square(), dim=-1)
 
 
-def rapid_feet_motion_l2(
-    env: ManagerBasedRLEnv,
-    motion_cfg: config.FeetMotionCfg = config.DEFAULT_FOOT_MOTION_PENALTY,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=".*_foot"),
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot"),
-) -> torch.Tensor:
-    """
-    Penalize excessive foot speed in a contact-aware way.
-
-    Stance feet are expected to move slowly.
-    Swing feet are allowed to move faster.
-
-    The penalty is:
-
-        penalty = max(foot_speed - allowed_speed, 0)^2
-
-    where allowed_speed is:
-        - max_stance_speed for feet in contact
-        - max_swing_speed for feet not in contact
-
-    Use with a negative reward weight.
-
-    Returns:
-        [num_envs]
-    """
-
-    foot_speed = robot._selected_body_speed_w(env, asset_cfg)
-
-    force_norm = contact._force_norm_mask(env, sensor_cfg=sensor_cfg)
-
-    in_contact = torch.any(force_norm > motion_cfg.contact_threshold, dim=1)
-
-    runtime._validate_matching_shape(
-        in_contact, foot_speed, lhs_name="foot contact mask", rhs_name="foot speed"
-    )
-
-    stance_speed_limit = torch.full_like(foot_speed, motion_cfg.max_stance_speed)
-
-    swing_speed_limit = torch.full_like(foot_speed, motion_cfg.max_swing_speed)
-
-    speed_limit = torch.where(in_contact, stance_speed_limit, swing_speed_limit)
-
-    excess_speed = torch.clamp(foot_speed - speed_limit, min=0.0)
-
-    penalty_per_foot = torch.clamp(
-        excess_speed.square(), max=motion_cfg.max_penalty_per_foot
-    )
-
-    return penalty_per_foot.mean(dim=-1)
-
-
 def touchdown_air_time(
     env: ManagerBasedRLEnv,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg(
-        "feet_contact", body_names=".*_foot"
-    ),
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot"),
     threshold: float = 0.25,
 ) -> torch.Tensor:
     """Reward sufficiently long swing periods once, when each foot lands.

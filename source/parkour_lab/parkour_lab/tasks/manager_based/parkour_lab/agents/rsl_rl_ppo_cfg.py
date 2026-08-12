@@ -147,9 +147,9 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # Maximum probability-ratio deviation allowed by the PPO surrogate
         # objective during one update.
         clip_param=0.2,
-        # Let task return, rather than a permanent entropy bonus, determine how
-        # much of the bounded initial exploration the policy retains.
-        entropy_coef=0.0,
+        # Retain enough exploration to acquire locomotion before the terrain
+        # curriculum exposes obstacle-specific behavior.
+        entropy_coef=0.01,
         # Number of passes over each collected rollout.
         num_learning_epochs=5,
         # Number of minibatches used for every learning epoch.

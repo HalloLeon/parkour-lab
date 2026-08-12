@@ -471,8 +471,8 @@ class RewardsCfg:
     """
     Task, safety, and motion-quality rewards for parkour locomotion.
 
-    Flat rows track the commanded speed. Obstacle rows saturate forward reward
-    at that command while a phase-local ceiling permits traversal speedups.
+    Signed waypoint progress saturates at the commanded speed. On obstacle
+    rows, a phase-local ceiling permits bounded traversal speedups.
     Heading provides directional guidance without prescribing a
     terrain-specific gait.
     A mild upright prior discourages persistent base lean while preserving
@@ -488,7 +488,6 @@ class RewardsCfg:
         params={
             "approach_allowance_distance_m": 0.6,
             "asset_cfg": SceneEntityCfg("robot"),
-            "flat_speed_std": 0.25,
             "obstacle_speed_cap_multiplier": 1.5,
             "std": 0.5,
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
@@ -500,7 +499,6 @@ class RewardsCfg:
         weight=0.5,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "overspeed_std": 0.3,
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
         },
     )
@@ -552,13 +550,9 @@ class RewardsCfg:
     # rewarding a policy-controlled set of airborne feet.
     feet_air_time = RewTerm(
         func=mdp.touchdown_air_time,
-        weight=0.1,
+        weight=0.01,
         params={
-            "sensor_cfg": SceneEntityCfg(
-                "feet_contact",
-                body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
-                preserve_order=True,
-            ),
+            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
             "threshold": 0.25,
         },
     )
@@ -586,11 +580,9 @@ class RewardsCfg:
         func=mdp.feet_stumble,
         weight=-0.5,
         params={
+            "lateral_to_vertical_force_ratio": 4.0,
+            "min_vertical_force": 1.0,
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
-            "stumble_cfg": mdp.config.FeetStumbleCfg(
-                lateral_to_vertical_force_ratio=4.0,
-                min_vertical_force=1.0,
-            ),
         },
     )
 

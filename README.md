@@ -67,8 +67,9 @@ environment and update, 20-second episodes, a discount factor of 0.995, and
 checkpoints every 100 iterations. The longer rollout and horizon preserve more
 approach-to-landing credit than the former short smoke-test settings.
 `--max_iterations` can still override the budget for diagnostics. Action noise
-starts at 0.8, is bounded to 0.10–0.80, and has no permanent entropy bonus, so
-PPO can reduce exploration once the deterministic motor acquires its gait.
+starts at 0.8 and is bounded to 0.10–0.80. A 0.01 entropy coefficient retains
+exploration through initial locomotion acquisition while allowing the bounded
+distribution to settle around a deterministic gait.
 
 New checkpoints store the per-environment curriculum frontier, rolling evidence,
 and demotion grace alongside RSL-RL's learner state. `--resume` restores that
@@ -228,21 +229,21 @@ post-promotion grace counters. Static thresholds remain in
 `ParkourCurriculumCfg`; the episode row selected by frontier/replay sampling
 remains authoritative in `TerrainImporter.terrain_levels`.
 
-Dense velocity shaping tracks the episode command symmetrically on the flat
-bootstrap and preserves capped positive acquisition on obstacle rows, while
-suppressing lateral motion in both cases. Faster obstacle motion remains
-available for takeoff. The symmetric speed kernel and heading gate discourage
-flat sprinting without constraining the airborne phases needed to clear
-obstacles.
-Standing still and moving backward receive negligible flat tracking reward and
-zero obstacle acquisition reward. Reward samples on the exact retarget step are
-masked so a marker jump is not mistaken for robot motion. A Go2-adapted Unitree
-air-time term scores each completed swing once at touchdown. It sums the four
-fixed foot contributions around a 0.25 s threshold, is disabled below a
-0.1 m/s command, and neither continuously rewards airborne feet nor normalizes
-by a policy-controlled swing-foot count. Undesired hip, thigh, and calf contacts
-remain recoverable penalties; base and Go2 head contacts are terminal. Edge,
-slide, and stumble penalties use the same semantics on every terrain row.
+Dense velocity shaping uses signed waypoint-directed speed on every terrain,
+while suppressing lateral motion. Standing still earns zero task reward and
+retreating is penalized. Forward reward saturates at the episode command; the
+flat speed ceiling equals that command, while the waypoint-local obstacle
+ceiling still permits faster takeoff without paying extra forward reward.
+Heading guidance uses the same signed progress gate, preventing a zero-net
+fore-aft oscillation from accumulating alignment credit. Reward samples on the
+exact retarget step are masked so a marker jump is not mistaken for robot
+motion. A low-weight Go2-adapted Unitree air-time term scores each completed
+swing once at touchdown. It sums the four fixed foot contributions around a
+0.25 s threshold, is disabled below a 0.1 m/s command, and neither continuously
+rewards airborne feet nor normalizes by a policy-controlled swing-foot count.
+Undesired hip, thigh, and calf contacts remain recoverable penalties; base and
+Go2 head contacts are terminal. Edge, slide, and stumble penalties use the same
+semantics on every terrain row.
 A mild absolute-orientation penalty discourages persistent base lean without
 prescribing a gait. Low-clearance error remains normalized to `[0, 1]` before
 its squared penalty. Every default course uses a 0.27 m Go2 base-clearance
