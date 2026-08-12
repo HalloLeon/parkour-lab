@@ -212,8 +212,9 @@ def terrain_relative_foot_clearance(
         valid, horizontal_speed, torch.zeros_like(horizontal_speed)
     )
     moving_gate = torch.tanh(float(velocity_scale) * finite_speed)
+    # Isaac Lab stores the newest contact sample at history index zero.
     current_force_norm = contact._force_norm_mask(env, sensor_cfg=contact_sensor_cfg)[
-        :, -1
+        :, 0
     ]
     in_contact = current_force_norm > contact_threshold
     runtime._validate_matching_shape(

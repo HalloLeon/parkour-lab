@@ -256,6 +256,8 @@ def build_teacher_interface(
         # intentionally exclude this field so the same policy can be evaluated
         # on corrected or new course geometry.
         "terrain_curriculum": {
+            "demotion_progress_metric": "active_waypoint_cursor_fraction_v1",
+            "demotion_progress_fraction": float(curriculum_cfg.demotion_progress_fraction),
             "tile_size_m": _simple_value(terrain_generator_cfg.size),
             "ground_thickness_m": ground_thickness_m,
             "desired_speed_range_m_s": _simple_value(base_env.cfg.desired_speed_range),
@@ -319,8 +321,7 @@ def load_teacher_checkpoint(
         raise ValueError("Teacher interface uses an unsupported serialization version: " f"{interface_path}")
     robot_identity = teacher_interface.get("robot")
     if not isinstance(robot_identity, dict) or any(
-        not isinstance(robot_identity.get(field), str) or not robot_identity[field]
-        for field in ("model", "asset_path")
+        not isinstance(robot_identity.get(field), str) or not robot_identity[field] for field in ("model", "asset_path")
     ):
         raise ValueError(f"Teacher interface robot identity is missing or invalid: {interface_path}")
     teacher_interface_hash = interface_sha256(teacher_interface)
@@ -375,9 +376,7 @@ def _describe_robot_asset(robot_cfg: object) -> dict[str, str]:
             break
 
     if asset_path is None:
-        raise InterfaceMismatchError(
-            "The teacher robot must expose a non-empty USD or URDF asset path."
-        )
+        raise InterfaceMismatchError("The teacher robot must expose a non-empty USD or URDF asset path.")
 
     # Official Unitree assets use model-specific filenames (``a1.usd``,
     # ``go2.usd``). Strip a possible URI query while preserving the exact path

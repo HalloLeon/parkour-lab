@@ -139,10 +139,10 @@ class ParkourCurriculumCfg:
     demotion_window: int = 3
     demotion_failures_required: int = 2
 
-    # A failed frontier attempt is stalled when it verifies less than this
-    # fraction of its physical milestones. Replay episodes do not contribute
-    # transition evidence, and the first episode after promotion is protected
-    # from demotion.
+    # A failed frontier attempt is stalled when it passes less than this
+    # fraction of its intermediate route waypoints. Replay episodes do not
+    # contribute transition evidence, and the first episode after promotion is
+    # protected from demotion.
     # Below the ceiling, keep the total replay budget at 25% while retaining
     # both the shared flat bootstrap and the frontier's immediate predecessor.
     # At the ceiling the combined budget is spread uniformly over every lower
@@ -177,11 +177,7 @@ class ParkourCurriculumCfg:
             raise IndexError("difficulty_index is out of range.")
         if not 0 <= geometry_variant_index < self.num_geometry_variants:
             raise IndexError("geometry_variant_index is out of range.")
-        return (
-            self.families[family_index]
-            .geometry_variants[geometry_variant_index]
-            .levels[difficulty_index]
-        )
+        return self.families[family_index].geometry_variants[geometry_variant_index].levels[difficulty_index]
 
     def course_index(
         self,
@@ -201,10 +197,7 @@ class ParkourCurriculumCfg:
         """Return family-then-variant-major cells for runtime lookup tables."""
 
         return tuple(
-            level
-            for family in self.families
-            for variant in family.geometry_variants
-            for level in variant.levels
+            level for family in self.families for variant in family.geometry_variants for level in variant.levels
         )
 
     def family_index(self, family_name: str) -> int:
@@ -312,12 +305,9 @@ class ParkourCurriculumCfg:
         if len(variant_counts) != 1:
             raise ValueError("Every obstacle family must define the same number of geometry variants.")
 
-        difficulty_orders = tuple(
-            level.difficulty.order for level in self.families[0].canonical_levels
-        )
+        difficulty_orders = tuple(level.difficulty.order for level in self.families[0].canonical_levels)
         if any(
-            tuple(level.difficulty.order for level in family.canonical_levels)
-            != difficulty_orders
+            tuple(level.difficulty.order for level in family.canonical_levels) != difficulty_orders
             for family in self.families[1:]
         ):
             raise ValueError("Every obstacle family must use the same difficulty ranks by row.")
@@ -403,9 +393,7 @@ class ParkourTerrainCfg(SubTerrainBaseCfg):
 
     function = parkour_terrain
 
-    levels: tuple[ParkourLevelCfg, ...] = DEFAULT_PARKOUR_CURRICULUM.families[
-        0
-    ].canonical_levels
+    levels: tuple[ParkourLevelCfg, ...] = DEFAULT_PARKOUR_CURRICULUM.families[0].canonical_levels
 
     ground_thickness: float = 0.05
 
@@ -433,9 +421,7 @@ def parkour_sub_terrains(
     return {
         f"{curriculum_cfg.families[family_index].name}_variant_{variant_index}": ParkourTerrainCfg(
             proportion=column_pairs.count((family_index, variant_index)) / terrain_layout.num_columns,
-            levels=curriculum_cfg.families[family_index]
-            .geometry_variants[variant_index]
-            .levels,
+            levels=curriculum_cfg.families[family_index].geometry_variants[variant_index].levels,
             ground_thickness=ground_thickness,
         )
         for family_index, variant_index in ordered_pairs

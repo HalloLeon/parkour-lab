@@ -408,8 +408,8 @@ class ParkourLevelCfg:
 
         self._validate_support_references(structure_by_name)
         self._validate_waypoint_supports()
-        self._validate_rewarded_milestones()
         self._validate_final_waypoint()
+        self._validate_rewarded_milestones()
         self._validate_training_targets()
 
     @property
@@ -476,28 +476,6 @@ class ParkourLevelCfg:
                         f"{self.name}: base-ground support regions {region.name!r} and {other.name!r} overlap."
                     )
 
-    def _validate_final_waypoint(self) -> None:
-        """Require the final waypoint to identify its intended support."""
-
-        if any(waypoint.is_terminal_landing for waypoint in self.waypoints[:-1]):
-            raise ValueError(f"{self.name}: only the final waypoint may be marked as a terminal landing.")
-        if self.waypoints[-1].is_rewarded_milestone:
-            raise ValueError(
-                f"{self.name}: the final waypoint uses the course-completion "
-                "reward and cannot also be an intermediate rewarded milestone."
-            )
-        if self.waypoints[-1].support_region_name is None:
-            raise ValueError(f"{self.name}: final waypoint must identify its intended support region.")
-
-    def _validate_rewarded_milestones(self) -> None:
-        """Require every rewarded intermediate milestone to be physical."""
-
-        for index, waypoint in enumerate(self.waypoints[:-1]):
-            if waypoint.is_rewarded_milestone and waypoint.support_region_name is None:
-                raise ValueError(
-                    f"{self.name}: rewarded waypoint {index} must identify its " "intended support region."
-                )
-
     def _validate_support_references(
         self,
         structure_by_name: dict[str, ParkourStructureCfg],
@@ -534,6 +512,27 @@ class ParkourLevelCfg:
                 raise ValueError(
                     f"{self.name}: {waypoint_label} must lie on its intended support region {support_name!r}."
                 )
+
+    def _validate_final_waypoint(self) -> None:
+        """Require the final waypoint to identify its intended support."""
+
+        if any(waypoint.is_terminal_landing for waypoint in self.waypoints[:-1]):
+            raise ValueError(f"{self.name}: only the final waypoint may be marked as a terminal landing.")
+        final_waypoint = self.waypoints[-1]
+        if final_waypoint.is_rewarded_milestone:
+            raise ValueError(
+                f"{self.name}: the final waypoint uses the course-completion "
+                "reward and cannot also be an intermediate rewarded milestone."
+            )
+        if final_waypoint.support_region_name is None:
+            raise ValueError(f"{self.name}: final waypoint must identify its intended support region.")
+
+    def _validate_rewarded_milestones(self) -> None:
+        """Require every rewarded intermediate milestone to be physical."""
+
+        for index, waypoint in enumerate(self.waypoints[:-1]):
+            if waypoint.is_rewarded_milestone and waypoint.support_region_name is None:
+                raise ValueError(f"{self.name}: rewarded waypoint {index} must identify its intended support region.")
 
     def _validate_training_targets(self) -> None:
         """Validate scalar training targets and store them as finite floats."""
@@ -608,9 +607,7 @@ class ParkourFamilyCfg:
             levels = geometry_variant.levels
             names = [level.name for level in levels]
             if len(names) != len(set(names)):
-                raise ValueError(
-                    "Parkour curriculum level names must be unique within each geometry variant."
-                )
+                raise ValueError("Parkour curriculum level names must be unique within each geometry variant.")
             if any(level.obstacle_family != self.name for level in levels):
                 raise ValueError(
                     f"Obstacle family {self.name!r} may contain only levels whose obstacle_family has the same name."
@@ -620,31 +617,20 @@ class ParkourFamilyCfg:
                 ("minimum clearance", [level.min_clearance for level in levels]),
                 ("target speed", [level.target_speed for level in levels]),
             ):
-                if any(
-                    current > following
-                    for current, following in zip(values, values[1:])
-                ):
-                    raise ValueError(
-                        f"Parkour curriculum {field_name} must be non-decreasing."
-                    )
+                if any(current > following for current, following in zip(values, values[1:])):
+                    raise ValueError(f"Parkour curriculum {field_name} must be non-decreasing.")
 
         canonical_levels = geometry_variants[0].levels
         canonical_contract = tuple(
-            (level.difficulty.order, level.target_speed, level.min_clearance)
-            for level in canonical_levels
+            (level.difficulty.order, level.target_speed, level.min_clearance) for level in canonical_levels
         )
         if any(
             len(variant.levels) != len(canonical_levels)
-            or tuple(
-                (level.difficulty.order, level.target_speed, level.min_clearance)
-                for level in variant.levels
-            )
+            or tuple((level.difficulty.order, level.target_speed, level.min_clearance) for level in variant.levels)
             != canonical_contract
             for variant in geometry_variants[1:]
         ):
-            raise ValueError(
-                "Every geometry variant must preserve the canonical difficulty rows and training targets."
-            )
+            raise ValueError("Every geometry variant must preserve the canonical difficulty rows and training targets.")
         object.__setattr__(self, "geometry_variants", geometry_variants)
 
     @property
@@ -660,8 +646,7 @@ class ParkourFamilyCfg:
             "name": self.name,
             "levels": [level.metadata() for level in self.canonical_levels],
             "level_variants": [
-                [level.metadata() for level in variant.levels]
-                for variant in self.geometry_variants[1:]
+                [level.metadata() for level in variant.levels] for variant in self.geometry_variants[1:]
             ],
         }
 
@@ -773,9 +758,7 @@ def coerce_family_cfg(
             ),
         )
     else:
-        raise ValueError(
-            "Obstacle family must define geometry_variants or legacy levels."
-        )
+        raise ValueError("Obstacle family must define geometry_variants or legacy levels.")
 
     return ParkourFamilyCfg(
         name=cast(str, family["name"]),

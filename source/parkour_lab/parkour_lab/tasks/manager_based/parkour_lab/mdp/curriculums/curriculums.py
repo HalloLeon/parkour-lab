@@ -75,7 +75,7 @@ class CurriculumBatch:
     # Numeric outcomes.
     frontier_change: torch.Tensor
     normalized_geometric_progress: torch.Tensor
-    normalized_verified_progress: torch.Tensor
+    normalized_waypoint_progress: torch.Tensor
 
 
 class ParkourTerrainCurriculum(ManagerTermBase):
@@ -156,7 +156,7 @@ class ParkourTerrainCurriculum(ManagerTermBase):
                         device=env.device,
                         dtype=torch.float32,
                     ),
-                    normalized_verified_progress=torch.empty(
+                    normalized_waypoint_progress=torch.empty(
                         0,
                         device=env.device,
                         dtype=torch.float32,
@@ -180,14 +180,14 @@ class ParkourTerrainCurriculum(ManagerTermBase):
         )
         # Read both signals before changing terrain rows: route state still
         # points at the course whose episode just ended. Geometric progress is
-        # retained for diagnosis; support-verified progress drives demotion.
+        # retained for diagnosis; discrete waypoint progress drives demotion.
         normalized_geometric_progress = route.normalized_course_progress(env, env_ids)
-        normalized_verified_progress = route.normalized_verified_course_progress(
+        normalized_waypoint_progress = route.normalized_waypoint_progress(
             env,
             env_ids,
         )
         stalled_failure_event = _demotion_transition_mask(
-            normalized_verified_progress,
+            normalized_waypoint_progress,
             failure_event,
             demotion_progress_fraction=curriculum_cfg.demotion_progress_fraction,
         )
@@ -260,7 +260,7 @@ class ParkourTerrainCurriculum(ManagerTermBase):
                 success=success_event,
                 frontier_change=frontier_change,
                 normalized_geometric_progress=normalized_geometric_progress,
-                normalized_verified_progress=normalized_verified_progress,
+                normalized_waypoint_progress=normalized_waypoint_progress,
             ),
             curriculum_cfg,
         )
@@ -365,8 +365,8 @@ def _curriculum_metrics(
             batch.normalized_geometric_progress.float() * frontier_attempts
         ).sum()
         / frontier_attempt_count,
-        "frontier_episode/mean_verified_progress": (
-            batch.normalized_verified_progress.float() * frontier_attempts
+        "frontier_episode/mean_waypoint_progress": (
+            batch.normalized_waypoint_progress.float() * frontier_attempts
         ).sum()
         / frontier_attempt_count,
         "frontier_episode/stalled_failure_rate": (batch.stalled_failure.float() * frontier_attempts).sum()
@@ -491,18 +491,18 @@ def _demotion_grace_transition(
 
 
 def _demotion_transition_mask(
-    normalized_verified_progress: torch.Tensor,
+    normalized_waypoint_progress: torch.Tensor,
     failure_event: torch.Tensor,
     *,
     demotion_progress_fraction: float,
 ) -> torch.Tensor:
-    """Return stalled failures that verified too few physical milestones.
+    """Return stalled failures that passed too few intermediate waypoints.
 
     The strict comparison leaves exact-threshold outcomes unchanged. Successful
     completions, initial resets, and manual resets remain ineligible.
     """
 
-    return failure_event & (normalized_verified_progress < demotion_progress_fraction)
+    return failure_event & (normalized_waypoint_progress < demotion_progress_fraction)
 
 
 def _frontier_transition_masks(

@@ -240,17 +240,15 @@ def normalized_course_progress(
     ).clamp(min=0.0, max=1.0)
 
 
-def normalized_verified_course_progress(
+def normalized_waypoint_progress(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Return progress backed by reached, support-verified milestones.
+    """Return the fraction of intermediate route waypoints already passed.
 
-    Geometric route projection remains useful as a dense diagnostic, but it
-    can advance while a robot falls past an obstacle. Rewarded milestones are
-    required by configuration validation to name physical support, so summing
-    their normalized fractions gives demotion logic a conservative traversal
-    signal without introducing additional mutable state.
+    Final completion is handled separately because it is a binary success
+    outcome. Every intermediate cursor transition contributes equally, keeping
+    curriculum evidence independent of the milestone reward budget.
     """
 
     import torch
@@ -269,14 +267,10 @@ def normalized_verified_course_progress(
 
     route_state = runtime.route
     course_indices = route_state.course_indices[env_ids]
-    fractions = runtime.courses.milestone_reward_fractions[course_indices]
-    waypoint_indices = torch.arange(
-        fractions.shape[1],
-        device=env.device,
-        dtype=torch.long,
-    )
-    reached = waypoint_indices[None, :] < route_state.active_waypoint_indices[env_ids, None]
-    progress = (fractions * reached.to(dtype=fractions.dtype)).sum(dim=-1)
+    dtype = runtime.courses.cumulative_distances_m.dtype
+    passed_waypoints = route_state.active_waypoint_indices[env_ids].to(dtype=dtype)
+    intermediate_counts = (runtime.courses.waypoint_counts[course_indices] - 1).clamp_min(1)
+    progress = passed_waypoints / intermediate_counts.to(dtype=dtype)
     return torch.where(
         route_state.course_completed[env_ids],
         torch.ones_like(progress),
@@ -323,16 +317,9 @@ def route_phase(env: ManagerBasedRLEnv) -> torch.Tensor:
     if runtime is None:
         return torch.zeros((env.num_envs, 2), device=env.device)
 
-    course_indices = runtime.route.course_indices
-    waypoint_counts = runtime.courses.waypoint_counts[course_indices]
-    route_dtype = runtime.courses.cumulative_distances_m.dtype
-    active_waypoint_fraction = (
-        runtime.route.active_waypoint_indices.to(dtype=route_dtype)
-        / (waypoint_counts - 1).clamp_min(1).to(dtype=route_dtype)
-    ).clamp(min=0.0, max=1.0)
     return torch.stack(
         (
-            active_waypoint_fraction,
+            normalized_waypoint_progress(env),
             normalized_course_progress(env),
         ),
         dim=-1,

@@ -209,15 +209,16 @@ height.
 Maximum progress is projected onto the active route segment only inside its
 lateral corridor, remains monotonic within an episode, and does not increase
 during chassis contact. It remains a dense diagnostic. Demotion instead uses
-support-verified progress: only reached rewarded milestones count, and those
-milestones are required to name physical support. Falling geometrically past an
-uncleared obstacle therefore cannot hide a stalled attempt. Three successes in
-the last five frontier attempts promote one row. Two stalled failures in the
-last three eligible frontier attempts, each below 60% verified progress, demote
-one row. The first harder attempt is protected from demotion. Later episodes
-use a 10% flat anchor and 15% immediate-predecessor replay below the ceiling;
-at the ceiling their combined budget samples every lower row uniformly. Replay
-never alters frontier evidence.
+the fraction of intermediate route waypoints already passed, independently of
+the milestone reward budget. This discrete signal changes only when the route
+cursor advances, while reward tuning cannot silently change demotion evidence.
+Three successes in the last five frontier attempts promote one row.
+Two stalled failures in the last three eligible frontier attempts, each below
+60% waypoint progress, demote one row. The first harder attempt is protected
+from demotion. Later episodes use a 10% flat anchor and 15%
+immediate-predecessor replay below the ceiling; at the ceiling their combined
+budget samples every lower row uniformly. Replay never alters frontier
+evidence.
 Promotion changes only future course sampling and pays no additional reward
 because completion already receives an explicit `+4` event.
 
