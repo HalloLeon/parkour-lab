@@ -236,15 +236,13 @@ flat sprinting without constraining the airborne phases needed to clear
 obstacles.
 Standing still and moving backward receive negligible flat tracking reward and
 zero obstacle acquisition reward. Reward samples on the exact retarget step are
-masked so a marker jump is not mistaken for robot motion. Positive air-time
-and no-feet-contact shaping are disabled. Four reward-only downward foot rays
-provide terrain-relative clearance on flat ground, ramps, and elevated support.
-A single bounded term rewards horizontally moving foot-link origins up to
-0.05 m clearance (about 0.03 m sole clearance), saturates above that target,
-and assigns zero to contacted or stationary feet, missing terrain hits, or
-unsupported flight phases. Undesired hip, thigh, and calf contacts remain
-recoverable penalties; base and Go2 head contacts are terminal. Edge, slide,
-and stumble penalties use the same semantics on every terrain row.
+masked so a marker jump is not mistaken for robot motion. A Go2-adapted Unitree
+air-time term scores each completed swing once at touchdown. It sums the four
+fixed foot contributions around a 0.25 s threshold, is disabled below a
+0.1 m/s command, and neither continuously rewards airborne feet nor normalizes
+by a policy-controlled swing-foot count. Undesired hip, thigh, and calf contacts
+remain recoverable penalties; base and Go2 head contacts are terminal. Edge,
+slide, and stumble penalties use the same semantics on every terrain row.
 A mild absolute-orientation penalty discourages persistent base lean without
 prescribing a gait. Low-clearance error remains normalized to `[0, 1]` before
 its squared penalty. Every default course uses a 0.27 m Go2 base-clearance

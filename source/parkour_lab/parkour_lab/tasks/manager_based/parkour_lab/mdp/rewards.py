@@ -16,7 +16,7 @@ from .reward_terms.limb import (
     feet_stumble,
     joint_deviation_l2,
     rapid_feet_motion_l2,
-    terrain_relative_foot_clearance,
+    touchdown_air_time,
 )
 from .reward_terms.root_motion import root_chatter_l2
 from .reward_terms.safety import base_clearance_below_l2, chassis_contact
@@ -49,7 +49,7 @@ __all__ = [
     "feet_stumble",
     "joint_deviation_l2",
     "rapid_feet_motion_l2",
-    "terrain_relative_foot_clearance",
+    "touchdown_air_time",
     # Stateful root-motion regularization.
     "root_chatter_l2",
 ]

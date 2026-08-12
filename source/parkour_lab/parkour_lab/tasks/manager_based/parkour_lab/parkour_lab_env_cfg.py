@@ -54,33 +54,6 @@ INITIAL_WAYPOINT_POS = DEFAULT_LEVEL.waypoints[0].position
 ##
 
 
-FOOT_SURFACE_SCANNER_NAMES = (
-    "fl_foot_surface_scanner",
-    "fr_foot_surface_scanner",
-    "rl_foot_surface_scanner",
-    "rr_foot_surface_scanner",
-)
-
-
-def _foot_surface_scanner_cfg(foot_name: str) -> RayCasterCfg:
-    """Create one world-vertical terrain ray attached to a foot link."""
-
-    return RayCasterCfg(
-        prim_path=f"{{ENV_REGEX_NS}}/Robot/{foot_name}",
-        # Start above the foot collision geometry so contact penetration cannot
-        # place the ray origin inside the supporting surface.
-        offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.10)),
-        ray_alignment="yaw",
-        pattern_cfg=patterns.GridPatternCfg(
-            resolution=1.0,
-            size=(0.0, 0.0),
-            direction=(0.0, 0.0, -1.0),
-        ),
-        mesh_prim_paths=["/World/Ground"],
-        max_distance=1.0,
-    )
-
-
 @configclass
 class ParkourLabSceneCfg(InteractiveSceneCfg):
     """Configuration for a parkour lab scene."""
@@ -161,14 +134,6 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
         # Set debug_vis=True temporarily when inspecting ray placement. Keep it
         # disabled during training to avoid visualization overhead.
     )
-
-    # Per-foot terrain hits make swing clearance independent of platform
-    # elevation and ramp banking. RayCaster requires a literal leaf prim, so
-    # each foot owns one single-ray sensor.
-    fl_foot_surface_scanner: RayCasterCfg = _foot_surface_scanner_cfg("FL_foot")
-    fr_foot_surface_scanner: RayCasterCfg = _foot_surface_scanner_cfg("FR_foot")
-    rl_foot_surface_scanner: RayCasterCfg = _foot_surface_scanner_cfg("RL_foot")
-    rr_foot_surface_scanner: RayCasterCfg = _foot_surface_scanner_cfg("RR_foot")
 
     # Dense, forward-looking terrain scan for the Phase 1 teacher actor. The
     # explicit RSL-RL routing supplies this independent terrain group to both
@@ -583,25 +548,18 @@ class RewardsCfg:
     joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.0002)
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
 
-    # Foot-placement quality.
-    foot_clearance = RewTerm(
-        func=mdp.terrain_relative_foot_clearance,
+    # Foot-placement quality. Reward completed swings rather than continuously
+    # rewarding a policy-controlled set of airborne feet.
+    feet_air_time = RewTerm(
+        func=mdp.touchdown_air_time,
         weight=0.1,
         params={
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
-                preserve_order=True,
-            ),
-            "contact_sensor_cfg": SceneEntityCfg(
+            "sensor_cfg": SceneEntityCfg(
                 "feet_contact",
                 body_names=["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
                 preserve_order=True,
             ),
-            "contact_threshold": 1.0,
-            "sensor_names": FOOT_SURFACE_SCANNER_NAMES,
-            "target_clearance": 0.05,
-            "velocity_scale": 2.0,
+            "threshold": 0.25,
         },
     )
 
@@ -752,11 +710,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
             self.scene.undesired_contact.update_period = self.sim.dt
 
         # Terrain rays used by observations and rewards update at policy rate.
-        for sensor_name in (
-            "base_height_scanner",
-            "height_scanner",
-            *FOOT_SURFACE_SCANNER_NAMES,
-        ):
+        for sensor_name in ("base_height_scanner", "height_scanner"):
             sensor = getattr(self.scene, sensor_name)
             if sensor is not None:
                 sensor.update_period = self.decimation * self.sim.dt
