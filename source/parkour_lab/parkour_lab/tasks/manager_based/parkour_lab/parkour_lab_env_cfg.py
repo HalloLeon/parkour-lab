@@ -120,14 +120,16 @@ class ParkourLabSceneCfg(InteractiveSceneCfg):
     robot: ArticulationCfg = UNITREE_GO2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
 
     # Contact sensors.
-    base_contact: ContactSensorCfg = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/base", history_length=3)
+    chassis_contact: ContactSensorCfg = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/(base|Head_.*)", history_length=3
+    )
 
     feet_contact: ContactSensorCfg = ContactSensorCfg(
         prim_path="{ENV_REGEX_NS}/Robot/.*_foot", history_length=3, track_air_time=True
     )
 
-    leg_contact: ContactSensorCfg = ContactSensorCfg(
-        prim_path="{ENV_REGEX_NS}/Robot/.*_(thigh|calf)",
+    undesired_contact: ContactSensorCfg = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/.*_(hip|thigh|calf.*)",
         history_length=3,
     )
 
@@ -554,21 +556,21 @@ class RewardsCfg:
         params={"asset_cfg": SceneEntityCfg("robot")},
     )
 
-    illegal_contact = RewTerm(
-        func=mdp.base_contact,
+    chassis_contact = RewTerm(
+        func=mdp.chassis_contact,
         weight=-10.0,
         params={
-            "sensor_cfg": SceneEntityCfg("base_contact", body_names="base"),
-            "threshold": PARKOUR_CURRICULUM.base_contact_threshold,
+            "sensor_cfg": SceneEntityCfg("chassis_contact"),
+            "threshold": PARKOUR_CURRICULUM.contact_force_threshold,
             "timestep_independent": True,
         },
     )
 
-    leg_contact = RewTerm(
+    undesired_contact = RewTerm(
         func=mdp.undesired_contacts,
         weight=-0.5,
         params={
-            "sensor_cfg": SceneEntityCfg("leg_contact"),
+            "sensor_cfg": SceneEntityCfg("undesired_contact"),
             "threshold": 1.0,
         },
     )
@@ -650,12 +652,9 @@ class TerminationsCfg:
                 "feet_contact",
                 body_names=".*_foot",
             ),
-            "base_contact_cfg": SceneEntityCfg(
-                "base_contact",
-                body_names="base",
-            ),
+            "chassis_contact_cfg": SceneEntityCfg("chassis_contact"),
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
-            "contact_threshold": PARKOUR_CURRICULUM.base_contact_threshold,
+            "contact_threshold": PARKOUR_CURRICULUM.contact_force_threshold,
             "max_completion_tilt": 0.5,
             "max_completion_vertical_speed": 0.5,
             "reach_threshold": PARKOUR_CURRICULUM.waypoint_reach_threshold,
@@ -664,11 +663,11 @@ class TerminationsCfg:
         },
     )
 
-    base_contact = DoneTerm(
-        func=mdp.base_contact_done,
+    chassis_contact = DoneTerm(
+        func=mdp.chassis_contact_done,
         params={
-            "sensor_cfg": SceneEntityCfg("base_contact", body_names="base"),
-            "threshold": PARKOUR_CURRICULUM.base_contact_threshold,
+            "sensor_cfg": SceneEntityCfg("chassis_contact"),
+            "threshold": PARKOUR_CURRICULUM.contact_force_threshold,
         },
     )
 
@@ -743,14 +742,14 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physics_material = self.scene.ground.physics_material
 
         # Contact sensors should update every physics step.
-        if self.scene.base_contact is not None:
-            self.scene.base_contact.update_period = self.sim.dt
+        if self.scene.chassis_contact is not None:
+            self.scene.chassis_contact.update_period = self.sim.dt
 
         if self.scene.feet_contact is not None:
             self.scene.feet_contact.update_period = self.sim.dt
 
-        if self.scene.leg_contact is not None:
-            self.scene.leg_contact.update_period = self.sim.dt
+        if self.scene.undesired_contact is not None:
+            self.scene.undesired_contact.update_period = self.sim.dt
 
         # Terrain rays used by observations and rewards update at policy rate.
         for sensor_name in (
@@ -951,12 +950,12 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         # The success term owns route advancement before reward computation.
         # Synchronize its waypoint radius with the authoritative curriculum.
         self.terminations.success.params["reach_threshold"] = curriculum_cfg.waypoint_reach_threshold
-        self.terminations.success.params["contact_threshold"] = curriculum_cfg.base_contact_threshold
+        self.terminations.success.params["contact_threshold"] = curriculum_cfg.contact_force_threshold
 
         # Likewise, use one contact threshold for both the safety penalty and
-        # base-contact termination.
-        self.rewards.illegal_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
-        self.terminations.base_contact.params["threshold"] = curriculum_cfg.base_contact_threshold
+        # chassis-contact termination.
+        self.rewards.chassis_contact.params["threshold"] = curriculum_cfg.contact_force_threshold
+        self.terminations.chassis_contact.params["threshold"] = curriculum_cfg.contact_force_threshold
 
         # Edge geometry, unlike simple level gates, needs the full course table.
         self.rewards.feet_edge.params["curriculum_cfg"] = curriculum_cfg

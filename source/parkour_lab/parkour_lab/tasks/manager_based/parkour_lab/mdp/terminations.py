@@ -6,12 +6,12 @@ from ._shared import contact, robot
 from .navigation.route import advance_active_waypoints
 
 
-def base_contact_done(
+def chassis_contact_done(
     env: ManagerBasedRLEnv,
     threshold: float = 1.0,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("base_contact", body_names="base"),
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("chassis_contact"),
 ) -> torch.Tensor:
-    """Return which environments exceed the base-contact force threshold."""
+    """Return which environments exceed the fatal chassis-contact threshold."""
 
     return torch.any(
         contact._force_norm_mask(env, sensor_cfg=sensor_cfg) > threshold,
@@ -43,10 +43,7 @@ def completed_course_done(
         "feet_contact",
         body_names=".*_foot",
     ),
-    base_contact_cfg: SceneEntityCfg = SceneEntityCfg(
-        "base_contact",
-        body_names="base",
-    ),
+    chassis_contact_cfg: SceneEntityCfg = SceneEntityCfg("chassis_contact"),
     contact_threshold: float = 1.0,
     max_completion_tilt: float = 0.5,
     max_completion_vertical_speed: float = 0.5,
@@ -66,7 +63,7 @@ def completed_course_done(
         asset_cfg=asset_cfg,
         feet_asset_cfg=feet_asset_cfg,
         feet_contact_cfg=feet_contact_cfg,
-        base_contact_cfg=base_contact_cfg,
+        chassis_contact_cfg=chassis_contact_cfg,
         contact_threshold=contact_threshold,
         max_completion_tilt=max_completion_tilt,
         max_completion_vertical_speed=max_completion_vertical_speed,

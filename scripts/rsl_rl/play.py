@@ -201,7 +201,7 @@ class _EvaluationSummary(TypedDict):
     """Aggregate metrics calculated from completed episodes."""
 
     success_rate: float | None
-    base_contact_rate: float | None
+    chassis_contact_rate: float | None
     fell_below_course_rate: float | None
     timeout_rate: float | None
     mean_return: float | None
@@ -214,7 +214,7 @@ class _EvaluationSummary(TypedDict):
     rms_vertical_velocity_m_s: float | None
     all_feet_airborne_fraction: float | None
     mean_feet_edge_contacts_per_step: float | None
-    mean_undesired_leg_contacts_per_step: float | None
+    mean_undesired_body_contacts_per_step: float | None
 
 
 class _EvaluationReport(TypedDict):
@@ -317,7 +317,7 @@ class _RolloutResult:
     return_sum: float = 0.0
     length_steps_sum: int = 0
     success_count: int = 0
-    base_contact_count: int = 0
+    chassis_contact_count: int = 0
     fell_below_course_count: int = 0
     timeout_count: int = 0
     max_course_progress_m_sum: float = 0.0
@@ -327,7 +327,7 @@ class _RolloutResult:
     vertical_velocity_squared_m2_s2_sum: float = 0.0
     all_feet_airborne_sum: float = 0.0
     feet_edge_contacts_sum: float = 0.0
-    undesired_leg_contacts_sum: float = 0.0
+    undesired_body_contacts_sum: float = 0.0
 
     def record_completed(
         self,
@@ -351,7 +351,7 @@ class _RolloutResult:
         self.return_sum += float(episode_returns[completed_indices].sum().item())
         self.length_steps_sum += int(episode_lengths[completed_indices].sum().item())
         self.success_count += int(outcomes["success"][completed_indices].sum().item())
-        self.base_contact_count += int(outcomes["base_contact"][completed_indices].sum().item())
+        self.chassis_contact_count += int(outcomes["chassis_contact"][completed_indices].sum().item())
         self.fell_below_course_count += int(outcomes["fell_below_course"][completed_indices].sum().item())
         self.timeout_count += int(outcomes["timeout"][completed_indices].sum().item())
         self.max_course_progress_m_sum += float(episode_max_course_progress_m[completed_indices].sum().item())
@@ -366,8 +366,8 @@ class _RolloutResult:
         self.feet_edge_contacts_sum += float(
             episode_metric_sums["feet_edge_contacts"][completed_indices].sum().item()
         )
-        self.undesired_leg_contacts_sum += float(
-            episode_metric_sums["undesired_leg_contacts"][completed_indices].sum().item()
+        self.undesired_body_contacts_sum += float(
+            episode_metric_sums["undesired_body_contacts"][completed_indices].sum().item()
         )
 
     def summary(self, step_dt: float) -> _EvaluationSummary:
@@ -381,7 +381,7 @@ class _RolloutResult:
         mean_length_steps = self.length_steps_sum / count
         return {
             "success_rate": self.success_count / count,
-            "base_contact_rate": self.base_contact_count / count,
+            "chassis_contact_rate": self.chassis_contact_count / count,
             "fell_below_course_rate": self.fell_below_course_count / count,
             "timeout_rate": self.timeout_count / count,
             "mean_return": self.return_sum / count,
@@ -394,7 +394,7 @@ class _RolloutResult:
             "rms_vertical_velocity_m_s": (self.vertical_velocity_squared_m2_s2_sum / step_count) ** 0.5,
             "all_feet_airborne_fraction": self.all_feet_airborne_sum / step_count,
             "mean_feet_edge_contacts_per_step": self.feet_edge_contacts_sum / step_count,
-            "mean_undesired_leg_contacts_per_step": self.undesired_leg_contacts_sum / step_count,
+            "mean_undesired_body_contacts_per_step": self.undesired_body_contacts_sum / step_count,
         }
 
 
@@ -753,7 +753,7 @@ def _print_evaluation_summary(report: _EvaluationReport, report_path: str) -> No
     print(f"  Desired speed (m/s): {format_metric(report['desired_speed_m_s'])}")
     print(f"  Episodes: {report['completed_episodes']}/{report['requested_episodes']}")
     print(f"  Success rate: {format_metric(summary['success_rate'], rate=True)}")
-    print(f"  Base-contact rate: {format_metric(summary['base_contact_rate'], rate=True)}")
+    print(f"  Chassis-contact rate: {format_metric(summary['chassis_contact_rate'], rate=True)}")
     print(f"  Fell-below-course rate: {format_metric(summary['fell_below_course_rate'], rate=True)}")
     print(f"  Timeout rate: {format_metric(summary['timeout_rate'], rate=True)}")
     print(f"  Mean return: {format_metric(summary['mean_return'])}")
@@ -768,8 +768,8 @@ def _print_evaluation_summary(report: _EvaluationReport, report_path: str) -> No
     print(f"  All-feet-airborne fraction: {airborne_fraction}")
     print(f"  Mean feet-edge contacts per step: {format_metric(summary['mean_feet_edge_contacts_per_step'])}")
     print(
-        "  Mean undesired-leg contacts per step: "
-        f"{format_metric(summary['mean_undesired_leg_contacts_per_step'])}"
+        "  Mean undesired-body contacts per step: "
+        f"{format_metric(summary['mean_undesired_body_contacts_per_step'])}"
     )
     print(f"  Metrics: {report_path}")
 
@@ -820,7 +820,7 @@ def _collect_rollout_statistics(
             "vertical_velocity_squared_m2_s2",
             "all_feet_airborne",
             "feet_edge_contacts",
-            "undesired_leg_contacts",
+            "undesired_body_contacts",
         )
     }
     rollout = _RolloutResult()
@@ -900,7 +900,7 @@ def _read_step_metrics(base_env: ManagerBasedRLEnv | DirectRLEnv) -> dict[str, t
         "vertical_velocity_squared_m2_s2": vertical_velocity.square(),
         "all_feet_airborne": all_feet_airborne.to(dtype=forward_speed.dtype),
         "feet_edge_contacts": raw_reward_term("feet_edge"),
-        "undesired_leg_contacts": raw_reward_term("leg_contact"),
+        "undesired_body_contacts": raw_reward_term("undesired_contact"),
     }
 
 
@@ -941,11 +941,11 @@ def _read_termination_outcomes(
             & done_mask
         )
 
-    base_contact = term("base_contact")
+    chassis_contact = term("chassis_contact")
     fell_below_course = term("fell_below_course")
     return {
-        "success": term("success") & (~base_contact) & (~fell_below_course),
-        "base_contact": base_contact,
+        "success": term("success") & (~chassis_contact) & (~fell_below_course),
+        "chassis_contact": chassis_contact,
         "fell_below_course": fell_below_course,
         "timeout": term("time_out"),
     }

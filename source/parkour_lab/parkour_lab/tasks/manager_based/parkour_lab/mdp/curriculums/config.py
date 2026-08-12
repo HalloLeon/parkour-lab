@@ -152,7 +152,8 @@ class ParkourCurriculumCfg:
     bootstrap_replay_probability: float = 0.10
     predecessor_replay_probability: float = 0.15
 
-    base_contact_threshold: float = 1.0
+    # Shared threshold for named-support evidence and fatal chassis contact.
+    contact_force_threshold: float = 1.0
 
     # A contacted foot within this metric distance of a support boundary is
     # counted by the edge penalty.
@@ -363,8 +364,8 @@ class ParkourCurriculumCfg:
         if self.bootstrap_replay_probability + self.predecessor_replay_probability >= 1.0:
             raise ValueError("Replay probabilities must sum to less than 1.")
 
-        if self.base_contact_threshold < 0.0:
-            raise ValueError("base_contact_threshold must be non-negative.")
+        if self.contact_force_threshold < 0.0:
+            raise ValueError("contact_force_threshold must be non-negative.")
 
         if not np.isfinite(self.edge_width_threshold) or self.edge_width_threshold <= 0.0:
             raise ValueError("edge_width_threshold must be positive.")

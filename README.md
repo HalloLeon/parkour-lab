@@ -197,17 +197,18 @@ control markers cannot increase the available budget. Intermediate waypoints
 still do not end an episode or count as curriculum success. The final waypoint
 ignores plane crossing and pays `+4` only after the robot reaches its radius
 with a foot on the named support, sufficient base clearance, low vertical speed
-and tilt, and no base contact. Event rewards are divided by the control
+and tilt, and no chassis contact. Event rewards are divided by the control
 timestep before Isaac Lab's reward integration, making these configured amounts
-the exact per-event bonuses. The terminating base-contact penalty uses the same
-rule for an exact `-10`; a base crash takes precedence if crash and success
-would otherwise occur on the same step. Falling more than 0.5 m below the
-environment-local course is also a terminal failure, which ends unrecoverable
-gap falls promptly without confusing elevated terrain with world height.
+the exact per-event bonuses. The terminating chassis-contact penalty uses the
+same rule for an exact `-10`; a base or head crash takes precedence if crash
+and success would otherwise occur on the same step. Falling more than 0.5 m
+below the environment-local course is also a terminal failure, which ends
+unrecoverable gap falls promptly without confusing elevated terrain with world
+height.
 
 Maximum progress is projected onto the active route segment only inside its
 lateral corridor, remains monotonic within an episode, and does not increase
-during base contact. It remains a dense diagnostic. Demotion instead uses
+during chassis contact. It remains a dense diagnostic. Demotion instead uses
 support-verified progress: only reached rewarded milestones count, and those
 milestones are required to name physical support. Falling geometrically past an
 uncleared obstacle therefore cannot hide a stalled attempt. Three successes in
@@ -240,14 +241,15 @@ provide terrain-relative clearance on flat ground, ramps, and elevated support.
 A single bounded term rewards horizontally moving foot-link origins up to
 0.05 m clearance (about 0.03 m sole clearance), saturates above that target,
 and assigns zero to contacted or stationary feet, missing terrain hits, or
-unsupported flight phases. Leg-contact, edge, slide, and stumble penalties use
-the same semantics on every terrain row.
+unsupported flight phases. Undesired hip, thigh, and calf contacts remain
+recoverable penalties; base and Go2 head contacts are terminal. Edge, slide,
+and stumble penalties use the same semantics on every terrain row.
 A mild absolute-orientation penalty discourages persistent base lean without
 prescribing a gait. Low-clearance error remains normalized to `[0, 1]` before
 its squared penalty. Every default course uses a 0.27 m Go2 base-clearance
 floor; this is a lower bound rather than an exact height-tracking target.
 
-The teacher-interface manifest is version 14. Version 4 introduced complete
+The teacher-interface manifest is version 15. Version 4 introduced complete
 declarative terrain courses because physical support segmentation changes the
 privileged ray values seen by the teacher. Version 5 replaces horizontal-only
 support metadata with ordered planar XYZ boundaries, making the banked ramp
@@ -267,7 +269,9 @@ waypoints. Version 13 records fixed per-term observation scaling, named support
 targets with contact-gated physical milestones, stable crash-free completion,
 and the revised flat and tilted-ramp curriculum geometry. Version 14 freezes
 the robot model and exact source asset path, intentionally rejecting older A1
-checkpoints despite their compatible action dimensions. The complete v14
+checkpoints despite their compatible action dimensions. Version 15 records the
+Go2 chassis-contact contract, where base and head impacts are fatal while limb
+contacts remain recoverable. The complete v15
 manifest and its hash remain the exact training provenance. Playback and
 distillation compare a projected inference contract that ignores only
 `terrain_curriculum`: robot asset, observation, scanner, network, action,
@@ -422,7 +426,7 @@ reports, starting a fresh Isaac Sim
 process for every cell so simulation state cannot leak between courses. The
 expected application restarts are printed as sweep progress. This option cannot
 be combined with the two single-cell selectors. Evaluation reports success,
-maximum course progress, base contact, below-course falls, timeout, return,
+maximum course progress, chassis contact, below-course falls, timeout, return,
 episode length, forward speed, overspeed, vertical-velocity RMS, and
 all-feet-airborne fraction for each selected matrix cell. It writes
 `metrics.json` plus the optional MP4 beneath

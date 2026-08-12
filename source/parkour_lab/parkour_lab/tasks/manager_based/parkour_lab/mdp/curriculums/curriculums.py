@@ -593,9 +593,9 @@ def _terminal_event_masks(
     """Return success, terminal, and failure masks for a reset batch.
 
     CurriculumManager runs only for reset environments. ``reset_buf`` therefore
-    covers base contact, falls, timeout, and future failure terminations. Requiring a
+    covers chassis contact, falls, timeout, and future failure terminations. Requiring a
     positive episode length keeps initial and repeated manual resets neutral.
-    A base contact or fall wins if it fires with success during the same step:
+    A chassis contact or fall wins if it fires with success during the same step:
     a robot cannot earn mastery by reaching the exit gate while crashing.
     """
 
@@ -618,8 +618,8 @@ def _terminal_event_masks(
         )
         & terminal_event
     )
-    base_contact_event = (
-        env.termination_manager.get_term("base_contact")[env_ids].to(
+    chassis_contact_event = (
+        env.termination_manager.get_term("chassis_contact")[env_ids].to(
             device=env.device,
             dtype=torch.bool,
         )
@@ -632,7 +632,7 @@ def _terminal_event_masks(
         )
         & terminal_event
     )
-    success_event = raw_success_event & (~base_contact_event) & (~fell_below_event)
+    success_event = raw_success_event & (~chassis_contact_event) & (~fell_below_event)
     failure_event = terminal_event & (~success_event)
     return success_event, terminal_event, failure_event
 

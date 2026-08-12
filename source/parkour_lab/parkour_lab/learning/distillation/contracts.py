@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
     from tensordict import TensorDict
 
-TEACHER_INTERFACE_VERSION = 14
+TEACHER_INTERFACE_VERSION = 15
 
 ADAPTATION_HISTORY_GROUP = "adaptation_history"
 DEPLOYABLE_STATE_GROUP = "policy"
@@ -201,7 +201,7 @@ def build_teacher_interface(
                 "support_margin_m": float(success_params["support_margin"]),
                 "support_plane_tolerance_m": float(success_params["support_plane_tolerance"]),
                 "final_transition": "root_radius_and_named_support_contact",
-                "final_requires_no_base_contact": True,
+                "final_requires_no_chassis_contact": True,
                 "final_requires_min_clearance": True,
                 "final_max_projected_gravity_xy_norm": float(success_params["max_completion_tilt"]),
                 "final_max_vertical_speed_m_s": float(success_params["max_completion_vertical_speed"]),

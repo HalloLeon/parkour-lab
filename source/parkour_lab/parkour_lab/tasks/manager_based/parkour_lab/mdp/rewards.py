@@ -7,7 +7,7 @@
 """Public reward terms for the parkour environment.
 
 Implementations are grouped by domain in the ``reward_terms`` package.
-They are imported here so references such as ``mdp.base_contact`` continue
+They are imported here so references such as ``mdp.chassis_contact`` continue
 to work.
 """
 
@@ -19,7 +19,7 @@ from .reward_terms.limb import (
     terrain_relative_foot_clearance,
 )
 from .reward_terms.root_motion import root_chatter_l2
-from .reward_terms.safety import base_clearance_below_l2, base_contact
+from .reward_terms.safety import base_clearance_below_l2, chassis_contact
 from .reward_terms.waypoint import (
     completed_course_reward,
     intermediate_milestone_reward,
@@ -43,7 +43,7 @@ __all__ = [
     "waypoint_velocity_tracking_exp",
     # Safety and clearance penalties.
     "base_clearance_below_l2",
-    "base_contact",
+    "chassis_contact",
     # Limb rewards and regularizers.
     "feet_edge",
     "feet_stumble",

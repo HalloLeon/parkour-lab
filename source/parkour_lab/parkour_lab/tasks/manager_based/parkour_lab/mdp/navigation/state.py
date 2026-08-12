@@ -99,7 +99,7 @@ class RouteState:
     # with the current position to detect genuine waypoint-plane crossings.
     previous_root_xy: torch.Tensor
     # [environment]: furthest safe route-projected distance reached in the
-    # current episode; monotonic and not advanced during base contact.
+    # current episode; monotonic and not advanced during chassis contact.
     maximum_progress_m: torch.Tensor
 
     # Completed-episode evaluation snapshot.

@@ -57,13 +57,13 @@ def base_clearance_below_l2(
     return clearance_error.square()
 
 
-def base_contact(
+def chassis_contact(
     env: ManagerBasedRLEnv,
     threshold: float = 1.0,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("base_contact", body_names="base"),
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("chassis_contact"),
     timestep_independent: bool = False,
 ) -> torch.Tensor:
-    """Penalty signal for illegal base contact.
+    """Penalty signal for fatal base or head contact.
 
     Set ``timestep_independent`` when contact also terminates the episode. The
     one-step signal is then divided by the control timestep before Isaac Lab's
@@ -85,9 +85,9 @@ def base_contact(
     force_norm = torch.linalg.norm(net_forces, dim=-1)
 
     # [num_envs]
-    has_illegal_contact = torch.any(force_norm > threshold, dim=(1, 2))
+    has_chassis_contact = torch.any(force_norm > threshold, dim=(1, 2))
 
-    penalty = has_illegal_contact.float()
+    penalty = has_chassis_contact.float()
     if timestep_independent:
         return penalty / float(env.step_dt)
     return penalty
