@@ -314,6 +314,8 @@ def build_level(
             ),
         ),
     )
+
+
 def build_ramp_sequence(
     stage_spec: TiltedRampStageSpec,
 ) -> tuple[TiltedRampGeometry, ...]:
@@ -471,12 +473,14 @@ def _paired_stage(
 
 DEFAULT_STAGE_SPECS = (
     # Obstacle stage 0 / curriculum row 1: acquire one wide, straight,
-    # gently banked support.
+    # gently banked support. Its top begins exactly where the approach ground
+    # ends and finishes exactly where the landing begins; introducing a narrow
+    # entry seam here turns the Go2-sized foot into a wedge.
     TiltedRampStageSpec(
-        sequence_anchor_xy=(1.50, 0.0),
+        sequence_anchor_xy=(1.475, 0.0),
         ramps=(
             RampSpec(
-                length=1.80,
+                length=1.85,
                 width=1.60,
                 incline_degrees=3.0,
                 yaw_degrees=0.0,
@@ -487,9 +491,11 @@ DEFAULT_STAGE_SPECS = (
         landing_y_range=(-1.0, 1.0),
     ),
     # Obstacle stage 1 / curriculum row 2: traverse two contiguous,
-    # aligned supports.
+    # aligned supports. Preserve row one's flush acquisition boundary and the
+    # original downstream ramp/landing placement while splitting the span.
     _paired_stage(
-        sequence_anchor_xy=(1.05, 0.0),
+        sequence_anchor_xy=(1.025, 0.0),
+        lengths=(0.95, 1.10),
         width=1.60,
         incline_degrees=(3.0, 3.0),
         yaw_degrees=(0.0, 0.0),
