@@ -244,7 +244,8 @@ unsupported flight phases. Leg-contact, edge, slide, and stumble penalties use
 the same semantics on every terrain row.
 A mild absolute-orientation penalty discourages persistent base lean without
 prescribing a gait. Low-clearance error remains normalized to `[0, 1]` before
-its squared penalty.
+its squared penalty. Every default course uses a 0.27 m Go2 base-clearance
+floor; this is a lower bound rather than an exact height-tracking target.
 
 The teacher-interface manifest is version 14. Version 4 introduced complete
 declarative terrain courses because physical support segmentation changes the

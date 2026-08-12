@@ -6,7 +6,7 @@ from .navigation import route
 
 def get_min_clearance(
     env: ManagerBasedRLEnv,
-    default: float = 0.25,
+    default: float = 0.27,
 ) -> torch.Tensor:
     """Return the active course's minimum clearance for every environment."""
 

@@ -159,7 +159,7 @@ def active_waypoint_positions(
 
 def current_min_clearances(
     env: ManagerBasedRLEnv,
-    default: float = 0.25,
+    default: float = 0.27,
 ) -> torch.Tensor:
     """Return per-environment clearance targets without materializing copies."""
 

@@ -137,7 +137,7 @@ def build_default_level(
         landing_x_range=(stage_spec.landing_start_x, _shared.TERRAIN_X_RANGE_M[1]),
         landing_y_range=stage_spec.landing_y_range,
         target_speed=0.60,
-        min_clearance=0.24,
+        min_clearance=_shared.DEFAULT_MIN_BASE_CLEARANCE_M,
     )
 
 

@@ -51,7 +51,7 @@ def build_default_levels(
                 0.03 * variant_offset,
             ),
             target_speed=0.55,
-            min_clearance=0.24,
+            min_clearance=_shared.DEFAULT_MIN_BASE_CLEARANCE_M,
         )
         for obstacle_stage_index in range(_shared.NUM_OBSTACLE_STAGES)
     )

@@ -22,6 +22,10 @@ TERRAIN_Y_RANGE_M = (-2.0, 2.0)
 # Every family has six obstacle-bearing rows after the shared flat bootstrap.
 NUM_OBSTACLE_STAGES = 6
 
+# Shared Go2 base-clearance floor. This remains below the nominal home-pose
+# clearance while reducing the slack that allowed a crouched solution.
+DEFAULT_MIN_BASE_CLEARANCE_M = 0.27
+
 # Variant zero is the nominal course used for fixed evaluation. The remaining
 # zero-mean offsets create a small deterministic geometry distribution across
 # training columns without consuming Isaac Lab's unretained within-row random
@@ -119,7 +123,7 @@ def build_bootstrap_level(obstacle_family: str) -> ParkourLevelCfg:
             ),
         ),
         target_speed=_BOOTSTRAP_TARGET_SPEED,
-        min_clearance=0.24,
+        min_clearance=DEFAULT_MIN_BASE_CLEARANCE_M,
         difficulty=ParkourDifficultyCfg(order=0.0, parameters={}),
     )
 
