@@ -152,8 +152,9 @@ def terrain_relative_foot_clearance(
 
     One downward ray per foot supplies the underlying surface height. The
     clearance score saturates at the target, so the extra lift required by an
-    obstacle is never penalized. Contacted or stationary feet, missing terrain
-    hits, and unsupported flight phases earn nothing.
+    obstacle is never penalized. Scores are averaged over non-contact feet so
+    their magnitude is independent of the number of feet in swing. Stationary
+    feet, missing terrain hits, and unsupported flight phases earn nothing.
 
     Returns:
         Floating tensor with shape ``(num_envs,)`` in ``[0, 1]``.
@@ -222,7 +223,9 @@ def terrain_relative_foot_clearance(
         rhs_name="foot contact mask",
     )
     has_support = torch.any(in_contact, dim=-1)
-    swing_score = moving_gate * clearance_score * (~in_contact).to(
+    swing_mask = ~in_contact
+    swing_score = moving_gate * clearance_score * swing_mask.to(dtype=foot_height.dtype)
+    swing_count = swing_mask.sum(dim=-1).clamp_min(1)
+    return (swing_score.sum(dim=-1) / swing_count) * has_support.to(
         dtype=foot_height.dtype
     )
-    return swing_score.mean(dim=-1) * has_support.to(dtype=foot_height.dtype)

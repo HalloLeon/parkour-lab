@@ -584,7 +584,7 @@ class RewardsCfg:
     # Foot-placement quality.
     foot_clearance = RewTerm(
         func=mdp.terrain_relative_foot_clearance,
-        weight=0.2,
+        weight=0.1,
         params={
             "asset_cfg": SceneEntityCfg(
                 "robot",
