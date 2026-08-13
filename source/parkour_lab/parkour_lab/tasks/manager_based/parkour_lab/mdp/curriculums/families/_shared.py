@@ -26,11 +26,12 @@ NUM_OBSTACLE_STAGES = 6
 # clearance while reducing the slack that allowed a crouched solution.
 DEFAULT_MIN_BASE_CLEARANCE_M = 0.27
 
-# Variant zero is the nominal course used for fixed evaluation. The remaining
-# zero-mean offsets create a small deterministic geometry distribution across
-# training columns without consuming Isaac Lab's unretained within-row random
-# difficulty value.
-GEOMETRY_VARIANT_OFFSETS = (0.0, -1.0, -0.5, 0.5, 1.0)
+# Variant zero is the nominal course used for fixed evaluation. Adjacent pairs
+# share one of five zero-mean severity offsets so the tilted-ramp family can
+# assign the original and its exact left-right reflection to equally many
+# training columns. Other families retain the same five severity values and
+# duplicate each one to preserve the shared rectangular curriculum matrix.
+GEOMETRY_VARIANT_OFFSETS = (0.0, 0.0, -1.0, -1.0, -0.5, -0.5, 0.5, 0.5, 1.0, 1.0)
 
 _BOOTSTRAP_ROUTE = (
     (1.25, 0.0, 0.01),
@@ -42,6 +43,18 @@ _SUPPORTED_OBSTACLE_FAMILIES = frozenset({"gap", "high_step", "hurdle", "tilted_
 
 
 # Curriculum-scalar helpers.
+
+
+def geometry_variant_handedness(variant_index: int) -> float:
+    """Return the paired lateral handedness for one geometry variant.
+
+    Every even variant retains the original geometry and the following odd
+    variant reflects it. Resolving the offset first applies the shared index
+    validation without maintaining a second definition of the valid range.
+    """
+
+    geometry_variant_offset(variant_index)
+    return 1.0 if variant_index % 2 == 0 else -1.0
 
 
 def geometry_variant_offset(variant_index: int) -> float:

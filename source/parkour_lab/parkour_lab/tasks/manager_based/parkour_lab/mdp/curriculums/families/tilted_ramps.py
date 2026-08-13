@@ -125,6 +125,11 @@ def build_default_level(
         _default_stage_spec_at(normalized_difficulty),
         variant_offset,
     )
+    # Adjacent geometry variants have identical severity. Odd variants reflect
+    # the complete stage across terrain-local y=0, giving each bank and route
+    # direction an equally frequent opposite-handed counterpart in training.
+    if _shared.geometry_variant_handedness(geometry_variant_index) < 0.0:
+        stage_spec = _mirrored_stage_spec(stage_spec)
     ramps = build_ramp_sequence(stage_spec)
     return build_level(
         name=(
@@ -576,6 +581,45 @@ def _default_stage_spec_at(normalized_difficulty: float) -> TiltedRampStageSpec:
         if math.isclose(normalized_difficulty, keyframe, abs_tol=1.0e-12):
             return stage_spec
     raise ValueError("Tilted-ramp difficulty must select a configured normalized keyframe.")
+
+
+def _mirrored_stage_spec(
+    stage_spec: TiltedRampStageSpec,
+) -> TiltedRampStageSpec:
+    """Reflect a complete stage across the terrain's longitudinal centerline.
+
+    Reflection maps ``(x, y, z)`` to ``(x, -y, z)``. Because a ramp's positive
+    incline raises its local-left edge, both its yaw and incline must change
+    sign. The local-left transition offset likewise changes sign, while its
+    forward gap and every scalar dimension remain unchanged.
+    """
+
+    landing_y_min, landing_y_max = stage_spec.landing_y_range
+    return TiltedRampStageSpec(
+        sequence_anchor_xy=(
+            stage_spec.sequence_anchor_xy[0],
+            -stage_spec.sequence_anchor_xy[1],
+        ),
+        ramps=tuple(
+            RampSpec(
+                length=ramp.length,
+                width=ramp.width,
+                incline_degrees=-ramp.incline_degrees,
+                yaw_degrees=-ramp.yaw_degrees,
+                thickness=ramp.thickness,
+            )
+            for ramp in stage_spec.ramps
+        ),
+        transitions=tuple(
+            RampTransitionSpec(
+                gap=transition.gap,
+                lateral_offset=-transition.lateral_offset,
+            )
+            for transition in stage_spec.transitions
+        ),
+        landing_start_x=stage_spec.landing_start_x,
+        landing_y_range=(-landing_y_max, -landing_y_min),
+    )
 
 
 def _variant_stage_spec(

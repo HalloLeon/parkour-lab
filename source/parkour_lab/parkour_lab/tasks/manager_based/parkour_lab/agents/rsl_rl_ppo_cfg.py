@@ -3,9 +3,13 @@ from isaaclab_rl.rsl_rl import (
     RslRlOnPolicyRunnerCfg,
     RslRlPpoActorCriticCfg,
     RslRlPpoAlgorithmCfg,
+    RslRlSymmetryCfg,
 )
 from parkour_lab.learning.distillation.architecture import (
     DEFAULT_TERRAIN_LATENT_DIM,
+)
+from parkour_lab.learning.distillation.teacher.symmetry import (
+    compute_symmetric_states,
 )
 
 
@@ -38,7 +42,7 @@ class PrivilegedTeacherActorCriticCfg(RslRlPpoActorCriticCfg):
 
 @configclass
 class RegularizedPPOCfg(RslRlPpoAlgorithmCfg):
-    """PPO with bidirectional regularized online adaptation."""
+    """PPO with left-right augmentation and regularized online adaptation."""
 
     class_name: str = "RegularizedPPO"
 
@@ -167,6 +171,14 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         # Maximum gradient norm used for gradient clipping.
         max_grad_norm=1.0,
+        # Reflect complete left-right transitions during PPO updates. Data
+        # augmentation imposes no gait phase and leaves mirror loss disabled.
+        symmetry_cfg=RslRlSymmetryCfg(
+            use_data_augmentation=True,
+            use_mirror_loss=False,
+            data_augmentation_func=compute_symmetric_states,
+            mirror_loss_coeff=0.0,
+        ),
     )
 
 

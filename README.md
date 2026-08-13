@@ -124,19 +124,22 @@ straight obstacle-free route. Rows 1 through 6 contain the six obstacle
 difficulties. Equal column blocks retain their future gap, high-step, hurdle,
 or tilted-ramp family even on the flat row, so each environment advances from
 flat ground into one stable family without resampling its obstacle type. Each
-family block is further divided into five deterministic, zero-mean geometry
-variants. Variant zero is the unchanged nominal ladder; the others perturb only
-bounded obstacle geometry by at most 5%. Every variant is a complete prebuilt
-course, so its mesh, route, support polygons, and edge geometry remain exact and
-synchronized. Isaac Lab's unretained random fraction within a terrain row is
-deliberately not used. Default builders use the shared normalized row scalar
+family block is further divided into ten deterministic variants: five
+zero-mean severity values, each represented by an adjacent left-right pair.
+Variant zero is the unchanged nominal ladder. High-step and tilted-ramp pairs
+contain exact reflected courses; centered gap and hurdle geometries are their
+own reflections. Nonzero severity values perturb only bounded obstacle geometry
+by at most 5%. Every variant is a complete prebuilt course, so its mesh, route,
+support polygons, and edge geometry remain exact and synchronized. Isaac Lab's
+unretained random fraction within a terrain row is deliberately not used.
+Default builders use the shared normalized row scalar
 `s = row / 6`; simple obstacle dimensions interpolate from that scalar while
 the proven tilted-ramp stages remain explicit normalized keyframes. Each course
 records ordered terrain-local waypoints, named mesh structures and their
 factory arguments, planar support polygons, nominal speed metadata, clearance,
 and explicit difficulty metadata. At reset, the live desired-speed command is
 sampled independently from 0.45 to 0.70 m/s, so obstacle geometry is not
-confounded with a family-specific command. Obstacle rows use a common 0.24 m
+confounded with a family-specific command. Obstacle rows use a common 0.27 m
 minimum clearance. Forward reward saturates at the sampled command while a
 waypoint-local 1.5x ceiling permits the policy to acquire extra traversal speed
 without rewarding it for doing so.
@@ -337,6 +340,14 @@ Teacher and future student share one action contract: 12 Unitree Go2 joint-posit
 offsets, scale `0.25`, interpreted relative to default joint positions at the
 same 50 Hz control rate. Observation asymmetry therefore does not alter the
 low-level controller or action interface.
+
+Teacher PPO updates append an exact sagittal left-right reflection of every
+collected transition. The transform reflects proprioception and actions by
+resolved Go2 joint name, flips heading and both terrain-scan channels, and also
+reflects the adaptation history, randomized dynamics, and critic-only state.
+Adaptive KL and entropy statistics continue to use only the collected samples.
+This is data augmentation rather than a gait-phase objective: mirror loss is
+disabled, and inference still evaluates one unmodified observation at a time.
 
 `learning/distillation/architecture.py` fixes the shared transferable motor
 input order as deployable state, two-component heading, 32-D terrain latent,

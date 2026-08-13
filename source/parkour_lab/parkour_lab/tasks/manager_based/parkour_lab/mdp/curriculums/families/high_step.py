@@ -23,6 +23,7 @@ def build_default_levels(
     """Build the flat bootstrap and one deterministic high-step ladder."""
 
     variant_offset = _shared.geometry_variant_offset(geometry_variant_index)
+    variant_handedness = _shared.geometry_variant_handedness(geometry_variant_index)
 
     return (_shared.build_bootstrap_level("high_step"),) + tuple(
         build_level(
@@ -48,7 +49,7 @@ def build_default_levels(
             obstacle_depth=1.6 * (1.0 + 0.03 * variant_offset),
             obstacle_position_xy=(
                 2.8 - 0.04 * variant_offset,
-                0.03 * variant_offset,
+                0.03 * variant_offset * variant_handedness,
             ),
             target_speed=0.55,
             min_clearance=_shared.DEFAULT_MIN_BASE_CLEARANCE_M,

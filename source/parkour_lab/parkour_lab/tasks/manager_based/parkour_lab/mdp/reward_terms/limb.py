@@ -94,8 +94,7 @@ def touchdown_air_time(
 ) -> torch.Tensor:
     """Reward sufficiently long swing periods once, when each foot lands.
 
-    This adapts Unitree RL Lab's Go2 air-time reward to the scalar route-speed
-    command used here. Durations are summed over the fixed foot set rather than
+    Durations are summed over the fixed foot set rather than
     normalized by the number of feet currently in swing. Commands below
     0.1 m/s disable the term.
 

@@ -224,7 +224,7 @@ class PrivilegedTeacherActorCritic(ActorCritic):
 
 
 class RegularizedPPO(PPO):
-    """PPO with bidirectional ROA losses and history-driven rollouts."""
+    """PPO with reflected transitions, bidirectional ROA, and history rollouts."""
 
     policy: PrivilegedTeacherActorCritic
 
@@ -242,8 +242,13 @@ class RegularizedPPO(PPO):
         **kwargs: object,
     ) -> None:
         super().__init__(policy, **kwargs)
-        if self.rnd is not None or self.symmetry is not None:
-            raise ValueError("RegularizedPPO does not support RND or symmetry objectives.")
+        if self.rnd is not None:
+            raise ValueError("RegularizedPPO does not support RND objectives.")
+        if self.symmetry is not None:
+            if not self.symmetry["use_data_augmentation"]:
+                raise ValueError("RegularizedPPO symmetry requires data augmentation.")
+            if self.symmetry["use_mirror_loss"]:
+                raise ValueError("RegularizedPPO does not support a symmetry mirror loss.")
         if history_rollout_interval <= 0:
             raise ValueError("history_rollout_interval must be positive.")
         if privileged_regularization_ramp_iterations <= 0:
@@ -314,9 +319,37 @@ class RegularizedPPO(PPO):
             _,  # Unused recurrent-state placeholder.
             _,  # Unused recurrent-mask placeholder.
         ) in generator:
+            original_batch_size = obs_batch.batch_size[0]
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
                     advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1.0e-8)
+
+            # Append reflected transitions after the untouched mini-batch. The
+            # augmentation function transforms observations and rollout actions;
+            # scalar PPO targets describe the same reflected transition and are
+            # therefore repeated. Old Gaussian parameters remain unaugmented
+            # because adaptive KL is deliberately measured on collected samples.
+            if self.symmetry is not None:
+                obs_batch, actions_batch = self.symmetry["data_augmentation_func"](
+                    env=self.symmetry["_env"],
+                    obs=obs_batch,
+                    actions=actions_batch,
+                )
+                if obs_batch is None or actions_batch is None:
+                    raise RuntimeError("Symmetry augmentation must return observations and actions.")
+                augmented_batch_size = obs_batch.batch_size[0]
+                if augmented_batch_size <= original_batch_size or augmented_batch_size % original_batch_size != 0:
+                    raise RuntimeError(
+                        "Symmetry augmentation must append one or more complete "
+                        "copies of the original mini-batch."
+                    )
+                if actions_batch.shape[0] != augmented_batch_size:
+                    raise RuntimeError("Symmetry augmentation returned inconsistent observation and action batches.")
+                num_augmentations = augmented_batch_size // original_batch_size
+                old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(num_augmentations, 1)
+                target_values_batch = target_values_batch.repeat(num_augmentations, 1)
+                advantages_batch = advantages_batch.repeat(num_augmentations, 1)
+                returns_batch = returns_batch.repeat(num_augmentations, 1)
 
             # Recompute the same actor path used to collect this rollout. This
             # keeps PPO's old and current action distributions comparable.
@@ -326,9 +359,12 @@ class RegularizedPPO(PPO):
             )
             actions_log_prob_batch = self.policy.get_actions_log_prob(actions_batch)
             value_batch = self.policy.evaluate(obs_batch)
-            mu_batch = self.policy.action_mean
-            sigma_batch = self.policy.action_std
-            entropy_batch = self.policy.entropy
+            # The first slice is the unmodified rollout batch by contract. Keep
+            # KL scheduling and entropy pressure independent of augmentation
+            # multiplicity, while PPO and ROA train on all reflected samples.
+            mu_batch = self.policy.action_mean[:original_batch_size]
+            sigma_batch = self.policy.action_std[:original_batch_size]
+            entropy_batch = self.policy.entropy[:original_batch_size]
             self._adapt_learning_rate(
                 mu_batch,
                 sigma_batch,
