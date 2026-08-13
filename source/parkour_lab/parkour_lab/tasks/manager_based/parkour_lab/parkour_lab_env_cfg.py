@@ -475,8 +475,6 @@ class RewardsCfg:
     rows, a phase-local ceiling permits bounded traversal speedups.
     Heading provides directional guidance without prescribing a
     terrain-specific gait.
-    A mild upright prior discourages persistent base lean while preserving
-    the attitude changes needed for obstacle traversal.
     One-shot physical milestones and completion bonuses make discrete progress
     unambiguous, while safety remains separate.
     """
@@ -541,48 +539,11 @@ class RewardsCfg:
     # Motion quality and regularization.
     # Keep vertical motion affordable enough for deliberate takeoff and landing.
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
-    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.05)
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.1)
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.025)
     joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.0002)
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
-    hip_deviation_l2 = RewTerm(
-        func=mdp.joint_deviation_l2,
-        weight=-0.05,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=".*_hip_joint")},
-    )
 
-    # Foot-placement quality. Tune the bounded completed-swing bonus separately
-    # from the short-swing penalty, then balance completed foot timing only on
-    # the shared flat bootstrap where persistent asymmetry is undesirable.
-    feet_air_time_bonus = RewTerm(
-        func=mdp.touchdown_air_time_bonus,
-        weight=0.05,
-        params={
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
-            "threshold": 0.25,
-            "max_air_time": 0.5,
-        },
-    )
-
-    feet_short_air_time = RewTerm(
-        func=mdp.touchdown_short_air_time_penalty,
-        weight=-0.1,
-        params={
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
-            "threshold": 0.25,
-        },
-    )
-
-    feet_air_contact_time_variance = RewTerm(
-        func=mdp.air_contact_time_variance,
-        weight=-0.1,
-        params={
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
-            "max_time": 0.5,
-            "flat_only": True,
-        },
-    )
-
+    # Foot-placement safety and contact quality.
     feet_edge = RewTerm(
         func=mdp.feet_edge,
         weight=-1.0,

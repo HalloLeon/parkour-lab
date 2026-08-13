@@ -244,17 +244,13 @@ ceiling still permits faster takeoff without paying extra forward reward.
 Heading guidance uses the same signed progress gate, preventing a zero-net
 fore-aft oscillation from accumulating alignment credit. Reward samples on the
 exact retarget step are masked so a marker jump is not mistaken for robot
-motion. A low-weight Go2-adapted Unitree air-time term scores each completed
-swing once at touchdown. It sums the four fixed foot contributions around a
-0.25 s threshold, is disabled below a 0.1 m/s command, and neither continuously
-rewards airborne feet nor normalizes by a policy-controlled swing-foot count.
-Undesired hip, thigh, and calf contacts remain recoverable penalties; base and
-Go2 head contacts are terminal. Edge, slide, and stumble penalties use the same
-semantics on every terrain row.
-A mild absolute-orientation penalty discourages persistent base lean without
-prescribing a gait. Low-clearance error remains normalized to `[0, 1]` before
-its squared penalty. Every default course uses a 0.27 m Go2 base-clearance
-floor; this is a lower bound rather than an exact height-tracking target.
+motion. No air-time, cross-foot timing, hip-posture, or upright-orientation
+term prescribes a flat gait during obstacle traversal. Undesired hip, thigh,
+and calf contacts remain recoverable penalties; base and Go2 head contacts are
+terminal. Edge, slide, and stumble penalties use the same semantics on every
+terrain row. Low-clearance error remains normalized to `[0, 1]` before its
+squared penalty. Every default course uses a 0.27 m Go2 base-clearance floor;
+this is a lower bound rather than an exact height-tracking target.
 
 The teacher-interface manifest is version 15. Version 4 introduced complete
 declarative terrain courses because physical support segmentation changes the
