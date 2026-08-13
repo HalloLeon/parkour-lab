@@ -12,10 +12,12 @@ to work.
 """
 
 from .reward_terms.limb import (
+    air_contact_time_variance,
     feet_edge,
     feet_stumble,
     joint_deviation_l2,
-    touchdown_air_time,
+    touchdown_air_time_bonus,
+    touchdown_short_air_time_penalty,
 )
 from .reward_terms.safety import base_clearance_below_l2, chassis_contact
 from .reward_terms.waypoint import (
@@ -35,8 +37,10 @@ __all__ = [
     "base_clearance_below_l2",
     "chassis_contact",
     # Limb rewards and regularizers.
+    "air_contact_time_variance",
     "feet_edge",
     "feet_stumble",
     "joint_deviation_l2",
-    "touchdown_air_time",
+    "touchdown_air_time_bonus",
+    "touchdown_short_air_time_penalty",
 ]
