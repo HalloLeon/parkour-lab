@@ -95,10 +95,14 @@ then use the wide stage only after narrow training remains stable:
 python scripts/rsl_rl/train.py \
   --task=Parkour-Lab-v0 \
   --resume \
-  --load_run=<nominal-run> \
+  --checkpoint=/absolute/path/to/model_1000.pt \
   --domain_randomization_stage=narrow \
   --headless
 ```
+
+`--checkpoint` has the same complete-path meaning in `train.py` and `play.py`.
+Alternatively, use `--load_run=<pattern>` for automatic lookup using the
+runner's configured checkpoint pattern; the two selectors cannot be combined.
 
 Replace `narrow` with `wide` for the final stage. The selected profile perturbs
 contact friction and restitution, base payload and center of mass, actuator

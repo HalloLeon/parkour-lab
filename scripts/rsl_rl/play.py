@@ -779,8 +779,8 @@ def _resolve_checkpoint(agent_cfg: RslRlBaseRunnerCfg) -> _CheckpointInfo:
 
     log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
     print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    # Match Isaac Lab's official playback behavior: an explicit checkpoint is
-    # a complete path and takes precedence over run-based automatic lookup.
+    # An explicit checkpoint is a complete path, matching train.py. Without
+    # one, ``load_run`` retains RSL-RL's automatic run/checkpoint lookup.
     resume_path = (
         retrieve_file_path(args_cli.checkpoint)
         if args_cli.checkpoint

@@ -135,9 +135,8 @@ def update_rsl_rl_cfg(agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Namespac
     load_run = getattr(args_cli, "load_run", None)
     if load_run is not None:
         agent_cfg.load_run = load_run
-    checkpoint = getattr(args_cli, "checkpoint", None)
-    if checkpoint is not None:
-        agent_cfg.load_checkpoint = checkpoint
+    # ``checkpoint`` is a complete runtime path owned by train.py/play.py. Do
+    # not copy it into RSL-RL's run-local ``load_checkpoint`` pattern.
     run_name = getattr(args_cli, "run_name", None)
     if run_name is not None:
         agent_cfg.run_name = run_name
@@ -156,15 +155,16 @@ def update_rsl_rl_cfg(agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Namespac
 def _add_rsl_rl_checkpoint_args(arg_group: argparse._ArgumentGroup) -> None:
     """Register checkpoint arguments on an existing parser group."""
 
-    arg_group.add_argument(
+    selectors = arg_group.add_mutually_exclusive_group()
+    selectors.add_argument(
         "--load_run",
         type=str,
         default=None,
-        help="Name or regular-expression pattern of the run folder to load.",
+        help="Run-folder name or pattern used for automatic checkpoint lookup.",
     )
-    arg_group.add_argument(
+    selectors.add_argument(
         "--checkpoint",
         type=str,
         default=None,
-        help="Checkpoint path for playback, or run-local filename/pattern when resuming training.",
+        help="Complete path of the checkpoint to load.",
     )

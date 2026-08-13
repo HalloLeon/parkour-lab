@@ -90,6 +90,7 @@ from isaaclab.envs import (
     ManagerBasedRLEnvCfg,
     multi_agent_to_single_agent,
 )
+from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
@@ -258,9 +259,13 @@ def main(
     # Resolve the checkpoint selected for resuming PPO training. Student
     # distillation has its own explicit entry point in ``distill.py``.
     if agent_cfg.resume:
-        # Match Isaac Lab's official resume behavior: ``load_run`` selects the
-        # run folder and ``load_checkpoint`` selects a file inside that folder.
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        # An explicit checkpoint is a complete path, matching play.py. Without
+        # one, ``load_run`` retains RSL-RL's automatic run/checkpoint lookup.
+        resume_path = (
+            retrieve_file_path(args_cli.checkpoint)
+            if args_cli.checkpoint
+            else get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        )
 
     # Add video recording before the final RSL-RL wrapper.
     if args_cli.video:
