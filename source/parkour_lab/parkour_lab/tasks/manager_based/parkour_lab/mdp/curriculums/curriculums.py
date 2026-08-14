@@ -279,6 +279,8 @@ class ParkourTerrainCurriculum(ManagerTermBase):
             max_level=curriculum_cfg.max_level,
             bootstrap_replay_probability=curriculum_cfg.bootstrap_replay_probability,
             predecessor_replay_probability=curriculum_cfg.predecessor_replay_probability,
+            ceiling_flat_replay_probability=curriculum_cfg.ceiling_flat_replay_probability,
+            ceiling_lower_obstacle_replay_probability=(curriculum_cfg.ceiling_lower_obstacle_replay_probability),
         )
         _set_terrain_levels(terrain, env_ids, next_levels)
 
@@ -661,32 +663,53 @@ def _sample_episode_levels(
     max_level: int,
     bootstrap_replay_probability: float,
     predecessor_replay_probability: float,
+    ceiling_flat_replay_probability: float,
+    ceiling_lower_obstacle_replay_probability: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Sample retained rows without increasing the configured replay budget.
+    """Sample retained rows while preserving the configured replay budgets.
 
     Below the ceiling, replay keeps the bootstrap and immediate predecessor.
-    At the ceiling, their combined probability is distributed uniformly over
-    every lower row so early obstacle skills remain represented.
+    At the ceiling, flat locomotion receives its own absolute probability and
+    the lower-obstacle budget is distributed uniformly over rows one through
+    ``max_level - 1``. The default policies both leave 75% frontier exposure.
     """
 
     replay_eligible = (frontier_levels > 0) & (~frontier_changed) & (grace_remaining == 0)
     draw = torch.rand_like(frontier_levels, dtype=torch.float32)
-    replay_probability = bootstrap_replay_probability + predecessor_replay_probability
-    replay = replay_eligible & (draw < replay_probability)
-    bootstrap_replay = replay & (draw < bootstrap_replay_probability)
-    levels = torch.where(replay, frontier_levels - 1, frontier_levels)
+    below_ceiling = frontier_levels < max_level
+    below_ceiling_replay_probability = bootstrap_replay_probability + predecessor_replay_probability
+    below_ceiling_replay = replay_eligible & below_ceiling & (draw < below_ceiling_replay_probability)
+    bootstrap_replay = below_ceiling_replay & (draw < bootstrap_replay_probability)
+    levels = torch.where(below_ceiling_replay, frontier_levels - 1, frontier_levels)
     levels = torch.where(bootstrap_replay, torch.zeros_like(levels), levels)
 
-    if max_level > 0 and replay_probability > 0.0:
-        lower_level = torch.zeros_like(frontier_levels)
-        for level in range(1, max_level):
-            lower_level = torch.where(
-                draw >= replay_probability * level / max_level,
-                torch.full_like(frontier_levels, level),
-                lower_level,
+    # A curriculum with no lower obstacle row can only retain flat episodes;
+    # excluding the unusable obstacle budget also keeps ``replay`` truthful.
+    ceiling_replay_probability = ceiling_flat_replay_probability
+    if max_level > 1:
+        ceiling_replay_probability += ceiling_lower_obstacle_replay_probability
+
+    at_ceiling = frontier_levels == max_level
+    ceiling_replay = replay_eligible & at_ceiling & (draw < ceiling_replay_probability)
+    ceiling_flat_replay = ceiling_replay & (draw < ceiling_flat_replay_probability)
+    levels = torch.where(ceiling_flat_replay, torch.zeros_like(levels), levels)
+
+    if max_level > 1 and ceiling_lower_obstacle_replay_probability > 0.0:
+        lower_obstacle_level = torch.full_like(frontier_levels, 1)
+        num_lower_obstacle_rows = max_level - 1
+        for level in range(2, max_level):
+            level_threshold = ceiling_flat_replay_probability + (
+                ceiling_lower_obstacle_replay_probability * (level - 1) / num_lower_obstacle_rows
             )
-        full_ladder_replay = replay & (frontier_levels == max_level)
-        levels = torch.where(full_ladder_replay, lower_level, levels)
+            lower_obstacle_level = torch.where(
+                draw >= level_threshold,
+                torch.full_like(frontier_levels, level),
+                lower_obstacle_level,
+            )
+        ceiling_lower_obstacle_replay = ceiling_replay & (~ceiling_flat_replay)
+        levels = torch.where(ceiling_lower_obstacle_replay, lower_obstacle_level, levels)
+
+    replay = below_ceiling_replay | ceiling_replay
     return levels, replay
 
 

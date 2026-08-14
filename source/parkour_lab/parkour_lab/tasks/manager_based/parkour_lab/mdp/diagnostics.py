@@ -39,6 +39,9 @@ GO2_JOINT_NAMES = tuple(
 )
 """Canonical leg-major order of the twelve Unitree Go2 joints."""
 
+_MIN_GAIT_DIAGNOSTIC_DURATION_S = 0.5
+"""Ignore shorter episode fragments in per-episode gait distributions."""
+
 
 class TrainingDiagnostics(ManagerTermBase):
     """Accumulate gait, control, task, and body metrics without changing reward.
@@ -146,17 +149,23 @@ class TrainingDiagnostics(ManagerTermBase):
 
         self._buffers: list[torch.Tensor] = []
         self._step_count = self._buffer(env)
-        self._flat_step_count = self._buffer(env)
+        self._bootstrap_flat_step_count = self._buffer(env)
         self._base_ray_valid_count = self._buffer(env)
 
         self._foot_air_time_sum = self._buffer(env, len(GO2_FOOT_NAMES))
-        self._foot_flat_air_time_sum = self._buffer(env, len(GO2_FOOT_NAMES))
+        self._foot_bootstrap_flat_air_time_sum = self._buffer(env, len(GO2_FOOT_NAMES))
+        self._foot_bootstrap_flat_contact_step_count = self._buffer(env, len(GO2_FOOT_NAMES))
+        self._foot_bootstrap_flat_current_noncontact_step_count = self._buffer(env, len(GO2_FOOT_NAMES))
+        self._foot_bootstrap_flat_max_noncontact_step_count = self._buffer(env, len(GO2_FOOT_NAMES))
+        self._foot_bootstrap_flat_touchdown_count = self._buffer(env, len(GO2_FOOT_NAMES))
+        self._foot_bootstrap_flat_vertical_force_sum = self._buffer(env, len(GO2_FOOT_NAMES))
         self._foot_contact_step_count = self._buffer(env, len(GO2_FOOT_NAMES))
-        self._foot_flat_contact_step_count = self._buffer(env, len(GO2_FOOT_NAMES))
+        self._foot_current_noncontact_step_count = self._buffer(env, len(GO2_FOOT_NAMES))
+        self._foot_max_noncontact_step_count = self._buffer(env, len(GO2_FOOT_NAMES))
         self._foot_touchdown_count = self._buffer(env, len(GO2_FOOT_NAMES))
-        self._foot_flat_touchdown_count = self._buffer(env, len(GO2_FOOT_NAMES))
         self._foot_vertical_force_sum = self._buffer(env, len(GO2_FOOT_NAMES))
-        self._foot_flat_vertical_force_sum = self._buffer(env, len(GO2_FOOT_NAMES))
+        self._has_previous_contact_sample = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+        self._buffers.append(self._has_previous_contact_sample)
 
         self._last_action = self._buffer(env, len(GO2_JOINT_NAMES))
         self._action_delta_square_sum = self._buffer(env, len(GO2_JOINT_NAMES))
@@ -164,12 +173,16 @@ class TrainingDiagnostics(ManagerTermBase):
         self._applied_torque_square_sum = self._buffer(env, len(GO2_JOINT_NAMES))
         self._default_deviation_square_sum = self._buffer(env, len(GO2_JOINT_NAMES))
         self._joint_tracking_error_square_sum = self._buffer(env, len(GO2_JOINT_NAMES))
+        self._joint_position_soft_limit_violation_count = self._buffer(env, len(GO2_JOINT_NAMES))
+        self._joint_soft_limit_valid_count = self._buffer(env, len(GO2_JOINT_NAMES))
+        self._joint_target_soft_limit_violation_count = self._buffer(env, len(GO2_JOINT_NAMES))
         self._torque_clip_count = self._buffer(env, len(GO2_JOINT_NAMES))
         self._velocity_limit_count = self._buffer(env, len(GO2_JOINT_NAMES))
 
         self._abs_lateral_speed_sum = self._buffer(env)
         self._abs_speed_error_sum = self._buffer(env)
         self._base_clearance_sum = self._buffer(env)
+        self._bootstrap_flat_projected_gravity_xy_square_sum = self._buffer(env)
         self._forward_speed_sum = self._buffer(env)
         self._projected_gravity_xy_square_sum = self._buffer(env)
         self._reverse_motion_count = self._buffer(env)
@@ -203,25 +216,57 @@ class TrainingDiagnostics(ManagerTermBase):
         )
 
         self._step_count += 1.0
-        flat = route.active_difficulty_indices(env) == 0
-        self._flat_step_count += flat.to(dtype=torch.float32)
+        # Difficulty row zero is the shared bootstrap course. Do not call
+        # horizontal approach/landing phases inside obstacle courses "flat":
+        # they currently have no explicit route-phase metadata.
+        bootstrap_flat = route.active_difficulty_indices(env) == 0
+        self._bootstrap_flat_step_count += bootstrap_flat.to(dtype=torch.float32)
 
         feet_ids = self._feet_sensor_cfg.body_ids
         foot_forces = self._feet_sensor.data.net_forces_w[:, feet_ids]
         foot_force_norm = torch.linalg.norm(foot_forces, dim=-1)
         in_contact = foot_force_norm > self._contact_threshold
         first_contact = self._feet_sensor.compute_first_contact(env.step_dt)[:, feet_ids]
+        # ContactSensor treats a planted reset stance as a newly established
+        # contact. Exclude that first sample so a foot that lifts immediately
+        # and is then carried for the entire episode still has zero touchdowns.
+        valid_touchdown = first_contact & self._has_previous_contact_sample.unsqueeze(-1)
         last_air_time = self._feet_sensor.data.last_air_time[:, feet_ids]
-        flat_feet = flat.unsqueeze(-1)
+        bootstrap_flat_feet = bootstrap_flat.unsqueeze(-1)
 
-        self._foot_air_time_sum += last_air_time * first_contact
-        self._foot_flat_air_time_sum += last_air_time * first_contact * flat_feet
+        current_noncontact_steps = torch.where(
+            in_contact,
+            torch.zeros_like(self._foot_current_noncontact_step_count),
+            self._foot_current_noncontact_step_count + 1.0,
+        )
+        self._foot_current_noncontact_step_count.copy_(current_noncontact_steps)
+        self._foot_max_noncontact_step_count.copy_(
+            torch.maximum(self._foot_max_noncontact_step_count, current_noncontact_steps)
+        )
+
+        bootstrap_flat_noncontact = bootstrap_flat_feet & ~in_contact
+        bootstrap_flat_current_noncontact_steps = torch.where(
+            bootstrap_flat_noncontact,
+            self._foot_bootstrap_flat_current_noncontact_step_count + 1.0,
+            torch.zeros_like(self._foot_bootstrap_flat_current_noncontact_step_count),
+        )
+        self._foot_bootstrap_flat_current_noncontact_step_count.copy_(bootstrap_flat_current_noncontact_steps)
+        self._foot_bootstrap_flat_max_noncontact_step_count.copy_(
+            torch.maximum(
+                self._foot_bootstrap_flat_max_noncontact_step_count,
+                bootstrap_flat_current_noncontact_steps,
+            )
+        )
+
+        self._foot_air_time_sum += last_air_time * valid_touchdown
+        self._foot_bootstrap_flat_air_time_sum += last_air_time * valid_touchdown * bootstrap_flat_feet
         self._foot_contact_step_count += in_contact.to(dtype=torch.float32)
-        self._foot_flat_contact_step_count += (in_contact & flat_feet).to(dtype=torch.float32)
-        self._foot_touchdown_count += first_contact.to(dtype=torch.float32)
-        self._foot_flat_touchdown_count += (first_contact & flat_feet).to(dtype=torch.float32)
+        self._foot_bootstrap_flat_contact_step_count += (in_contact & bootstrap_flat_feet).to(dtype=torch.float32)
+        self._foot_touchdown_count += valid_touchdown.to(dtype=torch.float32)
+        self._foot_bootstrap_flat_touchdown_count += (valid_touchdown & bootstrap_flat_feet).to(dtype=torch.float32)
         self._foot_vertical_force_sum += torch.abs(foot_forces[..., 2])
-        self._foot_flat_vertical_force_sum += torch.abs(foot_forces[..., 2]) * flat_feet
+        self._foot_bootstrap_flat_vertical_force_sum += torch.abs(foot_forces[..., 2]) * bootstrap_flat_feet
+        self._has_previous_contact_sample.fill_(True)
 
         joint_ids = self._asset_cfg.joint_ids
         action = self._action_term.raw_actions[:, self._action_indices]
@@ -231,6 +276,7 @@ class TrainingDiagnostics(ManagerTermBase):
         applied_torque = self._asset.data.applied_torque[:, joint_ids]
         computed_torque = self._asset.data.computed_torque[:, joint_ids]
         joint_velocity = self._asset.data.joint_vel[:, joint_ids]
+        joint_position_limits = self._asset.data.soft_joint_pos_limits[:, joint_ids]
         joint_velocity_limit = self._asset.data.soft_joint_vel_limits[:, joint_ids]
 
         self._action_delta_square_sum += (action - self._last_action).square()
@@ -238,6 +284,18 @@ class TrainingDiagnostics(ManagerTermBase):
         self._applied_torque_square_sum += applied_torque.square()
         self._default_deviation_square_sum += (joint_pos - default_joint_pos).square()
         self._joint_tracking_error_square_sum += (joint_pos_target - joint_pos).square()
+        valid_position_limit = torch.isfinite(joint_position_limits).all(dim=-1) & (
+            joint_position_limits[..., 1] > joint_position_limits[..., 0]
+        )
+        self._joint_soft_limit_valid_count += valid_position_limit.to(dtype=torch.float32)
+        self._joint_position_soft_limit_violation_count += (
+            valid_position_limit
+            & ((joint_pos < joint_position_limits[..., 0]) | (joint_pos > joint_position_limits[..., 1]))
+        ).to(dtype=torch.float32)
+        self._joint_target_soft_limit_violation_count += (
+            valid_position_limit
+            & ((joint_pos_target < joint_position_limits[..., 0]) | (joint_pos_target > joint_position_limits[..., 1]))
+        ).to(dtype=torch.float32)
         self._torque_clip_count += (torch.abs(computed_torque - applied_torque) > self._torque_clip_tolerance_nm).to(
             dtype=torch.float32
         )
@@ -262,10 +320,14 @@ class TrainingDiagnostics(ManagerTermBase):
         self._abs_lateral_speed_sum += torch.linalg.norm(lateral_velocity, dim=-1)
         self._abs_speed_error_sum += torch.abs(forward_speed - target_speed)
         self._forward_speed_sum += forward_speed
-        self._projected_gravity_xy_square_sum += torch.sum(
+        projected_gravity_xy_square = torch.sum(
             self._asset.data.projected_gravity_b[:, :2].square(),
             dim=-1,
         )
+        self._bootstrap_flat_projected_gravity_xy_square_sum += projected_gravity_xy_square * bootstrap_flat.to(
+            dtype=torch.float32
+        )
+        self._projected_gravity_xy_square_sum += projected_gravity_xy_square
         self._reverse_motion_count += (forward_speed < -self._reverse_speed_threshold_mps).to(dtype=torch.float32)
         self._vertical_speed_square_sum += root_velocity[:, 2].square()
 
@@ -286,36 +348,82 @@ class TrainingDiagnostics(ManagerTermBase):
 
         return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
 
-    def episode_metrics(self, env_ids: Sequence[int] | slice | None) -> dict[str, torch.Tensor]:
-        """Summarize completed episodes selected by ``env_ids``."""
+    def episode_metrics(self, env_ids: Sequence[int] | slice | None) -> dict[str, float]:
+        """Summarize completed episodes selected by ``env_ids``.
+
+        Conditional reset-batch previews are accompanied by raw sums and
+        sample counts. Their ratios remain correctly weighted after RSL-RL
+        averages log dictionaries across a rollout.
+        """
 
         env_ids = _all_env_ids(self._env, env_ids)
-        step_count = self._step_count[env_ids].sum()
+        episode_step_counts = self._step_count[env_ids]
+        episode_bootstrap_flat_step_counts = self._bootstrap_flat_step_count[env_ids]
+        step_count = episode_step_counts.sum()
         safe_step_count = step_count.clamp_min(1.0)
-        flat_step_count = self._flat_step_count[env_ids].sum()
-        safe_flat_step_count = flat_step_count.clamp_min(1.0)
+        bootstrap_flat_step_count = episode_bootstrap_flat_step_counts.sum()
+        safe_bootstrap_flat_step_count = bootstrap_flat_step_count.clamp_min(1.0)
+        minimum_gait_steps = max(1, math.ceil(_MIN_GAIT_DIAGNOSTIC_DURATION_S / float(self._env.step_dt)))
+        bootstrap_flat_episode_valid = episode_bootstrap_flat_step_counts >= minimum_gait_steps
+        bootstrap_flat_projected_gravity_valid_step_count = episode_bootstrap_flat_step_counts[
+            bootstrap_flat_episode_valid
+        ].sum()
+        bootstrap_flat_projected_gravity_xy_square_sum = self._bootstrap_flat_projected_gravity_xy_square_sum[env_ids][
+            bootstrap_flat_episode_valid
+        ].sum()
 
         contact_steps = self._foot_contact_step_count[env_ids].sum(dim=0)
-        flat_contact_steps = self._foot_flat_contact_step_count[env_ids].sum(dim=0)
+        bootstrap_flat_contact_steps = self._foot_bootstrap_flat_contact_step_count[env_ids].sum(dim=0)
         touchdowns = self._foot_touchdown_count[env_ids].sum(dim=0)
-        flat_touchdowns = self._foot_flat_touchdown_count[env_ids].sum(dim=0)
+        bootstrap_flat_touchdowns = self._foot_bootstrap_flat_touchdown_count[env_ids].sum(dim=0)
         vertical_forces = self._foot_vertical_force_sum[env_ids].sum(dim=0)
-        flat_vertical_forces = self._foot_flat_vertical_force_sum[env_ids].sum(dim=0)
+        bootstrap_flat_vertical_forces = self._foot_bootstrap_flat_vertical_force_sum[env_ids].sum(dim=0)
 
-        metrics: dict[str, torch.Tensor] = {}
+        metrics = _episode_foot_participation_metrics(
+            contact_step_counts=self._foot_contact_step_count[env_ids],
+            max_noncontact_step_counts=self._foot_max_noncontact_step_count[env_ids],
+            prefix="gait/episode",
+            step_counts=episode_step_counts,
+            step_dt=float(self._env.step_dt),
+            touchdown_counts=self._foot_touchdown_count[env_ids],
+            vertical_force_sums=self._foot_vertical_force_sum[env_ids],
+        )
+        metrics.update(
+            _episode_foot_participation_metrics(
+                contact_step_counts=self._foot_bootstrap_flat_contact_step_count[env_ids],
+                max_noncontact_step_counts=self._foot_bootstrap_flat_max_noncontact_step_count[env_ids],
+                prefix="gait/bootstrap_flat_episode",
+                step_counts=episode_bootstrap_flat_step_counts,
+                step_dt=float(self._env.step_dt),
+                touchdown_counts=self._foot_bootstrap_flat_touchdown_count[env_ids],
+                vertical_force_sums=self._foot_bootstrap_flat_vertical_force_sum[env_ids],
+            )
+        )
         for foot_index, foot_name in enumerate(GO2_FOOT_NAMES):
             prefix = f"gait/{foot_name}"
             metrics[f"{prefix}/contact_fraction"] = contact_steps[foot_index] / safe_step_count
-            metrics[f"{prefix}/flat_contact_fraction"] = flat_contact_steps[foot_index] / safe_flat_step_count
-            metrics[f"{prefix}/flat_mean_completed_air_time_s"] = self._foot_flat_air_time_sum[
+            bootstrap_flat_contact_fraction = bootstrap_flat_contact_steps[foot_index] / safe_bootstrap_flat_step_count
+            bootstrap_flat_mean_completed_air_time = self._foot_bootstrap_flat_air_time_sum[
                 env_ids, foot_index
-            ].sum() / flat_touchdowns[foot_index].clamp_min(1.0)
-            metrics[f"{prefix}/flat_touchdown_rate_hz"] = flat_touchdowns[foot_index] / (
-                safe_flat_step_count * float(self._env.step_dt)
+            ].sum() / bootstrap_flat_touchdowns[foot_index].clamp_min(1.0)
+            bootstrap_flat_touchdown_rate = bootstrap_flat_touchdowns[foot_index] / (
+                safe_bootstrap_flat_step_count * float(self._env.step_dt)
             )
-            metrics[f"{prefix}/flat_vertical_load_fraction"] = flat_vertical_forces[
+            bootstrap_flat_vertical_load_fraction = bootstrap_flat_vertical_forces[
                 foot_index
-            ] / flat_vertical_forces.sum().clamp_min(torch.finfo(torch.float32).eps)
+            ] / bootstrap_flat_vertical_forces.sum().clamp_min(torch.finfo(torch.float32).eps)
+
+            metrics[f"{prefix}/bootstrap_flat_contact_fraction"] = bootstrap_flat_contact_fraction
+            metrics[f"{prefix}/bootstrap_flat_mean_completed_air_time_s"] = bootstrap_flat_mean_completed_air_time
+            metrics[f"{prefix}/bootstrap_flat_touchdown_rate_hz"] = bootstrap_flat_touchdown_rate
+            metrics[f"{prefix}/bootstrap_flat_vertical_load_fraction"] = bootstrap_flat_vertical_load_fraction
+
+            # Compatibility aliases: these have always meant difficulty-row-zero
+            # bootstrap episodes, not horizontal phases of obstacle courses.
+            metrics[f"{prefix}/flat_contact_fraction"] = bootstrap_flat_contact_fraction
+            metrics[f"{prefix}/flat_mean_completed_air_time_s"] = bootstrap_flat_mean_completed_air_time
+            metrics[f"{prefix}/flat_touchdown_rate_hz"] = bootstrap_flat_touchdown_rate
+            metrics[f"{prefix}/flat_vertical_load_fraction"] = bootstrap_flat_vertical_load_fraction
             metrics[f"{prefix}/mean_completed_air_time_s"] = self._foot_air_time_sum[
                 env_ids, foot_index
             ].sum() / touchdowns[foot_index].clamp_min(1.0)
@@ -335,11 +443,21 @@ class TrainingDiagnostics(ManagerTermBase):
         tracking_error_square_sum = (
             self._joint_tracking_error_square_sum[env_ids].sum(dim=0).reshape(len(GO2_LEG_NAMES), -1)
         )
+        joint_position_limit_violation_count = (
+            self._joint_position_soft_limit_violation_count[env_ids].sum(dim=0).reshape(len(GO2_LEG_NAMES), -1)
+        )
+        joint_soft_limit_valid_count = (
+            self._joint_soft_limit_valid_count[env_ids].sum(dim=0).reshape(len(GO2_LEG_NAMES), -1)
+        )
+        joint_target_limit_violation_count = (
+            self._joint_target_soft_limit_violation_count[env_ids].sum(dim=0).reshape(len(GO2_LEG_NAMES), -1)
+        )
         torque_clip_count = self._torque_clip_count[env_ids].sum(dim=0).reshape(len(GO2_LEG_NAMES), -1)
         velocity_limit_count = self._velocity_limit_count[env_ids].sum(dim=0).reshape(len(GO2_LEG_NAMES), -1)
         joint_sample_count = safe_step_count * len(GO2_JOINT_TYPES)
         for leg_index, leg_name in enumerate(GO2_LEG_NAMES):
             prefix = f"control/{leg_name}"
+            leg_soft_limit_valid_count = joint_soft_limit_valid_count[leg_index].sum()
             metrics[f"{prefix}/action_rms"] = torch.sqrt(action_square_sum[leg_index].sum() / joint_sample_count)
             metrics[f"{prefix}/action_rate_rms"] = torch.sqrt(
                 action_delta_square_sum[leg_index].sum() / joint_sample_count
@@ -353,19 +471,57 @@ class TrainingDiagnostics(ManagerTermBase):
             metrics[f"{prefix}/joint_tracking_error_rms_rad"] = torch.sqrt(
                 tracking_error_square_sum[leg_index].sum() / joint_sample_count
             )
+            position_limit_violation_count = joint_position_limit_violation_count[leg_index].sum()
+            target_limit_violation_count = joint_target_limit_violation_count[leg_index].sum()
+            metrics[f"{prefix}/joint_position_soft_limit_valid_sample_count"] = leg_soft_limit_valid_count
+            metrics[f"{prefix}/joint_position_soft_limit_violation_count"] = position_limit_violation_count
+            metrics[f"{prefix}/joint_position_soft_limit_violation_fraction"] = (
+                position_limit_violation_count / leg_soft_limit_valid_count.clamp_min(1.0)
+            )
+            metrics[f"{prefix}/joint_position_soft_limit_valid_fraction"] = (
+                leg_soft_limit_valid_count / joint_sample_count
+            )
+            metrics[f"{prefix}/joint_position_target_soft_limit_violation_count"] = target_limit_violation_count
+            metrics[f"{prefix}/joint_position_target_soft_limit_violation_fraction"] = (
+                target_limit_violation_count / leg_soft_limit_valid_count.clamp_min(1.0)
+            )
             metrics[f"{prefix}/torque_clip_fraction"] = torque_clip_count[leg_index].sum() / joint_sample_count
             metrics[f"{prefix}/velocity_limit_fraction"] = velocity_limit_count[leg_index].sum() / joint_sample_count
 
         torque_clip_by_leg_and_type = torque_clip_count
         joint_type_sample_count = safe_step_count * len(GO2_LEG_NAMES)
         for joint_type_index, joint_type in enumerate(GO2_JOINT_TYPES):
-            metrics[f"control/joint_type/{joint_type}/torque_clip_fraction"] = (
+            prefix = f"control/joint_type/{joint_type}"
+            joint_type_soft_limit_valid_count = joint_soft_limit_valid_count[:, joint_type_index].sum()
+            position_limit_violation_count = joint_position_limit_violation_count[:, joint_type_index].sum()
+            target_limit_violation_count = joint_target_limit_violation_count[:, joint_type_index].sum()
+            metrics[f"{prefix}/joint_position_soft_limit_valid_sample_count"] = joint_type_soft_limit_valid_count
+            metrics[f"{prefix}/joint_position_soft_limit_violation_count"] = position_limit_violation_count
+            metrics[f"{prefix}/joint_position_soft_limit_violation_fraction"] = (
+                position_limit_violation_count / joint_type_soft_limit_valid_count.clamp_min(1.0)
+            )
+            metrics[f"{prefix}/joint_position_soft_limit_valid_fraction"] = (
+                joint_type_soft_limit_valid_count / joint_type_sample_count
+            )
+            metrics[f"{prefix}/joint_position_target_soft_limit_violation_count"] = target_limit_violation_count
+            metrics[f"{prefix}/joint_position_target_soft_limit_violation_fraction"] = (
+                target_limit_violation_count / joint_type_soft_limit_valid_count.clamp_min(1.0)
+            )
+            metrics[f"{prefix}/torque_clip_fraction"] = (
                 torque_clip_by_leg_and_type[:, joint_type_index].sum() / joint_type_sample_count
             )
 
         metrics.update(
             {
                 "body/base_ray_miss_fraction": 1.0 - self._base_ray_valid_count[env_ids].sum() / safe_step_count,
+                "body/bootstrap_flat_projected_gravity_valid_step_count": (
+                    bootstrap_flat_projected_gravity_valid_step_count
+                ),
+                "body/bootstrap_flat_projected_gravity_xy_rms": torch.sqrt(
+                    bootstrap_flat_projected_gravity_xy_square_sum
+                    / bootstrap_flat_projected_gravity_valid_step_count.clamp_min(1.0)
+                ),
+                "body/bootstrap_flat_projected_gravity_xy_square_sum": bootstrap_flat_projected_gravity_xy_square_sum,
                 "body/mean_valid_base_clearance_m": self._base_clearance_sum[env_ids].sum()
                 / self._base_ray_valid_count[env_ids].sum().clamp_min(1.0),
                 "body/projected_gravity_xy_rms": torch.sqrt(
@@ -374,7 +530,10 @@ class TrainingDiagnostics(ManagerTermBase):
                 "body/vertical_speed_rms_mps": torch.sqrt(
                     self._vertical_speed_square_sum[env_ids].sum() / safe_step_count
                 ),
-                "episode/flat_step_fraction": flat_step_count / safe_step_count,
+                "episode/bootstrap_flat_step_fraction": bootstrap_flat_step_count / safe_step_count,
+                # Compatibility alias for logs produced before the distinction
+                # between bootstrap courses and obstacle-course phases was made.
+                "episode/flat_step_fraction": bootstrap_flat_step_count / safe_step_count,
                 "episode/mean_duration_s": self._step_count[env_ids].mean() * float(self._env.step_dt),
                 "episode/mean_final_geometric_progress": route.normalized_course_progress(
                     self._env,
@@ -390,7 +549,7 @@ class TrainingDiagnostics(ManagerTermBase):
                 "task/reverse_motion_fraction": self._reverse_motion_count[env_ids].sum() / safe_step_count,
             }
         )
-        return metrics
+        return _metrics_to_python(metrics)
 
     def reset(self, env_ids: Sequence[int] | slice | None = None) -> None:
         """Clear selected completed-episode accumulators."""
@@ -410,7 +569,7 @@ def report_training_diagnostics(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int] | slice,
     reward_term_name: str,
-) -> dict[str, torch.Tensor]:
+) -> dict[str, float]:
     """Expose the logging-only reward term's completed-episode metrics."""
 
     term = env.reward_manager.get_term_cfg(reward_term_name).func
@@ -419,6 +578,187 @@ def report_training_diagnostics(
             f"Reward term '{reward_term_name}' must resolve to TrainingDiagnostics, got {type(term).__name__}."
         )
     return term.episode_metrics(env_ids)
+
+
+def _distribution_metrics(
+    values: torch.Tensor,
+    valid: torch.Tensor,
+    *,
+    prefix: str,
+) -> dict[str, torch.Tensor]:
+    """Return per-batch previews plus reconstructable sums and counts."""
+
+    selected = values[valid]
+    sample_count = valid.to(dtype=values.dtype).sum()
+    if selected.numel() == 0:
+        zero = values.new_zeros(())
+        return {
+            f"{prefix}/mean": zero,
+            f"{prefix}/median": zero,
+            f"{prefix}/median_weighted_sum": zero,
+            f"{prefix}/p05": zero,
+            f"{prefix}/p05_weighted_sum": zero,
+            f"{prefix}/p95": zero,
+            f"{prefix}/p95_weighted_sum": zero,
+            f"{prefix}/sample_count": sample_count,
+            f"{prefix}/sum": zero,
+        }
+    p05, median, p95 = torch.quantile(
+        selected,
+        selected.new_tensor((0.05, 0.50, 0.95)),
+    ).unbind()
+    return {
+        f"{prefix}/mean": selected.mean(),
+        f"{prefix}/median": median,
+        f"{prefix}/median_weighted_sum": median * sample_count,
+        f"{prefix}/p05": p05,
+        f"{prefix}/p05_weighted_sum": p05 * sample_count,
+        f"{prefix}/p95": p95,
+        f"{prefix}/p95_weighted_sum": p95 * sample_count,
+        f"{prefix}/sample_count": sample_count,
+        f"{prefix}/sum": selected.sum(),
+    }
+
+
+def _episode_foot_participation_metrics(
+    *,
+    contact_step_counts: torch.Tensor,
+    max_noncontact_step_counts: torch.Tensor,
+    prefix: str,
+    step_counts: torch.Tensor,
+    step_dt: float,
+    touchdown_counts: torch.Tensor,
+    vertical_force_sums: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Summarize per-episode foot use so opposite tripod modes cannot cancel."""
+
+    if step_counts.ndim != 1:
+        raise RuntimeError(f"step_counts must be one-dimensional, got shape {tuple(step_counts.shape)}.")
+    expected_shape = (step_counts.shape[0], len(GO2_FOOT_NAMES))
+    named_matrices = {
+        "contact_step_counts": contact_step_counts,
+        "max_noncontact_step_counts": max_noncontact_step_counts,
+        "touchdown_counts": touchdown_counts,
+        "vertical_force_sums": vertical_force_sums,
+    }
+    for name, matrix in named_matrices.items():
+        if matrix.shape != expected_shape:
+            raise RuntimeError(
+                f"{name} must have canonical FL/FR/RL/RR shape {expected_shape}, got {tuple(matrix.shape)}."
+            )
+    if not math.isfinite(step_dt) or step_dt <= 0.0:
+        raise ValueError("step_dt must be finite and positive.")
+
+    minimum_steps = max(1, math.ceil(_MIN_GAIT_DIAGNOSTIC_DURATION_S / step_dt))
+    valid = step_counts >= minimum_steps
+    valid_count = valid.to(dtype=torch.float32).sum()
+    safe_valid_count = valid_count.clamp_min(1.0)
+    safe_step_counts = step_counts.clamp_min(1.0).unsqueeze(-1)
+
+    contact_fractions = contact_step_counts / safe_step_counts
+    total_contact_fraction = contact_fractions.sum(dim=-1)
+    contact_balance_valid = valid & (total_contact_fraction > 0.0)
+
+    total_vertical_force = vertical_force_sums.sum(dim=-1)
+    vertical_load_valid = valid & (total_vertical_force > torch.finfo(vertical_force_sums.dtype).eps)
+    vertical_load_fractions = vertical_force_sums / total_vertical_force.clamp_min(
+        torch.finfo(vertical_force_sums.dtype).eps
+    ).unsqueeze(-1)
+
+    left_contact = contact_fractions[:, 0] + contact_fractions[:, 2]
+    right_contact = contact_fractions[:, 1] + contact_fractions[:, 3]
+    front_contact = contact_fractions[:, 0] + contact_fractions[:, 1]
+    rear_contact = contact_fractions[:, 2] + contact_fractions[:, 3]
+    abs_left_right_contact_imbalance = torch.abs(left_contact - right_contact) / total_contact_fraction.clamp_min(
+        torch.finfo(contact_fractions.dtype).eps
+    )
+    rear_contact_balance_valid = valid & (rear_contact > 0.0)
+    abs_rear_left_right_contact_imbalance = torch.abs(
+        contact_fractions[:, 2] - contact_fractions[:, 3]
+    ) / rear_contact.clamp_min(torch.finfo(contact_fractions.dtype).eps)
+    front_minus_rear_contact_imbalance = (front_contact - rear_contact) / total_contact_fraction.clamp_min(
+        torch.finfo(contact_fractions.dtype).eps
+    )
+
+    left_load = vertical_load_fractions[:, 0] + vertical_load_fractions[:, 2]
+    right_load = vertical_load_fractions[:, 1] + vertical_load_fractions[:, 3]
+    front_load = vertical_load_fractions[:, 0] + vertical_load_fractions[:, 1]
+    rear_load = vertical_load_fractions[:, 2] + vertical_load_fractions[:, 3]
+    abs_left_right_vertical_load_imbalance = torch.abs(left_load - right_load)
+    rear_vertical_load_balance_valid = vertical_load_valid & (
+        rear_load > torch.finfo(vertical_load_fractions.dtype).eps
+    )
+    abs_rear_left_right_vertical_load_imbalance = torch.abs(
+        vertical_load_fractions[:, 2] - vertical_load_fractions[:, 3]
+    ) / rear_load.clamp_min(torch.finfo(vertical_load_fractions.dtype).eps)
+    front_minus_rear_vertical_load_imbalance = front_load - rear_load
+
+    zero_touchdown = touchdown_counts <= 0.0
+    never_contacted = contact_step_counts <= 0.0
+    any_foot_never_contacted_count = (never_contacted.any(dim=-1) & valid).to(dtype=torch.float32).sum()
+    any_foot_zero_touchdown_count = (zero_touchdown.any(dim=-1) & valid).to(dtype=torch.float32).sum()
+    metrics = {
+        f"{prefix}/any_foot_never_contacted_episode_count": any_foot_never_contacted_count,
+        f"{prefix}/any_foot_never_contacted_fraction": any_foot_never_contacted_count / safe_valid_count,
+        f"{prefix}/any_foot_zero_touchdown_episode_count": any_foot_zero_touchdown_count,
+        f"{prefix}/any_foot_zero_touchdown_fraction": any_foot_zero_touchdown_count / safe_valid_count,
+        f"{prefix}/contact_balance_valid_episode_count": contact_balance_valid.to(dtype=torch.float32).sum(),
+        f"{prefix}/rear_contact_balance_valid_episode_count": rear_contact_balance_valid.to(dtype=torch.float32).sum(),
+        f"{prefix}/rear_vertical_load_balance_valid_episode_count": rear_vertical_load_balance_valid.to(
+            dtype=torch.float32
+        ).sum(),
+        f"{prefix}/valid_episode_count": valid_count,
+        f"{prefix}/vertical_load_valid_episode_count": vertical_load_valid.to(dtype=torch.float32).sum(),
+    }
+    for foot_index, foot_name in enumerate(GO2_FOOT_NAMES):
+        foot_prefix = f"{prefix}/{foot_name}"
+        contact_fraction_sum = (contact_fractions[:, foot_index] * valid).sum()
+        vertical_load_fraction_sum = (vertical_load_fractions[:, foot_index] * vertical_load_valid).sum()
+        never_contacted_count = (never_contacted[:, foot_index] & valid).to(dtype=torch.float32).sum()
+        zero_touchdown_count = (zero_touchdown[:, foot_index] & valid).to(dtype=torch.float32).sum()
+        metrics[f"{foot_prefix}/contact_fraction_sum"] = contact_fraction_sum
+        metrics[f"{foot_prefix}/mean_contact_fraction"] = contact_fraction_sum / safe_valid_count
+        metrics[f"{foot_prefix}/mean_vertical_load_fraction"] = vertical_load_fraction_sum / vertical_load_valid.to(
+            dtype=torch.float32
+        ).sum().clamp_min(1.0)
+        metrics[f"{foot_prefix}/never_contacted_episode_count"] = never_contacted_count
+        metrics[f"{foot_prefix}/never_contacted_fraction"] = never_contacted_count / safe_valid_count
+        metrics[f"{foot_prefix}/vertical_load_fraction_sum"] = vertical_load_fraction_sum
+        metrics[f"{foot_prefix}/zero_touchdown_episode_count"] = zero_touchdown_count
+        metrics[f"{foot_prefix}/zero_touchdown_fraction"] = zero_touchdown_count / safe_valid_count
+
+    distributions = {
+        "abs_left_right_contact_imbalance": (abs_left_right_contact_imbalance, contact_balance_valid),
+        "abs_left_right_vertical_load_imbalance": (
+            abs_left_right_vertical_load_imbalance,
+            vertical_load_valid,
+        ),
+        "abs_rear_left_right_contact_imbalance": (
+            abs_rear_left_right_contact_imbalance,
+            rear_contact_balance_valid,
+        ),
+        "abs_rear_left_right_vertical_load_imbalance": (
+            abs_rear_left_right_vertical_load_imbalance,
+            rear_vertical_load_balance_valid,
+        ),
+        "front_minus_rear_contact_imbalance": (front_minus_rear_contact_imbalance, contact_balance_valid),
+        "front_minus_rear_vertical_load_imbalance": (
+            front_minus_rear_vertical_load_imbalance,
+            vertical_load_valid,
+        ),
+        "maximum_foot_noncontact_time_s": (max_noncontact_step_counts.max(dim=-1).values * step_dt, valid),
+        "minimum_contact_fraction": (contact_fractions.min(dim=-1).values, valid),
+        "minimum_vertical_load_fraction": (vertical_load_fractions.min(dim=-1).values, vertical_load_valid),
+    }
+    for metric_name, (values, metric_valid) in distributions.items():
+        metrics.update(
+            _distribution_metrics(
+                values,
+                metric_valid,
+                prefix=f"{prefix}/{metric_name}",
+            )
+        )
+    return metrics
 
 
 def _finite_interval(value: object, *, name: str, lower: float, upper: float) -> float:
@@ -433,6 +773,14 @@ def _finite_nonnegative(value: object, *, name: str) -> float:
     if not math.isfinite(value) or value < 0.0:
         raise ValueError(f"{name} must be finite and non-negative.")
     return value
+
+
+def _metrics_to_python(metrics: dict[str, torch.Tensor]) -> dict[str, float]:
+    """Transfer all scalar diagnostics to the logger with one device sync."""
+
+    names = tuple(metrics)
+    values = torch.stack(tuple(metrics.values())).detach().cpu().tolist()
+    return dict(zip(names, values, strict=True))
 
 
 def _require_resolved_names(

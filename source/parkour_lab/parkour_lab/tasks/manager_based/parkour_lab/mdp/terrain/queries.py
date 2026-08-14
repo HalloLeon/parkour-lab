@@ -20,10 +20,31 @@ def _base_clearance(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("base_height_scanner"),
 ) -> torch.Tensor:
-    """Return vertical root clearance above the underlying surface.
+    """Return finite vertical root clearance above the underlying surface.
+
+    A missed ray is encoded as zero so observations remain finite. Reward and
+    completion code that needs to distinguish a miss from genuine zero
+    clearance must use :func:`_base_clearance_components`.
 
     Returns:
         Clearance with shape ``[num_envs]``.
+    """
+
+    clearance, _ = _base_clearance_components(env, asset_cfg, sensor_cfg)
+    return clearance
+
+
+def _base_clearance_components(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("base_height_scanner"),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return finite base clearance and whether the downward ray hit.
+
+    Returns:
+        A pair ``(clearance, valid_hit)`` with shape ``[num_envs]`` for each
+        tensor. Missing and otherwise non-finite hits have a finite clearance
+        value of zero and ``False`` validity.
     """
 
     sensor = env.scene[sensor_cfg.name]
@@ -38,10 +59,10 @@ def _base_clearance(
     base_height = _root_height_env(env, asset_cfg)
     surface_height = ray_hits_w[:, 0, 2] - env.scene.env_origins[:, 2]
     clearance = base_height - surface_height
+    valid_hit = torch.isfinite(ray_hits_w[:, 0, :]).all(dim=-1) & torch.isfinite(clearance)
 
-    # A missed ray is unsafe, but it should not inject non-finite values into
-    # rewards or observations during a temporary out-of-range state.
-    return torch.where(torch.isfinite(clearance), clearance, torch.zeros_like(clearance))
+    finite_clearance = torch.where(valid_hit, clearance, torch.zeros_like(clearance))
+    return finite_clearance, valid_hit
 
 
 def _terrain_height_components(

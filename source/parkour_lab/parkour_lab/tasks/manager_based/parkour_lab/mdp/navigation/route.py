@@ -415,7 +415,7 @@ def advance_active_waypoints(
         dim=(1, 2),
     )
 
-    clearance = queries._base_clearance(env, asset_cfg)
+    clearance, clearance_valid = queries._base_clearance_components(env, asset_cfg)
     min_clearance = courses.min_clearances[course_indices].to(
         device=clearance.device,
         dtype=clearance.dtype,
@@ -423,6 +423,7 @@ def advance_active_waypoints(
     final_waypoint_eligible = (
         supported
         & (~chassis_contact)
+        & clearance_valid
         & (clearance > min_clearance)
         & (torch.abs(robot._root_lin_vel_z(env, asset_cfg)) < max_completion_vertical_speed)
         & (

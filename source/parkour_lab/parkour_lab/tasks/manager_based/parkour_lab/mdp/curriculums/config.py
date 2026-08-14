@@ -145,12 +145,16 @@ class ParkourCurriculumCfg:
     # protected from demotion.
     # Below the ceiling, keep the total replay budget at 25% while retaining
     # both the shared flat bootstrap and the frontier's immediate predecessor.
-    # At the ceiling the combined budget is spread uniformly over every lower
-    # row, maintaining the whole acquired ladder without increasing replay.
+    # At the ceiling, reserve an absolute 15% for flat locomotion and spread
+    # the remaining 10% over acquired obstacle rows one through max_level - 1.
+    # The separate fields keep these two policies explicit even though both
+    # leave 75% of eligible episodes on the current frontier by default.
     demotion_progress_fraction: float = 0.60
     post_promotion_grace_episodes: int = 1
     bootstrap_replay_probability: float = 0.10
     predecessor_replay_probability: float = 0.15
+    ceiling_flat_replay_probability: float = 0.15
+    ceiling_lower_obstacle_replay_probability: float = 0.10
 
     # Shared threshold for named-support evidence and fatal chassis contact.
     contact_force_threshold: float = 1.0
@@ -348,11 +352,18 @@ class ParkourCurriculumCfg:
         for field_name, probability in (
             ("bootstrap_replay_probability", self.bootstrap_replay_probability),
             ("predecessor_replay_probability", self.predecessor_replay_probability),
+            ("ceiling_flat_replay_probability", self.ceiling_flat_replay_probability),
+            (
+                "ceiling_lower_obstacle_replay_probability",
+                self.ceiling_lower_obstacle_replay_probability,
+            ),
         ):
             if not np.isfinite(probability) or not 0.0 <= probability < 1.0:
                 raise ValueError(f"{field_name} must be in [0, 1).")
         if self.bootstrap_replay_probability + self.predecessor_replay_probability >= 1.0:
-            raise ValueError("Replay probabilities must sum to less than 1.")
+            raise ValueError("Below-ceiling replay probabilities must sum to less than 1.")
+        if self.ceiling_flat_replay_probability + self.ceiling_lower_obstacle_replay_probability >= 1.0:
+            raise ValueError("Ceiling replay probabilities must sum to less than 1.")
 
         if self.contact_force_threshold < 0.0:
             raise ValueError("contact_force_threshold must be non-negative.")

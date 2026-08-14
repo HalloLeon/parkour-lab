@@ -72,12 +72,15 @@ python -u scripts/rsl_rl/train.py \
 ```
 
 Each completed-episode batch prints behavior-neutral diagnostics under
-`Curriculum/training_diagnostics/`. Per-foot contact fraction, flat-terrain
-contact fraction, touchdown rate, completed air time, and vertical load share
-expose a carried or unloaded leg. Per-leg action magnitude and rate,
-default-pose deviation, tracking error, applied torque, torque clipping, and
-velocity-limit occupancy separate a learned tucked command from actuator or
-joint-limit problems. Task metrics report signed forward speed, speed error,
+`Curriculum/training_diagnostics/`. In addition to pooled per-foot values,
+per-episode distributions report zero-touchdown feet, minimum contact and load
+fractions, maximum uninterrupted non-contact time, and absolute left-right and
+front-rear imbalance. This prevents opposite tripod modes in different
+environments from averaging into an apparently balanced gait. Per-leg action
+magnitude and rate, default-pose deviation, tracking error, applied torque,
+torque clipping, and velocity-limit occupancy separate a learned tucked
+command from actuator or joint-limit problems. Task metrics report signed
+forward speed, speed error,
 lateral motion, and retreat;
 body metrics report tilt, vertical motion, clearance, and missing base-ray
 hits. Episode progress is reported for every reset, while
@@ -116,7 +119,10 @@ After promotion grace, training keeps 75% of eligible environments at their
 frontier, replays its immediate predecessor in 15%, and anchors the shared flat
 bootstrap in 10%. At frontier one, both replay choices resolve to level zero.
 Once a family reaches the final row, the same combined 25% replay budget is
-distributed uniformly across all lower rows to retain the complete ladder.
+rebalanced to keep 15% of all eligible episodes on the shared flat row. The
+remaining 10% is distributed uniformly across acquired lower obstacle rows,
+preserving 75% final-frontier exposure while continually rehearsing ordinary
+locomotion.
 
 ### Staged domain randomization
 
@@ -258,8 +264,8 @@ Two stalled failures in the last three eligible frontier attempts, each below
 60% waypoint progress, demote one row. The first harder attempt is protected
 from demotion. Later episodes use a 10% flat anchor and 15%
 immediate-predecessor replay below the ceiling; at the ceiling their combined
-budget samples every lower row uniformly. Replay never alters frontier
-evidence.
+budget reserves 15% for the shared flat row and distributes 10% over acquired
+lower obstacle rows. Replay never alters frontier evidence.
 Promotion changes only future course sampling and pays no additional reward
 because completion already receives an explicit `+4` event.
 
@@ -277,13 +283,17 @@ ceiling still permits faster takeoff without paying extra forward reward.
 Heading guidance uses the same signed progress gate, preventing a zero-net
 fore-aft oscillation from accumulating alignment credit. Reward samples on the
 exact retarget step are masked so a marker jump is not mistaken for robot
-motion. No air-time, cross-foot timing, hip-posture, or upright-orientation
-term prescribes a flat gait during obstacle traversal. Undesired hip, thigh,
-and calf contacts remain recoverable penalties; base and Go2 head contacts are
-terminal. Edge, slide, and stumble penalties use the same semantics on every
-terrain row. Low-clearance error remains normalized to `[0, 1]` before its
-squared penalty. Every default course uses a 0.27 m Go2 base-clearance floor;
-this is a lower bound rather than an exact height-tracking target.
+motion. No air-time, cross-foot timing, equal-load, or periodic-gait term
+prescribes contact timing during obstacle traversal. Mild world-up orientation
+and all-joint default-pose penalties instead make a persistent lean or folded
+leg costly without specifying which feet must be in contact. Undesired hip,
+thigh, and calf contacts remain recoverable penalties; base and Go2 head
+contacts are terminal. Edge, slide, and stumble penalties use the same
+semantics on every terrain row. Low-clearance error remains normalized to
+`[0, 1]` before its squared penalty; a missing ray over an intentional gap is
+tracked separately and does not masquerade as zero physical clearance. Every
+default course uses a 0.27 m Go2 base-clearance floor; this is a lower bound
+rather than an exact height-tracking target.
 
 The teacher-interface manifest is version 15. Version 4 introduced complete
 declarative terrain courses because physical support segmentation changes the

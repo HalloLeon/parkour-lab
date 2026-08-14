@@ -155,6 +155,8 @@ def _print_training_diagnostic_context(env: object, agent_cfg: RslRlBaseRunnerCf
         "control_dt_s": env.step_dt,
         "curriculum": {
             "bootstrap_replay_probability": curriculum_cfg.bootstrap_replay_probability,
+            "ceiling_flat_replay_probability": curriculum_cfg.ceiling_flat_replay_probability,
+            "ceiling_lower_obstacle_replay_probability": (curriculum_cfg.ceiling_lower_obstacle_replay_probability),
             "demotion_failures_required": curriculum_cfg.demotion_failures_required,
             "demotion_progress_fraction": curriculum_cfg.demotion_progress_fraction,
             "demotion_window": curriculum_cfg.demotion_window,
@@ -390,9 +392,7 @@ def main(
             teacher_interface,
             context="PPO resume runtime",
         )
-        resume_manifest_matches = (
-            resume_checkpoint.teacher_interface_sha256 == interface_sha256(teacher_interface)
-        )
+        resume_manifest_matches = resume_checkpoint.teacher_interface_sha256 == interface_sha256(teacher_interface)
 
     # This script trains PPO teachers. The task-specific student uses
     # ``scripts/rsl_rl/distill.py`` because it has separate heading and motor

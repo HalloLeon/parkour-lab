@@ -541,10 +541,23 @@ class RewardsCfg:
         },
     )
 
-    # Motion quality and regularization.
-    # Keep vertical motion affordable enough for deliberate takeoff and landing.
+    # Motion quality and regularization. Mild posture priors price persistent
+    # lean and folded limbs without prescribing a periodic gait. Keep vertical
+    # motion affordable enough for deliberate takeoff and landing.
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.025)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.25)
+    joint_deviation_l2 = RewTerm(
+        func=mdp.joint_deviation_l2,
+        weight=-0.02,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=list(mdp.GO2_JOINT_NAMES),
+                preserve_order=True,
+            ),
+        },
+    )
     joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.0002)
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
 
@@ -553,9 +566,17 @@ class RewardsCfg:
         func=mdp.feet_edge,
         weight=-1.0,
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=list(mdp.GO2_FOOT_NAMES),
+                preserve_order=True,
+            ),
             "curriculum_cfg": PARKOUR_CURRICULUM,
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+            "sensor_cfg": SceneEntityCfg(
+                "feet_contact",
+                body_names=list(mdp.GO2_FOOT_NAMES),
+                preserve_order=True,
+            ),
         },
     )
 
@@ -563,8 +584,16 @@ class RewardsCfg:
         func=mdp.feet_slide,
         weight=-0.05,
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=list(mdp.GO2_FOOT_NAMES),
+                preserve_order=True,
+            ),
+            "sensor_cfg": SceneEntityCfg(
+                "feet_contact",
+                body_names=list(mdp.GO2_FOOT_NAMES),
+                preserve_order=True,
+            ),
         },
     )
 
@@ -573,8 +602,12 @@ class RewardsCfg:
         weight=-0.5,
         params={
             "lateral_to_vertical_force_ratio": 4.0,
-            "min_vertical_force": 1.0,
-            "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+            "min_force": 1.0,
+            "sensor_cfg": SceneEntityCfg(
+                "feet_contact",
+                body_names=list(mdp.GO2_FOOT_NAMES),
+                preserve_order=True,
+            ),
         },
     )
 
@@ -616,10 +649,15 @@ class TerminationsCfg:
         func=mdp.completed_course_done,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
-            "feet_asset_cfg": SceneEntityCfg("robot", body_names=".*_foot"),
+            "feet_asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=list(mdp.GO2_FOOT_NAMES),
+                preserve_order=True,
+            ),
             "feet_contact_cfg": SceneEntityCfg(
                 "feet_contact",
-                body_names=".*_foot",
+                body_names=list(mdp.GO2_FOOT_NAMES),
+                preserve_order=True,
             ),
             "chassis_contact_cfg": SceneEntityCfg("chassis_contact"),
             "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),

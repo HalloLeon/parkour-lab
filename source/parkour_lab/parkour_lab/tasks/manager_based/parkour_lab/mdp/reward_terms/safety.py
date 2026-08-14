@@ -37,13 +37,15 @@ def base_clearance_below_l2(
 
     Normalizing by the commanded minimum gives the term a useful and stable
     ``[0, 1]`` scale instead of squaring a small distance measured in metres.
-    Use with a negative reward weight.
+    A missed ray is neutral: unsupported gap flight is not equivalent to a
+    valid surface being too close to the base. Use with a negative reward
+    weight.
 
     Returns:
         [num_envs]
     """
 
-    clearance = queries._base_clearance(env, asset_cfg)
+    clearance, clearance_valid = queries._base_clearance_components(env, asset_cfg)
 
     min_clearance = get_min_clearance(env).to(device=clearance.device, dtype=clearance.dtype)
 
@@ -54,7 +56,11 @@ def base_clearance_below_l2(
         max=1.0,
     )
 
-    return clearance_error.square()
+    return torch.where(
+        clearance_valid,
+        clearance_error.square(),
+        torch.zeros_like(clearance_error),
+    )
 
 
 def chassis_contact(

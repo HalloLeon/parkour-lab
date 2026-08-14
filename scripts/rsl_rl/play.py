@@ -157,7 +157,7 @@ simulation_app = app_launcher.app
 
 import time
 from collections.abc import Callable
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from functools import partial
 from typing import TypedDict, cast
@@ -175,6 +175,7 @@ from isaaclab.envs import (
     ManagerBasedRLEnvCfg,
     multi_agent_to_single_agent,
 )
+from isaaclab.sensors import ContactSensor
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
@@ -192,6 +193,7 @@ from parkour_lab.learning.distillation.teacher.rsl_rl import (
     register_rsl_rl_teacher_actor_critic,
 )
 from parkour_lab.tasks.manager_based.parkour_lab.mdp.commands import get_target_speed
+from parkour_lab.tasks.manager_based.parkour_lab.mdp.diagnostics import GO2_FOOT_NAMES
 from parkour_lab.tasks.manager_based.parkour_lab.mdp.navigation import geometry, route
 from rsl_rl.runners import OnPolicyRunner
 from tensordict import TensorDict
@@ -215,6 +217,20 @@ class _EvaluationSummary(TypedDict):
     all_feet_airborne_fraction: float | None
     mean_feet_edge_contacts_per_step: float | None
     mean_undesired_body_contacts_per_step: float | None
+    mean_foot_contact_duty: dict[str, float] | None
+    mean_foot_touchdown_count: dict[str, float] | None
+    mean_foot_touchdown_rate_hz: dict[str, float] | None
+    foot_zero_touchdown_episode_fraction: dict[str, float] | None
+    mean_foot_max_noncontact_duration_s: dict[str, float] | None
+    maximum_foot_noncontact_duration_s: dict[str, float] | None
+    mean_foot_vertical_load_share: dict[str, float] | None
+    mean_minimum_foot_vertical_load_share: float | None
+    mean_absolute_rear_contact_imbalance: float | None
+    mean_absolute_front_rear_contact_imbalance: float | None
+    mean_front_minus_rear_contact_imbalance: float | None
+    mean_absolute_rear_vertical_load_imbalance: float | None
+    mean_absolute_front_rear_vertical_load_imbalance: float | None
+    mean_front_minus_rear_vertical_load_imbalance: float | None
 
 
 class _EvaluationReport(TypedDict):
@@ -257,6 +273,9 @@ class _EvaluationReport(TypedDict):
 
     # Number of parallel simulation environments used during evaluation.
     num_envs: int
+
+    # Semantic order used by every named per-foot metric in ``summary``.
+    gait_foot_order: list[str]
 
     # Target number of completed episodes requested on the command line.
     requested_episodes: int
@@ -310,6 +329,19 @@ class _InterfaceInfo:
 
 
 @dataclass
+class _EpisodeFootGaitState:
+    """Per-environment gait buffers in canonical FL/FR/RL/RR order."""
+
+    sensor_body_ids: tuple[int, ...]
+    contact_step_counts: torch.Tensor
+    touchdown_counts: torch.Tensor
+    current_noncontact_step_counts: torch.Tensor
+    max_noncontact_step_counts: torch.Tensor
+    vertical_force_sums: torch.Tensor
+    has_previous_sample: torch.Tensor
+
+
+@dataclass
 class _RolloutResult:
     """Mutable accumulator for completed-episode statistics."""
 
@@ -328,6 +360,25 @@ class _RolloutResult:
     all_feet_airborne_sum: float = 0.0
     feet_edge_contacts_sum: float = 0.0
     undesired_body_contacts_sum: float = 0.0
+    gait_episode_count: int = 0
+    foot_contact_duty_sum: list[float] = field(default_factory=lambda: [0.0] * len(GO2_FOOT_NAMES))
+    foot_touchdown_count_sum: list[float] = field(default_factory=lambda: [0.0] * len(GO2_FOOT_NAMES))
+    foot_touchdown_rate_hz_sum: list[float] = field(default_factory=lambda: [0.0] * len(GO2_FOOT_NAMES))
+    foot_zero_touchdown_episode_count: list[float] = field(default_factory=lambda: [0.0] * len(GO2_FOOT_NAMES))
+    foot_max_noncontact_duration_s_sum: list[float] = field(default_factory=lambda: [0.0] * len(GO2_FOOT_NAMES))
+    foot_max_noncontact_duration_s_max: list[float] = field(default_factory=lambda: [0.0] * len(GO2_FOOT_NAMES))
+    foot_vertical_load_share_sum: list[float] = field(default_factory=lambda: [0.0] * len(GO2_FOOT_NAMES))
+    vertical_load_valid_episode_count: int = 0
+    contact_balance_valid_episode_count: int = 0
+    rear_contact_balance_valid_episode_count: int = 0
+    rear_vertical_load_balance_valid_episode_count: int = 0
+    minimum_foot_vertical_load_share_sum: float = 0.0
+    absolute_rear_contact_imbalance_sum: float = 0.0
+    absolute_front_rear_contact_imbalance_sum: float = 0.0
+    front_minus_rear_contact_imbalance_sum: float = 0.0
+    absolute_rear_vertical_load_imbalance_sum: float = 0.0
+    absolute_front_rear_vertical_load_imbalance_sum: float = 0.0
+    front_minus_rear_vertical_load_imbalance_sum: float = 0.0
 
     def record_completed(
         self,
@@ -339,6 +390,7 @@ class _RolloutResult:
         episode_max_course_progress_m: torch.Tensor,
         episode_max_waypoints_reached: torch.Tensor,
         episode_metric_sums: dict[str, torch.Tensor],
+        episode_foot_metrics: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Accumulate newly completed episodes, capped at the requested total."""
 
@@ -363,11 +415,66 @@ class _RolloutResult:
             episode_metric_sums["vertical_velocity_squared_m2_s2"][completed_indices].sum().item()
         )
         self.all_feet_airborne_sum += float(episode_metric_sums["all_feet_airborne"][completed_indices].sum().item())
-        self.feet_edge_contacts_sum += float(
-            episode_metric_sums["feet_edge_contacts"][completed_indices].sum().item()
-        )
+        self.feet_edge_contacts_sum += float(episode_metric_sums["feet_edge_contacts"][completed_indices].sum().item())
         self.undesired_body_contacts_sum += float(
             episode_metric_sums["undesired_body_contacts"][completed_indices].sum().item()
+        )
+        if episode_foot_metrics is not None:
+            self.gait_episode_count += int(completed_indices.numel())
+            self._record_completed_foot_metrics(completed_indices, episode_foot_metrics)
+
+    def _record_completed_foot_metrics(
+        self,
+        completed_indices: torch.Tensor,
+        episode_foot_metrics: dict[str, torch.Tensor],
+    ) -> None:
+        """Accumulate gait summaries after selecting complete episodes."""
+
+        per_foot_sums = {
+            "contact_duty": self.foot_contact_duty_sum,
+            "touchdown_count": self.foot_touchdown_count_sum,
+            "touchdown_rate_hz": self.foot_touchdown_rate_hz_sum,
+            "zero_touchdown": self.foot_zero_touchdown_episode_count,
+            "max_noncontact_duration_s": self.foot_max_noncontact_duration_s_sum,
+            "vertical_load_share": self.foot_vertical_load_share_sum,
+        }
+        for metric_name, accumulator in per_foot_sums.items():
+            selected = episode_foot_metrics[metric_name][completed_indices]
+            for foot_index in range(len(GO2_FOOT_NAMES)):
+                accumulator[foot_index] += float(selected[:, foot_index].sum().item())
+
+        selected_max_noncontact = episode_foot_metrics["max_noncontact_duration_s"][completed_indices]
+        for foot_index in range(len(GO2_FOOT_NAMES)):
+            maximum = float(selected_max_noncontact[:, foot_index].max().item())
+            self.foot_max_noncontact_duration_s_max[foot_index] = max(
+                self.foot_max_noncontact_duration_s_max[foot_index],
+                maximum,
+            )
+
+        scalar_sums = {
+            "minimum_vertical_load_share": "minimum_foot_vertical_load_share_sum",
+            "absolute_rear_contact_imbalance": "absolute_rear_contact_imbalance_sum",
+            "absolute_front_rear_contact_imbalance": "absolute_front_rear_contact_imbalance_sum",
+            "front_minus_rear_contact_imbalance": "front_minus_rear_contact_imbalance_sum",
+            "absolute_rear_vertical_load_imbalance": "absolute_rear_vertical_load_imbalance_sum",
+            "absolute_front_rear_vertical_load_imbalance": "absolute_front_rear_vertical_load_imbalance_sum",
+            "front_minus_rear_vertical_load_imbalance": "front_minus_rear_vertical_load_imbalance_sum",
+        }
+        for metric_name, attribute_name in scalar_sums.items():
+            selected_sum = float(episode_foot_metrics[metric_name][completed_indices].sum().item())
+            setattr(self, attribute_name, getattr(self, attribute_name) + selected_sum)
+
+        self.contact_balance_valid_episode_count += int(
+            episode_foot_metrics["contact_balance_valid"][completed_indices].sum().item()
+        )
+        self.rear_contact_balance_valid_episode_count += int(
+            episode_foot_metrics["rear_contact_balance_valid"][completed_indices].sum().item()
+        )
+        self.rear_vertical_load_balance_valid_episode_count += int(
+            episode_foot_metrics["rear_vertical_load_balance_valid"][completed_indices].sum().item()
+        )
+        self.vertical_load_valid_episode_count += int(
+            episode_foot_metrics["vertical_load_valid"][completed_indices].sum().item()
         )
 
     def summary(self, step_dt: float) -> _EvaluationSummary:
@@ -377,8 +484,17 @@ class _RolloutResult:
             return cast(_EvaluationSummary, dict.fromkeys(_EvaluationSummary.__annotations__))
 
         count = self.completed_episodes
+        gait_count = self.gait_episode_count
         step_count = self.length_steps_sum
         mean_length_steps = self.length_steps_sum / count
+        contact_balance_count = self.contact_balance_valid_episode_count
+        rear_contact_balance_count = self.rear_contact_balance_valid_episode_count
+        rear_vertical_load_balance_count = self.rear_vertical_load_balance_valid_episode_count
+        vertical_load_count = self.vertical_load_valid_episode_count
+
+        def mean_per_foot(values: list[float], denominator: int) -> dict[str, float]:
+            return {foot_name: values[foot_index] / denominator for foot_index, foot_name in enumerate(GO2_FOOT_NAMES)}
+
         return {
             "success_rate": self.success_count / count,
             "chassis_contact_rate": self.chassis_contact_count / count,
@@ -395,6 +511,67 @@ class _RolloutResult:
             "all_feet_airborne_fraction": self.all_feet_airborne_sum / step_count,
             "mean_feet_edge_contacts_per_step": self.feet_edge_contacts_sum / step_count,
             "mean_undesired_body_contacts_per_step": self.undesired_body_contacts_sum / step_count,
+            "mean_foot_contact_duty": (
+                mean_per_foot(self.foot_contact_duty_sum, gait_count) if gait_count > 0 else None
+            ),
+            "mean_foot_touchdown_count": (
+                mean_per_foot(self.foot_touchdown_count_sum, gait_count) if gait_count > 0 else None
+            ),
+            "mean_foot_touchdown_rate_hz": (
+                mean_per_foot(self.foot_touchdown_rate_hz_sum, gait_count) if gait_count > 0 else None
+            ),
+            "foot_zero_touchdown_episode_fraction": (
+                mean_per_foot(self.foot_zero_touchdown_episode_count, gait_count) if gait_count > 0 else None
+            ),
+            "mean_foot_max_noncontact_duration_s": (
+                mean_per_foot(self.foot_max_noncontact_duration_s_sum, gait_count) if gait_count > 0 else None
+            ),
+            "maximum_foot_noncontact_duration_s": (
+                {
+                    foot_name: self.foot_max_noncontact_duration_s_max[foot_index]
+                    for foot_index, foot_name in enumerate(GO2_FOOT_NAMES)
+                }
+                if gait_count > 0
+                else None
+            ),
+            "mean_foot_vertical_load_share": (
+                mean_per_foot(self.foot_vertical_load_share_sum, vertical_load_count)
+                if vertical_load_count > 0
+                else None
+            ),
+            "mean_minimum_foot_vertical_load_share": (
+                self.minimum_foot_vertical_load_share_sum / vertical_load_count if vertical_load_count > 0 else None
+            ),
+            "mean_absolute_rear_contact_imbalance": (
+                self.absolute_rear_contact_imbalance_sum / rear_contact_balance_count
+                if rear_contact_balance_count > 0
+                else None
+            ),
+            "mean_absolute_front_rear_contact_imbalance": (
+                self.absolute_front_rear_contact_imbalance_sum / contact_balance_count
+                if contact_balance_count > 0
+                else None
+            ),
+            "mean_front_minus_rear_contact_imbalance": (
+                self.front_minus_rear_contact_imbalance_sum / contact_balance_count
+                if contact_balance_count > 0
+                else None
+            ),
+            "mean_absolute_rear_vertical_load_imbalance": (
+                self.absolute_rear_vertical_load_imbalance_sum / rear_vertical_load_balance_count
+                if rear_vertical_load_balance_count > 0
+                else None
+            ),
+            "mean_absolute_front_rear_vertical_load_imbalance": (
+                self.absolute_front_rear_vertical_load_imbalance_sum / vertical_load_count
+                if vertical_load_count > 0
+                else None
+            ),
+            "mean_front_minus_rear_vertical_load_imbalance": (
+                self.front_minus_rear_vertical_load_imbalance_sum / vertical_load_count
+                if vertical_load_count > 0
+                else None
+            ),
         }
 
 
@@ -457,6 +634,7 @@ def _build_evaluation_report(
         "desired_speed_m_s": desired_speed,
         "difficulty_metadata": level_metadata,
         "num_envs": num_envs,
+        "gait_foot_order": list(GO2_FOOT_NAMES),
         "requested_episodes": args_cli.eval_episodes,
         "completed_episodes": rollout.completed_episodes,
         "summary": rollout.summary(step_dt),
@@ -744,6 +922,16 @@ def _print_evaluation_summary(report: _EvaluationReport, report_path: str) -> No
             return "n/a"
         return f"{100.0 * value:.1f}%" if rate else f"{value:.4f}"
 
+    def format_feet(values: dict[str, float] | None, *, rate: bool = False) -> str:
+        """Format one canonical per-foot mapping compactly."""
+
+        if values is None:
+            return "n/a"
+        return ", ".join(
+            f"{foot_name.removesuffix('_foot')}={format_metric(values[foot_name], rate=rate)}"
+            for foot_name in report["gait_foot_order"]
+        )
+
     summary = report["summary"]
     print("[RESULT] Evaluation summary")
     print(f"  Policy mode: {report['policy_mode']}")
@@ -768,8 +956,47 @@ def _print_evaluation_summary(report: _EvaluationReport, report_path: str) -> No
     print(f"  All-feet-airborne fraction: {airborne_fraction}")
     print(f"  Mean feet-edge contacts per step: {format_metric(summary['mean_feet_edge_contacts_per_step'])}")
     print(
-        "  Mean undesired-body contacts per step: "
-        f"{format_metric(summary['mean_undesired_body_contacts_per_step'])}"
+        "  Mean undesired-body contacts per step: " f"{format_metric(summary['mean_undesired_body_contacts_per_step'])}"
+    )
+    print(f"  Mean foot contact duty: {format_feet(summary['mean_foot_contact_duty'], rate=True)}")
+    print(f"  Mean foot touchdown count: {format_feet(summary['mean_foot_touchdown_count'])}")
+    print(f"  Mean foot touchdown rate (Hz): {format_feet(summary['mean_foot_touchdown_rate_hz'])}")
+    print(
+        "  Foot zero-touchdown episode fraction: "
+        f"{format_feet(summary['foot_zero_touchdown_episode_fraction'], rate=True)}"
+    )
+    print(
+        "  Mean foot maximum noncontact duration (s): " f"{format_feet(summary['mean_foot_max_noncontact_duration_s'])}"
+    )
+    print("  Worst foot noncontact duration (s): " f"{format_feet(summary['maximum_foot_noncontact_duration_s'])}")
+    print("  Mean foot vertical-load share: " f"{format_feet(summary['mean_foot_vertical_load_share'], rate=True)}")
+    print(
+        "  Mean minimum-foot vertical-load share: "
+        f"{format_metric(summary['mean_minimum_foot_vertical_load_share'], rate=True)}"
+    )
+    print(
+        "  Mean absolute rear contact imbalance: "
+        f"{format_metric(summary['mean_absolute_rear_contact_imbalance'], rate=True)}"
+    )
+    print(
+        "  Mean absolute front/rear contact imbalance: "
+        f"{format_metric(summary['mean_absolute_front_rear_contact_imbalance'], rate=True)}"
+    )
+    print(
+        "  Mean front-minus-rear contact imbalance: "
+        f"{format_metric(summary['mean_front_minus_rear_contact_imbalance'], rate=True)}"
+    )
+    print(
+        "  Mean absolute rear vertical-load imbalance: "
+        f"{format_metric(summary['mean_absolute_rear_vertical_load_imbalance'], rate=True)}"
+    )
+    print(
+        "  Mean absolute front/rear vertical-load imbalance: "
+        f"{format_metric(summary['mean_absolute_front_rear_vertical_load_imbalance'], rate=True)}"
+    )
+    print(
+        "  Mean front-minus-rear vertical-load imbalance: "
+        f"{format_metric(summary['mean_front_minus_rear_vertical_load_imbalance'], rate=True)}"
     )
     print(f"  Metrics: {report_path}")
 
@@ -795,6 +1022,181 @@ def _resolve_checkpoint(agent_cfg: RslRlBaseRunnerCfg) -> _CheckpointInfo:
         stem=stem,
         log_dir=os.path.dirname(path),
     )
+
+
+def _canonical_foot_sensor_body_ids(sensor: ContactSensor) -> tuple[int, ...]:
+    """Resolve the sensor's bodies into semantic FL/FR/RL/RR order."""
+
+    actual_names = tuple(sensor.body_names)
+    expected_names = tuple(GO2_FOOT_NAMES)
+    if len(actual_names) != len(expected_names) or set(actual_names) != set(expected_names):
+        raise RuntimeError(
+            "Evaluation contact sensor 'feet_contact' must contain exactly the canonical Go2 feet "
+            f"{expected_names}; got {actual_names}."
+        )
+    return tuple(actual_names.index(foot_name) for foot_name in expected_names)
+
+
+def _create_episode_foot_gait_state(
+    base_env: ManagerBasedRLEnv | DirectRLEnv,
+) -> _EpisodeFootGaitState:
+    """Allocate canonical per-foot episode buffers and validate the sensor."""
+
+    if not isinstance(base_env, ManagerBasedRLEnv):
+        raise TypeError("Parkour gait metrics require a ManagerBasedRLEnv.")
+    feet_sensor = base_env.scene["feet_contact"]
+    if not isinstance(feet_sensor, ContactSensor):
+        raise TypeError(f"Expected 'feet_contact' to be a ContactSensor, got {type(feet_sensor).__name__}.")
+    if not feet_sensor.cfg.track_air_time:
+        raise ValueError("Evaluation contact sensor 'feet_contact' must set track_air_time=True.")
+    force_threshold = float(feet_sensor.cfg.force_threshold)
+    if not math.isfinite(force_threshold) or force_threshold < 0.0:
+        raise ValueError("Evaluation contact sensor 'feet_contact' must have a finite non-negative force threshold.")
+
+    shape = (base_env.num_envs, len(GO2_FOOT_NAMES))
+    return _EpisodeFootGaitState(
+        sensor_body_ids=_canonical_foot_sensor_body_ids(feet_sensor),
+        contact_step_counts=torch.zeros(shape, device=base_env.device, dtype=torch.float32),
+        touchdown_counts=torch.zeros(shape, device=base_env.device, dtype=torch.float32),
+        current_noncontact_step_counts=torch.zeros(shape, device=base_env.device, dtype=torch.float32),
+        max_noncontact_step_counts=torch.zeros(shape, device=base_env.device, dtype=torch.float32),
+        vertical_force_sums=torch.zeros(shape, device=base_env.device, dtype=torch.float32),
+        has_previous_sample=torch.zeros(base_env.num_envs, device=base_env.device, dtype=torch.bool),
+    )
+
+
+def _episode_foot_gait_metrics(
+    state: _EpisodeFootGaitState,
+    episode_lengths: torch.Tensor,
+    step_dt: float,
+) -> dict[str, torch.Tensor]:
+    """Calculate gait metrics independently for every in-progress episode."""
+
+    if not math.isfinite(step_dt) or step_dt <= 0.0:
+        raise ValueError("Evaluation step_dt must be finite and positive.")
+    safe_step_counts = episode_lengths.to(dtype=torch.float32).clamp_min(1.0).unsqueeze(-1)
+    contact_duty = state.contact_step_counts / safe_step_counts
+    touchdown_rate_hz = state.touchdown_counts / (safe_step_counts * step_dt)
+    max_noncontact_duration_s = state.max_noncontact_step_counts * step_dt
+
+    total_vertical_force = state.vertical_force_sums.sum(dim=-1)
+    force_epsilon = torch.finfo(state.vertical_force_sums.dtype).eps
+    vertical_load_valid = total_vertical_force > force_epsilon
+    vertical_load_share = torch.where(
+        vertical_load_valid.unsqueeze(-1),
+        state.vertical_force_sums / total_vertical_force.clamp_min(force_epsilon).unsqueeze(-1),
+        torch.zeros_like(state.vertical_force_sums),
+    )
+
+    total_contact_duty = contact_duty.sum(dim=-1)
+    contact_epsilon = torch.finfo(contact_duty.dtype).eps
+    contact_balance_valid = total_contact_duty > contact_epsilon
+    safe_total_contact_duty = total_contact_duty.clamp_min(contact_epsilon)
+    front_contact = contact_duty[:, 0] + contact_duty[:, 1]
+    rear_contact = contact_duty[:, 2] + contact_duty[:, 3]
+    rear_contact_balance_valid = rear_contact > contact_epsilon
+    rear_contact_difference = torch.abs(contact_duty[:, 2] - contact_duty[:, 3])
+    front_minus_rear_contact = (front_contact - rear_contact) / safe_total_contact_duty
+
+    front_load = vertical_load_share[:, 0] + vertical_load_share[:, 1]
+    rear_load = vertical_load_share[:, 2] + vertical_load_share[:, 3]
+    rear_vertical_load_balance_valid = rear_load > force_epsilon
+    rear_load_difference = torch.abs(vertical_load_share[:, 2] - vertical_load_share[:, 3])
+    front_minus_rear_load = front_load - rear_load
+
+    return {
+        "contact_duty": contact_duty,
+        "touchdown_count": state.touchdown_counts,
+        "touchdown_rate_hz": touchdown_rate_hz,
+        "zero_touchdown": (state.touchdown_counts <= 0.0).to(dtype=torch.float32),
+        "max_noncontact_duration_s": max_noncontact_duration_s,
+        "vertical_load_share": vertical_load_share,
+        "minimum_vertical_load_share": vertical_load_share.min(dim=-1).values,
+        "absolute_rear_contact_imbalance": torch.where(
+            rear_contact_balance_valid,
+            rear_contact_difference / rear_contact.clamp_min(contact_epsilon),
+            torch.zeros_like(total_contact_duty),
+        ),
+        "absolute_front_rear_contact_imbalance": torch.where(
+            contact_balance_valid,
+            torch.abs(front_minus_rear_contact),
+            torch.zeros_like(total_contact_duty),
+        ),
+        "front_minus_rear_contact_imbalance": torch.where(
+            contact_balance_valid,
+            front_minus_rear_contact,
+            torch.zeros_like(total_contact_duty),
+        ),
+        "absolute_rear_vertical_load_imbalance": torch.where(
+            rear_vertical_load_balance_valid,
+            rear_load_difference / rear_load.clamp_min(force_epsilon),
+            torch.zeros_like(total_vertical_force),
+        ),
+        "absolute_front_rear_vertical_load_imbalance": torch.where(
+            vertical_load_valid,
+            torch.abs(front_minus_rear_load),
+            torch.zeros_like(total_vertical_force),
+        ),
+        "front_minus_rear_vertical_load_imbalance": torch.where(
+            vertical_load_valid,
+            front_minus_rear_load,
+            torch.zeros_like(total_vertical_force),
+        ),
+        "contact_balance_valid": contact_balance_valid.to(dtype=torch.float32),
+        "rear_contact_balance_valid": rear_contact_balance_valid.to(dtype=torch.float32),
+        "rear_vertical_load_balance_valid": rear_vertical_load_balance_valid.to(dtype=torch.float32),
+        "vertical_load_valid": vertical_load_valid.to(dtype=torch.float32),
+    }
+
+
+def _reset_episode_foot_gait(state: _EpisodeFootGaitState, done_mask: torch.Tensor) -> None:
+    """Clear gait history belonging to auto-reset environments."""
+
+    for values in (
+        state.contact_step_counts,
+        state.touchdown_counts,
+        state.current_noncontact_step_counts,
+        state.max_noncontact_step_counts,
+        state.vertical_force_sums,
+    ):
+        values[done_mask] = 0.0
+    state.has_previous_sample[done_mask] = False
+
+
+def _update_episode_foot_gait(
+    base_env: ManagerBasedRLEnv | DirectRLEnv,
+    state: _EpisodeFootGaitState,
+) -> None:
+    """Capture one pre-auto-reset contact sample for every environment."""
+
+    if not isinstance(base_env, ManagerBasedRLEnv):
+        raise TypeError("Parkour gait metrics require a ManagerBasedRLEnv.")
+    feet_sensor = base_env.scene["feet_contact"]
+    if not isinstance(feet_sensor, ContactSensor):
+        raise TypeError(f"Expected 'feet_contact' to be a ContactSensor, got {type(feet_sensor).__name__}.")
+
+    body_ids = list(state.sensor_body_ids)
+    foot_forces = feet_sensor.data.net_forces_w[:, body_ids]
+    force_threshold = float(feet_sensor.cfg.force_threshold)
+    in_contact = torch.linalg.norm(foot_forces, dim=-1) > force_threshold
+    first_contact = feet_sensor.compute_first_contact(base_env.step_dt)[:, body_ids]
+    valid_touchdown = first_contact & state.has_previous_sample.unsqueeze(-1)
+
+    state.contact_step_counts += in_contact.to(dtype=torch.float32)
+    state.touchdown_counts += valid_touchdown.to(dtype=torch.float32)
+    current_noncontact_steps = torch.where(
+        in_contact,
+        torch.zeros_like(state.current_noncontact_step_counts),
+        state.current_noncontact_step_counts + 1.0,
+    )
+    state.current_noncontact_step_counts.copy_(current_noncontact_steps)
+    state.max_noncontact_step_counts.copy_(torch.maximum(state.max_noncontact_step_counts, current_noncontact_steps))
+    state.vertical_force_sums += torch.abs(foot_forces[..., 2])
+    # Immediately after an auto-reset the sensor buffers are still zero and no
+    # physics sample belongs to the new episode yet. Keep the touchdown gate
+    # closed through the first completed policy step, matching the post-physics
+    # training diagnostic's reset-stance handling.
+    state.has_previous_sample |= base_env.episode_length_buf > 0
 
 
 def _collect_rollout_statistics(
@@ -823,6 +1225,7 @@ def _collect_rollout_statistics(
             "undesired_body_contacts",
         )
     }
+    episode_foot_gait = _create_episode_foot_gait_state(env.unwrapped)
     rollout = _RolloutResult()
 
     while simulation_app.is_running() and rollout.completed_episodes < args_cli.eval_episodes:
@@ -831,6 +1234,7 @@ def _collect_rollout_statistics(
             actions = policy(observations)
             active_waypoint_indices = route.active_waypoint_indices(env.unwrapped)
             step_metrics = _read_step_metrics(env.unwrapped)
+            _update_episode_foot_gait(env.unwrapped, episode_foot_gait)
             # Advance every parallel environment and return its next observations,
             # per-environment reward, episode-completion flags, and auxiliary data.
             observations, rewards, dones, _ = env.step(actions)
@@ -849,6 +1253,11 @@ def _collect_rollout_statistics(
             active_waypoint_indices + outcomes["success"].to(dtype=active_waypoint_indices.dtype),
         )
         episode_max_course_progress_m = route.last_episode_max_course_progress_m(env.unwrapped)
+        episode_foot_metrics = _episode_foot_gait_metrics(
+            episode_foot_gait,
+            episode_lengths,
+            step_dt,
+        )
         rollout.record_completed(
             args_cli.eval_episodes,
             done_mask,
@@ -858,12 +1267,14 @@ def _collect_rollout_statistics(
             episode_max_course_progress_m,
             episode_max_waypoints_reached,
             episode_metric_sums,
+            episode_foot_metrics,
         )
         episode_returns[done_mask] = 0.0
         episode_lengths[done_mask] = 0
         episode_max_waypoints_reached[done_mask] = 0
         for values in episode_metric_sums.values():
             values[done_mask] = 0.0
+        _reset_episode_foot_gait(episode_foot_gait, done_mask)
 
         sleep_time = step_dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:

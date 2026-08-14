@@ -40,39 +40,36 @@ def feet_edge(
 def feet_stumble(
     env: ManagerBasedRLEnv,
     lateral_to_vertical_force_ratio: float = 1.0,
-    min_vertical_force: float = 0.5,
+    min_force: float = 0.5,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot"),
 ) -> torch.Tensor:
     """
     Penalize feet hitting near-vertical surfaces.
 
-    A stumble is detected when lateral contact force is large compared with
-    vertical contact force.
+    A stumble is detected when total contact is strong and lateral force is
+    large compared with vertical force. Gating on total force preserves
+    near-horizontal impacts whose vertical component is intentionally small.
 
     Returns:
         [num_envs]
     """
 
-    contact_forces = contact._selected_contact_forces_w_history(
-        env, sensor_cfg=sensor_cfg
-    )
+    contact_forces = contact._selected_contact_forces_w_history(env, sensor_cfg=sensor_cfg)
 
     lateral_force = torch.linalg.norm(contact_forces[..., :2], dim=-1)
     vertical_force = torch.abs(contact_forces[..., 2])
 
-    valid_vertical_contact = vertical_force > min_vertical_force
+    strong_contact = torch.linalg.norm(contact_forces, dim=-1) > min_force
 
     stumble = torch.logical_and(
-        valid_vertical_contact,
+        strong_contact,
         lateral_force > lateral_to_vertical_force_ratio * vertical_force,
     )
 
     return torch.any(stumble, dim=(1, 2)).float()
 
 
-def joint_deviation_l2(
-    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
-) -> torch.Tensor:
+def joint_deviation_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
     """
     Penalize selected joints deviating from their default pose.
 
