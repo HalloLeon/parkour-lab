@@ -75,6 +75,7 @@ simulation_app = app_launcher.app
 
 # The remaining imports require the running simulation application.
 
+import json
 import os
 from datetime import datetime, timezone
 
@@ -125,6 +126,89 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 _CURRICULUM_STATE_KEY = "parkour_curriculum"
+
+
+def _print_training_diagnostic_context(env: object, agent_cfg: RslRlBaseRunnerCfg) -> None:
+    """Print one machine-readable line describing diagnostic interpretation."""
+
+    reward_manager = getattr(env, "reward_manager", None)
+    if reward_manager is None or "training_diagnostics" not in reward_manager.active_terms:
+        return
+
+    from parkour_lab.tasks.manager_based.parkour_lab.mdp.diagnostics import (
+        GO2_FOOT_NAMES,
+        GO2_JOINT_NAMES,
+    )
+
+    env_cfg = env.cfg
+    curriculum_cfg = env_cfg.parkour_curriculum
+    algorithm_cfg = agent_cfg.algorithm
+    policy_cfg = agent_cfg.policy
+    symmetry_cfg = algorithm_cfg.symmetry_cfg
+    action_term = env.action_manager.get_term("joint_pos")
+    feet_sensor = env.scene["feet_contact"]
+    chassis_sensor = env.scene["chassis_contact"]
+    undesired_sensor = env.scene["undesired_contact"]
+    context = {
+        "action_clip": agent_cfg.clip_actions,
+        "action_joint_order": list(getattr(action_term, "_joint_names", ())),
+        "control_dt_s": env.step_dt,
+        "curriculum": {
+            "bootstrap_replay_probability": curriculum_cfg.bootstrap_replay_probability,
+            "demotion_failures_required": curriculum_cfg.demotion_failures_required,
+            "demotion_progress_fraction": curriculum_cfg.demotion_progress_fraction,
+            "demotion_window": curriculum_cfg.demotion_window,
+            "post_promotion_grace_episodes": curriculum_cfg.post_promotion_grace_episodes,
+            "predecessor_replay_probability": curriculum_cfg.predecessor_replay_probability,
+            "promotion_successes_required": curriculum_cfg.promotion_successes_required,
+            "promotion_window": curriculum_cfg.promotion_window,
+        },
+        "desired_speed_range_mps": list(env_cfg.desired_speed_range),
+        "domain_randomization_stage": env_cfg.domain_randomization.stage,
+        "episode_length_s": env_cfg.episode_length_s,
+        "families": list(curriculum_cfg.family_names),
+        "feet": list(GO2_FOOT_NAMES),
+        "feet_contact_body_order": list(feet_sensor.body_names),
+        "geometry_variants": curriculum_cfg.num_geometry_variants,
+        "joints": list(GO2_JOINT_NAMES),
+        "max_difficulty": curriculum_cfg.max_level,
+        "num_envs": env.num_envs,
+        "physics_dt_s": env.physics_dt,
+        "ppo": {
+            "clip_param": algorithm_cfg.clip_param,
+            "desired_kl": algorithm_cfg.desired_kl,
+            "entropy_coef": algorithm_cfg.entropy_coef,
+            "gamma": algorithm_cfg.gamma,
+            "lam": algorithm_cfg.lam,
+            "learning_rate": algorithm_cfg.learning_rate,
+            "num_learning_epochs": algorithm_cfg.num_learning_epochs,
+            "num_mini_batches": algorithm_cfg.num_mini_batches,
+            "num_steps_per_env": agent_cfg.num_steps_per_env,
+        },
+        "reward_weights": {name: reward_manager.get_term_cfg(name).weight for name in reward_manager.active_terms},
+        "robot_body_order": list(env.scene["robot"].body_names),
+        "run": {
+            "max_iterations": agent_cfg.max_iterations,
+            "resume": agent_cfg.resume,
+            "run_name": agent_cfg.run_name,
+        },
+        "seed": env_cfg.seed,
+        "sensors": {
+            "chassis_contact_bodies": list(chassis_sensor.body_names),
+            "undesired_contact_bodies": list(undesired_sensor.body_names),
+        },
+        "symmetry": {
+            "data_augmentation": bool(symmetry_cfg is not None and symmetry_cfg.use_data_augmentation),
+            "mirror_loss": bool(symmetry_cfg is not None and symmetry_cfg.use_mirror_loss),
+        },
+        "termination_terms": list(env.termination_manager.active_terms),
+        "teacher_noise": {
+            "initial_std": policy_cfg.init_noise_std,
+            "max_std": policy_cfg.max_noise_std,
+            "min_std": policy_cfg.min_noise_std,
+        },
+    }
+    print(f"[INFO] Parkour training diagnostic context: {json.dumps(context, sort_keys=True)}")
 
 
 def _parkour_curriculum_term(env: object):
@@ -284,6 +368,7 @@ def main(
         gym_env,
         clip_actions=agent_cfg.clip_actions,
     )
+    _print_training_diagnostic_context(env.unwrapped, agent_cfg)
 
     # Record the actor interface and exact training terrain in one manifest.
     teacher_interface = None

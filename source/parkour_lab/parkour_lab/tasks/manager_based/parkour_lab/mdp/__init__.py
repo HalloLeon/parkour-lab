@@ -13,6 +13,7 @@ from . import config as config
 from .commands import *  # noqa: F401, F403
 from .curriculums import curriculums_config as curriculums_config
 from .curriculums.curriculums import ParkourTerrainCurriculum as ParkourTerrainCurriculum
+from .diagnostics import *  # noqa: F401, F403
 from .domain_randomization import *  # noqa: F401, F403
 from .events import *  # noqa: F401, F403
 from .observations import *  # noqa: F401, F403

@@ -62,6 +62,39 @@ Runs are written beneath `logs/rsl_rl/parkour_lab/<run>/`. This includes policy
 checkpoints (`model_*.pt`), the resolved environment and agent configurations in
 `params/`, TensorBoard data, and optional clips in `videos/train/`.
 
+To retain the complete terminal report while still watching it live, run Python
+unbuffered and copy stdout and stderr with `tee`:
+
+```bash
+python -u scripts/rsl_rl/train.py \
+  --task=Parkour-Lab-v0 \
+  --headless 2>&1 | tee training.log
+```
+
+Each completed-episode batch prints behavior-neutral diagnostics under
+`Curriculum/training_diagnostics/`. Per-foot contact fraction, flat-terrain
+contact fraction, touchdown rate, completed air time, and vertical load share
+expose a carried or unloaded leg. Per-leg action magnitude and rate,
+default-pose deviation, tracking error, applied torque, torque clipping, and
+velocity-limit occupancy separate a learned tucked command from actuator or
+joint-limit problems. Task metrics report signed forward speed, speed error,
+lateral motion, and retreat;
+body metrics report tilt, vertical motion, clearance, and missing base-ray
+hits. Episode progress is reported for every reset, while
+`Curriculum/terrain_levels/family/*` reports attempt coverage, mutually
+exclusive failure causes, frontier success, stalls, and both geometric and
+waypoint progress separately for each obstacle family. It also separates the
+mean speed command of successful and failed frontier attempts, exposing
+speed-dependent feasibility failures. The single
+`Episode_Reward/training_diagnostics` entry is intentionally always zero: the
+sampler never changes the reward or policy objective.
+
+The terminal also prints one JSON diagnostic-context line containing the seed,
+timing, speed range, reward weights, PPO and symmetry settings, randomization
+stage, curriculum dimensions, and resolved robot, sensor, foot, and joint
+orders. Keep `training.log` together with the run's `params/env.yaml` and
+`params/agent.yaml` when comparing experiments.
+
 The default teacher budget is 1,000 PPO iterations with 48 control steps per
 environment and update, 20-second episodes, a discount factor of 0.995, and
 checkpoints every 100 iterations. The longer rollout and horizon preserve more

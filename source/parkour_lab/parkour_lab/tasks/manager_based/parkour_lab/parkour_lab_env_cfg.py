@@ -465,6 +465,11 @@ class CurriculumCfg:
         },
     )
 
+    training_diagnostics = CurrTerm(
+        func=mdp.report_training_diagnostics,
+        params={"reward_term_name": "training_diagnostics"},
+    )
+
 
 @configclass
 class RewardsCfg:
@@ -570,6 +575,33 @@ class RewardsCfg:
             "lateral_to_vertical_force_ratio": 4.0,
             "min_vertical_force": 1.0,
             "sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+        },
+    )
+
+    # Logging-only manager term. Its callable samples post-physics state and
+    # returns exactly zero, so these diagnostics never affect policy reward.
+    training_diagnostics = RewTerm(
+        func=mdp.TrainingDiagnostics,
+        weight=1.0,
+        params={
+            "action_term_name": "joint_pos",
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                body_names=list(mdp.GO2_FOOT_NAMES),
+                joint_names=list(mdp.GO2_JOINT_NAMES),
+                preserve_order=True,
+            ),
+            "base_height_sensor_cfg": SceneEntityCfg("base_height_scanner"),
+            "contact_threshold": PARKOUR_CURRICULUM.contact_force_threshold,
+            "feet_sensor_cfg": SceneEntityCfg(
+                "feet_contact",
+                body_names=list(mdp.GO2_FOOT_NAMES),
+                preserve_order=True,
+            ),
+            "joint_velocity_limit_ratio": 0.95,
+            "reverse_speed_threshold_mps": 0.05,
+            "torque_clip_tolerance_nm": 1.0e-3,
+            "waypoint_marker_cfg": SceneEntityCfg("waypoint_marker"),
         },
     )
 
@@ -885,9 +917,12 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         self.terminations.success.params["reach_threshold"] = curriculum_cfg.waypoint_reach_threshold
         self.terminations.success.params["contact_threshold"] = curriculum_cfg.contact_force_threshold
 
-        # Likewise, use one contact threshold for both the safety penalty and
-        # chassis-contact termination.
+        # Likewise, use one contact threshold for safety, route transitions,
+        # and the contact-duration diagnostics.
         self.rewards.chassis_contact.params["threshold"] = curriculum_cfg.contact_force_threshold
+        self.scene.feet_contact.force_threshold = curriculum_cfg.contact_force_threshold
+        if self.rewards.training_diagnostics is not None:
+            self.rewards.training_diagnostics.params["contact_threshold"] = curriculum_cfg.contact_force_threshold
         self.terminations.chassis_contact.params["threshold"] = curriculum_cfg.contact_force_threshold
 
         # Edge geometry, unlike simple level gates, needs the full course table.
@@ -1068,3 +1103,7 @@ class ParkourLabEnvCfgPlay(ParkourLabEnvCfg):
             self.parkour_curriculum.family_names[0],
             self.parkour_curriculum.max_level,
         )
+        # Fixed evaluation has its own episode reporter in play.py. Avoid the
+        # training-only diagnostic reduction overhead when no curriculum
+        # manager is present to publish those values.
+        self.rewards.training_diagnostics = None

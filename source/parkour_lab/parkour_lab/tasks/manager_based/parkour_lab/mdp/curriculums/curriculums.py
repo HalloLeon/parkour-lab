@@ -67,15 +67,27 @@ def initialize_parkour_terrain_levels(
 class CurriculumBatch:
     """Transient reset-batch evidence for curriculum metrics."""
 
-    # Outcome masks.
+    # Course identity.
+    family_indices: torch.Tensor
+
+    # Attempt selection.
     frontier_attempt: torch.Tensor
-    stalled_failure: torch.Tensor
+
+    # Mutually exclusive terminal outcomes.
+    chassis_contact_failure: torch.Tensor
+    fell_below_failure: torch.Tensor
+    other_failure: torch.Tensor
     success: torch.Tensor
+    timeout_failure: torch.Tensor
+
+    # Curriculum outcome.
+    stalled_failure: torch.Tensor
 
     # Numeric outcomes.
     frontier_change: torch.Tensor
     normalized_geometric_progress: torch.Tensor
     normalized_waypoint_progress: torch.Tensor
+    target_speed: torch.Tensor
 
 
 class ParkourTerrainCurriculum(ManagerTermBase):
@@ -143,9 +155,18 @@ class ParkourTerrainCurriculum(ManagerTermBase):
                 terrain.terrain_levels,
                 population_family_indices,
                 CurriculumBatch(
+                    family_indices=torch.empty(
+                        0,
+                        device=env.device,
+                        dtype=torch.long,
+                    ),
                     frontier_attempt=empty_bool,
+                    chassis_contact_failure=empty_bool,
+                    fell_below_failure=empty_bool,
+                    other_failure=empty_bool,
                     stalled_failure=empty_bool,
                     success=empty_bool,
+                    timeout_failure=empty_bool,
                     frontier_change=torch.empty(
                         0,
                         device=env.device,
@@ -161,11 +182,22 @@ class ParkourTerrainCurriculum(ManagerTermBase):
                         device=env.device,
                         dtype=torch.float32,
                     ),
+                    target_speed=torch.empty(
+                        0,
+                        device=env.device,
+                        dtype=torch.float32,
+                    ),
                 ),
                 curriculum_cfg,
             )
 
         attempted_levels = terrain.terrain_levels[env_ids].clone()
+        attempted_family_indices = _family_indices_for_terrain_columns(
+            env,
+            terrain,
+            env_ids,
+            terrain_layout,
+        )
         uninitialized = state.frontier_levels[env_ids] < 0
         state.frontier_levels[env_ids] = torch.where(
             uninitialized,
@@ -174,10 +206,15 @@ class ParkourTerrainCurriculum(ManagerTermBase):
         )
         old_frontiers = state.frontier_levels[env_ids].clone()
 
-        success_event, terminal_event, failure_event = _terminal_event_masks(
-            env,
-            env_ids,
-        )
+        (
+            success_event,
+            terminal_event,
+            failure_event,
+            chassis_contact_failure_event,
+            fell_below_failure_event,
+            timeout_failure_event,
+            other_failure_event,
+        ) = _terminal_event_masks(env, env_ids)
         # Read both signals before changing terrain rows: route state still
         # points at the course whose episode just ended. Geometric progress is
         # retained for diagnosis; discrete waypoint progress drives demotion.
@@ -186,6 +223,7 @@ class ParkourTerrainCurriculum(ManagerTermBase):
             env,
             env_ids,
         )
+        target_speed = route.current_target_speeds(env)[env_ids].clone()
         stalled_failure_event = _demotion_transition_mask(
             normalized_waypoint_progress,
             failure_event,
@@ -255,12 +293,18 @@ class ParkourTerrainCurriculum(ManagerTermBase):
             terrain.terrain_levels,
             population_family_indices,
             CurriculumBatch(
+                family_indices=attempted_family_indices,
                 frontier_attempt=frontier_attempt,
+                chassis_contact_failure=chassis_contact_failure_event,
+                fell_below_failure=fell_below_failure_event,
+                other_failure=other_failure_event,
                 stalled_failure=stalled_failure_event,
                 success=success_event,
+                timeout_failure=timeout_failure_event,
                 frontier_change=frontier_change,
                 normalized_geometric_progress=normalized_geometric_progress,
                 normalized_waypoint_progress=normalized_waypoint_progress,
+                target_speed=target_speed,
             ),
             curriculum_cfg,
         )
@@ -353,6 +397,10 @@ def _curriculum_metrics(
 
     frontier_attempts = batch.frontier_attempt.to(dtype=torch.float32)
     frontier_attempt_count = frontier_attempts.sum().clamp_min(1.0)
+    frontier_failures = frontier_attempts * (~batch.success).float()
+    frontier_failure_count = frontier_failures.sum().clamp_min(1.0)
+    frontier_successes = frontier_attempts * batch.success.float()
+    frontier_success_count = frontier_successes.sum().clamp_min(1.0)
     bootstrap_replay = (population_frontier_levels > 0) & (population_sampled_levels == 0)
 
     stats = {
@@ -369,8 +417,14 @@ def _curriculum_metrics(
             batch.normalized_waypoint_progress.float() * frontier_attempts
         ).sum()
         / frontier_attempt_count,
+        "frontier_episode/mean_target_speed_mps": (batch.target_speed * frontier_attempts).sum()
+        / frontier_attempt_count,
+        "frontier_episode/failure_mean_target_speed_mps": (batch.target_speed * frontier_failures).sum()
+        / frontier_failure_count,
         "frontier_episode/stalled_failure_rate": (batch.stalled_failure.float() * frontier_attempts).sum()
         / frontier_attempt_count,
+        "frontier_episode/success_mean_target_speed_mps": (batch.target_speed * frontier_successes).sum()
+        / frontier_success_count,
         "frontier_episode/success_rate": (batch.success.float() * frontier_attempts).sum() / frontier_attempt_count,
         "transition/demotion_rate": (batch.frontier_change < 0).float().sum() / frontier_attempt_count,
         "transition/promotion_rate": (batch.frontier_change > 0).float().sum() / frontier_attempt_count,
@@ -378,9 +432,59 @@ def _curriculum_metrics(
     for family_index, family_name in enumerate(curriculum_cfg.family_names):
         family_weights = (population_family_indices == family_index).float()
         family_count = family_weights.sum().clamp_min(1.0)
+        family_batch = (batch.family_indices == family_index).float()
+        family_batch_count = family_batch.sum().clamp_min(1.0)
+        family_frontier_attempts = frontier_attempts * family_batch
+        family_frontier_attempt_count = family_frontier_attempts.sum().clamp_min(1.0)
+        family_frontier_failures = family_frontier_attempts * (~batch.success).float()
+        family_frontier_failure_count = family_frontier_failures.sum().clamp_min(1.0)
+        family_frontier_successes = family_frontier_attempts * batch.success.float()
+        family_frontier_success_count = family_frontier_successes.sum().clamp_min(1.0)
         stats[f"family/{family_name}/mean_frontier"] = (
             population_frontier_levels.float() * family_weights
         ).sum() / family_count
+        stats[f"family/{family_name}/mean_sampled"] = (
+            population_sampled_levels.float() * family_weights
+        ).sum() / family_count
+        stats[f"family/{family_name}/top_fraction"] = (
+            (population_frontier_levels == curriculum_cfg.max_level).float() * family_weights
+        ).sum() / family_count
+        stats[f"family/{family_name}/frontier_episode/attempt_fraction"] = (
+            family_frontier_attempts.sum() / family_batch_count
+        )
+        stats[f"family/{family_name}/frontier_episode/chassis_contact_failure_rate"] = (
+            batch.chassis_contact_failure.float() * family_frontier_attempts
+        ).sum() / family_frontier_attempt_count
+        stats[f"family/{family_name}/frontier_episode/fell_below_failure_rate"] = (
+            batch.fell_below_failure.float() * family_frontier_attempts
+        ).sum() / family_frontier_attempt_count
+        stats[f"family/{family_name}/frontier_episode/failure_mean_target_speed_mps"] = (
+            batch.target_speed * family_frontier_failures
+        ).sum() / family_frontier_failure_count
+        stats[f"family/{family_name}/frontier_episode/mean_geometric_progress"] = (
+            batch.normalized_geometric_progress.float() * family_frontier_attempts
+        ).sum() / family_frontier_attempt_count
+        stats[f"family/{family_name}/frontier_episode/mean_waypoint_progress"] = (
+            batch.normalized_waypoint_progress.float() * family_frontier_attempts
+        ).sum() / family_frontier_attempt_count
+        stats[f"family/{family_name}/frontier_episode/mean_target_speed_mps"] = (
+            batch.target_speed * family_frontier_attempts
+        ).sum() / family_frontier_attempt_count
+        stats[f"family/{family_name}/frontier_episode/stalled_failure_rate"] = (
+            batch.stalled_failure.float() * family_frontier_attempts
+        ).sum() / family_frontier_attempt_count
+        stats[f"family/{family_name}/frontier_episode/success_rate"] = (
+            batch.success.float() * family_frontier_attempts
+        ).sum() / family_frontier_attempt_count
+        stats[f"family/{family_name}/frontier_episode/success_mean_target_speed_mps"] = (
+            batch.target_speed * family_frontier_successes
+        ).sum() / family_frontier_success_count
+        stats[f"family/{family_name}/frontier_episode/timeout_failure_rate"] = (
+            batch.timeout_failure.float() * family_frontier_attempts
+        ).sum() / family_frontier_attempt_count
+        stats[f"family/{family_name}/frontier_episode/other_failure_rate"] = (
+            batch.other_failure.float() * family_frontier_attempts
+        ).sum() / family_frontier_attempt_count
     return stats
 
 
@@ -589,8 +693,8 @@ def _sample_episode_levels(
 def _terminal_event_masks(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return success, terminal, and failure masks for a reset batch.
+) -> tuple[torch.Tensor, ...]:
+    """Return curriculum and mutually exclusive terminal masks for a reset batch.
 
     CurriculumManager runs only for reset environments. ``reset_buf`` therefore
     covers chassis contact, falls, timeout, and future failure terminations. Requiring a
@@ -632,9 +736,28 @@ def _terminal_event_masks(
         )
         & terminal_event
     )
+    timeout_event = (
+        env.termination_manager.get_term("time_out")[env_ids].to(
+            device=env.device,
+            dtype=torch.bool,
+        )
+        & terminal_event
+    )
     success_event = raw_success_event & (~chassis_contact_event) & (~fell_below_event)
     failure_event = terminal_event & (~success_event)
-    return success_event, terminal_event, failure_event
+    chassis_contact_failure = failure_event & chassis_contact_event
+    fell_below_failure = failure_event & (~chassis_contact_failure) & fell_below_event
+    timeout_failure = failure_event & (~chassis_contact_failure) & (~fell_below_failure) & timeout_event
+    other_failure = failure_event & (~chassis_contact_failure) & (~fell_below_failure) & (~timeout_failure)
+    return (
+        success_event,
+        terminal_event,
+        failure_event,
+        chassis_contact_failure,
+        fell_below_failure,
+        timeout_failure,
+        other_failure,
+    )
 
 
 # Terrain-layout validation.
