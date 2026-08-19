@@ -77,6 +77,7 @@ simulation_app = app_launcher.app
 
 import json
 import os
+import subprocess
 from datetime import datetime, timezone
 
 import gymnasium as gym
@@ -401,9 +402,13 @@ def main(
         raise ValueError("train.py supports only OnPolicyRunner; use distill.py for student distillation.")
     register_rsl_rl_teacher_actor_critic()
     runner = ParkourOnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
-    # Record the Git commit and local code changes that produced this run so the
-    # training result can be traced back to its exact repository state.
-    runner.add_git_repo_to_log(__file__)
+    git_dir = os.path.join(log_dir, "git")
+    os.makedirs(git_dir, exist_ok=True)
+    git_commit = subprocess.check_output(
+        ["git", "-C", os.path.dirname(__file__), "rev-parse", "HEAD"], text=True
+    ).strip()
+    with open(os.path.join(git_dir, "commit.txt"), "w", encoding="utf-8") as file:
+        file.write(f"{git_commit}\n")
     # Load the selected checkpoint when continuing an existing run.
     if agent_cfg.resume:
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
