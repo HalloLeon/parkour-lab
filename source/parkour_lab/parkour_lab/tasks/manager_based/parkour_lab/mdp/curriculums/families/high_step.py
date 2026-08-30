@@ -25,14 +25,18 @@ def build_default_levels(
     variant_offset = _shared.geometry_variant_offset(geometry_variant_index)
     variant_handedness = _shared.geometry_variant_handedness(geometry_variant_index)
 
-    return (_shared.build_bootstrap_level("high_step"),) + tuple(
+    return (
+        _shared.build_bootstrap_level("high_step", geometry_variant_index),
+    ) + tuple(
         build_level(
             name=(
                 f"high_step_difficulty_{obstacle_stage_index}"
                 if geometry_variant_index == 0
                 else f"high_step_variant_{geometry_variant_index}_difficulty_{obstacle_stage_index}"
             ),
-            difficulty_order=_shared.normalized_level_difficulty(obstacle_stage_index + 1)
+            difficulty_order=_shared.normalized_level_difficulty(
+                obstacle_stage_index + 1
+            )
             * _shared.NUM_OBSTACLE_STAGES,
             # Begin below ordinary swing clearance so accidental early
             # successes teach progressively higher foot placement.
@@ -40,7 +44,9 @@ def build_default_levels(
                 _shared.lerp(
                     _MIN_OBSTACLE_HEIGHT_M,
                     _MAX_OBSTACLE_HEIGHT_M,
-                    _shared.obstacle_progress(_shared.normalized_level_difficulty(obstacle_stage_index + 1)),
+                    _shared.obstacle_progress(
+                        _shared.normalized_level_difficulty(obstacle_stage_index + 1)
+                    ),
                 )
                 * (1.0 + 0.05 * variant_offset),
                 4,

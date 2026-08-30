@@ -17,37 +17,25 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+# Module-private Cartesian XYZ point used by the geometry properties below.
+_Point3 = tuple[float, float, float]
 
-@dataclass(frozen=True)
+# Module-private type alias for a 3D quadrilateral: exactly four ordered XYZ
+# corners. Their order defines the face's perimeter winding; ``top_corners``
+# uses counterclockwise order. This adds type information but no runtime class.
+_Quad3 = tuple[_Point3, _Point3, _Point3, _Point3]
+
+
+@dataclass(frozen=True, slots=True)
 class TiltedRampGeometry:
-    """Represent a rectangular ramp whose top is cross-sloped by a roll.
+    """Exact geometry for a laterally rolled rectangular collision slab.
 
     ``center_xy`` is the world-frame XY projection of the top face's center.
-    It is not generally the XY position of the collision box's volume center.
-    With zero incline the two centers coincide in XY. After a lateral roll,
-    however, the top normal has a horizontal component, so moving half the
-    slab thickness inward from the top face to the volume center also shifts
-    XY. :attr:`mesh_position` computes that displacement.
-
-    The ramp's local X axis is its travel direction, its local Y axis points
-    left, and ``incline_radians`` rotates the slab about local X before
-    ``yaw_radians`` rotates it about world Z. A positive incline therefore
-    raises the ramp's left edge.
-
-    ``low_edge_z`` fixes the lower of the two top-surface side edges. The
-    derived collision-box position accounts for both the lateral roll and the
-    horizontal displacement between the box center and its top-face center.
-
-    Attributes:
-        center_xy: World-frame XY projection of the top-face center.
-        length: Distance along the ramp's travel direction.
-        width: Distance across the tilted top surface.
-        thickness: Collision-slab thickness measured normal to the top surface.
-        incline_radians: Roll about the local X axis. Positive values raise the
-            local-left edge.
-        yaw_radians: Counterclockwise angle from world positive X to the local
-            positive X axis.
-        low_edge_z: Height of the lower top-surface side edge.
+    Local X points along travel and local Y points left. ``incline_radians``
+    rolls about local X, with positive values raising the left edge;
+    ``yaw_radians`` then rotates counterclockwise about world Z. ``low_edge_z``
+    anchors the lower top edge, while :attr:`mesh_position` converts the
+    top-face anchor into the collision box's volume-center position.
     """
 
     center_xy: tuple[float, float]
@@ -94,8 +82,6 @@ class TiltedRampGeometry:
     def travel_direction_xy(self) -> tuple[float, float]:
         """Return the unit XY direction of the ramp's local positive X axis."""
 
-        # Yaw is measured counterclockwise from world positive X. Its unit-circle
-        # coordinates ``(cos(yaw), sin(yaw))`` are therefore already normalized.
         return (math.cos(self.yaw_radians), math.sin(self.yaw_radians))
 
     @property
@@ -103,62 +89,38 @@ class TiltedRampGeometry:
         """Return the unit XY direction pointing left of ramp travel."""
 
         travel_x, travel_y = self.travel_direction_xy
-
-        # A positive 90-degree rotation maps ``(x, y)`` to ``(-y, x)``. In the
-        # right-handed XY plane, this produces the unit direction to the left.
         return (-travel_y, travel_x)
 
     @property
     def top_center_z(self) -> float:
         """Return the height at the center of the ramp's top surface."""
 
-        # Half the surface width has vertical projection
-        # ``0.5 * width * sin(incline)``. The left and right edges receive
-        # opposite signed projections, so the lower edge lies their absolute
-        # magnitude below the top center. Adding that magnitude to
-        # ``low_edge_z`` recovers the center height. This uses sine rather than
-        # tangent because ``width`` is measured along the tilted surface.
+        # Width is measured along the surface, so its vertical projection uses
+        # sine rather than tangent.
         return self.low_edge_z + 0.5 * self.width * abs(math.sin(self.incline_radians))
 
     @property
-    def centerline_start(self) -> tuple[float, float, float]:
+    def centerline_start(self) -> _Point3:
         """Return the top-centerline endpoint opposite the travel direction."""
 
-        travel_x, travel_y = self.travel_direction_xy
-        half_length = 0.5 * self.length
-        return (
-            self.center_xy[0] - half_length * travel_x,
-            self.center_xy[1] - half_length * travel_y,
-            self.top_center_z,
-        )
+        return self._top_surface_point(-0.5 * self.length, 0.0)
 
     @property
-    def centerline_end(self) -> tuple[float, float, float]:
+    def centerline_end(self) -> _Point3:
         """Return the top-centerline endpoint in the travel direction."""
 
-        travel_x, travel_y = self.travel_direction_xy
-        half_length = 0.5 * self.length
-        return (
-            self.center_xy[0] + half_length * travel_x,
-            self.center_xy[1] + half_length * travel_y,
-            self.top_center_z,
-        )
+        return self._top_surface_point(0.5 * self.length, 0.0)
 
     @property
-    def surface_normal(self) -> tuple[float, float, float]:
+    def surface_normal(self) -> _Point3:
         """Return the upward unit normal of the tilted top surface."""
 
         left_x, left_y = self.left_direction_xy
         sin_incline = math.sin(self.incline_radians)
         cos_incline = math.cos(self.incline_radians)
 
-        # In the ``(forward, left, up)`` basis, rolling about forward changes
-        # the top normal from ``(0, 0, 1)`` to
-        # ``(0, -sin(incline), cos(incline))``. Yaw maps local left to
-        # ``(left_x, left_y, 0)`` while leaving world up unchanged. Expanding
-        # those basis coefficients gives the components below. The positive
-        # cosine term keeps the normal upward-facing over the permitted incline
-        # range.
+        # n_world = R_z(psi) R_x(phi) (0, 0, 1)^T: roll tilts the local top
+        # normal, then yaw rotates its horizontal component into world XY.
         return (
             -sin_incline * left_x,
             -sin_incline * left_y,
@@ -166,15 +128,13 @@ class TiltedRampGeometry:
         )
 
     @property
-    def mesh_position(self) -> tuple[float, float, float]:
+    def mesh_position(self) -> _Point3:
         """Return the XYZ center required by the rotated collision box."""
 
         normal_x, normal_y, normal_z = self.surface_normal
         half_thickness = 0.5 * self.thickness
 
-        # A box factory positions its volume center. Move half a thickness
-        # opposite the top normal so the configured top center remains at
-        # ``(*center_xy, top_center_z)`` after rotation.
+        # Move inward from the anchored top face to the box's volume center.
         return (
             self.center_xy[0] - half_thickness * normal_x,
             self.center_xy[1] - half_thickness * normal_y,
@@ -182,20 +142,13 @@ class TiltedRampGeometry:
         )
 
     @property
-    def orientation_rpy(self) -> tuple[float, float, float]:
+    def orientation_rpy(self) -> _Point3:
         """Return roll, pitch, and yaw for ``ParkourStructureCfg``."""
 
         return (self.incline_radians, 0.0, self.yaw_radians)
 
     @property
-    def top_corners(
-        self,
-    ) -> tuple[
-        tuple[float, float, float],
-        tuple[float, float, float],
-        tuple[float, float, float],
-        tuple[float, float, float],
-    ]:
+    def top_corners(self) -> _Quad3:
         """Return the four top corners in counterclockwise local-XY order."""
 
         half_length = 0.5 * self.length
@@ -208,18 +161,7 @@ class TiltedRampGeometry:
         )
 
     @property
-    def collision_corners(
-        self,
-    ) -> tuple[
-        tuple[float, float, float],
-        tuple[float, float, float],
-        tuple[float, float, float],
-        tuple[float, float, float],
-        tuple[float, float, float],
-        tuple[float, float, float],
-        tuple[float, float, float],
-        tuple[float, float, float],
-    ]:
+    def collision_corners(self) -> tuple[_Point3, ...]:
         """Return the four top and four bottom collision-box corners."""
 
         top_corners = self.top_corners
@@ -262,31 +204,9 @@ class TiltedRampGeometry:
     ) -> TiltedRampGeometry:
         """Construct the next ramp after this ramp's centerline end.
 
-        The next centerline starts ``gap`` meters beyond this ramp along this
-        ramp's travel direction, with ``lateral_offset`` measured along this
-        ramp's left direction. From that start point, half of the next ramp's
-        length is applied along the next ramp's own yaw to obtain its center.
-        Omitting ``low_edge_z`` retains this ramp's lower-edge height.
-
-        Args:
-            length: Length of the next ramp.
-            width: Surface width of the next ramp.
-            thickness: Collision-slab thickness of the next ramp.
-            incline_radians: Roll of the next ramp about its local X axis.
-            yaw_radians: World-frame yaw of the next ramp.
-            gap: Non-negative distance beyond this ramp's centerline end.
-            lateral_offset: Signed offset along this ramp's left direction.
-            low_edge_z: Lower-edge height of the next ramp. If omitted, reuse
-                this ramp's value.
-
-        Returns:
-            Validated geometry for the positioned next ramp.
-
-        Raises:
-            ValueError: If ``gap`` is negative or any numeric constraint is
-                invalid.
-            TypeError: If any numeric argument cannot be converted to a finite
-                non-Boolean float.
+        ``gap`` follows the current travel direction and ``lateral_offset``
+        follows its left direction. The next center then advances half its own
+        length along its own yaw. An omitted ``low_edge_z`` is inherited.
         """
 
         gap = _finite_float(gap, field_name="gap")
@@ -297,10 +217,13 @@ class TiltedRampGeometry:
         if gap < 0.0:
             raise ValueError("gap must be non-negative.")
 
-        next_low_edge_z = self.low_edge_z if low_edge_z is None else _finite_float(low_edge_z, field_name="low_edge_z")
+        next_low_edge_z = (
+            self.low_edge_z
+            if low_edge_z is None
+            else _finite_float(low_edge_z, field_name="low_edge_z")
+        )
 
-        # Construct once at the origin to normalize and validate all new-ramp
-        # parameters before using its own yaw to calculate its final center.
+        # Validate the new geometry before its normalized values define center.
         next_ramp = TiltedRampGeometry(
             center_xy=(0.0, 0.0),
             length=length,
@@ -313,13 +236,16 @@ class TiltedRampGeometry:
 
         current_travel_x, current_travel_y = self.travel_direction_xy
         current_left_x, current_left_y = self.left_direction_xy
-        next_start_x = self.centerline_end[0] + gap * current_travel_x + lateral_offset * current_left_x
-        next_start_y = self.centerline_end[1] + gap * current_travel_y + lateral_offset * current_left_y
+        end_x, end_y, _ = self.centerline_end
+        next_start_xy = (
+            end_x + gap * current_travel_x + lateral_offset * current_left_x,
+            end_y + gap * current_travel_y + lateral_offset * current_left_y,
+        )
 
         next_travel_x, next_travel_y = next_ramp.travel_direction_xy
         next_center_xy = (
-            next_start_x + 0.5 * next_ramp.length * next_travel_x,
-            next_start_y + 0.5 * next_ramp.length * next_travel_y,
+            next_start_xy[0] + 0.5 * next_ramp.length * next_travel_x,
+            next_start_xy[1] + 0.5 * next_ramp.length * next_travel_y,
         )
         return TiltedRampGeometry(
             center_xy=next_center_xy,
@@ -335,54 +261,29 @@ class TiltedRampGeometry:
         self,
         longitudinal_offset: float,
         lateral_offset: float,
-    ) -> tuple[float, float, float]:
-        """Map local top-surface offsets to world-frame XYZ coordinates.
-
-        Args:
-            longitudinal_offset: Signed distance along the travel direction.
-            lateral_offset: Signed surface distance toward the local left.
-
-        Returns:
-            World-frame XYZ coordinates of the requested top-surface point.
-        """
+    ) -> _Point3:
+        """Map local top-surface offsets to world-frame XYZ."""
 
         travel_x, travel_y = self.travel_direction_xy
         left_x, left_y = self.left_direction_xy
         cos_incline = math.cos(self.incline_radians)
         sin_incline = math.sin(self.incline_radians)
 
-        # Yaw maps the longitudinal basis to
-        # ``travel_w = (travel_x, travel_y, 0)``. Roll leaves that axis
-        # unchanged and maps the lateral basis to
-        # ``left_w = (cos(incline) * left_x,
-        #             cos(incline) * left_y,
-        #             sin(incline))``.
-        #
-        # The two rotated basis vectors remain perpendicular unit vectors, so
-        # both offsets remain exact signed distances along the top surface.
-        # Adding their scaled components to the top-face center produces the
-        # world point returned below.
+        # p_world = c + R_z(psi) R_x(phi) p_local, where R_x applies the
+        # incline about local X and R_z applies the yaw about world Z.
         return (
-            self.center_xy[0] + longitudinal_offset * travel_x + lateral_offset * cos_incline * left_x,
-            self.center_xy[1] + longitudinal_offset * travel_y + lateral_offset * cos_incline * left_y,
+            self.center_xy[0]
+            + longitudinal_offset * travel_x
+            + lateral_offset * cos_incline * left_x,
+            self.center_xy[1]
+            + longitudinal_offset * travel_y
+            + lateral_offset * cos_incline * left_y,
             self.top_center_z + lateral_offset * sin_incline,
         )
 
 
 def _finite_float(value: object, *, field_name: str) -> float:
-    """Convert a configuration value to a finite, non-Boolean float.
-
-    Args:
-        value: Candidate numeric value.
-        field_name: Configuration field named in validation errors.
-
-    Returns:
-        The converted finite float.
-
-    Raises:
-        TypeError: If ``value`` is Boolean or cannot be converted to a float.
-        ValueError: If the converted value is not finite.
-    """
+    """Convert a configuration value to a finite non-Boolean float."""
 
     if isinstance(value, bool):
         raise TypeError(f"{field_name} must be a finite number, not bool.")
@@ -396,19 +297,7 @@ def _finite_float(value: object, *, field_name: str) -> float:
 
 
 def _positive_float(value: object, *, field_name: str) -> float:
-    """Convert a configuration value to a finite positive float.
-
-    Args:
-        value: Candidate numeric value.
-        field_name: Configuration field named in validation errors.
-
-    Returns:
-        The converted finite positive float.
-
-    Raises:
-        TypeError: If ``value`` is Boolean or cannot be converted to a float.
-        ValueError: If the converted value is not finite and positive.
-    """
+    """Convert a configuration value to a finite positive float."""
 
     converted = _finite_float(value, field_name=field_name)
     if converted <= 0.0:

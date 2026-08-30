@@ -16,8 +16,6 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-import trimesh
-
 from ...terrain.ramps import TiltedRampGeometry
 from ..levels import (
     ParkourDifficultyCfg,
@@ -27,6 +25,7 @@ from ..levels import (
     ParkourWaypointCfg,
 )
 from . import _shared
+from ._meshes import box_mesh
 
 # Terrain-local X boundary at which the tilted-ramp approach support region
 # ends; final landing regions must begin beyond it.
@@ -91,9 +90,13 @@ class TiltedRampStageSpec:
         object.__setattr__(self, "transitions", transitions)
 
         if not ramps:
-            raise ValueError("A tilted-ramp stage must contain at least one ramp specification.")
+            raise ValueError(
+                "A tilted-ramp stage must contain at least one ramp specification."
+            )
         if len(transitions) != len(ramps) - 1:
-            raise ValueError("A tilted-ramp stage must contain exactly one transition between adjacent ramps.")
+            raise ValueError(
+                "A tilted-ramp stage must contain exactly one transition between adjacent ramps."
+            )
 
 
 # Public course builders
@@ -117,9 +120,13 @@ def build_default_level(
     """
 
     if not 0 <= obstacle_stage_index < len(DEFAULT_STAGE_SPECS):
-        raise ValueError("Tilted-ramp obstacle index must select one configured obstacle row.")
+        raise ValueError(
+            "Tilted-ramp obstacle index must select one configured obstacle row."
+        )
 
-    normalized_difficulty = _shared.normalized_level_difficulty(obstacle_stage_index + 1)
+    normalized_difficulty = _shared.normalized_level_difficulty(
+        obstacle_stage_index + 1
+    )
     variant_offset = _shared.geometry_variant_offset(geometry_variant_index)
     stage_spec = _variant_stage_spec(
         _default_stage_spec_at(normalized_difficulty),
@@ -152,9 +159,13 @@ def build_default_levels(
     """Build the flat bootstrap and one deterministic tilted-ramp ladder."""
 
     if len(DEFAULT_STAGE_SPECS) != _shared.NUM_OBSTACLE_STAGES:
-        raise ValueError("The tilted-ramp family must define the shared number of obstacle stages.")
+        raise ValueError(
+            "The tilted-ramp family must define the shared number of obstacle stages."
+        )
 
-    return (_shared.build_bootstrap_level("tilted_ramps"),) + tuple(
+    return (
+        _shared.build_bootstrap_level("tilted_ramps", geometry_variant_index),
+    ) + tuple(
         build_default_level(obstacle_stage_index, geometry_variant_index)
         for obstacle_stage_index in range(len(DEFAULT_STAGE_SPECS))
     )
@@ -185,10 +196,18 @@ def build_level(
     for ramp in ramps:
         x_bounds, y_bounds = ramp.collision_bounds_xy
         if not (
-            _shared.TERRAIN_X_RANGE_M[0] <= x_bounds[0] < x_bounds[1] <= _shared.TERRAIN_X_RANGE_M[1]
-            and _shared.TERRAIN_Y_RANGE_M[0] <= y_bounds[0] < y_bounds[1] <= _shared.TERRAIN_Y_RANGE_M[1]
+            _shared.TERRAIN_X_RANGE_M[0]
+            <= x_bounds[0]
+            < x_bounds[1]
+            <= _shared.TERRAIN_X_RANGE_M[1]
+            and _shared.TERRAIN_Y_RANGE_M[0]
+            <= y_bounds[0]
+            < y_bounds[1]
+            <= _shared.TERRAIN_Y_RANGE_M[1]
         ):
-            raise ValueError("Tilted-ramp collision geometry must lie inside the terrain tile.")
+            raise ValueError(
+                "Tilted-ramp collision geometry must lie inside the terrain tile."
+            )
 
     marker_offset_z = 0.01
     approach_region = ParkourSupportRegionCfg.horizontal_rectangle(
@@ -223,7 +242,9 @@ def build_level(
     ):
         if math.isclose(direction, 0.0, abs_tol=1.0e-12):
             if not bounds[0] <= origin <= bounds[1]:
-                raise ValueError("The final ramp centerline must point into the landing.")
+                raise ValueError(
+                    "The final ramp centerline must point into the landing."
+                )
             continue
         distances = (
             (bounds[0] - origin) / direction,
@@ -235,9 +256,14 @@ def build_level(
         raise ValueError("The final ramp centerline must point into the landing.")
     terminal_distance = ray_exit - _WAYPOINT_INSET_M
     if terminal_distance <= ray_entry:
-        raise ValueError("The final ramp path through the landing must exceed the waypoint inset.")
+        raise ValueError(
+            "The final ramp path through the landing must exceed the waypoint inset."
+        )
 
-    structures = tuple(_ramp_structure(f"tilted_ramp_{index}", ramp) for index, ramp in enumerate(ramps, start=1))
+    structures = tuple(
+        _ramp_structure(f"tilted_ramp_{index}", ramp)
+        for index, ramp in enumerate(ramps, start=1)
+    )
     ramp_supports = tuple(
         ParkourSupportRegionCfg(
             name=f"tilted_ramp_{index}_top",
@@ -279,14 +305,18 @@ def build_level(
                 root_reach_radius=_RAMP_ROOT_REACH_RADIUS_M,
             ),
         )
-        if not all(support.supports_waypoint(waypoint.position) for waypoint in ramp_waypoints):
+        if not all(
+            support.supports_waypoint(waypoint.position) for waypoint in ramp_waypoints
+        ):
             raise ValueError(f"Ramp {index + 1} waypoints must lie on its top surface.")
         waypoints.extend(ramp_waypoints)
 
     final_waypoint = ParkourWaypointCfg(
         position=(
-            final_ramp.centerline_end[0] + terminal_distance * final_ramp.travel_direction_xy[0],
-            final_ramp.centerline_end[1] + terminal_distance * final_ramp.travel_direction_xy[1],
+            final_ramp.centerline_end[0]
+            + terminal_distance * final_ramp.travel_direction_xy[0],
+            final_ramp.centerline_end[1]
+            + terminal_distance * final_ramp.travel_direction_xy[1],
             marker_offset_z,
         ),
         support_region_name=landing_region.name,
@@ -429,13 +459,13 @@ def _ramp_structure(
 
     return ParkourStructureCfg(
         name=name,
-        mesh_factory=trimesh.creation.box,
+        mesh_factory=box_mesh,
         mesh_kwargs={
-            "extents": (
+            "extents": [
                 geometry.length,
                 geometry.width,
                 geometry.thickness,
-            )
+            ]
         },
         # ``mesh_position`` compensates for rotating the slab thickness, so
         # ``center_xy`` continues to identify the center of the top surface.
@@ -465,7 +495,9 @@ def _paired_stage(
 
     ramps = tuple(
         RampSpec(length=length, width=width, incline_degrees=incline, yaw_degrees=yaw)
-        for length, incline, yaw in zip(lengths, incline_degrees, yaw_degrees, strict=True)
+        for length, incline, yaw in zip(
+            lengths, incline_degrees, yaw_degrees, strict=True
+        )
     )
     return TiltedRampStageSpec(
         sequence_anchor_xy=sequence_anchor_xy,
@@ -566,7 +598,8 @@ DEFAULT_STAGE_SPECS = (
 )
 
 DEFAULT_STAGE_DIFFICULTIES = tuple(
-    _shared.normalized_level_difficulty(stage_index + 1) for stage_index in range(_shared.NUM_OBSTACLE_STAGES)
+    _shared.normalized_level_difficulty(stage_index + 1)
+    for stage_index in range(_shared.NUM_OBSTACLE_STAGES)
 )
 
 
@@ -580,7 +613,9 @@ def _default_stage_spec_at(normalized_difficulty: float) -> TiltedRampStageSpec:
     ):
         if math.isclose(normalized_difficulty, keyframe, abs_tol=1.0e-12):
             return stage_spec
-    raise ValueError("Tilted-ramp difficulty must select a configured normalized keyframe.")
+    raise ValueError(
+        "Tilted-ramp difficulty must select a configured normalized keyframe."
+    )
 
 
 def _mirrored_stage_spec(

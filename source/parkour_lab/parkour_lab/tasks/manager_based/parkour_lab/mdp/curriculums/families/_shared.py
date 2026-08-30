@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import math
 
-import trimesh
-
 from ..levels import (
     ParkourDifficultyCfg,
     ParkourLevelCfg,
@@ -13,6 +11,7 @@ from ..levels import (
     ParkourSupportRegionCfg,
     ParkourWaypointCfg,
 )
+from ._meshes import box_mesh
 
 # Terrain-local bounds of each 8 m by 4 m tile. Every default family uses these
 # bounds when defining support regions and validating obstacle geometry.
@@ -37,6 +36,16 @@ _BOOTSTRAP_ROUTE = (
     (1.25, 0.0, 0.01),
     (2.50, 0.0, 0.01),
     (3.80, 0.0, 0.01),
+)
+_ROTATED_BOOTSTRAP_ROUTE = (
+    (1.25, 0.25, 0.01),
+    (2.50, 0.50, 0.01),
+    (3.80, 0.76, 0.01),
+)
+_TURNING_BOOTSTRAP_ROUTE = (
+    (1.20, 0.22, 0.01),
+    (2.40, 0.65, 0.01),
+    (3.65, 1.20, 0.01),
 )
 _BOOTSTRAP_TARGET_SPEED = 0.55
 _SUPPORTED_OBSTACLE_FAMILIES = frozenset({"gap", "high_step", "hurdle", "tilted_ramps"})
@@ -74,14 +83,20 @@ def lerp(start: float, end: float, fraction: float) -> float:
 
     values = (float(start), float(end), float(fraction))
     if any(not math.isfinite(value) for value in values) or not 0.0 <= values[2] <= 1.0:
-        raise ValueError("Interpolation requires finite endpoints and a fraction in [0, 1].")
+        raise ValueError(
+            "Interpolation requires finite endpoints and a fraction in [0, 1]."
+        )
     return values[0] + (values[1] - values[0]) * values[2]
 
 
 def normalized_level_difficulty(level_index: int) -> float:
     """Map the flat-plus-obstacle row index onto the public ``[0, 1]`` scale."""
 
-    if isinstance(level_index, bool) or not isinstance(level_index, int) or not 0 <= level_index <= NUM_OBSTACLE_STAGES:
+    if (
+        isinstance(level_index, bool)
+        or not isinstance(level_index, int)
+        or not 0 <= level_index <= NUM_OBSTACLE_STAGES
+    ):
         raise ValueError("level_index must select the flat row or an obstacle stage.")
     return level_index / NUM_OBSTACLE_STAGES
 
@@ -91,7 +106,10 @@ def obstacle_progress(normalized_difficulty: float) -> float:
 
     normalized_difficulty = float(normalized_difficulty)
     first_obstacle = 1.0 / NUM_OBSTACLE_STAGES
-    if not math.isfinite(normalized_difficulty) or not first_obstacle <= normalized_difficulty <= 1.0:
+    if (
+        not math.isfinite(normalized_difficulty)
+        or not first_obstacle <= normalized_difficulty <= 1.0
+    ):
         raise ValueError("normalized_difficulty must select an obstacle-bearing row.")
     return (normalized_difficulty - first_obstacle) / (1.0 - first_obstacle)
 
@@ -99,31 +117,40 @@ def obstacle_progress(normalized_difficulty: float) -> float:
 # Shared course builders.
 
 
-def build_bootstrap_level(obstacle_family: str) -> ParkourLevelCfg:
+def build_bootstrap_level(
+    obstacle_family: str,
+    geometry_variant_index: int = 0,
+) -> ParkourLevelCfg:
     """Create the obstacle-free row-zero course for one eventual family.
 
-    Every terrain column retains its assigned family while row zero shares one
-    flat route and nominal evaluation speed. This keeps the acquisition task
-    identical across cohorts before promotion introduces family-specific
-    obstacles.
+    Variants zero through five retain the original straight route. Variants
+    six/seven rotate that line left/right, and eight/nine add mirrored gentle
+    turns, without changing any obstacle row.
     """
 
     if obstacle_family not in _SUPPORTED_OBSTACLE_FAMILIES:
         raise ValueError(f"Unsupported flat-bootstrap family: {obstacle_family!r}.")
+    handedness = geometry_variant_handedness(geometry_variant_index)
+    if geometry_variant_index < 6:
+        route = _BOOTSTRAP_ROUTE
+    elif geometry_variant_index < 8:
+        route = _ROTATED_BOOTSTRAP_ROUTE
+    else:
+        route = _TURNING_BOOTSTRAP_ROUTE
 
     return ParkourLevelCfg(
         name=f"{obstacle_family}_flat_entry",
         obstacle_family=obstacle_family,
         waypoints=tuple(
             ParkourWaypointCfg(
-                position=position,
+                position=(position[0], handedness * position[1], position[2]),
                 support_region_name="ground",
                 # Split the existing intermediate-milestone budget across the
                 # two supported acquisition checkpoints.  The final waypoint
                 # retains the separate course-completion bonus.
-                is_rewarded_milestone=index < len(_BOOTSTRAP_ROUTE) - 1,
+                is_rewarded_milestone=index < len(route) - 1,
             )
-            for index, position in enumerate(_BOOTSTRAP_ROUTE)
+            for index, position in enumerate(route)
         ),
         structures=(),
         support_regions=(
@@ -158,7 +185,9 @@ def build_box_obstacle(
     dimensions = (obstacle_depth, obstacle_width, obstacle_height)
     if any(not math.isfinite(value) or value <= 0.0 for value in dimensions):
         raise ValueError("Box-obstacle height, width, and depth must be positive.")
-    if len(obstacle_position_xy) != 2 or any(not math.isfinite(value) for value in obstacle_position_xy):
+    if len(obstacle_position_xy) != 2 or any(
+        not math.isfinite(value) for value in obstacle_position_xy
+    ):
         raise ValueError("Box-obstacle XY position must contain two finite values.")
 
     center_x, center_y = obstacle_position_xy
@@ -179,8 +208,8 @@ def build_box_obstacle(
     return (
         ParkourStructureCfg(
             name=name,
-            mesh_factory=trimesh.creation.box,
-            mesh_kwargs={"extents": dimensions},
+            mesh_factory=box_mesh,
+            mesh_kwargs={"extents": list(dimensions)},
             # Center the box vertically so its base is exactly on ground z=0.
             position=(center_x, center_y, 0.5 * obstacle_height),
         ),
