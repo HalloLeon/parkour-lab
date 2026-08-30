@@ -65,6 +65,11 @@ class RegularizedPPOCfg(RslRlPpoAlgorithmCfg):
     # initial rate during long runs, including for the adaptation encoders.
     max_learning_rate: float = 3.0e-4
 
+    # Bound only the extreme wrong-direction importance-ratio tail. Its exact
+    # exponential magnitude is no longer useful once one sample would dominate
+    # the globally clipped gradient; the cap prevents overflow first.
+    max_log_ratio: float = 20.0
+
 
 @configclass
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
