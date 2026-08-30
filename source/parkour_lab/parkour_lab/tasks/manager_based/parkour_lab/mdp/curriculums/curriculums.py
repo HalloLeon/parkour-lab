@@ -719,16 +719,17 @@ def _terminal_event_masks(
 ) -> tuple[torch.Tensor, ...]:
     """Return curriculum and mutually exclusive terminal masks for a reset batch.
 
-    CurriculumManager runs only for reset environments. ``reset_buf`` therefore
-    covers chassis contact, falls, timeout, and future failure terminations. Requiring a
-    positive episode length keeps initial and repeated manual resets neutral.
+    CurriculumManager runs only for reset environments. The termination manager's
+    aggregate ``dones`` signal therefore covers chassis contact, falls, timeouts, and
+    future failure terminations. Requiring a positive episode length keeps initial and
+    repeated manual resets neutral.
     A chassis contact or fall wins if it fires with success during the same step:
     a robot cannot earn mastery by reaching the exit gate while crashing.
     """
 
     has_completed_step = env.episode_length_buf[env_ids] > 0
     terminal_event = (
-        env.reset_buf[env_ids].to(
+        env.termination_manager.dones[env_ids].to(
             device=env.device,
             dtype=torch.bool,
         )
