@@ -16,8 +16,19 @@ the same environment:
 python -m pip install -e source/parkour_lab
 ```
 
-Parkour Lab targets Isaac Lab 2.3.0 and its RSL-RL 3.0.1 integration. Install
-the learning framework through Isaac Lab before installing this extension:
+Parkour Lab uses the following tested server stack as one compatibility unit:
+
+| Package | Version |
+| --- | --- |
+| Isaac Lab | `2.3.2.post1` |
+| Isaac Sim | `5.1.0.0` |
+| PyTorch | `2.7.0+cu128` |
+| TorchVision | `0.22.0+cu128` |
+| RSL-RL | `3.1.2` |
+
+Training and evaluation validate these exact versions before starting Isaac
+Sim. Install RSL-RL through the matching Isaac Lab checkout before installing
+this extension:
 
 ```bash
 cd PATH_TO_ISAACLAB
@@ -61,6 +72,9 @@ python scripts/rsl_rl/train.py \
 Runs are written beneath `logs/rsl_rl/parkour_lab/<run>/`. This includes policy
 checkpoints (`model_*.pt`), the resolved environment and agent configurations in
 `params/`, TensorBoard data, and optional clips in `videos/train/`.
+Training also archives Git provenance. It refuses untracked executable files
+under `scripts/` or `source/`, because RSL-RL's Git diff cannot preserve their
+contents; stage or commit new source before starting a run.
 
 To retain the complete terminal report while still watching it live, run Python
 unbuffered and copy stdout and stderr with `tee`:
@@ -99,9 +113,10 @@ orders. Keep `training.log` together with the run's `params/env.yaml` and
 `params/agent.yaml` when comparing experiments.
 
 The default teacher budget is 1,000 PPO iterations with 48 control steps per
-environment and update, 20-second episodes, a discount factor of 0.995, and
-checkpoints every 100 iterations. The longer rollout and horizon preserve more
-approach-to-landing credit than the former short smoke-test settings.
+environment and update, a 25-second commanded-motion budget, a 32-second hard
+wall-clock cap, a discount factor of 0.995, and checkpoints every 100
+iterations. The longer rollout and horizon preserve more approach-to-landing
+credit than the former short smoke-test settings.
 `--max_iterations` can still override the budget for diagnostics. Action noise
 starts at 0.8 and is bounded to 0.10–0.80. A 0.01 entropy coefficient retains
 exploration through initial locomotion acquisition while allowing the bounded
@@ -109,12 +124,12 @@ distribution to settle around a deterministic gait.
 
 New checkpoints store the per-environment curriculum frontier, rolling evidence,
 and demotion grace alongside RSL-RL's learner state. `--resume` restores that
-memory only when the checkpoint and runtime full teacher-interface hashes match,
+memory only when checkpoint and runtime terrain/curriculum provenance match,
 then starts fresh episodes sampled from the restored frontier. Changed geometry
 still permits weight/optimizer fine-tuning but restarts curriculum memory from
-the configured bootstrap rows. Checkpoints created before curriculum state was
-added use the same conservative fallback. Fixed `Parkour-Lab-Play-v0`
-evaluation remains pinned to its requested matrix cell.
+the configured bootstrap rows. A same-terrain checkpoint without curriculum
+state is rejected instead of silently changing resume semantics. Fixed
+`Parkour-Lab-Play-v0` evaluation remains pinned to its requested matrix cell.
 After promotion grace, training keeps 75% of eligible environments at their
 frontier, replays its immediate predecessor in 15%, and anchors the shared flat
 bootstrap in 10%. At frontier one, both replay choices resolve to level zero.
@@ -151,20 +166,19 @@ stored in `params/env.yaml`. Action and observation widths do not change between
 stages. Fixed evaluation always selects `off`, removing randomization, noise,
 pushes, and delays before constructing the environment.
 
-The same option is available in `distill.py`. If it is supplied together with
-the advanced Hydra override `env.domain_randomization.stage=...`, the explicit
-CLI option takes precedence.
-
 ## Declarative course configuration
 
 Each curriculum matrix cell is a reusable course description rather than a
-special case in the runtime. Terrain row 0 gives every family cohort the same
-straight obstacle-free route. Rows 1 through 6 contain the six obstacle
-difficulties. Equal column blocks retain their future gap, high-step, hurdle,
-or tilted-ramp family even on the flat row, so each environment advances from
-flat ground into one stable family without resampling its obstacle type. Each
-family block is further divided into ten deterministic variants: five
-zero-mean severity values, each represented by an adjacent left-right pair.
+special case in the runtime. Terrain row 0 is obstacle-free: variants 0–5 use
+the canonical straight route, variants 6/7 use an exact mirrored pair of
+constant-heading rotated-straight routes, and variants 8/9 use an exact mirrored
+pair of broad gentle turns. Rows 1 through 6 contain the six obstacle
+difficulties. Equal column blocks retain their future
+gap, high-step, hurdle, or tilted-ramp family even on the flat row, so each
+environment advances from flat ground into one stable family without
+resampling its obstacle type. Each family block is further divided into ten
+deterministic variants: five zero-mean severity values, each represented by an
+adjacent left-right pair.
 Variant zero is the unchanged nominal ladder. High-step and tilted-ramp pairs
 contain exact reflected courses; centered gap and hurdle geometries are their
 own reflections. Nonzero severity values perturb only bounded obstacle geometry
@@ -176,10 +190,10 @@ Default builders use the shared normalized row scalar
 the proven tilted-ramp stages remain explicit normalized keyframes. Each course
 records ordered terrain-local waypoints, named mesh structures and their
 factory arguments, planar support polygons, nominal speed metadata, clearance,
-and explicit difficulty metadata. At reset, the live desired-speed command is
-sampled independently from 0.45 to 0.70 m/s, so obstacle geometry is not
-confounded with a family-specific command. Obstacle rows use a common 0.27 m
-minimum clearance. Forward reward saturates at the sampled command while a
+and explicit difficulty metadata. Moving commands are sampled independently
+from 0.20 to 0.70 m/s on the flat row and 0.45 to 0.70 m/s on obstacle rows.
+Only the flat row receives exact-zero stop/wait/restart windows. Obstacle rows
+use a common 0.27 m minimum clearance. Forward reward saturates at the sampled command while a
 waypoint-local 1.5x ceiling permits the policy to acquire extra traversal speed
 without rewarding it for doing so.
 Factory arguments are passed directly to each structure factory. A support
@@ -231,10 +245,9 @@ height-field mask.
 Each environment owns an active waypoint index and course-progress state. A
 reset selects waypoint zero from the route belonging to that environment's
 obstacle family and difficulty. A route-control target advances immediately
-when the robot enters its 0.20 m XY radius or genuinely crosses its route-normal
-plane inside the same lateral corridor. Physical milestones instead require
-radius entry and recent foot contact on their explicitly named support polygon.
-Both cases immediately retarget the marker, oracle heading, critic distance,
+when the robot enters its 0.20 m XY radius. Physical milestones additionally
+require recent foot contact on their explicitly named support polygon.
+Both cases immediately retarget the marker, oracle travel direction, critic distance,
 and directional reward without teaching the robot to dwell at control markers.
 
 Only explicitly marked physical milestones split a one-shot `+2` shaping budget
@@ -242,9 +255,9 @@ across the course. The flat bootstrap's two intermediate ground targets each
 receive `+1`; obstacle approach and alignment guides do not pay, and adding
 control markers cannot increase the available budget. Intermediate waypoints
 still do not end an episode or count as curriculum success. The final waypoint
-ignores plane crossing and pays `+4` only after the robot reaches its radius
-with a foot on the named support, sufficient base clearance, low vertical speed
-and tilt, and no chassis contact. Event rewards are divided by the control
+pays `+4` only after the robot reaches its radius with a foot on the named
+support, sufficient base clearance, low vertical speed and tilt, and no chassis
+contact. Event rewards are divided by the control
 timestep before Isaac Lab's reward integration, making these configured amounts
 the exact per-event bonuses. The terminating chassis-contact penalty uses the
 same rule for an exact `-10`; a base or head crash takes precedence if crash
@@ -295,7 +308,7 @@ tracked separately and does not masquerade as zero physical clearance. Every
 default course uses a 0.27 m Go2 base-clearance floor; this is a lower bound
 rather than an exact height-tracking target.
 
-The teacher-interface manifest is version 15. Version 4 introduced complete
+The teacher-interface manifest is version 18. Version 4 introduced complete
 declarative terrain courses because physical support segmentation changes the
 privileged ray values seen by the teacher. Version 5 replaces horizontal-only
 support metadata with ordered planar XYZ boundaries, making the banked ramp
@@ -317,13 +330,24 @@ and the revised flat and tilted-ramp curriculum geometry. Version 14 freezes
 the robot model and exact source asset path, intentionally rejecting older A1
 checkpoints despite their compatible action dimensions. Version 15 records the
 Go2 chassis-contact contract, where base and head impacts are fatal while limb
-contacts remain recoverable. The complete v15
-manifest and its hash remain the exact training provenance. Playback and
-distillation compare a projected inference contract that ignores only
-`terrain_curriculum`: robot asset, observation, scanner, network, action,
-waypoint-protocol, and timing mismatches remain fatal, while course-geometry
-changes emit an out-of-distribution warning without making compatible weights
-unloadable.
+contacts remain recoverable. Version 16 moves preferred speed into the intent
+command, adds exact-zero stop and signed in-place yaw-rate semantics, and
+exposes the separate 2-D requested travel direction. The appended yaw-rate scalar
+changes the deployable state/history and motor widths. Version 17 adds the
+resolved per-joint processed-target safety clamp. Version 18 derives adaptation
+history from the exact delivered policy stream in frame-major order and records
+the tested runtime stack. Version 19 names the privileged local input
+`oracle_travel_direction` and keeps the requested travel direction solely in
+the command manager until a deployable student consumes it. Version 19
+checkpoints load strictly; earlier interface versions are not imported or
+resumed.
+
+The complete manifest and its hash remain the exact training provenance.
+Playback compares a projected inference contract that excludes
+command-source, training-provenance, and terrain-curriculum metadata: robot
+asset, actor observations, scanner, network, action, waypoint protocol, and
+timing mismatches remain fatal, while a changed terrain domain emits an
+out-of-distribution warning without making compatible weights unloadable.
 
 ## Phase 1 observation architecture
 
@@ -331,18 +355,19 @@ Phase 1 trains an asymmetric, privileged parkour teacher. The runtime roles are:
 
 | Role | RSL-RL observation mapping | Inputs |
 |---|---|---|
-| Teacher actor | `policy + heading_target + terrain + dynamics` | 43-D deployable state, 2-D oracle heading, 264-D privileged scan, and 31-D actual dynamics (340 total) |
-| Privileged critic | `policy + heading_target + terrain + dynamics + critic_privileged` | Everything seen by the teacher, plus 11-D simulator-only value and route-phase information (351 total) |
-| Restricted student | `policy + student_exteroception + adaptation_history` | The same 43-D deployable state, a temporary 32-D terrain latent, and ten-step 430-D deployable history (505 observed values; its motor also receives predicted 2-D heading and 20-D adaptation latents) |
+| Teacher actor | `policy + oracle_travel_direction + terrain + dynamics` | 44-D deployable state, 2-D local travel direction, 264-D privileged scan, and 31-D actual dynamics (341 total) |
+| Privileged critic | `policy + oracle_travel_direction + terrain + dynamics + critic_privileged` | Everything seen by the teacher, plus 11-D simulator-only value and route-phase information (352 total) |
 
 The shared `policy` group is base angular velocity, projected gravity, desired
-speed, relative joint position and velocity, and the previous action. Fixed
+speed, relative joint position and velocity, the previous action, and finally
+the signed desired yaw rate. Fixed
 per-term scales keep angular velocity and joint velocity numerically controlled
 without checkpoint-dependent running normalization. The teacher then receives
-the yaw-aligned oracle heading, simulator ray-cast height scan, and actual
+the yaw-aligned oracle travel direction, simulator ray-cast height scan, and actual
 randomized dynamics. Heights are clipped to ±0.50 m and normalized to `[-1, 1]`,
-followed by a binary hit-validity mask. Missing hits use normalized height `+1`
-and mask `0`, so a future gap cannot be confused with a valid surface.
+followed within the same observation term by a binary hit-validity mask.
+Missing hits use normalized height `+1` and mask `0`, so a future gap cannot be
+confused with a valid surface while the ray data is preprocessed only once.
 
 Exact active-waypoint distance, scaled base linear velocity and clearance, a
 two-component normalized route cursor/progress phase, and simulator-derived
@@ -367,43 +392,38 @@ must not keep using this static target. Either bake the obstacles into generated
 terrain or upgrade to an Isaac Lab release that provides transform-aware
 multi-mesh ray casting.
 
-The teacher and student deliberately reuse one `policy` group, preventing two
-copies of the deployable state order from drifting apart. The student excludes
-the oracle heading, exact active-waypoint distance, simulator ray hits, contacts and
-clearance, curriculum-level and obstacle-family identifiers, and configured
-obstacle dimensions. Its 32-D exteroception group is all zeros in this tutorial;
-it represents the fixed-width output contract of a later depth encoder, not a
-visual representation.
-
-Teacher and future student share one action contract: 12 Unitree Go2 joint-position
-offsets, scale `0.25`, interpreted relative to default joint positions at the
-same 50 Hz control rate. Observation asymmetry therefore does not alter the
-low-level controller or action interface.
+The motor action contract is 12 Unitree Go2 joint-position offsets with scale
+`0.25`, interpreted relative to default joint positions at 50 Hz. Observation
+asymmetry therefore does not alter the low-level controller or action interface.
 
 Teacher PPO updates append an exact sagittal left-right reflection of every
 collected transition. The transform reflects proprioception and actions by
-resolved Go2 joint name, flips heading and both terrain-scan channels, and also
+resolved Go2 joint name, flips the travel direction and both terrain-scan
+channels, and also
 reflects the adaptation history, randomized dynamics, and critic-only state.
 Adaptive KL and entropy statistics continue to use only the collected samples.
 This is data augmentation rather than a gait-phase objective: mirror loss is
 disabled, and inference still evaluates one unmodified observation at a time.
 
 `learning/distillation/architecture.py` fixes the shared transferable motor
-input order as deployable state, two-component heading, 32-D terrain latent,
-and a required 20-D adaptation latent. Teacher-specific PyTorch composition
+input order as deployable state, two-component local travel direction, 32-D
+terrain latent, and a required 20-D adaptation latent. Teacher-specific PyTorch composition
 lives in `teacher/model.py`, while `teacher/rsl_rl.py` contains the RSL-RL
-`ActorCritic` and regularized-PPO adapters. The student remains in `student.py`
-because it does not currently require a package of its own.
+`ActorCritic` and regularized-PPO adapters. The perception student is deferred
+until its real depth encoder and training loop are implemented.
 
 The Phase-1 actor compresses the 264-D privileged height-and-validity scan to
 the fixed 32-D terrain latent. It separately compresses 31 actual randomized
 dynamics values—base mass and center of mass, mean contact material, and
 per-joint stiffness and damping ratios—to the 20-D adaptation latent. The
-motor therefore always receives the same 97 values: 43-D deployable state,
-2-D heading, 32-D terrain latent, and 20-D adaptation latent.
+motor therefore always receives the same 98 values: 44-D deployable state,
+2-D local travel direction, 32-D terrain latent, and 20-D adaptation latent.
 
-Isaac Lab also maintains a ten-step, term-major flattened history of the 43-D
-deployable state, including previous actions. Full regularized online adaptation
+The RSL-RL wrapper maintains a ten-step, frame-major flattened history of the
+exact delivered 44-D policy packets, including previous actions. A reset row is
+filled with its first packet and then receives one packet per control step, so
+the current observation and newest history frame cannot receive independent
+noise or delay. Full regularized online adaptation
 uses two directed losses: `actor.history_encoder` learns the detached latent
 from `actor.dynamics_encoder`, while the reverse stop-gradient loss regularizes
 the privileged latent so that it remains reproducible from deployable history.
@@ -412,17 +432,16 @@ After a 200-iteration warmup, the reverse coefficient ramps from 0 to 0.1 over
 history path rather than privileged dynamics, exposing it to its own state
 distribution. The checkpoint additionally keeps the ROA schedule position, scan
 encoder under `actor.terrain_encoder`, and shared motor under `actor.motor`.
-During deployment, the student copies the history encoder and motor, and
-estimates adaptation solely from that deployable history; the privileged
-dynamics vector is not an input to `StudentPolicy`.
+The history-policy evaluation path estimates adaptation solely from deployable
+history; the privileged dynamics vector is not one of its runtime inputs.
 
 Three controlled RSL-RL entry points support observation ablations without
 changing PPO settings, hidden layers, rewards, curricula, or actions:
 
 ```text
-rsl_rl_baseline_cfg_entry_point              actor: policy + oracle heading + dynamics
-rsl_rl_privileged_critic_cfg_entry_point     actor: policy + oracle heading + dynamics; critic also sees terrain
-rsl_rl_cfg_entry_point                       actor and critic see policy + oracle heading + terrain + dynamics
+rsl_rl_baseline_cfg_entry_point              actor: policy + oracle travel direction + dynamics
+rsl_rl_privileged_critic_cfg_entry_point     actor: policy + oracle travel direction + dynamics; critic also sees terrain
+rsl_rl_cfg_entry_point                       actor and critic see policy + oracle travel direction + terrain + dynamics
 ```
 
 Select one with `--agent=<entry-point>` and use that same entry point for
@@ -472,8 +491,18 @@ python scripts/rsl_rl/play.py \
   --video
 ```
 
-`--desired_speed` fixes the scalar command for every reset. When omitted, the
-selected course's nominal speed is retained for backward-compatible evaluation.
+`--geometry_variant=0..9` fixes the within-family geometry; it defaults to the
+canonical variant 0 and can also be combined with `--all_courses` to evaluate
+one complete 28-cell variant slice. At difficulty 0, variants 6/7 select the
+mirrored constant-heading cohort and variants 8/9 select the mirrored
+gentle-turn cohort. `--desired_speed` fixes the scalar command for every reset.
+When omitted, the selected course's nominal speed is retained.
+On level 0, `--desired_yaw_rate=<signed rad/s>` selects deterministic
+translate→two-second-pivot→translate pulses; `--desired_speed` is the positive
+restart speed, or the course nominal when omitted. Ordinary training and
+evaluation sample symmetric `0.25-0.80 rad/s`, `0.75-4.0 s` pivot windows on
+only 5% of eligible flat command transitions; obstacle rows never receive
+them.
 Run the same matrix at 0.45, 0.55, and 0.70 m/s to measure command conditioning
 separately from terrain difficulty. `--all_courses` creates all 28 independent
 reports, starting a fresh Isaac Sim
@@ -482,98 +511,41 @@ expected application restarts are printed as sweep progress. This option cannot
 be combined with the two single-cell selectors. Evaluation reports success,
 maximum course progress, chassis contact, below-course falls, timeout, return,
 episode length, forward speed, overspeed, vertical-velocity RMS, and
-all-feet-airborne fraction for each selected matrix cell. It writes
+all-feet-airborne fraction for each selected matrix cell. Command diagnostics
+separate moving speed error, stopped planar speed/yaw rate, mean/p95
+movement-direction error, first-threshold-crossing stop settling, maximum XY
+excursion during the following two seconds, restart outcomes, and active versus
+wall-only timeouts. Pivot samples are excluded from stop denominators and
+separately report planar speed, mean/p95 yaw-rate error, wrong-way fraction,
+exposure, maximum XY excursion, and eventual course success after a
+pivot-to-translation restart. The unclamped oracle-residual report retains
+signed ranges,
+absolute p50/p95/p99/p99.9/max tails, the provisional 35-degree exceedance rate,
+success/failure splits, and waypoint-transition samples. Reports also retain
+mean per-episode p50/p95 and the global maximum root cross-track distance for
+successful episodes, measured against the finite configured waypoint polyline,
+plus the mean per-episode fraction beyond the configured `0.30 m` soft
+half-width and raw values at waypoint transitions. The dedicated off-route rate
+reports hard-width violations. During training, moving excess beyond the soft
+width receives a small squared cost; crossing the `0.50 m` hard width is an
+explicit off-route failure that cannot advance route state. Neither distance
+nor width is an actor observation. Evaluation samples after physics and reward
+computation but before Isaac Lab auto-resets completed rows, so the terminal
+state is included and the following reset state is excluded.
+Evaluation writes
 `metrics.json` plus the optional MP4 beneath
-`<run>/evaluation/<checkpoint>-<hash>/family_<family>/level_<n>/speed_<m_s>/seed_<seed>/`, separated
+`<run>/evaluation/<checkpoint>-<hash>/family_<family>/level_<n>/variant_<v>/speed_<m_s>/yaw_rate_<rad_s>/seed_<seed>/`, separated
 into `metrics/episodes_<n>/` and `video/episodes_<n>-steps_<length>/`.
 Each invocation gets a timestamped `run_*` leaf so before/after results are not
 overwritten. Use `--video_output_dir` to choose another artifact root. Omit
 `--video` for faster numerical evaluation.
 
-## Online student-driven distillation
+## Perception student status
 
-The distillation pipeline accepts the exact teacher checkpoint directly.
-Teacher training writes the compact `params/teacher_interface.json` manifest
-beside its checkpoints. Distillation hashes the requested checkpoint, validates
-that manifest, and reconstructs the runtime interface before loading the
-policy. The complete manifest retains the exact terrain curriculum as training
-provenance. Its hard compatibility projection ignores only
-`terrain_curriculum`; a changed course therefore emits an out-of-distribution
-warning while actor observation order and dimensions, normalization,
-terrain-scan encoding, robot asset identity, action order and scaling, waypoint
-protocol, and control timing remain strict. Critic details, unused observation
-groups, framework versions, and source-code hashes remain outside the contract.
-
-Use `play.py` independently to compare promising checkpoints under identical
-fixed evaluation conditions. After choosing one from those results, pass its
-checkpoint path directly to distillation:
-
-```bash
-python scripts/rsl_rl/distill.py \
-  --task=Parkour-Lab-v0 \
-  --teacher_checkpoint=/absolute/path/to/model_1000.pt \
-  --allow_zero_exteroception \
-  --max_iterations=2 \
-  --steps_per_iteration=2 \
-  --headless
-```
-
-At this stage, `--allow_zero_exteroception` is an explicit acknowledgement
-that the run is only a short pipeline smoke test. Without that option,
-`distill.py` refuses to train from the information-free placeholder. A
-constant-zero feature cannot describe obstacles, so checkpoints from this
-stage must not be selected as terrain-aware or deployable students.
-
-The distinct information sets are:
-
-| Information set | Shape | Contents and status |
-|---|---:|---|
-| Teacher actor observations | Runtime-derived; currently `[N, 340]` | Shared 43-D `policy`, 2-D oracle `heading_target`, 264-D privileged `terrain`, and 31-D privileged `dynamics` |
-| Student observations | Runtime-derived; currently `[N, 505]` | Shared 43-D `policy`, temporary 32-D zero terrain latent, and 430-D deployable `adaptation_history`; no privileged dynamics |
-| Deployable adaptation history | `[N, 430]` | Ten current-and-past samples of deployable proprioception, command state, and previous actions; flattened term-major from oldest to newest |
-| Privileged dynamics target | `[N, 31]` | Actual randomized physical properties used only to train the teacher's privileged encoder and supervise the history encoder |
-| Oracle heading target | `[N, 2]` | Yaw-aligned direction to the active course waypoint, `[forward, left] = [cos(Δψ), sin(Δψ)]`; teacher input and student supervision, never a student motor input |
-| Teacher motor-action target | `[N, 12]` | Frozen teacher's deterministic action-distribution mean in resolved Go2 joint order; supervision only |
-
-The instantiated group dimensions and exact student group order are stored in
-`distillation_config.json`. Frames, units, normalization, and deployment status
-are documented here and beside the corresponding observation definitions,
-avoiding a second hard-coded runtime description. The heading head predicts a
-two-vector from restricted student information, normalizes it to a unit
-direction, and appends that predicted direction—not the oracle target—to the
-motor MLP. This is continuous across the `-pi/+pi` boundary. At an exactly
-reached active waypoint, where direction is undefined, the target
-deterministically falls back to body-forward until the waypoint transition is
-applied.
-
-Every online transition follows one ownership rule: construct teacher and
-student inputs from the same current state, obtain the frozen teacher mean as a
-label, obtain the student action, store the pair, and step physics only with the
-student action. Consequently, `last_action` is the previously executed student
-action and training data comes from student-visited states. The initial losses
-are action Smooth L1/Huber (`1.0`), heading cosine direction (`0.2`), and raw
-heading-vector unit-norm regularization (`0.01`). The teacher is in evaluation
-mode, label generation runs under inference mode, and only student parameters
-enter the optimizer.
-
-This stage does not render cameras, encode depth, or claim that the zero feature
-is deployable perception. It establishes and tests the information barrier and
-student-driven training semantics. The terrain-latent contract is fixed at 32
-values and stored with the student model; both the privileged scan encoder and
-future depth encoder must produce that width. A new student starts from the
-exact `actor.motor` weights in the selected teacher checkpoint before online
-updates begin. Teacher and student still emit the same 12 action values, which
-use the same scale, default-position offset, controller, and 50 Hz rate.
-
-Runs are stored beneath `logs/distillation/parkour_lab/`. Each run records the
-teacher checkpoint identity, runtime group dimensions and student group order,
-resolved environment and teacher configuration, JSONL losses, pre-update
-teacher/student action L2 disagreement, and student-only checkpoints. The run
-configuration labels the current mode as
-`zero_exteroception_pipeline_smoke_test`. A resumed student is accepted when
-its serialization version, model configuration, exact teacher checkpoint, and
-teacher interface match. The runtime teacher interface is validated separately
-before the checkpoint is loaded.
+The perception student and its online distillation entry point are intentionally
+deferred. They will be added with the real recurrent depth encoder and
+student-driven data collection stage; the repository does not expose a
+zero-information placeholder policy or a smoke-test checkpoint format.
 
 ## Evaluation best practice
 
