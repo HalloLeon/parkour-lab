@@ -356,6 +356,7 @@ class RegularizedPPO(PPO):
         mean_adaptation_loss = 0.0
         mean_entropy = 0.0
         mean_privileged_regularization_loss = 0.0
+        stable_gradient_clip_fallbacks = 0
         mean_surrogate_loss = 0.0
         mean_value_loss = 0.0
         behavior_actor = None
@@ -484,7 +485,7 @@ class RegularizedPPO(PPO):
 
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            self._clip_gradients()
+            stable_gradient_clip_fallbacks += int(self._clip_gradients())
             self.optimizer.step()
             self.policy.enforce_action_std_bounds_()
 
@@ -507,6 +508,9 @@ class RegularizedPPO(PPO):
             "privileged_regularization": mean_privileged_regularization_loss
             / num_updates,
             "privileged_regularization_coefficient": regularization_coef,
+            "stable_gradient_clip_fallback_fraction": (
+                stable_gradient_clip_fallbacks / num_updates
+            ),
             "surrogate": mean_surrogate_loss / num_updates,
             "value_function": mean_value_loss / num_updates,
         }
@@ -589,8 +593,12 @@ class RegularizedPPO(PPO):
         ).mean()
         return surrogate_loss, value_loss
 
-    def _clip_gradients(self) -> None:
-        """Clip finite gradients and identify the originating parameters on failure."""
+    def _clip_gradients(self) -> bool:
+        """Clip gradients, using a scale-normalized norm after float32 overflow.
+
+        Returns ``True`` only when the numerically stable fallback was needed.
+        Non-finite gradient elements remain fatal.
+        """
 
         try:
             torch.nn.utils.clip_grad_norm_(
@@ -601,20 +609,54 @@ class RegularizedPPO(PPO):
         except RuntimeError as error:
             if "non-finite" not in str(error):
                 raise
-            offenders = [
-                name
+            named_gradients = [
+                (name, parameter.grad)
                 for name, parameter in self.policy.named_parameters()
                 if parameter.grad is not None
-                and not torch.isfinite(parameter.grad).all()
             ]
-            detail = (
-                ", ".join(offenders[:8])
-                if offenders
-                else "all individual gradient elements were finite; their aggregate norm overflowed"
+            offenders = [
+                name
+                for name, gradient in named_gradients
+                if not torch.isfinite(gradient).all()
+            ]
+            if offenders:
+                raise FloatingPointError(
+                    "RegularizedPPO produced non-finite gradients after a finite loss: "
+                    f"{', '.join(offenders[:8])}."
+                ) from error
+            self._clip_finite_gradients_with_stable_norm(
+                [gradient for _, gradient in named_gradients]
             )
-            raise FloatingPointError(
-                f"RegularizedPPO produced non-finite gradients after a finite loss: {detail}."
-            ) from error
+            return True
+        return False
+
+    @torch.no_grad()
+    def _clip_finite_gradients_with_stable_norm(
+        self,
+        gradients: list[torch.Tensor],
+    ) -> None:
+        """Clip large finite gradients without overflowing their float32 L2 norm."""
+
+        max_abs = torch.stack(
+            [
+                gradient.detach().abs().max().to(dtype=torch.float64)
+                for gradient in gradients
+            ]
+        ).max()
+        if max_abs <= 0.0:
+            return
+
+        # Normalize first so squaring cannot overflow. Multiplying the normalized
+        # tensors by max_grad_norm / ||g / max_abs|| is algebraically equivalent
+        # to ordinary global L2 clipping, without forming the overflowing norm.
+        for gradient in gradients:
+            gradient.div_(max_abs.to(device=gradient.device, dtype=gradient.dtype))
+        scaled_squared_norm = torch.stack(
+            [gradient.square().sum(dtype=torch.float64) for gradient in gradients]
+        ).sum()
+        scale = self.max_grad_norm / torch.sqrt(scaled_squared_norm)
+        for gradient in gradients:
+            gradient.mul_(scale.to(device=gradient.device, dtype=gradient.dtype))
 
     def _regularization_coefficient(self, update_count: int) -> float:
         """Return the warmup-and-ramp coefficient for privileged ROA."""
