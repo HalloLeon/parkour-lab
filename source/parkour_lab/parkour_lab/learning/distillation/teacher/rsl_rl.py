@@ -484,11 +484,7 @@ class RegularizedPPO(PPO):
 
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                self.policy.parameters(),
-                self.max_grad_norm,
-                error_if_nonfinite=True,
-            )
+            self._clip_gradients()
             self.optimizer.step()
             self.policy.enforce_action_std_bounds_()
 
@@ -566,14 +562,19 @@ class RegularizedPPO(PPO):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the clipped policy-surrogate and value-function losses."""
 
-        ratio = torch.exp(actions_log_prob - torch.squeeze(old_actions_log_prob))
-        surrogate = -torch.squeeze(advantages) * ratio
-        surrogate_clipped = -torch.squeeze(advantages) * torch.clamp(
-            ratio,
-            1.0 - self.clip_param,
-            1.0 + self.clip_param,
+        advantages = torch.squeeze(advantages)
+        log_ratio = actions_log_prob - torch.squeeze(old_actions_log_prob)
+        # This is algebraically identical to max(-A*r, -A*clip(r)), but it
+        # applies the active PPO bound before exponentiation. The conventional
+        # expression can evaluate exp(log_ratio)=inf on a branch that clipping
+        # subsequently discards; autograd then produces a hidden 0*inf NaN even
+        # though the scalar loss is finite.
+        effective_log_ratio = torch.where(
+            advantages >= 0.0,
+            log_ratio.clamp_max(math.log1p(self.clip_param)),
+            log_ratio.clamp_min(math.log1p(-self.clip_param)),
         )
-        surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+        surrogate_loss = (-advantages * torch.exp(effective_log_ratio)).mean()
 
         if not self.use_clipped_value_loss:
             return surrogate_loss, torch.square(returns - values).mean()
@@ -587,6 +588,33 @@ class RegularizedPPO(PPO):
             torch.square(values_clipped - returns),
         ).mean()
         return surrogate_loss, value_loss
+
+    def _clip_gradients(self) -> None:
+        """Clip finite gradients and identify the originating parameters on failure."""
+
+        try:
+            torch.nn.utils.clip_grad_norm_(
+                self.policy.parameters(),
+                self.max_grad_norm,
+                error_if_nonfinite=True,
+            )
+        except RuntimeError as error:
+            if "non-finite" not in str(error):
+                raise
+            offenders = [
+                name
+                for name, parameter in self.policy.named_parameters()
+                if parameter.grad is not None
+                and not torch.isfinite(parameter.grad).all()
+            ]
+            detail = (
+                ", ".join(offenders[:8])
+                if offenders
+                else "all individual gradient elements were finite; their aggregate norm overflowed"
+            )
+            raise FloatingPointError(
+                f"RegularizedPPO produced non-finite gradients after a finite loss: {detail}."
+            ) from error
 
     def _regularization_coefficient(self, update_count: int) -> float:
         """Return the warmup-and-ramp coefficient for privileged ROA."""
