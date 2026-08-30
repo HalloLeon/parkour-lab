@@ -77,8 +77,8 @@ class RouteState:
     ``course_indices`` retains the completed episode's course until reset, so
     curriculum progress is normalized against the right route. The two progress
     tensors distinguish the running maximum from the post-reset evaluation
-    snapshot. ``previous_root_xy`` bridges manager ordering for plane crossings;
-    the Boolean event tensors expose one-step retarget and completion events.
+    snapshot. The Boolean event tensors expose one-step retarget and completion
+    events.
     """
 
     # Selected course and active cursor. The selected course determines the
@@ -89,18 +89,13 @@ class RouteState:
     # [environment]: index of the waypoint currently targeted in that course.
     active_waypoint_indices: torch.Tensor
 
-    # Episode command sampled independently of the selected course.
-    # [environment]: desired forward speed sampled at reset and held constant
-    # for the complete episode.
-    target_speeds: torch.Tensor
-
-    # Cross-step crossing and progress history.
-    # [environment, xy]: root position from the preceding route update, used
-    # with the current position to detect genuine waypoint-plane crossings.
-    previous_root_xy: torch.Tensor
+    # Progress and terminal-stability history.
     # [environment]: furthest safe route-projected distance reached in the
     # current episode; monotonic and not advanced during chassis contact.
     maximum_progress_m: torch.Tensor
+    # [environment]: uninterrupted time satisfying the terminal-landing support
+    # and whole-body stability gate. Non-terminal targets keep this at zero.
+    terminal_landing_stable_time_s: torch.Tensor
 
     # Completed-episode evaluation snapshot.
     # [environment]: previous value of ``maximum_progress_m``, copied during
@@ -112,7 +107,7 @@ class RouteState:
     # use it for milestone credit and to ignore the retargeting distance jump.
     waypoint_changed: torch.Tensor
     # [environment]: true on the step that the final waypoint passes all
-    # support, clearance, tilt, contact, and vertical-speed completion gates.
+    # configured support, clearance, contact, pose, and motion-stability gates.
     course_completed: torch.Tensor
 
 
@@ -132,17 +127,11 @@ def _ensure_parkour_runtime(
     curriculum_cfg: ParkourCurriculumCfg,
     *,
     dtype: torch.dtype,
-    initial_target_speed: float,
 ) -> ParkourRuntime:
-    """Build the grouped runtime once and rebuild it only for a stale layout."""
+    """Build the environment-owned navigation runtime on first use."""
 
     runtime = _parkour_runtime_or_none(env)
-    if runtime is not None and _runtime_matches(
-        runtime,
-        env,
-        curriculum_cfg,
-        dtype=dtype,
-    ):
+    if runtime is not None:
         return runtime
 
     courses = _build_course_tables(
@@ -153,7 +142,6 @@ def _ensure_parkour_runtime(
     route = _build_route_state(
         env,
         dtype=dtype,
-        initial_target_speed=initial_target_speed,
     )
     runtime = ParkourRuntime(courses=courses, route=route)
 
@@ -193,9 +181,13 @@ def _build_course_tables(
     import torch
 
     courses = curriculum_cfg.courses
-    routes = tuple(tuple(waypoint.position for waypoint in course.waypoints) for course in courses)
+    routes = tuple(
+        tuple(waypoint.position for waypoint in course.waypoints) for course in courses
+    )
     max_waypoints = max(len(route) for route in routes)
-    max_support_vertices = max(len(region.vertices) for course in courses for region in course.support_regions)
+    max_support_vertices = max(
+        len(region.vertices) for course in courses for region in course.support_regions
+    )
 
     cumulative_distances_m = torch.zeros(
         (len(routes), max_waypoints),
@@ -257,7 +249,7 @@ def _build_course_tables(
                 (
                     waypoint.root_reach_radius
                     if waypoint.root_reach_radius is not None
-                    else curriculum_cfg.waypoint_reach_threshold
+                    else curriculum_cfg.waypoint_reach_radius_m
                 )
                 for waypoint in course.waypoints
             ],
@@ -271,9 +263,13 @@ def _build_course_tables(
             device=env.device,
             dtype=torch.bool,
         )
-        terminal_landing_masks[course_index, waypoint_count:] = course.waypoints[-1].is_terminal_landing
+        terminal_landing_masks[course_index, waypoint_count:] = course.waypoints[
+            -1
+        ].is_terminal_landing
 
-        rewarded_milestones = tuple(waypoint.is_rewarded_milestone for waypoint in course.waypoints[:-1])
+        rewarded_milestones = tuple(
+            waypoint.is_rewarded_milestone for waypoint in course.waypoints[:-1]
+        )
         rewarded_milestone_count = sum(rewarded_milestones)
         if rewarded_milestone_count > 0:
             milestone_reward_fractions[
@@ -349,7 +345,6 @@ def _build_route_state(
     env: ManagerBasedRLEnv,
     *,
     dtype: torch.dtype,
-    initial_target_speed: float,
 ) -> RouteState:
     """Allocate fresh mutable route state for every environment."""
 
@@ -368,18 +363,8 @@ def _build_route_state(
     return RouteState(
         course_indices=integer_zeros,
         active_waypoint_indices=integer_zeros.clone(),
-        target_speeds=torch.full(
-            (env.num_envs,),
-            initial_target_speed,
-            device=env.device,
-            dtype=dtype,
-        ),
-        previous_root_xy=torch.zeros(
-            (env.num_envs, 2),
-            device=env.device,
-            dtype=dtype,
-        ),
         maximum_progress_m=floating_zeros,
+        terminal_landing_stable_time_s=floating_zeros.clone(),
         previous_episode_maximum_progress_m=floating_zeros.clone(),
         waypoint_changed=torch.zeros(
             env.num_envs,
@@ -391,59 +376,4 @@ def _build_route_state(
             device=env.device,
             dtype=torch.bool,
         ),
-    )
-
-
-# Runtime validation.
-
-
-def _runtime_matches(
-    runtime: ParkourRuntime,
-    env: ManagerBasedRLEnv,
-    curriculum_cfg: ParkourCurriculumCfg,
-    *,
-    dtype: torch.dtype,
-) -> bool:
-    """Return whether an existing runtime has the requested tensor layout."""
-
-    import torch
-
-    courses = runtime.courses
-    route = runtime.route
-    device = torch.device(env.device)
-    waypoint_changed = getattr(route, "waypoint_changed", None)
-    course_completed = getattr(route, "course_completed", None)
-    target_speeds = getattr(route, "target_speeds", None)
-    root_reach_radii = getattr(courses, "root_reach_radii", None)
-    terminal_landing_masks = getattr(courses, "terminal_landing_masks", None)
-    return (
-        courses.num_difficulties == curriculum_cfg.num_difficulties
-        and courses.waypoints.shape[0] == len(curriculum_cfg.courses)
-        and courses.waypoints.device == device
-        and courses.waypoints.dtype == dtype
-        and isinstance(root_reach_radii, torch.Tensor)
-        and root_reach_radii.shape == courses.waypoints.shape[:2]
-        and root_reach_radii.device == device
-        and root_reach_radii.dtype == dtype
-        and isinstance(terminal_landing_masks, torch.Tensor)
-        and terminal_landing_masks.shape == courses.waypoints.shape[:2]
-        and terminal_landing_masks.device == device
-        and terminal_landing_masks.dtype == torch.bool
-        and route.course_indices.shape == (env.num_envs,)
-        and route.course_indices.device == device
-        and isinstance(target_speeds, torch.Tensor)
-        and target_speeds.shape == (env.num_envs,)
-        and target_speeds.device == device
-        and target_speeds.dtype == dtype
-        and route.previous_root_xy.shape == (env.num_envs, 2)
-        and route.previous_root_xy.device == device
-        and route.previous_root_xy.dtype == dtype
-        and isinstance(waypoint_changed, torch.Tensor)
-        and waypoint_changed.shape == (env.num_envs,)
-        and waypoint_changed.device == device
-        and waypoint_changed.dtype == torch.bool
-        and isinstance(course_completed, torch.Tensor)
-        and course_completed.shape == (env.num_envs,)
-        and course_completed.device == device
-        and course_completed.dtype == torch.bool
     )

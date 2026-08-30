@@ -3,7 +3,9 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
 from .._shared.robot import _root_forward_xy_w, _root_lin_vel_xy, _root_pos_env
-from .route import active_waypoint_positions
+from .route import active_waypoint_positions, final_waypoint_positions
+
+# Active-waypoint geometry.
 
 
 def _active_waypoint_direction_xy(
@@ -33,41 +35,12 @@ def _active_waypoint_direction_yaw_xy(
 ) -> torch.Tensor:
     """Return active-waypoint direction in the robot's yaw-aligned XY frame."""
 
-    forward_direction_w = _root_forward_xy_w(env, asset_cfg)
-    forward_norm = torch.linalg.norm(forward_direction_w, dim=-1, keepdim=True)
-    fallback_forward_w = torch.zeros_like(forward_direction_w)
-    fallback_forward_w[:, 0] = 1.0
-    forward_direction_w = torch.where(
-        forward_norm > 1.0e-6,
-        forward_direction_w / forward_norm,
-        fallback_forward_w,
-    )
-    waypoint_vector_w = _active_waypoint_vector_xy(
+    direction, _ = _world_vector_to_yaw_direction_xy(
         env,
-        waypoint_marker_cfg,
+        _active_waypoint_vector_xy(env, waypoint_marker_cfg, asset_cfg),
         asset_cfg,
     )
-    waypoint_distance = torch.linalg.norm(
-        waypoint_vector_w,
-        dim=-1,
-        keepdim=True,
-    )
-    waypoint_direction_w = torch.where(
-        waypoint_distance > 1.0e-6,
-        waypoint_vector_w / waypoint_distance,
-        forward_direction_w,
-    )
-    left_direction_w = torch.stack(
-        (-forward_direction_w[:, 1], forward_direction_w[:, 0]),
-        dim=-1,
-    )
-    return torch.stack(
-        (
-            torch.sum(waypoint_direction_w * forward_direction_w, dim=-1),
-            torch.sum(waypoint_direction_w * left_direction_w, dim=-1),
-        ),
-        dim=-1,
-    )
+    return direction
 
 
 def _active_waypoint_distance_xy(
@@ -143,29 +116,6 @@ def _heading_error_to_active_waypoint_xy(
     return torch.acos(cosine)
 
 
-def _lateral_drift_to_active_waypoint_xy(
-    env: ManagerBasedRLEnv,
-    *,
-    root_delta_xy: torch.Tensor,
-    waypoint_marker_cfg: SceneEntityCfg,
-    asset_cfg: SceneEntityCfg,
-) -> torch.Tensor:
-    """Return root displacement perpendicular to active-waypoint direction."""
-
-    waypoint_direction_xy = _active_waypoint_direction_xy(
-        env,
-        waypoint_marker_cfg=waypoint_marker_cfg,
-        asset_cfg=asset_cfg,
-    )
-    forward_delta = torch.sum(
-        root_delta_xy * waypoint_direction_xy,
-        dim=-1,
-        keepdim=True,
-    )
-    lateral_delta_xy = root_delta_xy - forward_delta * waypoint_direction_xy
-    return torch.linalg.norm(lateral_delta_xy, dim=-1)
-
-
 def _velocity_along_active_waypoint_xy(
     env: ManagerBasedRLEnv,
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
@@ -180,3 +130,68 @@ def _velocity_along_active_waypoint_xy(
     )
     root_velocity_xy = _root_lin_vel_xy(env, asset_cfg)
     return torch.sum(root_velocity_xy * waypoint_direction_xy, dim=-1)
+
+
+# Reference-direction geometry.
+
+
+def _final_waypoint_direction_yaw_xy_components(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return final-goal yaw direction and a non-zero-distance validity mask."""
+
+    root_xy = _root_pos_env(env, asset_cfg)[:, :2]
+    final_vector_w = final_waypoint_positions(env)[:, :2] - root_xy
+    return _world_vector_to_yaw_direction_xy(env, final_vector_w, asset_cfg)
+
+
+def _world_vector_to_yaw_direction_xy(
+    env: ManagerBasedRLEnv,
+    vector_w: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Normalize a world XY vector and express it as yaw-frame forward/left."""
+
+    forward_direction_w = _root_forward_xy_w(env, asset_cfg)
+    forward_norm = torch.linalg.norm(forward_direction_w, dim=-1, keepdim=True)
+    fallback_forward_w = torch.zeros_like(forward_direction_w)
+    fallback_forward_w[:, 0] = 1.0
+    safe_forward_norm = torch.where(
+        forward_norm > 1.0e-6, forward_norm, torch.ones_like(forward_norm)
+    )
+    forward_direction_w = torch.where(
+        forward_norm > 1.0e-6,
+        forward_direction_w / safe_forward_norm,
+        fallback_forward_w,
+    )
+    vector_distance = torch.linalg.norm(
+        vector_w,
+        dim=-1,
+        keepdim=True,
+    )
+    valid = vector_distance[:, 0] > 1.0e-6
+    safe_vector_distance = torch.where(
+        vector_distance > 1.0e-6,
+        vector_distance,
+        torch.ones_like(vector_distance),
+    )
+    direction_w = torch.where(
+        valid[:, None],
+        vector_w / safe_vector_distance,
+        forward_direction_w,
+    )
+    left_direction_w = torch.stack(
+        (-forward_direction_w[:, 1], forward_direction_w[:, 0]),
+        dim=-1,
+    )
+    return (
+        torch.stack(
+            (
+                torch.sum(direction_w * forward_direction_w, dim=-1),
+                torch.sum(direction_w * left_direction_w, dim=-1),
+            ),
+            dim=-1,
+        ),
+        valid,
+    )

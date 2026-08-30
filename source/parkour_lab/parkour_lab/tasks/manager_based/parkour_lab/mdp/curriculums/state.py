@@ -82,7 +82,10 @@ class ParkourCurriculumState:
         return {
             "version": _CHECKPOINT_VERSION,
             "family_names": tuple(cfg.family_names),
-            **{field.name: getattr(self, field.name).detach().cpu().clone() for field in fields(self)},
+            **{
+                field.name: getattr(self, field.name).detach().cpu().clone()
+                for field in fields(self)
+            },
         }
 
     def load_state_dict(
@@ -95,16 +98,22 @@ class ParkourCurriculumState:
         import torch
 
         if state.get("version") != _CHECKPOINT_VERSION:
-            raise ValueError(f"Unsupported parkour curriculum state version: {state.get('version')!r}.")
+            raise ValueError(
+                f"Unsupported parkour curriculum state version: {state.get('version')!r}."
+            )
         if tuple(state.get("family_names", ())) != tuple(cfg.family_names):
-            raise ValueError("Checkpoint and environment use different parkour families.")
+            raise ValueError(
+                "Checkpoint and environment use different parkour families."
+            )
 
         tensors: dict[str, torch.Tensor] = {}
         for field in fields(self):
             saved = state.get(field.name)
             target = getattr(self, field.name)
             if not isinstance(saved, torch.Tensor):
-                raise TypeError(f"Checkpoint curriculum state {field.name!r} is not a tensor.")
+                raise TypeError(
+                    f"Checkpoint curriculum state {field.name!r} is not a tensor."
+                )
             if saved.shape != target.shape or saved.dtype != target.dtype:
                 raise ValueError(
                     f"Checkpoint curriculum state {field.name!r} has shape/dtype "
@@ -114,9 +123,13 @@ class ParkourCurriculumState:
 
         frontiers = tensors["frontier_levels"]
         if torch.any((frontiers < -1) | (frontiers > cfg.max_level)):
-            raise ValueError(f"Checkpoint curriculum frontiers must be between -1 and {cfg.max_level}.")
+            raise ValueError(
+                f"Checkpoint curriculum frontiers must be between -1 and {cfg.max_level}."
+            )
         if torch.any(tensors["demotion_grace_episodes_remaining"] < 0):
-            raise ValueError("Checkpoint curriculum grace counters must be non-negative.")
+            raise ValueError(
+                "Checkpoint curriculum grace counters must be non-negative."
+            )
 
         for name, saved in tensors.items():
             target = getattr(self, name)

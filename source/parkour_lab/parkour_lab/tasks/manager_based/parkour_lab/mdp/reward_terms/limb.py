@@ -54,7 +54,9 @@ def feet_stumble(
         [num_envs]
     """
 
-    contact_forces = contact._selected_contact_forces_w_history(env, sensor_cfg=sensor_cfg)
+    contact_forces = contact._selected_contact_forces_w_history(
+        env, sensor_cfg=sensor_cfg
+    )
 
     lateral_force = torch.linalg.norm(contact_forces[..., :2], dim=-1)
     vertical_force = torch.abs(contact_forces[..., 2])
@@ -69,7 +71,9 @@ def feet_stumble(
     return torch.any(stumble, dim=(1, 2)).float()
 
 
-def joint_deviation_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+def joint_deviation_l2(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
     """
     Penalize selected joints deviating from their default pose.
 

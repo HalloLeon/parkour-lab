@@ -1,3 +1,5 @@
+import math
+
 from isaaclab.utils import configclass
 
 # ==================== OBSERVATION CONFIGURATIONS ====================
@@ -22,11 +24,16 @@ class HeightScanObservationCfg:
     """Symmetric metric clipping bound in metres, also used as the fixed normalization divisor."""
 
     def __post_init__(self) -> None:
-        if self.num_rays <= 0:
-            raise ValueError("num_rays must be positive.")
-
-        if self.clip <= 0.0:
-            raise ValueError("clip must be positive.")
+        if (
+            isinstance(self.num_rays, bool)
+            or not isinstance(self.num_rays, int)
+            or self.num_rays <= 0
+        ):
+            raise ValueError("num_rays must be a positive integer.")
+        if not math.isfinite(self.vertical_offset):
+            raise ValueError("vertical_offset must be finite.")
+        if not math.isfinite(self.clip) or self.clip <= 0.0:
+            raise ValueError("clip must be finite and positive.")
 
 
 DEFAULT_HEIGHT_SCAN_OBSERVATION = HeightScanObservationCfg()

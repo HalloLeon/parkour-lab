@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import torch
 from isaaclab.assets import Articulation
@@ -20,6 +20,9 @@ from isaaclab.managers.action_manager import ActionTerm
 from isaaclab.utils import configclass
 from isaaclab.utils.buffers import DelayBuffer
 from isaaclab.utils.modifiers import ModifierBase, ModifierCfg
+
+if TYPE_CHECKING:
+    from isaaclab.envs.utils.io_descriptors import GenericActionIODescriptor
 
 ##
 # Configuration
@@ -81,7 +84,7 @@ class DomainRandomizationCfg:
 
 
 class DelayedJointPositionAction(JointPositionAction):
-    """Joint-position action with a per-environment control-step delay."""
+    """Delayed joint-position action bounded by the robot's safe soft limits."""
 
     cfg: DelayedJointPositionActionCfg
 
@@ -91,16 +94,46 @@ class DelayedJointPositionAction(JointPositionAction):
         env: ManagerBasedEnv,
     ) -> None:
         super().__init__(cfg, env)
+        self._safe_target_limits = _safe_joint_position_target_limits(
+            self._asset.data.soft_joint_pos_limits[:, self._joint_ids],
+            cfg.soft_joint_limit_margin_rad,
+        )
+        default_positions = self._asset.data.default_joint_pos[:, self._joint_ids]
+        if torch.any(
+            (default_positions < self._safe_target_limits[:, 0])
+            | (default_positions > self._safe_target_limits[:, 1])
+        ):
+            raise ValueError(
+                "The joint-limit margin excludes a default joint position."
+            )
         self._delay_buffer = DelayBuffer(
             history_length=cfg.max_delay_steps,
             batch_size=self.num_envs,
             device=self.device,
         )
 
+    @property
+    def IO_descriptor(self) -> GenericActionIODescriptor:
+        """Describe the exact processed-target clamp used by this action term."""
+
+        descriptor = super().IO_descriptor
+        descriptor.clip = self._safe_target_limits.detach().cpu().tolist()
+        descriptor.extras = {
+            **descriptor.extras,
+            "clip_semantics": "processed_joint_position_target_rad",
+            "clip_source": "soft_joint_pos_limits_intersection",
+            "soft_joint_limit_margin_rad": self.cfg.soft_joint_limit_margin_rad,
+        }
+        return descriptor
+
     def process_actions(self, actions: torch.Tensor) -> None:
-        """Delay raw policy actions before the normal affine transformation."""
+        """Delay, transform, then clamp targets before they reach the actuator."""
 
         super().process_actions(self._delay_buffer.compute(actions))
+        self._processed_actions.clamp_(
+            min=self._safe_target_limits[:, 0],
+            max=self._safe_target_limits[:, 1],
+        )
 
     def reset(self, env_ids: Sequence[int] | slice | None = None) -> None:
         """Clear selected histories and sample their next episode delays."""
@@ -152,18 +185,18 @@ class ProprioceptionDelay(ModifierBase):
         self._delay_buffer.reset(batch_ids=batch_ids)
 
 
-class RecordPrivilegedDynamics(ManagerTermBase):
-    """Record the actual persistent dynamics randomized for each environment."""
+class PrivilegedDynamicsRecorder(ManagerTermBase):
+    """Cache actual persistent dynamics after startup randomization."""
 
     def __init__(self, cfg: EventTermCfg, env: ManagerBasedEnv) -> None:
         super().__init__(cfg, env)
-        self.asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
-        self.asset: Articulation = env.scene[self.asset_cfg.name]
-        joint_ids = self.asset_cfg.joint_ids
+        asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self._asset: Articulation = env.scene[asset_cfg.name]
+        joint_ids = asset_cfg.joint_ids
         joint_names = (
-            self.asset.joint_names[joint_ids]
+            self._asset.joint_names[joint_ids]
             if isinstance(joint_ids, slice)
-            else [self.asset.joint_names[index] for index in joint_ids]
+            else [self._asset.joint_names[index] for index in joint_ids]
         )
         self.component_names = privileged_dynamics_component_names(joint_names)
 
@@ -177,33 +210,34 @@ class RecordPrivilegedDynamics(ManagerTermBase):
 
     def __call__(
         self,
-        env: ManagerBasedEnv,
-        env_ids: torch.Tensor | None,
+        _env: ManagerBasedEnv,
+        _env_ids: torch.Tensor | None,
         asset_cfg: SceneEntityCfg,
     ) -> None:
         """Read actual simulator properties after startup randomization."""
 
-        del env, env_ids, asset_cfg
-        body_ids = self.asset_cfg.body_ids
-        joint_ids = self.asset_cfg.joint_ids
+        body_ids = asset_cfg.body_ids
+        joint_ids = asset_cfg.joint_ids
 
         # N: environments, B: selected bodies (B=1), S: collision shapes,
         # J: selected joints.
         # Post-randomization PhysX masses and nominal asset masses: (N, B).
-        masses = self.asset.root_physx_view.get_masses()[:, body_ids]
-        default_masses = self.asset.data.default_mass[:, body_ids]
+        masses = self._asset.root_physx_view.get_masses()[:, body_ids]
+        default_masses = self._asset.data.default_mass[:, body_ids]
         # Relative change from nominal (zero means unchanged): (N, B).
         mass_ratio = (
             masses.to(self.values) / default_masses.to(self.values).clamp_min(1.0e-6)
             - 1.0
         )
         # Post-randomization local COM xyz: (N, B, 3).
-        centers_of_mass = self.asset.root_physx_view.get_coms()[:, body_ids, :3].to(
+        centers_of_mass = self._asset.root_physx_view.get_coms()[:, body_ids, :3].to(
             self.values
         )
         # Per-shape (static friction, dynamic friction, restitution): (N, S, 3).
         # Mean across shapes: (N, 3).
-        materials = self.asset.root_physx_view.get_material_properties().to(self.values)
+        materials = self._asset.root_physx_view.get_material_properties().to(
+            self.values
+        )
         mean_material = materials.mean(dim=1)
 
         # Explicit actuator models such as Unitree's DC motors keep their operative
@@ -211,20 +245,20 @@ class RecordPrivilegedDynamics(ManagerTermBase):
         # Assemble the current global gain tensors from those actuator-local
         # values so this vector records the gains that actually produce torque.
         # Full-robot operative gains: (N, number of robot joints).
-        stiffness = self.asset.data.default_joint_stiffness.clone()
-        damping = self.asset.data.default_joint_damping.clone()
-        for actuator in self.asset.actuators.values():
+        stiffness = self._asset.data.default_joint_stiffness.clone()
+        damping = self._asset.data.default_joint_damping.clone()
+        for actuator in self._asset.actuators.values():
             stiffness[:, actuator.joint_indices] = actuator.stiffness
             damping[:, actuator.joint_indices] = actuator.damping
 
         # Selected operative gains and relative changes from nominal: (N, J).
         stiffness = stiffness[:, joint_ids]
-        default_stiffness = self.asset.data.default_joint_stiffness[:, joint_ids]
+        default_stiffness = self._asset.data.default_joint_stiffness[:, joint_ids]
         stiffness_ratio = (stiffness / default_stiffness.clamp_min(1.0e-6) - 1.0).to(
             self.values
         )
         damping = damping[:, joint_ids]
-        default_damping = self.asset.data.default_joint_damping[:, joint_ids]
+        default_damping = self._asset.data.default_joint_damping[:, joint_ids]
         damping_ratio = (damping / default_damping.clamp_min(1.0e-6) - 1.0).to(
             self.values
         )
@@ -246,11 +280,12 @@ class RecordPrivilegedDynamics(ManagerTermBase):
 
 @configclass
 class DelayedJointPositionActionCfg(JointPositionActionCfg):
-    """Configuration for delayed joint-position actions."""
+    """Configuration for delayed, soft-limit-bounded joint-position actions."""
 
     class_type: type[ActionTerm] = DelayedJointPositionAction
     min_delay_steps: int = 0
     max_delay_steps: int = 0
+    soft_joint_limit_margin_rad: float = 0.05
 
 
 @configclass
@@ -267,13 +302,32 @@ class ProprioceptionDelayCfg(ModifierCfg):
 ##
 
 
-def privileged_dynamics(env: ManagerBasedEnv) -> torch.Tensor:
-    """Return the persistent randomized dynamics recorded at startup."""
+def _safe_joint_position_target_limits(
+    soft_limits: torch.Tensor,
+    margin_rad: float,
+) -> torch.Tensor:
+    """Return one exportable safe target interval per joint.
 
-    recorder = env.event_manager.get_term_cfg("record_privileged_dynamics").func
-    if not isinstance(recorder, RecordPrivilegedDynamics):
-        raise TypeError("record_privileged_dynamics must use RecordPrivilegedDynamics.")
-    return recorder.values.clone()
+    The intersection across environments keeps the action contract fixed even
+    if a simulator configuration supplies environment-specific soft limits.
+    """
+
+    if not math.isfinite(margin_rad) or margin_rad < 0.0:
+        raise ValueError("soft_joint_limit_margin_rad must be finite and non-negative.")
+    if soft_limits.ndim != 3 or soft_limits.shape[-1] != 2:
+        raise ValueError("soft joint limits must have shape [environment, joint, 2].")
+    limits = torch.stack(
+        (
+            torch.amax(soft_limits[..., 0], dim=0) + margin_rad,
+            torch.amin(soft_limits[..., 1], dim=0) - margin_rad,
+        ),
+        dim=-1,
+    )
+    if not torch.all(torch.isfinite(limits)) or torch.any(limits[:, 0] >= limits[:, 1]):
+        raise ValueError(
+            "Soft joint limits must remain finite and ordered after the margin."
+        )
+    return limits
 
 
 def privileged_dynamics_component_names(
@@ -348,8 +402,7 @@ __all__ = [
     "DomainRandomizationCfg",
     "ProprioceptionDelay",
     "ProprioceptionDelayCfg",
-    "RecordPrivilegedDynamics",
-    "privileged_dynamics",
+    "PrivilegedDynamicsRecorder",
     "privileged_dynamics_component_names",
     "scaled_delay",
     "scaled_range",

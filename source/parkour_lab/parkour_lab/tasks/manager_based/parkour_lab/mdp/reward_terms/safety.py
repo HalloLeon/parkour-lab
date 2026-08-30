@@ -10,7 +10,7 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 
-from ..commands import get_min_clearance
+from ..navigation import route
 from ..terrain import queries
 
 
@@ -47,7 +47,9 @@ def base_clearance_below_l2(
 
     clearance, clearance_valid = queries._base_clearance_components(env, asset_cfg)
 
-    min_clearance = get_min_clearance(env).to(device=clearance.device, dtype=clearance.dtype)
+    min_clearance = route.current_min_clearances(env, default=0.27).to(
+        device=clearance.device, dtype=clearance.dtype
+    )
 
     normalization = min_clearance.clamp_min(torch.finfo(clearance.dtype).eps)
     clearance_error = torch.clamp(

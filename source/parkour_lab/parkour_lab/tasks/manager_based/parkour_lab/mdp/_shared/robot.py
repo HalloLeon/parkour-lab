@@ -6,8 +6,12 @@ from isaaclab.utils.math import quat_apply
 
 from .contact import _require_body_ids
 
+# Root pose and orientation.
 
-def _root_forward_xy_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+
+def _root_forward_xy_w(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
+) -> torch.Tensor:
     """
     Robot root forward direction in world XY.
 
@@ -60,7 +64,9 @@ def _root_forward_xy_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = Scene
     #
     # clamp_min(1.0e-6) avoids division by zero if the horizontal projection is
     # extremely small, for example if the robot is nearly vertical.
-    return forward_xy / torch.linalg.norm(forward_xy, dim=-1, keepdim=True).clamp_min(1.0e-6)
+    return forward_xy / torch.linalg.norm(forward_xy, dim=-1, keepdim=True).clamp_min(
+        1.0e-6
+    )
 
 
 def _root_height_env(
@@ -75,39 +81,6 @@ def _root_height_env(
     """
 
     return _root_pos_env(env, asset_cfg)[:, 2]
-
-
-def _root_lin_vel_xy(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """
-    Robot root linear velocity in the world XY plane.
-
-    Returns:
-        [num_envs, 2]
-    """
-
-    asset: Articulation = env.scene[asset_cfg.name]
-
-    return asset.data.root_lin_vel_w[:, :2]
-
-
-def _root_lin_vel_z(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """
-    Robot root linear velocity in the world Z direction.
-
-
-    Returns:
-        [num_envs]
-    """
-
-    asset: Articulation = env.scene[asset_cfg.name]
-
-    return asset.data.root_lin_vel_w[:, 2]
 
 
 def _root_pos_env(
@@ -143,7 +116,68 @@ def _root_projected_gravity_xy(
     return asset.data.projected_gravity_b[:, :2]
 
 
-def _selected_body_pos_env(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+# Root velocities.
+
+
+def _root_ang_vel_z(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return world-frame root yaw rate for every environment."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.root_ang_vel_w[:, 2]
+
+
+def _root_ang_vel_xy(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return world-frame root roll/pitch angular velocity."""
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    return asset.data.root_ang_vel_w[:, :2]
+
+
+def _root_lin_vel_xy(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    Robot root linear velocity in the world XY plane.
+
+    Returns:
+        [num_envs, 2]
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    return asset.data.root_lin_vel_w[:, :2]
+
+
+def _root_lin_vel_z(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """
+    Robot root linear velocity in the world Z direction.
+
+
+    Returns:
+        [num_envs]
+    """
+
+    asset: Articulation = env.scene[asset_cfg.name]
+
+    return asset.data.root_lin_vel_w[:, 2]
+
+
+# Selected articulation state.
+
+
+def _selected_body_pos_env(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
     """Return selected body positions in each environment's local frame.
 
     Returns:
@@ -153,7 +187,9 @@ def _selected_body_pos_env(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) ->
     return _selected_body_pos_w(env, asset_cfg) - env.scene.env_origins[:, None, :]
 
 
-def _selected_body_pos_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+def _selected_body_pos_w(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
     """Return selected body positions in world frame.
 
     Returns:
@@ -166,7 +202,9 @@ def _selected_body_pos_w(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> t
     return asset.data.body_pos_w[:, asset_cfg.body_ids, :]
 
 
-def _selected_joint_pos_error(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+def _selected_joint_pos_error(
+    env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg
+) -> torch.Tensor:
     """
     Position error of selected joints relative to their default joint positions.
 

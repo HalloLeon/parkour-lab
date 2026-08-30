@@ -1,16 +1,18 @@
 import torch
 from isaaclab.assets import Articulation
-from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCaster
-from isaaclab.utils.math import quat_apply_inverse
 
 from . import config
 from ._shared import contact
-from .commands import get_target_speed
+from .commands import (
+    get_target_speed,
+    get_target_yaw_rate,
+)
+from .domain_randomization import PrivilegedDynamicsRecorder
 from .navigation import geometry, route
 from .terrain import queries
-
 
 # Robot state and course commands.
 
@@ -25,7 +27,7 @@ def base_clearance_obs(
         [num_envs, 1]
     """
 
-    return queries._base_clearance(env, asset_cfg).unsqueeze(-1)
+    return queries._base_clearance_components(env, asset_cfg)[0].unsqueeze(-1)
 
 
 def desired_speed_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -37,6 +39,12 @@ def desired_speed_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
     """
 
     return get_target_speed(env).unsqueeze(-1)
+
+
+def desired_yaw_rate_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return the signed in-place yaw-rate command in radians per second."""
+
+    return get_target_yaw_rate(env).unsqueeze(-1)
 
 
 def foot_contact_state(
@@ -65,64 +73,6 @@ def foot_contact_state(
 # Route state.
 
 
-def active_waypoint_direction_body_xy(
-    env: ManagerBasedRLEnv,
-    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """
-    Direction to the active waypoint in the robot body frame.
-
-    Returns:
-        [num_envs, 2]
-
-    Interpretation:
-        x component: waypoint is in front/behind robot
-        y component: waypoint is left/right of robot
-    """
-
-    asset: Articulation = env.scene[asset_cfg.name]
-
-    waypoint_vector_xy = geometry._active_waypoint_vector_xy(
-        env,
-        waypoint_marker_cfg,
-        asset_cfg,
-    )
-
-    waypoint_vector_w = torch.zeros(
-        (waypoint_vector_xy.shape[0], 3),
-        device=waypoint_vector_xy.device,
-        dtype=waypoint_vector_xy.dtype,
-    )
-    waypoint_vector_w[:, :2] = waypoint_vector_xy
-
-    # Rotate the world-frame waypoint vector into the robot body frame.
-    #
-    # If q is the robot root orientation, this applies the inverse rotation:
-    #
-    #     waypoint_vector_b = q^-1 * waypoint_vector_w * q
-    #
-    # This answers the question:
-    #
-    #     "Where is the waypoint relative to the robot's forward/left axes?"
-    #
-    # Examples:
-    #   robot yaw =   0 deg, waypoint world +x -> vector_b ≈ [ 1,  0, 0]
-    #   robot yaw =  90 deg, waypoint world +x -> vector_b ≈ [ 0, -1, 0]
-    #   robot yaw = 180 deg, waypoint world +x -> vector_b ≈ [-1,  0, 0]
-    waypoint_vector_b = quat_apply_inverse(
-        asset.data.root_quat_w,
-        waypoint_vector_w,
-    )
-    waypoint_direction_b_xy = waypoint_vector_b[:, :2]
-
-    return waypoint_direction_b_xy / torch.linalg.norm(
-        waypoint_direction_b_xy,
-        dim=-1,
-        keepdim=True,
-    ).clamp_min(1.0e-6)
-
-
 def active_waypoint_direction_yaw_xy(
     env: ManagerBasedRLEnv,
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
@@ -131,9 +81,8 @@ def active_waypoint_direction_yaw_xy(
     """
     Wrap-safe direction to the active waypoint in the robot's yaw-aligned frame.
 
-    The unit vector is ``[forward, left]``. It is training-only supervision
-    for the student's heading head and must never be concatenated into the
-    student policy input.
+    The unit vector is ``[forward, left]`` and supplies the privileged teacher's
+    oracle travel-direction input.
 
     Returns:
         [num_envs, 2]
@@ -178,31 +127,18 @@ def route_phase(env: ManagerBasedRLEnv) -> torch.Tensor:
     return route.route_phase(env)
 
 
-# Student exteroception boundary.
+# Privileged teacher observations.
 
 
-def student_exteroception_stub(
-    env: ManagerBasedRLEnv, feature_dim: int = 64
-) -> torch.Tensor:
-    """
-    Return an information-free placeholder for a future depth embedding.
+def recorded_privileged_dynamics(env: ManagerBasedEnv) -> torch.Tensor:
+    """Return the persistent randomized dynamics cached at startup."""
 
-    This configurable-width zero tensor establishes the student exteroception
-    API without exposing ray hits or other simulator geometry. It is suitable
-    only for testing the pipeline. The future depth encoder may deliberately
-    choose a different feature width, which will create a new student model
-    interface while leaving the action contract unchanged.
-
-    Returns:
-        [num_envs, feature_dim]
-    """
-
-    if feature_dim <= 0:
-        raise ValueError("feature_dim must be positive.")
-    return torch.zeros((env.num_envs, feature_dim), device=env.device)
-
-
-# Privileged terrain observations.
+    recorder = env.event_manager.get_term_cfg("record_privileged_dynamics").func
+    if not isinstance(recorder, PrivilegedDynamicsRecorder):
+        raise TypeError(
+            "record_privileged_dynamics must use PrivilegedDynamicsRecorder."
+        )
+    return recorder.values
 
 
 def terrain_height_scan(
@@ -211,81 +147,30 @@ def terrain_height_scan(
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """
-    Fixed-size privileged terrain-height scan for the Phase 1 teacher.
+    """Return one fixed-size privileged terrain scan for the Phase 1 teacher.
 
     The configured ray caster is required. Failing when it is absent prevents
     training a supposedly terrain-aware teacher on an accidental all-zero
-    terrain input. Heights are clipped in metres using ``obs_cfg.clip`` and
-    then divided by that fixed bound, producing values in ``[-1, 1]``.
-
-    A value of zero places the surface at ``root_z - vertical_offset``.
-    Negative values represent surfaces above that reference plane; positive
-    values represent surfaces below it. Missing hits use the deterministic
-    value ``+1``; consume :func:`terrain_height_scan_validity` alongside this
-    term to distinguish them from genuinely clipped-low surfaces.
+    terrain input. The first ``num_rays`` entries are normalized heights and
+    the remaining entries are their floating validity mask. Concatenating them
+    here reads and preprocesses the ray caster only once per observation.
 
     Returns:
-        Normalized heights with shape ``[num_envs, obs_cfg.num_rays]``.
+        Heights followed by validity with shape ``[num_envs, 2 * num_rays]``.
     """
-
-    heights, _ = _terrain_height_scan_components(
-        env,
-        obs_cfg=obs_cfg,
-        sensor_cfg=sensor_cfg,
-        asset_cfg=asset_cfg,
-    )
-    return heights
-
-
-def terrain_height_scan_validity(
-    env: ManagerBasedRLEnv,
-    obs_cfg: config.HeightScanObservationCfg = config.DEFAULT_HEIGHT_SCAN_OBSERVATION,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> torch.Tensor:
-    """Return a fixed-size floating mask identifying finite terrain-ray hits.
-
-    ``1`` denotes a valid surface hit and ``0`` denotes a missing or otherwise
-    non-finite hit. The mask has the same stable ray ordering as
-    :func:`terrain_height_scan`.
-
-    Returns:
-        Validity mask with shape ``[num_envs, obs_cfg.num_rays]``.
-    """
-
-    _, validity = _terrain_height_scan_components(
-        env,
-        obs_cfg=obs_cfg,
-        sensor_cfg=sensor_cfg,
-        asset_cfg=asset_cfg,
-    )
-    return validity
-
-
-# Private observation helpers.
-
-
-def _terrain_height_scan_components(
-    env: ManagerBasedRLEnv,
-    obs_cfg: config.HeightScanObservationCfg = config.DEFAULT_HEIGHT_SCAN_OBSERVATION,
-    sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Read and process the configured privileged terrain ray caster."""
 
     sensor = env.scene[sensor_cfg.name]
     asset: Articulation = env.scene[asset_cfg.name]
-
     if not isinstance(sensor, RayCaster):
         raise TypeError(
             f"Expected '{sensor_cfg.name}' to be a RayCaster, got {type(sensor).__name__}."
         )
 
-    return queries._terrain_height_components(
+    heights, validity = queries._terrain_height_components(
         asset.data.root_pos_w[:, 2],
         sensor.data.ray_hits_w,
         num_rays=obs_cfg.num_rays,
         vertical_offset=obs_cfg.vertical_offset,
         clip=obs_cfg.clip,
     )
+    return torch.cat((heights, validity), dim=-1)

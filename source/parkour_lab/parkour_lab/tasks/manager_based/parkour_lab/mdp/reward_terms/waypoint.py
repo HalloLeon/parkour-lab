@@ -5,14 +5,12 @@
 
 """Active-waypoint task rewards."""
 
-import math
-
 import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
 from .._shared import robot
-from ..commands import get_target_speed
+from ..commands import get_target_speed, get_target_yaw_rate
 from ..navigation import geometry, route
 
 _MAX_NORMALIZED_OVERSPEED = 4.0
@@ -55,7 +53,8 @@ def _obstacle_speed_cap(
         dtype=target_speed.dtype,
     )
     approach_allowance = torch.clamp(
-        (reach_radius + approach_allowance_distance_m - waypoint_distance) / approach_allowance_distance_m,
+        (reach_radius + approach_allowance_distance_m - waypoint_distance)
+        / approach_allowance_distance_m,
         min=0.0,
         max=1.0,
     )
@@ -109,12 +108,20 @@ def waypoint_heading_alignment_exp(
         device=velocity_along_waypoint.device,
         dtype=velocity_along_waypoint.dtype,
     )
+    moving = target_speed > 0.0
+    normalization_speed = torch.where(
+        moving, target_speed, torch.ones_like(target_speed)
+    )
     signed_progress = torch.clamp(
-        velocity_along_waypoint / target_speed.clamp_min(torch.finfo(target_speed.dtype).eps),
+        velocity_along_waypoint / normalization_speed,
         min=-1.0,
         max=1.0,
     )
-    reward = signed_progress * torch.exp(-torch.abs(heading_error))
+    reward = torch.where(
+        moving,
+        signed_progress * torch.exp(-torch.abs(heading_error)),
+        torch.zeros_like(signed_progress),
+    )
     return _mask_waypoint_change(env, reward)
 
 
@@ -150,13 +157,6 @@ def waypoint_velocity_tracking_exp(
         Tensor with shape ``(num_envs,)``.
     """
 
-    if not math.isfinite(std) or std <= 0.0:
-        raise ValueError("std must be finite and positive.")
-    if not math.isfinite(obstacle_speed_cap_multiplier) or obstacle_speed_cap_multiplier < 1.0:
-        raise ValueError("obstacle_speed_cap_multiplier must be finite and at least 1.0.")
-    if not math.isfinite(approach_allowance_distance_m) or approach_allowance_distance_m <= 0.0:
-        raise ValueError("approach_allowance_distance_m must be finite and positive.")
-
     waypoint_direction_xy = geometry._active_waypoint_direction_xy(
         env,
         waypoint_marker_cfg=waypoint_marker_cfg,
@@ -167,14 +167,21 @@ def waypoint_velocity_tracking_exp(
         root_velocity_xy * waypoint_direction_xy,
         dim=-1,
     )
-    lateral_velocity_xy = root_velocity_xy - velocity_along_waypoint.unsqueeze(-1) * waypoint_direction_xy
+    lateral_velocity_xy = (
+        root_velocity_xy - velocity_along_waypoint.unsqueeze(-1) * waypoint_direction_xy
+    )
 
     target_speed = get_target_speed(env).to(
         device=root_velocity_xy.device,
         dtype=root_velocity_xy.dtype,
     )
-    normalization_speed = target_speed.clamp_min(torch.finfo(target_speed.dtype).eps)
-    lateral_alignment = torch.exp(-torch.sum(lateral_velocity_xy.square(), dim=-1) / float(std) ** 2)
+    moving = target_speed > 0.0
+    normalization_speed = torch.where(
+        moving, target_speed, torch.ones_like(target_speed)
+    )
+    lateral_alignment = torch.exp(
+        -torch.sum(lateral_velocity_xy.square(), dim=-1) / float(std) ** 2
+    )
     obstacle_mask = route.active_difficulty_indices(env) > 0
     speed_cap = _obstacle_speed_cap(
         env,
@@ -194,11 +201,55 @@ def waypoint_velocity_tracking_exp(
         torch.relu(velocity_along_waypoint - speed_cap) / normalization_speed,
         max=_MAX_NORMALIZED_OVERSPEED,
     )
-    tracking = forward_fraction * lateral_alignment
+    tracking = torch.where(
+        moving,
+        forward_fraction * lateral_alignment - normalized_overspeed.square(),
+        torch.zeros_like(forward_fraction),
+    )
     return _mask_waypoint_change(
         env,
-        tracking - normalized_overspeed.square(),
+        tracking,
     )
+
+
+# Stop and route-envelope shaping.
+
+
+def route_cross_track_excess_l2(
+    env: ManagerBasedRLEnv,
+    soft_half_width_m: float,
+    hard_half_width_m: float,
+) -> torch.Tensor:
+    """Penalize only the moving distance outside the soft route envelope."""
+
+    error = route.route_cross_track_error_m(env)
+    bounded_error = torch.where(
+        torch.isfinite(error),
+        error.clamp_max(hard_half_width_m),
+        torch.full_like(error, soft_half_width_m),
+    )
+    excess = torch.relu(bounded_error - soft_half_width_m).square()
+    active = (get_target_speed(env) > 0.0) & torch.isfinite(error)
+    return torch.where(active, excess, torch.zeros_like(excess))
+
+
+def stationary_velocity_tracking_exp(
+    env: ManagerBasedRLEnv,
+    planar_speed_std: float = 0.15,
+    yaw_rate_std: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Track stationary or pivot velocity whenever translation is zero."""
+
+    planar_speed_sq = torch.sum(robot._root_lin_vel_xy(env, asset_cfg).square(), dim=-1)
+    yaw_rate_error_sq = (
+        robot._root_ang_vel_z(env, asset_cfg) - get_target_yaw_rate(env)
+    ).square()
+    score = torch.exp(-planar_speed_sq / planar_speed_std**2) * torch.exp(
+        -yaw_rate_error_sq / yaw_rate_std**2
+    )
+    nontranslating = get_target_speed(env).eq(0)
+    return torch.where(nontranslating, score, torch.zeros_like(score))
 
 
 # Sparse course events.

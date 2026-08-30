@@ -7,6 +7,7 @@ from isaaclab.managers import CurriculumTermCfg, ManagerTermBase, SceneEntityCfg
 from isaaclab.terrains import TerrainImporter
 
 from .._shared.runtime import _all_env_ids
+from ..commands import get_target_speed
 from ..navigation import route
 from . import config
 from .state import ParkourCurriculumState
@@ -76,6 +77,7 @@ class CurriculumBatch:
     # Mutually exclusive terminal outcomes.
     chassis_contact_failure: torch.Tensor
     fell_below_failure: torch.Tensor
+    off_route_failure: torch.Tensor
     other_failure: torch.Tensor
     success: torch.Tensor
     timeout_failure: torch.Tensor
@@ -142,55 +144,6 @@ class ParkourTerrainCurriculum(ManagerTermBase):
             population_env_ids,
             terrain_layout,
         )
-        population_frontiers = torch.where(
-            state.frontier_levels >= 0,
-            state.frontier_levels,
-            terrain.terrain_levels,
-        )
-
-        if env_ids.numel() == 0:
-            empty_bool = torch.empty(0, device=env.device, dtype=torch.bool)
-            return _curriculum_metrics(
-                population_frontiers,
-                terrain.terrain_levels,
-                population_family_indices,
-                CurriculumBatch(
-                    family_indices=torch.empty(
-                        0,
-                        device=env.device,
-                        dtype=torch.long,
-                    ),
-                    frontier_attempt=empty_bool,
-                    chassis_contact_failure=empty_bool,
-                    fell_below_failure=empty_bool,
-                    other_failure=empty_bool,
-                    stalled_failure=empty_bool,
-                    success=empty_bool,
-                    timeout_failure=empty_bool,
-                    frontier_change=torch.empty(
-                        0,
-                        device=env.device,
-                        dtype=torch.long,
-                    ),
-                    normalized_geometric_progress=torch.empty(
-                        0,
-                        device=env.device,
-                        dtype=torch.float32,
-                    ),
-                    normalized_waypoint_progress=torch.empty(
-                        0,
-                        device=env.device,
-                        dtype=torch.float32,
-                    ),
-                    target_speed=torch.empty(
-                        0,
-                        device=env.device,
-                        dtype=torch.float32,
-                    ),
-                ),
-                curriculum_cfg,
-            )
-
         attempted_levels = terrain.terrain_levels[env_ids].clone()
         attempted_family_indices = _family_indices_for_terrain_columns(
             env,
@@ -212,6 +165,7 @@ class ParkourTerrainCurriculum(ManagerTermBase):
             failure_event,
             chassis_contact_failure_event,
             fell_below_failure_event,
+            off_route_failure_event,
             timeout_failure_event,
             other_failure_event,
         ) = _terminal_event_masks(env, env_ids)
@@ -223,11 +177,14 @@ class ParkourTerrainCurriculum(ManagerTermBase):
             env,
             env_ids,
         )
-        target_speed = route.current_target_speeds(env)[env_ids].clone()
-        stalled_failure_event = _demotion_transition_mask(
-            normalized_waypoint_progress,
-            failure_event,
-            demotion_progress_fraction=curriculum_cfg.demotion_progress_fraction,
+        target_speed = get_target_speed(env)[env_ids].clone()
+        stalled_failure_event = (
+            _demotion_transition_mask(
+                normalized_waypoint_progress,
+                failure_event,
+                demotion_progress_fraction=curriculum_cfg.demotion_progress_fraction,
+            )
+            | off_route_failure_event
         )
         frontier_attempt = terminal_event & (attempted_levels == old_frontiers)
         updated_grace, demotion_eligible = _demotion_grace_transition(
@@ -269,10 +226,12 @@ class ParkourTerrainCurriculum(ManagerTermBase):
         changed_env_ids = env_ids[changed]
         state.success_history[changed_env_ids] = False
         state.stalled_history[changed_env_ids] = False
-        state.demotion_grace_episodes_remaining[env_ids[move_up]] = curriculum_cfg.post_promotion_grace_episodes
+        state.demotion_grace_episodes_remaining[env_ids[move_up]] = (
+            curriculum_cfg.post_promotion_grace_episodes
+        )
         state.demotion_grace_episodes_remaining[env_ids[move_down]] = 0
 
-        next_levels, _ = _sample_episode_levels(
+        next_levels = _sample_episode_levels(
             new_frontiers,
             state.demotion_grace_episodes_remaining[env_ids],
             changed,
@@ -280,7 +239,9 @@ class ParkourTerrainCurriculum(ManagerTermBase):
             bootstrap_replay_probability=curriculum_cfg.bootstrap_replay_probability,
             predecessor_replay_probability=curriculum_cfg.predecessor_replay_probability,
             ceiling_flat_replay_probability=curriculum_cfg.ceiling_flat_replay_probability,
-            ceiling_lower_obstacle_replay_probability=(curriculum_cfg.ceiling_lower_obstacle_replay_probability),
+            ceiling_lower_obstacle_replay_probability=(
+                curriculum_cfg.ceiling_lower_obstacle_replay_probability
+            ),
         )
         _set_terrain_levels(terrain, env_ids, next_levels)
 
@@ -299,6 +260,7 @@ class ParkourTerrainCurriculum(ManagerTermBase):
                 frontier_attempt=frontier_attempt,
                 chassis_contact_failure=chassis_contact_failure_event,
                 fell_below_failure=fell_below_failure_event,
+                off_route_failure=off_route_failure_event,
                 other_failure=other_failure_event,
                 stalled_failure=stalled_failure_event,
                 success=success_event,
@@ -321,8 +283,6 @@ def reset_routes(
     terrain_layout: config.ParkourTerrainLayout,
     curriculum_cfg: config.ParkourCurriculumCfg = config.DEFAULT_PARKOUR_CURRICULUM,
     waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
-    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-    target_speed_range: tuple[float, float] = (0.45, 0.70),
 ) -> None:
     """Reset the route cursor and waypoint marker for new episodes.
 
@@ -339,10 +299,6 @@ def reset_routes(
         curriculum_cfg: Course matrix used to resolve the selected family and
             difficulty into route geometry.
         waypoint_marker_cfg: Scene-entity selection for the visible marker.
-        asset_cfg: Scene-entity selection whose post-reset root position seeds
-            route crossing history.
-        target_speed_range: Bounds for the family-independent episode speed
-            command. Equal bounds produce deterministic evaluation commands.
     """
 
     env_ids = _all_env_ids(env, env_ids)
@@ -374,8 +330,6 @@ def reset_routes(
         difficulty_indices=difficulty_indices,
         curriculum_cfg=curriculum_cfg,
         waypoint_marker_cfg=waypoint_marker_cfg,
-        asset_cfg=asset_cfg,
-        target_speed_range=target_speed_range,
         geometry_variant_indices=geometry_variant_indices,
     )
 
@@ -403,13 +357,23 @@ def _curriculum_metrics(
     frontier_failure_count = frontier_failures.sum().clamp_min(1.0)
     frontier_successes = frontier_attempts * batch.success.float()
     frontier_success_count = frontier_successes.sum().clamp_min(1.0)
-    bootstrap_replay = (population_frontier_levels > 0) & (population_sampled_levels == 0)
+    bootstrap_replay = (population_frontier_levels > 0) & (
+        population_sampled_levels == 0
+    )
 
     stats = {
         "frontier/mean": population_frontier_levels.float().mean(),
-        "frontier/top_fraction": (population_frontier_levels == curriculum_cfg.max_level).float().mean(),
+        "frontier/top_fraction": (
+            population_frontier_levels == curriculum_cfg.max_level
+        )
+        .float()
+        .mean(),
         "sampled/mean": population_sampled_levels.float().mean(),
-        "sampled/replay_fraction": (population_sampled_levels < population_frontier_levels).float().mean(),
+        "sampled/replay_fraction": (
+            population_sampled_levels < population_frontier_levels
+        )
+        .float()
+        .mean(),
         "sampled/bootstrap_replay_fraction": bootstrap_replay.float().mean(),
         "frontier_episode/mean_geometric_progress": (
             batch.normalized_geometric_progress.float() * frontier_attempts
@@ -419,17 +383,34 @@ def _curriculum_metrics(
             batch.normalized_waypoint_progress.float() * frontier_attempts
         ).sum()
         / frontier_attempt_count,
-        "frontier_episode/mean_target_speed_mps": (batch.target_speed * frontier_attempts).sum()
+        "frontier_episode/mean_terminal_target_speed_mps": (
+            batch.target_speed * frontier_attempts
+        ).sum()
         / frontier_attempt_count,
-        "frontier_episode/failure_mean_target_speed_mps": (batch.target_speed * frontier_failures).sum()
+        "frontier_episode/failure_mean_terminal_target_speed_mps": (
+            batch.target_speed * frontier_failures
+        ).sum()
         / frontier_failure_count,
-        "frontier_episode/stalled_failure_rate": (batch.stalled_failure.float() * frontier_attempts).sum()
+        "frontier_episode/stalled_failure_rate": (
+            batch.stalled_failure.float() * frontier_attempts
+        ).sum()
         / frontier_attempt_count,
-        "frontier_episode/success_mean_target_speed_mps": (batch.target_speed * frontier_successes).sum()
+        "frontier_episode/off_route_failure_rate": (
+            batch.off_route_failure.float() * frontier_attempts
+        ).sum()
+        / frontier_attempt_count,
+        "frontier_episode/success_mean_terminal_target_speed_mps": (
+            batch.target_speed * frontier_successes
+        ).sum()
         / frontier_success_count,
-        "frontier_episode/success_rate": (batch.success.float() * frontier_attempts).sum() / frontier_attempt_count,
-        "transition/demotion_rate": (batch.frontier_change < 0).float().sum() / frontier_attempt_count,
-        "transition/promotion_rate": (batch.frontier_change > 0).float().sum() / frontier_attempt_count,
+        "frontier_episode/success_rate": (
+            batch.success.float() * frontier_attempts
+        ).sum()
+        / frontier_attempt_count,
+        "transition/demotion_rate": (batch.frontier_change < 0).float().sum()
+        / frontier_attempt_count,
+        "transition/promotion_rate": (batch.frontier_change > 0).float().sum()
+        / frontier_attempt_count,
     }
     for family_index, family_name in enumerate(curriculum_cfg.family_names):
         family_weights = (population_family_indices == family_index).float()
@@ -449,7 +430,8 @@ def _curriculum_metrics(
             population_sampled_levels.float() * family_weights
         ).sum() / family_count
         stats[f"family/{family_name}/top_fraction"] = (
-            (population_frontier_levels == curriculum_cfg.max_level).float() * family_weights
+            (population_frontier_levels == curriculum_cfg.max_level).float()
+            * family_weights
         ).sum() / family_count
         stats[f"family/{family_name}/frontier_episode/attempt_fraction"] = (
             family_frontier_attempts.sum() / family_batch_count
@@ -460,7 +442,12 @@ def _curriculum_metrics(
         stats[f"family/{family_name}/frontier_episode/fell_below_failure_rate"] = (
             batch.fell_below_failure.float() * family_frontier_attempts
         ).sum() / family_frontier_attempt_count
-        stats[f"family/{family_name}/frontier_episode/failure_mean_target_speed_mps"] = (
+        stats[f"family/{family_name}/frontier_episode/off_route_failure_rate"] = (
+            batch.off_route_failure.float() * family_frontier_attempts
+        ).sum() / family_frontier_attempt_count
+        stats[
+            f"family/{family_name}/frontier_episode/failure_mean_terminal_target_speed_mps"
+        ] = (
             batch.target_speed * family_frontier_failures
         ).sum() / family_frontier_failure_count
         stats[f"family/{family_name}/frontier_episode/mean_geometric_progress"] = (
@@ -469,7 +456,9 @@ def _curriculum_metrics(
         stats[f"family/{family_name}/frontier_episode/mean_waypoint_progress"] = (
             batch.normalized_waypoint_progress.float() * family_frontier_attempts
         ).sum() / family_frontier_attempt_count
-        stats[f"family/{family_name}/frontier_episode/mean_target_speed_mps"] = (
+        stats[
+            f"family/{family_name}/frontier_episode/mean_terminal_target_speed_mps"
+        ] = (
             batch.target_speed * family_frontier_attempts
         ).sum() / family_frontier_attempt_count
         stats[f"family/{family_name}/frontier_episode/stalled_failure_rate"] = (
@@ -478,7 +467,9 @@ def _curriculum_metrics(
         stats[f"family/{family_name}/frontier_episode/success_rate"] = (
             batch.success.float() * family_frontier_attempts
         ).sum() / family_frontier_attempt_count
-        stats[f"family/{family_name}/frontier_episode/success_mean_target_speed_mps"] = (
+        stats[
+            f"family/{family_name}/frontier_episode/success_mean_terminal_target_speed_mps"
+        ] = (
             batch.target_speed * family_frontier_successes
         ).sum() / family_frontier_success_count
         stats[f"family/{family_name}/frontier_episode/timeout_failure_rate"] = (
@@ -665,7 +656,7 @@ def _sample_episode_levels(
     predecessor_replay_probability: float,
     ceiling_flat_replay_probability: float,
     ceiling_lower_obstacle_replay_probability: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """Sample retained rows while preserving the configured replay budgets.
 
     Below the ceiling, replay keeps the bootstrap and immediate predecessor.
@@ -674,11 +665,17 @@ def _sample_episode_levels(
     ``max_level - 1``. The default policies both leave 75% frontier exposure.
     """
 
-    replay_eligible = (frontier_levels > 0) & (~frontier_changed) & (grace_remaining == 0)
+    replay_eligible = (
+        (frontier_levels > 0) & (~frontier_changed) & (grace_remaining == 0)
+    )
     draw = torch.rand_like(frontier_levels, dtype=torch.float32)
     below_ceiling = frontier_levels < max_level
-    below_ceiling_replay_probability = bootstrap_replay_probability + predecessor_replay_probability
-    below_ceiling_replay = replay_eligible & below_ceiling & (draw < below_ceiling_replay_probability)
+    below_ceiling_replay_probability = (
+        bootstrap_replay_probability + predecessor_replay_probability
+    )
+    below_ceiling_replay = (
+        replay_eligible & below_ceiling & (draw < below_ceiling_replay_probability)
+    )
     bootstrap_replay = below_ceiling_replay & (draw < bootstrap_replay_probability)
     levels = torch.where(below_ceiling_replay, frontier_levels - 1, frontier_levels)
     levels = torch.where(bootstrap_replay, torch.zeros_like(levels), levels)
@@ -699,7 +696,9 @@ def _sample_episode_levels(
         num_lower_obstacle_rows = max_level - 1
         for level in range(2, max_level):
             level_threshold = ceiling_flat_replay_probability + (
-                ceiling_lower_obstacle_replay_probability * (level - 1) / num_lower_obstacle_rows
+                ceiling_lower_obstacle_replay_probability
+                * (level - 1)
+                / num_lower_obstacle_rows
             )
             lower_obstacle_level = torch.where(
                 draw >= level_threshold,
@@ -707,10 +706,11 @@ def _sample_episode_levels(
                 lower_obstacle_level,
             )
         ceiling_lower_obstacle_replay = ceiling_replay & (~ceiling_flat_replay)
-        levels = torch.where(ceiling_lower_obstacle_replay, lower_obstacle_level, levels)
+        levels = torch.where(
+            ceiling_lower_obstacle_replay, lower_obstacle_level, levels
+        )
 
-    replay = below_ceiling_replay | ceiling_replay
-    return levels, replay
+    return levels
 
 
 def _terminal_event_masks(
@@ -727,57 +727,79 @@ def _terminal_event_masks(
     """
 
     has_completed_step = env.episode_length_buf[env_ids] > 0
-    reset_buf = getattr(env, "reset_buf", None)
-    if reset_buf is None:
-        terminal_event = torch.zeros_like(has_completed_step)
-    else:
-        terminal_event = (
-            reset_buf[env_ids].to(
+    terminal_event = (
+        env.reset_buf[env_ids].to(
+            device=env.device,
+            dtype=torch.bool,
+        )
+        & has_completed_step
+    )
+
+    def term(name: str) -> torch.Tensor:
+        return (
+            env.termination_manager.get_term(name)[env_ids].to(
                 device=env.device,
                 dtype=torch.bool,
             )
-            & has_completed_step
+            & terminal_event
         )
-    raw_success_event = (
-        env.termination_manager.get_term("success")[env_ids].to(
+
+    active_timeout_event = term("time_out")
+    chassis_contact_event = term("chassis_contact")
+    fell_below_event = term("fell_below_course")
+    off_route_event = term("off_route")
+    raw_success_event = term("success")
+    wall_timeout_event = term("wall_time_out")
+    success_event = (
+        raw_success_event
+        & (~chassis_contact_event)
+        & (~fell_below_event)
+        & (~off_route_event)
+    )
+    # The validated wall cap exceeds the active-motion budget. A wall-only
+    # timeout therefore proves that command stops consumed the difference.
+    # Non-timeout terminations (including future safety terms) still win.
+    non_timeout_event = (
+        env.termination_manager.terminated[env_ids].to(
             device=env.device,
             dtype=torch.bool,
         )
         & terminal_event
     )
-    chassis_contact_event = (
-        env.termination_manager.get_term("chassis_contact")[env_ids].to(
-            device=env.device,
-            dtype=torch.bool,
-        )
-        & terminal_event
+    neutral_wall_timeout = (
+        wall_timeout_event & (~active_timeout_event) & (~non_timeout_event)
     )
-    fell_below_event = (
-        env.termination_manager.get_term("fell_below_course")[env_ids].to(
-            device=env.device,
-            dtype=torch.bool,
-        )
-        & terminal_event
-    )
-    timeout_event = (
-        env.termination_manager.get_term("time_out")[env_ids].to(
-            device=env.device,
-            dtype=torch.bool,
-        )
-        & terminal_event
-    )
-    success_event = raw_success_event & (~chassis_contact_event) & (~fell_below_event)
-    failure_event = terminal_event & (~success_event)
+    curriculum_terminal_event = terminal_event & (~neutral_wall_timeout)
+    failure_event = curriculum_terminal_event & (~success_event)
     chassis_contact_failure = failure_event & chassis_contact_event
     fell_below_failure = failure_event & (~chassis_contact_failure) & fell_below_event
-    timeout_failure = failure_event & (~chassis_contact_failure) & (~fell_below_failure) & timeout_event
-    other_failure = failure_event & (~chassis_contact_failure) & (~fell_below_failure) & (~timeout_failure)
+    off_route_failure = (
+        failure_event
+        & (~chassis_contact_failure)
+        & (~fell_below_failure)
+        & off_route_event
+    )
+    timeout_failure = (
+        failure_event
+        & (~chassis_contact_failure)
+        & (~fell_below_failure)
+        & (~off_route_failure)
+        & (active_timeout_event | wall_timeout_event)
+    )
+    other_failure = (
+        failure_event
+        & (~chassis_contact_failure)
+        & (~fell_below_failure)
+        & (~off_route_failure)
+        & (~timeout_failure)
+    )
     return (
         success_event,
-        terminal_event,
+        curriculum_terminal_event,
         failure_event,
         chassis_contact_failure,
         fell_below_failure,
+        off_route_failure,
         timeout_failure,
         other_failure,
     )
@@ -804,7 +826,9 @@ def _validate_terrain_layout(
     """
 
     if terrain is None or terrain.terrain_origins is None:
-        raise RuntimeError("The parkour curriculum requires TerrainImporterCfg with terrain_type='generator'.")
+        raise RuntimeError(
+            "The parkour curriculum requires TerrainImporterCfg with terrain_type='generator'."
+        )
 
     terrain_layout.validate_grid(
         curriculum_difficulties=curriculum_cfg.num_difficulties,

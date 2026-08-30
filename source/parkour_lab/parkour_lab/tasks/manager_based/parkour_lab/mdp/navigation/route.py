@@ -11,7 +11,6 @@ transition can also be exercised by dependency-light NumPy tests.
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -22,7 +21,7 @@ if TYPE_CHECKING:
     from ..curriculums.config import ParkourCurriculumCfg
 
 
-# Read-only route queries.
+# Course-selection queries.
 
 
 def active_course_indices(
@@ -48,6 +47,9 @@ def active_difficulty_indices(
 
     runtime = _parkour_runtime(env)
     return active_course_indices(env, env_ids) % runtime.courses.num_difficulties
+
+
+# Active-waypoint queries.
 
 
 def active_waypoint_changed_this_step(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -76,16 +78,17 @@ def active_waypoint_indices(env: ManagerBasedRLEnv) -> torch.Tensor:
     return _parkour_runtime(env).route.active_waypoint_indices.clone()
 
 
-def active_waypoint_root_reach_radii(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return the configured root-reach radius of each active waypoint."""
+def active_waypoint_is_final(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return whether each active waypoint is the course's final target."""
 
     from .state import _parkour_runtime
 
     runtime = _parkour_runtime(env)
-    return runtime.courses.root_reach_radii[
-        runtime.route.course_indices,
-        runtime.route.active_waypoint_indices,
-    ]
+    course_indices = runtime.route.course_indices
+    return (
+        runtime.route.active_waypoint_indices
+        == runtime.courses.waypoint_counts[course_indices] - 1
+    )
 
 
 def active_waypoint_is_rewarded_milestone(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -103,16 +106,6 @@ def active_waypoint_is_rewarded_milestone(env: ManagerBasedRLEnv) -> torch.Tenso
     )
 
 
-def active_waypoint_is_final(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return whether each active waypoint is the course's final target."""
-
-    from .state import _parkour_runtime
-
-    runtime = _parkour_runtime(env)
-    course_indices = runtime.route.course_indices
-    return runtime.route.active_waypoint_indices == runtime.courses.waypoint_counts[course_indices] - 1
-
-
 def active_waypoint_is_terminal_landing(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Return whether each active target is itself the final landing."""
 
@@ -123,19 +116,6 @@ def active_waypoint_is_terminal_landing(env: ManagerBasedRLEnv) -> torch.Tensor:
         runtime.route.course_indices,
         runtime.route.active_waypoint_indices,
     ]
-
-
-def course_completed_this_step(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Return which environments safely completed a course this step."""
-
-    import torch
-
-    from .state import _parkour_runtime_or_none
-
-    runtime = _parkour_runtime_or_none(env)
-    if runtime is None:
-        return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
-    return runtime.route.course_completed
 
 
 def active_waypoint_positions(
@@ -155,6 +135,34 @@ def active_waypoint_positions(
 
     waypoint_marker = env.scene[waypoint_marker_cfg.name]
     return waypoint_marker.data.root_pos_w - env.scene.env_origins
+
+
+def active_waypoint_root_reach_radii(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return the configured root-reach radius of each active waypoint."""
+
+    from .state import _parkour_runtime
+
+    runtime = _parkour_runtime(env)
+    return runtime.courses.root_reach_radii[
+        runtime.route.course_indices,
+        runtime.route.active_waypoint_indices,
+    ]
+
+
+# Route-state and geometry queries.
+
+
+def course_completed_this_step(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return which environments safely completed a course this step."""
+
+    import torch
+
+    from .state import _parkour_runtime_or_none
+
+    runtime = _parkour_runtime_or_none(env)
+    if runtime is None:
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
+    return runtime.route.course_completed
 
 
 def current_min_clearances(
@@ -178,25 +186,14 @@ def current_min_clearances(
     return runtime.courses.min_clearances[runtime.route.course_indices]
 
 
-def current_target_speeds(
-    env: ManagerBasedRLEnv,
-    default: float = 0.70,
-) -> torch.Tensor:
-    """Return the episode speed command for every environment."""
+def final_waypoint_positions(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return each selected course's final terrain-local waypoint."""
 
-    import torch
+    from .state import _parkour_runtime
 
-    from .state import _parkour_runtime_or_none
-
-    runtime = _parkour_runtime_or_none(env)
-    if runtime is None:
-        return torch.full(
-            (env.num_envs,),
-            default,
-            device=env.device,
-            dtype=torch.float32,
-        )
-    return runtime.route.target_speeds
+    runtime = _parkour_runtime(env)
+    final_indices = runtime.courses.waypoint_counts[runtime.route.course_indices] - 1
+    return runtime.courses.waypoints[runtime.route.course_indices, final_indices]
 
 
 def last_episode_max_course_progress_m(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -236,7 +233,9 @@ def normalized_course_progress(
     maximum_progress = runtime.route.maximum_progress_m[env_ids]
     return (
         maximum_progress
-        / course_lengths.to(dtype=maximum_progress.dtype).clamp_min(torch.finfo(maximum_progress.dtype).eps)
+        / course_lengths.to(dtype=maximum_progress.dtype).clamp_min(
+            torch.finfo(maximum_progress.dtype).eps
+        )
     ).clamp(min=0.0, max=1.0)
 
 
@@ -269,7 +268,9 @@ def normalized_waypoint_progress(
     course_indices = route_state.course_indices[env_ids]
     dtype = runtime.courses.cumulative_distances_m.dtype
     passed_waypoints = route_state.active_waypoint_indices[env_ids].to(dtype=dtype)
-    intermediate_counts = (runtime.courses.waypoint_counts[course_indices] - 1).clamp_min(1)
+    intermediate_counts = (
+        runtime.courses.waypoint_counts[course_indices] - 1
+    ).clamp_min(1)
     progress = passed_waypoints / intermediate_counts.to(dtype=dtype)
     return torch.where(
         route_state.course_completed[env_ids],
@@ -306,6 +307,26 @@ def reached_milestone_reward_fractions(env: ManagerBasedRLEnv) -> torch.Tensor:
     )
 
 
+def route_cross_track_error_m(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return root XY distance to the nearest finite segment of the route.
+
+    The approved route is the terrain-local polyline from the course origin to
+    its valid waypoints. The fixed route envelope consumes this query without
+    exposing either the distance or its limits to the actor.
+    """
+
+    from .._shared import robot
+    from .state import _parkour_runtime
+
+    runtime = _parkour_runtime(env)
+    course_indices = runtime.route.course_indices
+    return _finite_route_cross_track_error_m(
+        robot._root_pos_env(env)[:, :2],
+        runtime.courses.waypoints[course_indices, :, :2],
+        runtime.courses.waypoint_counts[course_indices],
+    )
+
+
 def route_phase(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Return normalized active-cursor and safe-progress phase."""
 
@@ -332,17 +353,26 @@ def route_phase(env: ManagerBasedRLEnv) -> torch.Tensor:
 def advance_active_waypoints(
     env: ManagerBasedRLEnv,
     *,
-    reach_threshold: float,
     waypoint_marker_cfg: SceneEntityCfg,
     asset_cfg: SceneEntityCfg,
     feet_asset_cfg: SceneEntityCfg,
     feet_contact_cfg: SceneEntityCfg,
     chassis_contact_cfg: SceneEntityCfg,
     contact_threshold: float = 1.0,
-    max_completion_tilt: float = 0.5,
-    max_completion_vertical_speed: float = 0.5,
+    max_completion_tilt_sine: float = 0.5,
+    max_completion_vertical_speed_m_s: float = 0.5,
     support_margin: float = 0.05,
     support_plane_tolerance: float = 0.12,
+    terminal_support_load_threshold_n: float = 10.0,
+    terminal_min_support_feet: int = 2,
+    terminal_stability_dwell_s: float = 0.2,
+    terminal_max_planar_speed_m_s: float = 0.2,
+    terminal_max_vertical_speed_m_s: float = 0.2,
+    terminal_max_yaw_rate_rad_s: float = 0.35,
+    terminal_max_roll_pitch_rate_rad_s: float = 0.35,
+    terminal_max_tilt_sine: float = 0.25,
+    progress_route_half_width_m: float = 0.2,
+    hard_route_half_width_m: float | None = None,
 ) -> torch.Tensor:
     """Update every route once and return final-course completions.
 
@@ -357,18 +387,6 @@ def advance_active_waypoints(
     from ..terrain import queries
     from .state import _parkour_runtime
 
-    if reach_threshold <= 0.0:
-        raise ValueError("reach_threshold must be positive.")
-    if contact_threshold < 0.0:
-        raise ValueError("contact_threshold must be non-negative.")
-    if max_completion_tilt <= 0.0:
-        raise ValueError("max_completion_tilt must be positive.")
-    if max_completion_vertical_speed <= 0.0:
-        raise ValueError("max_completion_vertical_speed must be positive.")
-    if support_margin < 0.0:
-        raise ValueError("support_margin must be non-negative.")
-    if support_plane_tolerance <= 0.0:
-        raise ValueError("support_plane_tolerance must be positive.")
     runtime = _parkour_runtime(env)
     courses = runtime.courses
     route_state = runtime.route
@@ -377,6 +395,19 @@ def advance_active_waypoints(
     waypoint_counts = courses.waypoint_counts[course_indices]
     active_positions = courses.waypoints[course_indices, active_indices]
     robot_pos = robot._root_pos_env(env, asset_cfg)
+    if hard_route_half_width_m is None:
+        inside_hard_route_envelope = torch.ones(
+            env.num_envs, device=env.device, dtype=torch.bool
+        )
+    else:
+        cross_track_error = _finite_route_cross_track_error_m(
+            robot_pos[:, :2],
+            courses.waypoints[course_indices, :, :2],
+            waypoint_counts,
+        )
+        inside_hard_route_envelope = torch.isfinite(cross_track_error) & (
+            cross_track_error <= hard_route_half_width_m
+        )
     distance_xy = torch.linalg.norm(
         robot_pos[:, :2] - active_positions[:, :2],
         dim=-1,
@@ -386,15 +417,6 @@ def advance_active_waypoints(
         active_indices,
     ]
     root_within_radius = distance_xy < active_root_reach_radii
-    previous_robot_xy = route_state.previous_root_xy.clone()
-    passed_waypoint_plane = _active_waypoint_plane_passed(
-        env,
-        previous_robot_xy,
-        robot_pos[:, :2],
-        lateral_tolerance=reach_threshold,
-    )
-    route_state.previous_root_xy[:] = robot_pos[:, :2]
-
     support_required = (
         courses.support_vertex_counts[
             course_indices,
@@ -402,48 +424,100 @@ def advance_active_waypoints(
         ]
         > 0
     )
-    supported = _active_waypoint_support(
+    supported, terminal_load_supported = _active_waypoint_support(
         env,
         feet_asset_cfg=feet_asset_cfg,
         feet_contact_cfg=feet_contact_cfg,
         contact_threshold=contact_threshold,
         support_margin=support_margin,
         support_plane_tolerance=support_plane_tolerance,
+        terminal_support_load_threshold_n=terminal_support_load_threshold_n,
+        terminal_min_support_feet=terminal_min_support_feet,
     )
     chassis_contact = torch.any(
-        contact._force_norm_mask(env, sensor_cfg=chassis_contact_cfg) > contact_threshold,
+        contact._force_norm_mask(env, sensor_cfg=chassis_contact_cfg)
+        > contact_threshold,
         dim=(1, 2),
     )
+    route_state_eligible = (~chassis_contact) & inside_hard_route_envelope
 
     clearance, clearance_valid = queries._base_clearance_components(env, asset_cfg)
     min_clearance = courses.min_clearances[course_indices].to(
         device=clearance.device,
         dtype=clearance.dtype,
     )
-    final_waypoint_eligible = (
+    completion_clearance = clearance_valid & (clearance > min_clearance)
+    ordinary_final_eligible = (
         supported
         & (~chassis_contact)
-        & clearance_valid
-        & (clearance > min_clearance)
-        & (torch.abs(robot._root_lin_vel_z(env, asset_cfg)) < max_completion_vertical_speed)
+        & completion_clearance
+        & (
+            torch.abs(robot._root_lin_vel_z(env, asset_cfg))
+            < max_completion_vertical_speed_m_s
+        )
         & (
             torch.linalg.norm(
                 robot._root_projected_gravity_xy(env, asset_cfg),
                 dim=-1,
             )
-            < max_completion_tilt
+            < max_completion_tilt_sine
         )
+    )
+    terminal_landing = courses.terminal_landing_masks[course_indices, active_indices]
+    terminal_stable = (
+        terminal_landing
+        & root_within_radius
+        & route_state_eligible
+        & terminal_load_supported
+        & completion_clearance
+        & (
+            torch.linalg.norm(robot._root_lin_vel_xy(env, asset_cfg), dim=-1)
+            < terminal_max_planar_speed_m_s
+        )
+        & (
+            torch.abs(robot._root_lin_vel_z(env, asset_cfg))
+            < terminal_max_vertical_speed_m_s
+        )
+        & (
+            torch.abs(robot._root_ang_vel_z(env, asset_cfg))
+            < terminal_max_yaw_rate_rad_s
+        )
+        & (
+            torch.linalg.norm(robot._root_ang_vel_xy(env, asset_cfg), dim=-1)
+            < terminal_max_roll_pitch_rate_rad_s
+        )
+        & (
+            torch.linalg.norm(
+                robot._root_projected_gravity_xy(env, asset_cfg),
+                dim=-1,
+            )
+            < terminal_max_tilt_sine
+        )
+    )
+    route_state.terminal_landing_stable_time_s[:] = torch.where(
+        terminal_stable,
+        route_state.terminal_landing_stable_time_s + float(env.step_dt),
+        torch.zeros_like(route_state.terminal_landing_stable_time_s),
+    )
+    terminal_final_eligible = (
+        route_state.terminal_landing_stable_time_s + 1.0e-6
+        >= terminal_stability_dwell_s
+    )
+    final_waypoint_eligible = torch.where(
+        terminal_landing,
+        terminal_final_eligible,
+        ordinary_final_eligible,
     )
 
     progress = _route_progress_m(
         env,
         robot_pos[:, :2],
-        lateral_tolerance=reach_threshold,
+        route_half_width_m=progress_route_half_width_m,
     )
     # Progress can decrease if the robot backtracks. Preserve the furthest point
     # reached safely so a crash or off-route shortcut cannot drive curriculum.
     route_state.maximum_progress_m[:] = torch.where(
-        chassis_contact,
+        ~route_state_eligible,
         route_state.maximum_progress_m,
         torch.maximum(
             route_state.maximum_progress_m,
@@ -455,10 +529,9 @@ def advance_active_waypoints(
         active_indices,
         waypoint_counts,
         root_within_radius,
-        passed_waypoint_plane,
         support_required,
         supported,
-        ~chassis_contact,
+        route_state_eligible,
         final_waypoint_eligible,
     )
 
@@ -498,9 +571,7 @@ def reset_routes(
     difficulty_indices: torch.Tensor,
     curriculum_cfg: ParkourCurriculumCfg,
     waypoint_marker_cfg: SceneEntityCfg,
-    asset_cfg: SceneEntityCfg,
-    target_speed_range: tuple[float, float] = (0.45, 0.70),
-    geometry_variant_indices: torch.Tensor | None = None,
+    geometry_variant_indices: torch.Tensor,
 ) -> torch.Tensor:
     """Reset selected environments to the first waypoint of their new routes.
 
@@ -519,14 +590,8 @@ def reset_routes(
         curriculum_cfg: Course definitions used to build the waypoint table.
         waypoint_marker_cfg: Scene-entity selection for the visible waypoint
             marker.
-        asset_cfg: Robot scene entity whose post-reset terrain-local root
-            position seeds genuine route-plane crossing detection.
-        target_speed_range: Bounds for the per-episode speed command.
-            Sampling is independent of obstacle family and difficulty. Equal
-            bounds select a deterministic command for evaluation.
         geometry_variant_indices: Deterministic geometry variant selected by
-            each environment's physical terrain column. ``None`` selects the
-            canonical variant for backward-compatible direct callers.
+            each environment's physical terrain column.
 
     Returns:
         Flattened family-then-variant-major course index for each reset
@@ -536,20 +601,16 @@ def reset_routes(
 
     import torch
 
-    from .._shared import robot
     from .._shared.runtime import _all_env_ids
     from .state import _ensure_parkour_runtime
 
     env_ids = _all_env_ids(env, env_ids)
     family_indices = family_indices.to(device=env.device, dtype=torch.long)
     difficulty_indices = difficulty_indices.to(device=env.device, dtype=torch.long)
-    if geometry_variant_indices is None:
-        geometry_variant_indices = torch.zeros_like(env_ids)
-    else:
-        geometry_variant_indices = geometry_variant_indices.to(
-            device=env.device,
-            dtype=torch.long,
-        )
+    geometry_variant_indices = geometry_variant_indices.to(
+        device=env.device,
+        dtype=torch.long,
+    )
     if any(
         indices.shape != env_ids.shape
         for indices in (
@@ -562,57 +623,42 @@ def reset_routes(
             "family, geometry variant, and difficulty indices must contain one value per reset environment."
         )
 
-    try:
-        min_target_speed, max_target_speed = (float(value) for value in target_speed_range)
-    except (TypeError, ValueError) as error:
-        raise ValueError("target_speed_range must contain exactly two finite positive values.") from error
-    if (
-        not math.isfinite(min_target_speed)
-        or not math.isfinite(max_target_speed)
-        or min_target_speed <= 0.0
-        or max_target_speed < min_target_speed
-    ):
-        raise ValueError("target_speed_range must contain finite positive bounds in ascending order.")
-
     waypoint_marker = env.scene[waypoint_marker_cfg.name]
     dtype = waypoint_marker.data.default_root_state.dtype
     runtime = _ensure_parkour_runtime(
         env,
         curriculum_cfg,
         dtype=dtype,
-        initial_target_speed=0.5 * (min_target_speed + max_target_speed),
     )
 
-    if torch.any((family_indices < 0) | (family_indices >= len(curriculum_cfg.families))):
+    if torch.any(
+        (family_indices < 0) | (family_indices >= len(curriculum_cfg.families))
+    ):
         raise ValueError("family_indices contains an out-of-range obstacle family.")
-    if torch.any((difficulty_indices < 0) | (difficulty_indices >= curriculum_cfg.num_difficulties)):
+    if torch.any(
+        (difficulty_indices < 0)
+        | (difficulty_indices >= curriculum_cfg.num_difficulties)
+    ):
         raise ValueError("difficulty_indices contains an out-of-range difficulty.")
-    if torch.any((geometry_variant_indices < 0) | (geometry_variant_indices >= curriculum_cfg.num_geometry_variants)):
+    if torch.any(
+        (geometry_variant_indices < 0)
+        | (geometry_variant_indices >= curriculum_cfg.num_geometry_variants)
+    ):
         raise ValueError("geometry_variant_indices contains an out-of-range variant.")
 
     course_indices = (
         family_indices * curriculum_cfg.num_geometry_variants + geometry_variant_indices
     ) * curriculum_cfg.num_difficulties + difficulty_indices
     route_state = runtime.route
-    route_state.previous_episode_maximum_progress_m[env_ids] = route_state.maximum_progress_m[env_ids]
+    route_state.previous_episode_maximum_progress_m[env_ids] = (
+        route_state.maximum_progress_m[env_ids]
+    )
     route_state.maximum_progress_m[env_ids] = 0.0
+    route_state.terminal_landing_stable_time_s[env_ids] = 0.0
     route_state.course_indices[env_ids] = course_indices
     route_state.active_waypoint_indices[env_ids] = 0
-    if min_target_speed == max_target_speed:
-        route_state.target_speeds[env_ids] = min_target_speed
-    else:
-        route_state.target_speeds[env_ids] = torch.empty(
-            env_ids.shape,
-            device=env.device,
-            dtype=dtype,
-        ).uniform_(min_target_speed, max_target_speed)
     route_state.waypoint_changed[env_ids] = False
     route_state.course_completed[env_ids] = False
-    route_state.previous_root_xy[env_ids] = robot._root_pos_env(
-        env,
-        asset_cfg,
-    )[env_ids, :2]
-
     first_waypoints = runtime.courses.waypoints[course_indices, 0]
     _write_waypoint_marker(
         env,
@@ -623,91 +669,6 @@ def reset_routes(
     return course_indices
 
 
-# Private route geometry and transition helpers.
-
-
-def _active_waypoint_plane_passed(
-    env: ManagerBasedRLEnv,
-    previous_robot_xy: torch.Tensor,
-    robot_xy: torch.Tensor,
-    *,
-    lateral_tolerance: float,
-) -> torch.Tensor:
-    """Detect a genuine previous-to-current crossing inside the route corridor."""
-
-    import torch
-
-    from .state import _parkour_runtime
-
-    runtime = _parkour_runtime(env)
-    # [num_envs]: course and active-waypoint cursor for each environment.
-    course_indices = runtime.route.course_indices
-    active_indices = runtime.route.active_waypoint_indices
-    # [num_envs]: waypoint cursor immediately before each active target.
-    previous_indices = (active_indices - 1).clamp_min(0)
-    # [num_envs, 2]: XY waypoint preceding each active target.
-    previous_waypoints = runtime.courses.waypoints[
-        course_indices,
-        previous_indices,
-        :2,
-    ]
-    # [num_envs, 2]: segment start; the condition broadcasts over XY.
-    segment_starts = torch.where(
-        (active_indices > 0)[:, None],
-        previous_waypoints,
-        torch.zeros_like(previous_waypoints),
-    )
-    # [num_envs, 2]: active target and vector from segment start to target.
-    segment_ends = runtime.courses.waypoints[
-        course_indices,
-        active_indices,
-        :2,
-    ]
-    segment_vectors = segment_ends - segment_starts
-    segment_lengths = torch.linalg.norm(segment_vectors, dim=-1)
-    valid_segment = segment_lengths > torch.finfo(robot_xy.dtype).eps
-    unit_directions = segment_vectors / segment_lengths.clamp_min(torch.finfo(robot_xy.dtype).eps)[:, None]
-    # Project both robot samples onto the route direction. The target plane is at
-    # ``segment_lengths`` along this direction.
-    previous_longitudinal = torch.sum(
-        (previous_robot_xy - segment_starts) * unit_directions,
-        dim=-1,
-    )
-    current_longitudinal = torch.sum(
-        (robot_xy - segment_starts) * unit_directions,
-        dim=-1,
-    )
-    # A crossing occurs only when the robot moves from behind the target plane to
-    # the plane or beyond it during this step.
-    crossed_forward = (previous_longitudinal < segment_lengths) & (current_longitudinal >= segment_lengths)
-
-    # Treat the motion between samples as a straight line. This fraction says how
-    # far through the step the robot reaches the target plane. The epsilon keeps
-    # division safe for non-crossing rows, which are rejected below.
-    longitudinal_delta = current_longitudinal - previous_longitudinal
-    crossing_fraction = (
-        (segment_lengths - previous_longitudinal) / longitudinal_delta.clamp_min(torch.finfo(robot_xy.dtype).eps)
-    ).clamp(0.0, 1.0)
-    # ``crossing_xy`` is the estimated XY position where that straight-line motion
-    # intersects the target plane. ``[:, None]`` applies one fraction to both XY
-    # coordinates for each environment.
-    crossing_xy = previous_robot_xy + crossing_fraction[:, None] * (robot_xy - previous_robot_xy)
-
-    # Remove the component parallel to the route; the remaining vector is the
-    # lateral offset from the route centerline at the crossing point.
-    target_relative = crossing_xy - segment_ends
-    target_longitudinal = torch.sum(
-        target_relative * unit_directions,
-        dim=-1,
-    )
-    lateral_vector = target_relative - target_longitudinal[:, None] * unit_directions
-    lateral_distance = torch.linalg.norm(lateral_vector, dim=-1)
-
-    # Testing the interpolated crossing position prevents a robot from crossing
-    # outside the corridor and then moving laterally inside before this sample.
-    return valid_segment & crossed_forward & (lateral_distance <= lateral_tolerance)
-
-
 def _active_waypoint_support(
     env: ManagerBasedRLEnv,
     *,
@@ -716,8 +677,10 @@ def _active_waypoint_support(
     contact_threshold: float,
     support_margin: float,
     support_plane_tolerance: float,
-) -> torch.Tensor:
-    """Report whether any recently contacted foot is on the active support."""
+    terminal_support_load_threshold_n: float,
+    terminal_min_support_feet: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ordinary contact and terminal load-bearing support masks."""
 
     import torch
 
@@ -774,7 +737,9 @@ def _active_waypoint_support(
         dim=-1,
     )
     # foot - d * unit_normal is its orthogonal projection onto the plane.
-    projected_feet = foot_positions - signed_plane_distance[..., None] * support_normals[:, None, :]
+    projected_feet = (
+        foot_positions - signed_plane_distance[..., None] * support_normals[:, None, :]
+    )
     # Vector from every edge start to every projected foot.
     edge_to_foot = projected_feet[:, :, None, :] - edge_starts[:, None, :, :]
     # ((edge x edge_to_foot) dot normal) / |edge| is the signed distance
@@ -799,15 +764,33 @@ def _active_waypoint_support(
     )
     # A foot supports the waypoint only if it contacts inside and near its plane.
     near_plane = torch.abs(signed_plane_distance) <= support_plane_tolerance
-    supported_feet = support_required[:, None] & recent_contact & inside_polygon & near_plane
-    return torch.any(supported_feet, dim=-1)
+    feet_on_support = support_required[:, None] & inside_polygon & near_plane
+    ordinary_supported = torch.any(feet_on_support & recent_contact, dim=-1)
+
+    current_forces_w = contact._selected_contact_forces_w(env, feet_contact_cfg)
+    runtime._validate_matching_shape(
+        current_forces_w[..., 0],
+        foot_positions[..., 0],
+        lhs_name="current foot contact force",
+        rhs_name="foot positions",
+    )
+    normal_load = torch.sum(
+        current_forces_w * support_normals[:, None, :],
+        dim=-1,
+    )
+    load_bearing_feet = feet_on_support & (
+        normal_load >= terminal_support_load_threshold_n
+    )
+    terminal_supported = (
+        torch.sum(load_bearing_feet, dim=-1) >= terminal_min_support_feet
+    )
+    return ordinary_supported, terminal_supported
 
 
 def _advance_route_state(
     active_indices: torch.Tensor,
     waypoint_counts: torch.Tensor,
     root_within_radius: torch.Tensor,
-    passed_waypoint_plane: torch.Tensor,
     support_required: torch.Tensor,
     supported: torch.Tensor,
     route_state_eligible: torch.Tensor,
@@ -815,8 +798,8 @@ def _advance_route_state(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Advance independently reached cursors without exceeding route lengths.
 
-    Control targets advance from root proximity or a safe route-plane crossing.
-    Intermediate physical targets require root proximity and named support.
+    Control targets advance from root proximity. Intermediate physical targets
+    require root proximity and named support.
     Final completion requires root proximity and ``final_waypoint_eligible``.
 
     Args:
@@ -825,9 +808,6 @@ def _advance_route_state(
         waypoint_counts: Number of valid waypoints in each environment's route.
         root_within_radius: Whether each robot root is currently close enough
             to its active waypoint.
-        passed_waypoint_plane: Whether each environment passed its active
-            waypoint along the current route segment while remaining inside
-            the configured lateral corridor.
         support_required: Whether the active waypoint identifies a physical
             support instead of serving only as a route-control target.
         supported: Whether a recently contacted foot is on the active
@@ -846,15 +826,21 @@ def _advance_route_state(
     # its final index from its own waypoint count rather than a shared constant.
     final_waypoint = active_indices == waypoint_counts - 1
 
-    # Control targets use root proximity or one genuine plane crossing.
     # Physical targets additionally require contact on their named support.
     # Final completion retains the stricter whole-body stability conditions
     # collected in ``final_waypoint_eligible``.
-    control_reached = (~support_required) & (root_within_radius | passed_waypoint_plane)
+    control_reached = (~support_required) & root_within_radius
     physical_reached = support_required & root_within_radius & supported
-    advance_cursor = (~final_waypoint) & route_state_eligible & (control_reached | physical_reached)
+    advance_cursor = (
+        (~final_waypoint) & route_state_eligible & (control_reached | physical_reached)
+    )
 
-    completed_course = final_waypoint & physical_reached & route_state_eligible & final_waypoint_eligible
+    completed_course = (
+        final_waypoint
+        & physical_reached
+        & route_state_eligible
+        & final_waypoint_eligible
+    )
 
     # Adding a Boolean tensor increments selected cursors by exactly one. Final
     # cursors are excluded above, so no index can exceed its route length.
@@ -866,7 +852,7 @@ def _route_progress_m(
     env: ManagerBasedRLEnv,
     robot_xy: torch.Tensor,
     *,
-    lateral_tolerance: float,
+    route_half_width_m: float,
 ) -> torch.Tensor:
     """Project onto the route without crediting motion outside its corridor."""
 
@@ -901,9 +887,13 @@ def _route_progress_m(
     ]
     segment_vectors = segment_ends - segment_starts
     # [num_envs]: squared length and clamped projection along each segment.
-    squared_lengths = torch.sum(segment_vectors.square(), dim=-1).clamp_min(torch.finfo(robot_xy.dtype).eps)
+    squared_lengths = torch.sum(segment_vectors.square(), dim=-1).clamp_min(
+        torch.finfo(robot_xy.dtype).eps
+    )
     relative_position = robot_xy - segment_starts
-    fraction = (torch.sum(relative_position * segment_vectors, dim=-1) / squared_lengths).clamp(0.0, 1.0)
+    fraction = (
+        torch.sum(relative_position * segment_vectors, dim=-1) / squared_lengths
+    ).clamp(0.0, 1.0)
     # [num_envs]: active-segment length and distance completed before it.
     segment_lengths = torch.sqrt(squared_lengths)
     unit_directions = segment_vectors / segment_lengths[:, None]
@@ -912,7 +902,7 @@ def _route_progress_m(
         dim=-1,
     )
     lateral_vector = relative_position - longitudinal[:, None] * unit_directions
-    inside_corridor = torch.linalg.norm(lateral_vector, dim=-1) <= lateral_tolerance
+    inside_corridor = torch.linalg.norm(lateral_vector, dim=-1) <= route_half_width_m
     # The [num_courses, max_waypoints] table stores cumulative route distances.
     prior_progress = torch.where(
         active_indices > 0,
@@ -929,6 +919,44 @@ def _route_progress_m(
         prior_progress,
     )
     return progress
+
+
+# Route-envelope geometry.
+
+
+def _finite_route_cross_track_error_m(
+    root_xy: torch.Tensor,
+    waypoints_xy: torch.Tensor,
+    waypoint_counts: torch.Tensor,
+) -> torch.Tensor:
+    """Measure batched point-to-polyline distance using finite segments only."""
+
+    import torch
+
+    segment_starts = torch.cat(
+        (torch.zeros_like(waypoints_xy[:, :1]), waypoints_xy[:, :-1]),
+        dim=1,
+    )
+    segment_vectors = waypoints_xy - segment_starts
+    squared_lengths = torch.sum(segment_vectors.square(), dim=-1)
+    relative_positions = root_xy[:, None, :] - segment_starts
+    fractions = (
+        torch.sum(relative_positions * segment_vectors, dim=-1)
+        / squared_lengths.clamp_min(torch.finfo(root_xy.dtype).eps)
+    ).clamp(0.0, 1.0)
+    closest_points = segment_starts + fractions[..., None] * segment_vectors
+    distances = torch.linalg.norm(root_xy[:, None, :] - closest_points, dim=-1)
+
+    segment_indices = torch.arange(waypoints_xy.shape[1], device=root_xy.device)
+    valid_segments = segment_indices[None, :] < waypoint_counts[:, None]
+    distances = distances.masked_fill(~valid_segments, torch.inf)
+    minimum = torch.amin(distances, dim=1)
+    return torch.where(
+        torch.isfinite(minimum), minimum, torch.full_like(minimum, torch.inf)
+    )
+
+
+# Marker synchronization.
 
 
 def _write_waypoint_marker(

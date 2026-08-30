@@ -61,3 +61,13 @@ def _selected_contact_forces_w_history(
     contact_sensor: ContactSensor = env.scene[sensor_cfg.name]
 
     return contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+
+
+def _selected_contact_forces_w(
+    env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg
+) -> torch.Tensor:
+    """Return current world-frame net normal forces for selected sensor bodies."""
+
+    _require_body_ids(sensor_cfg, role="current contact force selection")
+    contact_sensor: ContactSensor = env.scene[sensor_cfg.name]
+    return contact_sensor.data.net_forces_w[:, sensor_cfg.body_ids, :]
