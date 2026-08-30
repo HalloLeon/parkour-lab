@@ -9,11 +9,24 @@ import argparse
 import random
 from typing import TYPE_CHECKING
 
+from parkour_lab import runtime_versions
+
 if TYPE_CHECKING:
     from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg
 
 
 DOMAIN_RANDOMIZATION_STAGES = ("off", "narrow", "wide")
+REQUIRED_RUNTIME_VERSIONS = runtime_versions.REQUIRED_RUNTIME_VERSIONS
+require_runtime_versions = runtime_versions.require_runtime_versions
+
+
+def positive_int(value: str) -> int:
+    """Parse a strictly positive command-line integer."""
+
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 def add_rsl_rl_args(parser: argparse.ArgumentParser) -> None:
@@ -23,7 +36,9 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser) -> None:
         parser: The parser to add the arguments to.
     """
     # Group RSL-RL options in the generated help text.
-    arg_group = parser.add_argument_group("rsl_rl", description="Arguments for RSL-RL agent.")
+    arg_group = parser.add_argument_group(
+        "rsl_rl", description="Arguments for RSL-RL agent."
+    )
     # Experiment arguments.
     arg_group.add_argument(
         "--experiment_name",
@@ -40,9 +55,9 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser) -> None:
     # Checkpoint-loading arguments.
     arg_group.add_argument(
         "--resume",
-        action="store_true",
-        default=False,
-        help="Whether to resume from a checkpoint.",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Enable or disable checkpoint resume, overriding the configured value.",
     )
     _add_rsl_rl_checkpoint_args(arg_group)
     # Logger arguments.
@@ -61,16 +76,6 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def add_rsl_rl_checkpoint_args(parser: argparse.ArgumentParser) -> None:
-    """Add only the checkpoint-selection arguments needed for evaluation."""
-
-    arg_group = parser.add_argument_group(
-        "rsl_rl_checkpoint",
-        description="Arguments for selecting an RSL-RL checkpoint.",
-    )
-    _add_rsl_rl_checkpoint_args(arg_group)
-
-
 def add_domain_randomization_args(parser: argparse.ArgumentParser) -> None:
     """Add the staged domain-randomization option to a script parser."""
 
@@ -83,32 +88,35 @@ def add_domain_randomization_args(parser: argparse.ArgumentParser) -> None:
         choices=DOMAIN_RANDOMIZATION_STAGES,
         default=None,
         help=(
-            "Select the off, narrow, or wide domain-randomization stage for supported tasks. "
+            "Select the off, narrow, or wide parkour domain-randomization stage. "
             "Overrides env.domain_randomization.stage when provided."
         ),
     )
+
+
+def add_rsl_rl_checkpoint_args(parser: argparse.ArgumentParser) -> None:
+    """Add only the checkpoint-selection arguments needed for evaluation."""
+
+    arg_group = parser.add_argument_group(
+        "rsl_rl_checkpoint",
+        description="Arguments for selecting an RSL-RL checkpoint.",
+    )
+    _add_rsl_rl_checkpoint_args(arg_group)
 
 
 def apply_domain_randomization_stage(
     env_cfg: object,
     args_cli: argparse.Namespace,
 ) -> None:
-    """Apply the optional CLI stage to an environment that supports it."""
+    """Apply the optional CLI stage to the parkour environment."""
 
-    stage = getattr(args_cli, "domain_randomization_stage", None)
-    if stage is None:
-        return
-
-    randomization_cfg = getattr(env_cfg, "domain_randomization", None)
-    if randomization_cfg is None:
-        raise ValueError(
-            "--domain_randomization_stage is only supported by environments "
-            "with a domain_randomization configuration."
-        )
-    randomization_cfg.stage = stage
+    if args_cli.domain_randomization_stage is not None:
+        env_cfg.domain_randomization.stage = args_cli.domain_randomization_stage
 
 
-def update_rsl_rl_cfg(agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Namespace) -> RslRlBaseRunnerCfg:
+def update_rsl_rl_cfg(
+    agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Namespace
+) -> RslRlBaseRunnerCfg:
     """Update configuration for RSL-RL agent based on inputs.
 
     Args:

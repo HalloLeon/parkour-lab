@@ -4,4 +4,3 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """Learning algorithms and model-training support for Parkour Lab."""
-

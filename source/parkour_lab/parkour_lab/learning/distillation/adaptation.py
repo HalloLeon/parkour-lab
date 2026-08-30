@@ -3,12 +3,12 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Privileged and deployable encoders for online dynamics adaptation.
+"""Privileged and history-based encoders for online dynamics adaptation.
 
 The teacher compresses simulator-known dynamics parameters into the motor
-actor's adaptation latent. The deployable student predicts the same latent
-from a causal history of robot states, whose final values already contain the
-previous low-level action.
+actor's adaptation latent. Its history-policy ablation predicts the same latent
+from causal robot-state history, whose final values already contain the previous
+low-level action.
 """
 
 from __future__ import annotations
@@ -16,17 +16,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from .architecture import (
-    DEFAULT_ADAPTATION_LATENT_DIM,
-    _build_mlp,
-    _validate_input,
-)
-
-DEPLOYABLE_HISTORY_LENGTH = 10
-"""Number of current-and-past deployable states used for adaptation."""
+from .architecture import DEFAULT_ADAPTATION_LATENT_DIM, _build_mlp
 
 __all__ = [
-    "DEPLOYABLE_HISTORY_LENGTH",
     "DeployableHistoryEncoder",
     "PrivilegedDynamicsEncoder",
 ]
@@ -50,8 +42,6 @@ class DeployableHistoryEncoder(nn.Module):
         ):
             raise ValueError("History-encoder dimensions must be positive.")
 
-        self.history_dim = history_dim
-        self.latent_dim = latent_dim
         self.network = _build_mlp(
             history_dim,
             latent_dim,
@@ -60,12 +50,6 @@ class DeployableHistoryEncoder(nn.Module):
 
     def forward(self, deployable_history: torch.Tensor) -> torch.Tensor:
         """Encode one flattened causal history per sample."""
-
-        _validate_input(
-            deployable_history,
-            self.history_dim,
-            "deployable_history",
-        )
         return self.network(deployable_history)
 
 
@@ -87,8 +71,6 @@ class PrivilegedDynamicsEncoder(nn.Module):
         ):
             raise ValueError("Dynamics-encoder dimensions must be positive.")
 
-        self.dynamics_dim = dynamics_dim
-        self.latent_dim = latent_dim
         self.network = _build_mlp(
             dynamics_dim,
             latent_dim,
@@ -97,10 +79,4 @@ class PrivilegedDynamicsEncoder(nn.Module):
 
     def forward(self, privileged_dynamics: torch.Tensor) -> torch.Tensor:
         """Return one privileged adaptation target per environment."""
-
-        _validate_input(
-            privileged_dynamics,
-            self.dynamics_dim,
-            "privileged_dynamics",
-        )
         return self.network(privileged_dynamics)

@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from collections.abc import Mapping, Sequence
 from typing import Literal
@@ -24,6 +25,7 @@ from ..contracts import (
     ADAPTATION_HISTORY_GROUP,
     PRIVILEGED_DYNAMICS_GROUP,
     PRIVILEGED_TERRAIN_GROUP,
+    SUPPORTED_TEACHER_OBSERVATION_GROUPS,
     TEACHER_OBSERVATION_GROUPS,
 )
 from .model import (
@@ -54,6 +56,7 @@ class PrivilegedTeacherActorCritic(ActorCritic):
         activation: str = "elu",
         init_noise_std: float = 1.0,
         noise_std_type: Literal["scalar", "log"] = "scalar",
+        state_dependent_std: bool = False,
         min_noise_std: float = 0.05,
         max_noise_std: float = 1.5,
         dynamics_encoder_hidden_dims: Sequence[int] = (128, 64),
@@ -63,20 +66,21 @@ class PrivilegedTeacherActorCritic(ActorCritic):
         **kwargs: object,
     ) -> None:
         actor_groups = tuple(obs_groups["policy"])
-        groups_without_terrain = tuple(
-            group for group in TEACHER_OBSERVATION_GROUPS if group != PRIVILEGED_TERRAIN_GROUP
-        )
-        if actor_groups not in (groups_without_terrain, TEACHER_OBSERVATION_GROUPS):
+        if actor_groups not in SUPPORTED_TEACHER_OBSERVATION_GROUPS:
             raise ValueError(
-                "The modular teacher actor requires observation groups "
-                f"{list(groups_without_terrain)} with optional "
-                f"{PRIVILEGED_TERRAIN_GROUP!r}, got {list(actor_groups)}."
+                "The modular teacher actor requires one of the supported observation routes "
+                f"{[list(route) for route in SUPPORTED_TEACHER_OBSERVATION_GROUPS]}, "
+                f"got {list(actor_groups)}."
             )
         if activation != "elu":
-            raise ValueError("The shared teacher/student motor actor requires ELU.")
+            raise ValueError("The modular teacher motor actor requires ELU.")
         if actor_obs_normalization:
             raise ValueError(
                 "The adaptation encoders require raw actor observations; actor_obs_normalization must remain disabled."
+            )
+        if state_dependent_std:
+            raise ValueError(
+                "The modular teacher requires state-independent action noise."
             )
         if (
             not math.isfinite(min_noise_std)
@@ -84,7 +88,9 @@ class PrivilegedTeacherActorCritic(ActorCritic):
             or min_noise_std <= 0.0
             or max_noise_std < min_noise_std
         ):
-            raise ValueError("Action-noise bounds must be finite and satisfy 0 < min_noise_std <= max_noise_std.")
+            raise ValueError(
+                "Action-noise bounds must be finite and satisfy 0 < min_noise_std <= max_noise_std."
+            )
 
         super().__init__(
             obs,
@@ -97,17 +103,20 @@ class PrivilegedTeacherActorCritic(ActorCritic):
             activation=activation,
             init_noise_std=init_noise_std,
             noise_std_type=noise_std_type,
+            state_dependent_std=False,
             **kwargs,
         )
         self.min_noise_std = min_noise_std
         self.max_noise_std = max_noise_std
 
         terrain_scan_dim = (
-            int(obs[PRIVILEGED_TERRAIN_GROUP].shape[-1]) if actor_groups == TEACHER_OBSERVATION_GROUPS else None
+            int(obs[PRIVILEGED_TERRAIN_GROUP].shape[-1])
+            if PRIVILEGED_TERRAIN_GROUP in actor_groups
+            else None
         )
         motor_cfg = MotorInterfaceCfg(
             state_dim=int(obs[TEACHER_OBSERVATION_GROUPS[0]].shape[-1]),
-            heading_dim=int(obs[TEACHER_OBSERVATION_GROUPS[1]].shape[-1]),
+            travel_direction_dim=int(obs[TEACHER_OBSERVATION_GROUPS[1]].shape[-1]),
             terrain_latent_dim=terrain_latent_dim,
             action_dim=num_actions,
             hidden_dims=tuple(actor_hidden_dims),
@@ -130,35 +139,21 @@ class PrivilegedTeacherActorCritic(ActorCritic):
         self.enforce_action_std_bounds_()
         print(f"Modular teacher actor: {self.actor}")
 
-    def update_distribution(self, obs: torch.Tensor) -> None:
-        """Build the privileged actor distribution with bounded exploration."""
-
-        mean = self.actor(obs)
-        self.distribution = torch.distributions.Normal(
-            mean,
-            self._bounded_action_std(mean),
-        )
-
-    # Extend ActorCritic.act with ROA's history-conditioned path.
     def act(
         self,
         obs: Mapping[str, torch.Tensor],
         *,
         use_history: bool = False,
-        **kwargs: object,
+        **_: object,
     ) -> torch.Tensor:
         """Sample from the privileged or history-conditioned actor."""
 
-        if not use_history:
-            return super().act(obs, **kwargs)
-
-        mean = self.act_inference_from_history(obs)
+        mean = self._actor_mean(obs, use_history=use_history)
         self.distribution = torch.distributions.Normal(
             mean,
             self._bounded_action_std(mean),
         )
         return self.distribution.sample()
-    
 
     def act_inference_from_history(
         self,
@@ -166,14 +161,47 @@ class PrivilegedTeacherActorCritic(ActorCritic):
     ) -> torch.Tensor:
         """Return deterministic actions without using privileged dynamics."""
 
-        terrain_scan = obs[PRIVILEGED_TERRAIN_GROUP] if PRIVILEGED_TERRAIN_GROUP in self.obs_groups["policy"] else None
-        return self.actor.forward_from_history(
+        return self._actor_mean(obs, use_history=True)
+
+    def _actor_mean(
+        self,
+        obs: Mapping[str, torch.Tensor],
+        *,
+        use_history: bool,
+        actor: PrivilegedTeacherActor | None = None,
+    ) -> torch.Tensor:
+        """Evaluate either actor path, optionally with a frozen actor snapshot."""
+
+        actor = self.actor if actor is None else actor
+        if not use_history:
+            actor_obs = self.actor_obs_normalizer(self.get_actor_obs(obs))
+            return actor(actor_obs)
+        terrain_scan = (
+            obs[PRIVILEGED_TERRAIN_GROUP]
+            if PRIVILEGED_TERRAIN_GROUP in self.obs_groups["policy"]
+            else None
+        )
+        return actor.forward_from_history(
             obs[TEACHER_OBSERVATION_GROUPS[0]],
             obs[TEACHER_OBSERVATION_GROUPS[1]],
             terrain_scan,
             obs[ADAPTATION_HISTORY_GROUP],
         )
 
+    def _actions_log_prob(
+        self,
+        obs: Mapping[str, torch.Tensor],
+        actions: torch.Tensor,
+        *,
+        actor: PrivilegedTeacherActor,
+        action_std: torch.Tensor,
+        use_history: bool,
+    ) -> torch.Tensor:
+        """Evaluate actions under a frozen behavior actor and action noise."""
+
+        mean = self._actor_mean(obs, use_history=use_history, actor=actor)
+        distribution = torch.distributions.Normal(mean, action_std.expand_as(mean))
+        return distribution.log_prob(actions).sum(dim=-1)
 
     def enforce_action_std_bounds_(self) -> None:
         """Project the learned noise parameter into its configured safe range."""
@@ -188,16 +216,20 @@ class PrivilegedTeacherActorCritic(ActorCritic):
                 lower_bound = math.log(self.min_noise_std)
                 upper_bound = math.log(self.max_noise_std)
             else:
-                raise ValueError(f"Unsupported noise_std_type: {self.noise_std_type!r}.")
+                raise ValueError(
+                    f"Unsupported noise_std_type: {self.noise_std_type!r}."
+                )
             if not torch.isfinite(parameter).all():
-                raise FloatingPointError("The learned action-noise parameter became non-finite.")
+                raise FloatingPointError(
+                    "The learned action-noise parameter became non-finite."
+                )
             parameter.clamp_(min=lower_bound, max=upper_bound)
 
     def load_state_dict(
         self,
         state_dict: Mapping[str, torch.Tensor],
         strict: bool = True,
-    ) -> object:
+    ) -> bool:
         """Load a compatible checkpoint and project its action noise safely."""
 
         result = super().load_state_dict(state_dict, strict=strict)
@@ -242,27 +274,41 @@ class RegularizedPPO(PPO):
         **kwargs: object,
     ) -> None:
         super().__init__(policy, **kwargs)
+        if self.is_multi_gpu:
+            raise ValueError("RegularizedPPO supports only single-process training.")
         if self.rnd is not None:
             raise ValueError("RegularizedPPO does not support RND objectives.")
         if self.symmetry is not None:
             if not self.symmetry["use_data_augmentation"]:
                 raise ValueError("RegularizedPPO symmetry requires data augmentation.")
             if self.symmetry["use_mirror_loss"]:
-                raise ValueError("RegularizedPPO does not support a symmetry mirror loss.")
+                raise ValueError(
+                    "RegularizedPPO does not support a symmetry mirror loss."
+                )
         if history_rollout_interval <= 0:
             raise ValueError("history_rollout_interval must be positive.")
         if privileged_regularization_ramp_iterations <= 0:
-            raise ValueError("privileged_regularization_ramp_iterations must be positive.")
+            raise ValueError(
+                "privileged_regularization_ramp_iterations must be positive."
+            )
         if privileged_regularization_warmup_iterations < 0:
-            raise ValueError("privileged_regularization_warmup_iterations cannot be negative.")
+            raise ValueError(
+                "privileged_regularization_warmup_iterations cannot be negative."
+            )
         if max_learning_rate <= 0.0 or max_learning_rate < self.learning_rate:
-            raise ValueError("max_learning_rate must be positive and no smaller than the initial learning rate.")
+            raise ValueError(
+                "max_learning_rate must be positive and no smaller than the initial learning rate."
+            )
         self.adaptation_loss_coef = adaptation_loss_coef
         self.history_rollout_interval = history_rollout_interval
         self.privileged_regularization_coef_end = privileged_regularization_coef_end
         self.privileged_regularization_coef_start = privileged_regularization_coef_start
-        self.privileged_regularization_ramp_iterations = privileged_regularization_ramp_iterations
-        self.privileged_regularization_warmup_iterations = privileged_regularization_warmup_iterations
+        self.privileged_regularization_ramp_iterations = (
+            privileged_regularization_ramp_iterations
+        )
+        self.privileged_regularization_warmup_iterations = (
+            privileged_regularization_warmup_iterations
+        )
         self.max_learning_rate = max_learning_rate
         self._history_rollout = False
         self._update_count: int | None = None
@@ -275,17 +321,27 @@ class RegularizedPPO(PPO):
             # Read the checkpointed counter once; subsequent iterations remain
             # in Python to avoid synchronizing the GPU at every environment step.
             self._update_count = int(self.policy.roa_update_count.item())
-        self._history_rollout = (self._update_count + 1) % self.history_rollout_interval == 0
+        self._history_rollout = (
+            self._update_count + 1
+        ) % self.history_rollout_interval == 0
         self.transition.actions = self.policy.act(
             obs,
             use_history=self._history_rollout,
         ).detach()
-        self.transition.values = self.policy.evaluate(obs).detach()  # Critic estimate for returns.
-        self.transition.actions_log_prob = (  # Old log probability for the PPO ratio.
-            self.policy.get_actions_log_prob(self.transition.actions).detach()
+        self.transition.values = self.policy.evaluate(
+            obs
+        ).detach()  # Critic estimate for returns.
+        self.transition.actions_log_prob = (
+            self.policy.get_actions_log_prob(  # Old log probability for the PPO ratio.
+                self.transition.actions
+            ).detach()
         )
-        self.transition.action_mean = self.policy.action_mean.detach()  # Old Gaussian mean for KL.
-        self.transition.action_sigma = self.policy.action_std.detach()  # Old Gaussian std for KL.
+        self.transition.action_mean = (
+            self.policy.action_mean.detach()
+        )  # Old Gaussian mean for KL.
+        self.transition.action_sigma = (
+            self.policy.action_std.detach()
+        )  # Old Gaussian std for KL.
         self.transition.observations = obs
         return self.transition.actions
 
@@ -302,6 +358,11 @@ class RegularizedPPO(PPO):
         mean_privileged_regularization_loss = 0.0
         mean_surrogate_loss = 0.0
         mean_value_loss = 0.0
+        behavior_actor = None
+        behavior_action_std = None
+        if self.symmetry is not None:
+            behavior_actor = copy.deepcopy(self.policy.actor).requires_grad_(False)
+            behavior_action_std = self.policy.action_std[:1].detach().clone()
         generator = self.storage.mini_batch_generator(  # Yield shuffled rollout splits for each PPO epoch.
             self.num_mini_batches,
             self.num_learning_epochs,
@@ -322,7 +383,9 @@ class RegularizedPPO(PPO):
             original_batch_size = obs_batch.batch_size[0]
             if self.normalize_advantage_per_mini_batch:
                 with torch.no_grad():
-                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (advantages_batch.std() + 1.0e-8)
+                    advantages_batch = (advantages_batch - advantages_batch.mean()) / (
+                        advantages_batch.std() + 1.0e-8
+                    )
 
             # Append reflected transitions after the untouched mini-batch. The
             # augmentation function transforms observations and rollout actions;
@@ -336,17 +399,30 @@ class RegularizedPPO(PPO):
                     actions=actions_batch,
                 )
                 if obs_batch is None or actions_batch is None:
-                    raise RuntimeError("Symmetry augmentation must return observations and actions.")
-                augmented_batch_size = obs_batch.batch_size[0]
-                if augmented_batch_size <= original_batch_size or augmented_batch_size % original_batch_size != 0:
                     raise RuntimeError(
-                        "Symmetry augmentation must append one or more complete "
-                        "copies of the original mini-batch."
+                        "Symmetry augmentation must return observations and actions."
+                    )
+                augmented_batch_size = obs_batch.batch_size[0]
+                if (
+                    augmented_batch_size <= original_batch_size
+                    or augmented_batch_size % original_batch_size != 0
+                ):
+                    raise RuntimeError(
+                        "Symmetry augmentation must append complete copies of the original mini-batch."
                     )
                 if actions_batch.shape[0] != augmented_batch_size:
-                    raise RuntimeError("Symmetry augmentation returned inconsistent observation and action batches.")
+                    raise RuntimeError(
+                        "Symmetry augmentation returned inconsistent observation and action batches."
+                    )
                 num_augmentations = augmented_batch_size // original_batch_size
-                old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(num_augmentations, 1)
+                with torch.inference_mode():
+                    old_actions_log_prob_batch = self.policy._actions_log_prob(
+                        obs_batch,
+                        actions_batch,
+                        actor=behavior_actor,
+                        action_std=behavior_action_std,
+                        use_history=self._history_rollout,
+                    ).unsqueeze(-1)
                 target_values_batch = target_values_batch.repeat(num_augmentations, 1)
                 advantages_batch = advantages_batch.repeat(num_augmentations, 1)
                 returns_batch = returns_batch.repeat(num_augmentations, 1)
@@ -380,9 +456,11 @@ class RegularizedPPO(PPO):
                 value_batch,
             )
 
-            adaptation_loss, privileged_regularization_loss = self.policy.actor.roa_losses(
-                obs_batch[ADAPTATION_HISTORY_GROUP],
-                obs_batch[PRIVILEGED_DYNAMICS_GROUP],
+            adaptation_loss, privileged_regularization_loss = (
+                self.policy.actor.roa_losses(
+                    obs_batch[ADAPTATION_HISTORY_GROUP],
+                    obs_batch[PRIVILEGED_DYNAMICS_GROUP],
+                )
             )
             loss = (
                 surrogate_loss
@@ -393,13 +471,6 @@ class RegularizedPPO(PPO):
             )
 
             loss_is_finite = torch.isfinite(loss).to(dtype=torch.int32)
-            if self.is_multi_gpu:
-                # Every rank must reach the same failure decision before any
-                # rank enters the gradient all-reduce below.
-                torch.distributed.all_reduce(
-                    loss_is_finite,
-                    op=torch.distributed.ReduceOp.MIN,
-                )
             if not loss_is_finite:
                 raise FloatingPointError(
                     "RegularizedPPO produced a non-finite loss before the "
@@ -413,8 +484,6 @@ class RegularizedPPO(PPO):
 
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            if self.is_multi_gpu:
-                self.reduce_parameters()
             torch.nn.utils.clip_grad_norm_(
                 self.policy.parameters(),
                 self.max_grad_norm,
@@ -425,7 +494,9 @@ class RegularizedPPO(PPO):
 
             mean_adaptation_loss += float(adaptation_loss.detach().item())
             mean_entropy += float(entropy_batch.mean().detach().item())
-            mean_privileged_regularization_loss += float(privileged_regularization_loss.detach().item())
+            mean_privileged_regularization_loss += float(
+                privileged_regularization_loss.detach().item()
+            )
             mean_surrogate_loss += float(surrogate_loss.detach().item())
             mean_value_loss += float(value_loss.detach().item())
 
@@ -437,7 +508,8 @@ class RegularizedPPO(PPO):
             "adaptation": mean_adaptation_loss / num_updates,
             "entropy": mean_entropy / num_updates,
             "history_rollout": float(self._history_rollout),
-            "privileged_regularization": mean_privileged_regularization_loss / num_updates,
+            "privileged_regularization": mean_privileged_regularization_loss
+            / num_updates,
             "privileged_regularization_coefficient": regularization_coef,
             "surrogate": mean_surrogate_loss / num_updates,
             "value_function": mean_value_loss / num_updates,
@@ -458,37 +530,28 @@ class RegularizedPPO(PPO):
         with torch.inference_mode():
             kl = torch.sum(
                 torch.log(action_std / old_action_std + 1.0e-5)
-                + (torch.square(old_action_std) + torch.square(old_action_mean - action_mean))
+                + (
+                    torch.square(old_action_std)
+                    + torch.square(old_action_mean - action_mean)
+                )
                 / (2.0 * torch.square(action_std))
                 - 0.5,
                 dim=-1,
             )
             kl_mean = torch.mean(kl)
-            if self.is_multi_gpu:
-                torch.distributed.all_reduce(
-                    kl_mean,
-                    op=torch.distributed.ReduceOp.SUM,
-                )
-                kl_mean /= self.gpu_world_size
             if not torch.isfinite(kl_mean):
-                raise FloatingPointError("The adaptive PPO KL divergence became non-finite.")
-            # The policy moved too far from the rollout policy, so take smaller optimization steps.
-            if self.gpu_global_rank == 0:
-                if kl_mean > self.desired_kl * 2.0:
-                    self.learning_rate = max(1.0e-5, self.learning_rate / 1.5)
-                # The policy update was conservative, so allow larger steps while keeping the rate bounded.
-                elif 0.0 < kl_mean < self.desired_kl / 2.0:
-                    self.learning_rate = min(
-                        self.max_learning_rate,
-                        self.learning_rate * 1.5,
-                    )
-            if self.is_multi_gpu:
-                learning_rate = torch.tensor(
-                    self.learning_rate,
-                    device=self.device,
+                raise FloatingPointError(
+                    "The adaptive PPO KL divergence became non-finite."
                 )
-                torch.distributed.broadcast(learning_rate, src=0)
-                self.learning_rate = learning_rate.item()
+            # The policy moved too far from the rollout policy, so take smaller optimization steps.
+            if kl_mean > self.desired_kl * 2.0:
+                self.learning_rate = max(1.0e-5, self.learning_rate / 1.5)
+            # The policy update was conservative, so allow larger steps while keeping the rate bounded.
+            elif 0.0 < kl_mean < self.desired_kl / 2.0:
+                self.learning_rate = min(
+                    self.max_learning_rate,
+                    self.learning_rate * 1.5,
+                )
             for parameter_group in self.optimizer.param_groups:
                 parameter_group["lr"] = self.learning_rate
 
@@ -537,14 +600,15 @@ class RegularizedPPO(PPO):
             1.0,
         )
         return self.privileged_regularization_coef_start + progress * (
-            self.privileged_regularization_coef_end - self.privileged_regularization_coef_start
+            self.privileged_regularization_coef_end
+            - self.privileged_regularization_coef_start
         )
 
 
 def register_rsl_rl_teacher_actor_critic() -> None:
     """Expose the custom policy and algorithm to RSL-RL's runner lookup."""
 
-    # RSL-RL 3.0.1 resolves policy and algorithm class names with ``eval``
+    # RSL-RL 3.1.2 resolves policy and algorithm class names with ``eval``
     # inside this module rather than accepting external classes directly.
     # Registering both names preserves the stock runner.
     import rsl_rl.runners.on_policy_runner as on_policy_runner

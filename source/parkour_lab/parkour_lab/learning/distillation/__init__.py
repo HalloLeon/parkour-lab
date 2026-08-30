@@ -3,6 +3,4 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Online privileged-teacher distillation support."""
-
-from .contracts import *  # noqa: F401, F403
+"""Modular privileged-teacher architecture and checkpoint contracts."""

@@ -24,7 +24,6 @@ from ..architecture import (
     MotorActor,
     MotorInterfaceCfg,
     _build_mlp,
-    _validate_input,
 )
 
 __all__ = [
@@ -51,14 +50,10 @@ class PrivilegedScanEncoder(nn.Module):
             raise ValueError("Scan and terrain-latent dimensions must be positive.")
         if not hidden_dims or any(width <= 0 for width in hidden_dims):
             raise ValueError("Scan-encoder hidden dimensions must be positive.")
-        self.scan_dim = scan_dim
-        self.latent_dim = latent_dim
         self.network = _build_mlp(scan_dim, latent_dim, hidden_dims)
 
     def forward(self, terrain_scan: torch.Tensor) -> torch.Tensor:
         """Return one fixed-width terrain latent per environment."""
-
-        _validate_input(terrain_scan, self.scan_dim, "terrain_scan")
         return self.network(terrain_scan)
 
 
@@ -135,8 +130,6 @@ class PrivilegedTeacherActor(nn.Module):
 
     def __init__(self, cfg: PrivilegedTeacherModelCfg) -> None:
         super().__init__()
-        cfg.validate()
-        self.cfg = cfg
         self.dynamics_encoder = PrivilegedDynamicsEncoder(
             cfg.privileged_dynamics_dim,
             cfg.motor.adaptation_latent_dim,
@@ -159,7 +152,7 @@ class PrivilegedTeacherActor(nn.Module):
         )
         self._input_dims = (
             cfg.motor.state_dim,
-            cfg.motor.heading_dim,
+            cfg.motor.travel_direction_dim,
             *((cfg.terrain_scan_dim,) if cfg.terrain_scan_dim is not None else ()),
             cfg.privileged_dynamics_dim,
         )
@@ -168,14 +161,14 @@ class PrivilegedTeacherActor(nn.Module):
         """Split RSL-RL's concatenated observations and produce motor actions."""
 
         components = torch.split(observations, self._input_dims, dim=-1)
-        deployable_state, oracle_heading = components[:2]
+        deployable_state, oracle_travel_direction = components[:2]
         terrain_scan = components[2] if self.terrain_encoder is not None else None
         privileged_dynamics = components[-1]
         adaptation_latent = self.dynamics_encoder(privileged_dynamics)
         terrain_latent = self._encode_terrain(deployable_state, terrain_scan)
         return self.motor(
             deployable_state,
-            oracle_heading,
+            oracle_travel_direction,
             terrain_latent,
             adaptation_latent,
         )
@@ -183,7 +176,7 @@ class PrivilegedTeacherActor(nn.Module):
     def forward_from_history(
         self,
         deployable_state: torch.Tensor,
-        oracle_heading: torch.Tensor,
+        oracle_travel_direction: torch.Tensor,
         terrain_scan: torch.Tensor | None,
         deployable_history: torch.Tensor,
     ) -> torch.Tensor:
@@ -193,7 +186,7 @@ class PrivilegedTeacherActor(nn.Module):
         terrain_latent = self._encode_terrain(deployable_state, terrain_scan)
         return self.motor(
             deployable_state,
-            oracle_heading,
+            oracle_travel_direction,
             terrain_latent,
             adaptation_latent,
         )
@@ -232,8 +225,12 @@ class PrivilegedTeacherActor(nn.Module):
 
         if self.terrain_encoder is None:
             if terrain_scan is not None:
-                raise ValueError("terrain_scan must be omitted when terrain is disabled.")
-            return deployable_state.new_zeros((deployable_state.shape[0], self.motor.cfg.terrain_latent_dim))
+                raise ValueError(
+                    "terrain_scan must be omitted when terrain is disabled."
+                )
+            return deployable_state.new_zeros(
+                (deployable_state.shape[0], self.motor.cfg.terrain_latent_dim)
+            )
         if terrain_scan is None:
             raise ValueError("terrain_scan is required when terrain is enabled.")
         return self.terrain_encoder(terrain_scan)

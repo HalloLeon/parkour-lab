@@ -30,8 +30,8 @@ class PrivilegedTeacherActorCriticCfg(RslRlPpoActorCriticCfg):
     # adaptation latent during teacher training.
     dynamics_encoder_hidden_dims: list[int] = [128, 64]
 
-    # The deployable encoder learns the same latent from manager-owned
-    # proprioception/action history.
+    # The deployable encoder learns the same latent from the exact policy frames
+    # buffered by the RSL-RL environment wrapper.
     history_encoder_hidden_dims: list[int] = [256, 128]
 
     # Keep exploration broad enough to discover motion while allowing the
@@ -99,19 +99,19 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     # Dictionary keys name RSL-RL network inputs; list entries name Isaac Lab
     # observation groups declared on ObservationsCfg in parkour_lab_env_cfg.py:
-    # policy -> DeployablePolicyCfg, heading_target -> OracleHeadingTargetCfg,
-    # terrain -> PrivilegedTerrainCfg, dynamics -> PrivilegedDynamicsCfg, and
-    # critic_privileged -> CriticPrivilegedCfg.
+    # policy -> DeployablePolicyCfg, oracle_travel_direction ->
+    # OracleTravelDirectionCfg, terrain -> PrivilegedTerrainCfg, dynamics ->
+    # PrivilegedDynamicsCfg, and critic_privileged -> CriticPrivilegedCfg.
     obs_groups = {
         # RSL-RL calls the action-producing actor input "policy". Its counterpart
         # below is the actor_* configuration on RslRlPpoActorCriticCfg. The
         # identically named list entry is instead ObservationsCfg.policy.
-        "policy": ["policy", "heading_target", "terrain", "dynamics"],
+        "policy": ["policy", "oracle_travel_direction", "terrain", "dynamics"],
         # The "critic" input feeds the value-estimating network configured by
         # critic_* below. It sees every actor group plus simulator-only state.
         "critic": [
             "policy",
-            "heading_target",
+            "oracle_travel_direction",
             "terrain",
             "dynamics",
             "critic_privileged",
@@ -127,8 +127,8 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # Keep the direct parameter used by existing checkpoints and their Adam
         # state; the custom actor projects it into positive safe bounds.
         noise_std_type="scalar",
-        # Keep learned running statistics disabled: the deployable student and
-        # exported motor actor do not carry an RSL-RL normalizer. Every actor
+        # Keep learned running statistics disabled: the exported motor actor
+        # does not carry an RSL-RL normalizer. Every actor
         # observation must instead use a fixed, deployment-reproducible scale at
         # its observation source. Apply the same convention to critic inputs so
         # checkpoint behavior does not depend on hidden normalization state.
@@ -183,27 +183,6 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
-class PPOPrivilegedCriticRunnerCfg(PPORunnerCfg):
-    """Ablation with terrain available only to the critic."""
-
-    # Identify this routing variant in its run-directory name.
-    run_name = "privileged_critic"
-
-    # Keep terrain privileged to the value function. The actor still receives
-    # the oracle heading required by every Phase-1 teacher variant.
-    obs_groups = {
-        "policy": ["policy", "heading_target", "dynamics"],
-        "critic": [
-            "policy",
-            "heading_target",
-            "terrain",
-            "dynamics",
-            "critic_privileged",
-        ],
-    }
-
-
-@configclass
 class PPOBaselineRunnerCfg(PPORunnerCfg):
     """Ablation without terrain observations."""
 
@@ -212,10 +191,31 @@ class PPOBaselineRunnerCfg(PPORunnerCfg):
 
     # Remove terrain from both networks while retaining the critic-only state.
     obs_groups = {
-        "policy": ["policy", "heading_target", "dynamics"],
+        "policy": ["policy", "oracle_travel_direction", "dynamics"],
         "critic": [
             "policy",
-            "heading_target",
+            "oracle_travel_direction",
+            "dynamics",
+            "critic_privileged",
+        ],
+    }
+
+
+@configclass
+class PPOPrivilegedCriticRunnerCfg(PPORunnerCfg):
+    """Ablation with terrain available only to the critic."""
+
+    # Identify this routing variant in its run-directory name.
+    run_name = "privileged_critic"
+
+    # Keep terrain privileged to the value function. The actor still receives
+    # the oracle travel direction required by every Phase-1 teacher variant.
+    obs_groups = {
+        "policy": ["policy", "oracle_travel_direction", "dynamics"],
+        "critic": [
+            "policy",
+            "oracle_travel_direction",
+            "terrain",
             "dynamics",
             "critic_privileged",
         ],
