@@ -17,30 +17,19 @@ EXTENSION_TOML_DATA = toml.load(
     os.path.join(EXTENSION_PATH, "config", "extension.toml")
 )
 
-# Minimum dependencies required prior to installation
-INSTALL_REQUIRES = ["psutil"]
-
 # Installation operation
 setup(
     name="parkour_lab",
     packages=find_packages(),
-    author=EXTENSION_TOML_DATA["package"]["author"],
-    maintainer=EXTENSION_TOML_DATA["package"]["maintainer"],
-    url=EXTENSION_TOML_DATA["package"]["repository"],
     version=EXTENSION_TOML_DATA["package"]["version"],
     description=EXTENSION_TOML_DATA["package"]["description"],
-    keywords=EXTENSION_TOML_DATA["package"]["keywords"],
-    install_requires=INSTALL_REQUIRES,
+    author=EXTENSION_TOML_DATA["package"]["author"],
+    url=EXTENSION_TOML_DATA["package"]["repository"],
     license="BSD-3-Clause",
-    include_package_data=True,
-    python_requires=">=3.10",
+    python_requires=">=3.10,<3.12",
     classifiers=[
-        "Natural Language :: English",
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
-        "Isaac Sim :: 4.5.0",
-        "Isaac Sim :: 5.0.0",
         "Isaac Sim :: 5.1.0",
     ],
-    zip_safe=False,
 )

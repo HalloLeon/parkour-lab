@@ -3,7 +3,9 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Parkour Lab extension package."""
+"""Parkour Lab package.
 
-# Register Gym environments.
-from . import tasks as tasks
+Import :mod:`parkour_lab.tasks` explicitly to register the simulator tasks.
+Keeping the root package inert lets model and checkpoint utilities run without
+loading Isaac Lab.
+"""

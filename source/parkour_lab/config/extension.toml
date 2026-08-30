@@ -12,7 +12,6 @@ author = "Leon Yi Bai"
 maintainer = "Leon Yi Bai"
 description = "Adaptive parkour curriculum and reproducible evaluation for a Unitree Go2 in Isaac Lab"
 repository = "https://github.com/HalloLeon/parkour-lab.git"
-keywords = ["isaaclab", "reinforcement-learning", "parkour", "unitree-go2"]
 
 [dependencies]
 "isaaclab" = {}
@@ -21,7 +20,7 @@ keywords = ["isaaclab", "reinforcement-learning", "parkour", "unitree-go2"]
 "isaaclab_tasks" = {}
 
 [[python.module]]
-name = "parkour_lab"
+name = "parkour_lab.tasks"
 
 [isaaclab_settings]
 # Optional system dependencies can be declared here when needed.
