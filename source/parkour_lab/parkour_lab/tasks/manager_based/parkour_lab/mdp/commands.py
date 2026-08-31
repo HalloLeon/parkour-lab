@@ -516,6 +516,12 @@ def get_target_speed(env: ManagerBasedRLEnv) -> Tensor:
     """
 
     preferred_speed = get_preferred_speed(env)
+    # ObservationManager evaluates terms once for shape inference before the
+    # first curriculum reset creates route state. At that point there is no
+    # route context to condition on, so preserve the raw command semantics.
+    if not route.has_active_routes(env):
+        return preferred_speed
+
     terminal_landing = route.active_waypoint_is_terminal_landing(env)
     term = cast(ParkourIntentCommand, env.command_manager.get_term(INTENT_COMMAND_NAME))
     distance = geometry._active_waypoint_distance_xy(env).to(

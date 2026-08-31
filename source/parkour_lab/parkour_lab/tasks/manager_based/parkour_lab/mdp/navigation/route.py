@@ -52,6 +52,14 @@ def active_difficulty_indices(
 # Active-waypoint queries.
 
 
+def has_active_routes(env: ManagerBasedRLEnv) -> bool:
+    """Return whether the first curriculum reset initialized route state."""
+
+    from .state import _parkour_runtime_or_none
+
+    return _parkour_runtime_or_none(env) is not None
+
+
 def active_waypoint_changed_this_step(env: ManagerBasedRLEnv) -> torch.Tensor:
     """Return which environments switched targets during the current step.
 

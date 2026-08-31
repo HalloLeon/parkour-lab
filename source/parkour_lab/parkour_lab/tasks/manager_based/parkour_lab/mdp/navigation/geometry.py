@@ -96,6 +96,11 @@ def _active_waypoint_guidance_vector_xy(
     """
 
     point_vector = _active_waypoint_vector_xy(env, waypoint_marker_cfg, asset_cfg)
+    # Isaac Lab probes observation shapes before the first curriculum reset.
+    # Until route state exists, retain the original point-bearing behavior.
+    if not route.has_active_routes(env):
+        return point_vector
+
     terminal = route.active_waypoint_is_terminal_landing(env)
     inbound = route.active_waypoint_inbound_direction_xy(env).to(
         device=point_vector.device,
