@@ -512,6 +512,9 @@ class RewardsCfg:
             "hard_half_width_m": PARKOUR_CURRICULUM.hard_route_half_width_m,
         },
     )
+    # A hard envelope violation is a real failure, not a cheap way to truncate
+    # the remaining task cost.
+    off_route_failure = RewTerm(func=mdp.off_route_failure, weight=-10.0)
 
     # Explicit physical milestones split one conservative +2 shaping budget;
     # this includes the two supported flat-bootstrap progress targets.

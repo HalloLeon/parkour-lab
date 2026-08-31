@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import copy
 import math
 from collections.abc import Mapping, Sequence
 from typing import Literal
@@ -38,9 +37,6 @@ __all__ = [
     "RegularizedPPO",
     "register_rsl_rl_teacher_actor_critic",
 ]
-
-_MAX_PPO_LOG_RATIO = 20.0
-"""Largest supported cap for the extreme, otherwise-unbounded PPO ratio tail."""
 
 
 class PrivilegedTeacherActorCritic(ActorCritic):
@@ -191,21 +187,6 @@ class PrivilegedTeacherActorCritic(ActorCritic):
             obs[ADAPTATION_HISTORY_GROUP],
         )
 
-    def _actions_log_prob(
-        self,
-        obs: Mapping[str, torch.Tensor],
-        actions: torch.Tensor,
-        *,
-        actor: PrivilegedTeacherActor,
-        action_std: torch.Tensor,
-        use_history: bool,
-    ) -> torch.Tensor:
-        """Evaluate actions under a frozen behavior actor and action noise."""
-
-        mean = self._actor_mean(obs, use_history=use_history, actor=actor)
-        distribution = torch.distributions.Normal(mean, action_std.expand_as(mean))
-        return distribution.log_prob(actions).sum(dim=-1)
-
     def enforce_action_std_bounds_(self) -> None:
         """Project the learned noise parameter into its configured safe range."""
 
@@ -274,7 +255,6 @@ class RegularizedPPO(PPO):
         privileged_regularization_ramp_iterations: int = 300,
         privileged_regularization_warmup_iterations: int = 200,
         max_learning_rate: float = 1.0e-3,
-        max_log_ratio: float = _MAX_PPO_LOG_RATIO,
         **kwargs: object,
     ) -> None:
         super().__init__(policy, **kwargs)
@@ -311,15 +291,6 @@ class RegularizedPPO(PPO):
             raise ValueError(
                 "clip_param must be finite and lie strictly between 0 and 1."
             )
-        if (
-            not math.isfinite(max_log_ratio)
-            or max_log_ratio <= math.log1p(self.clip_param)
-            or max_log_ratio > _MAX_PPO_LOG_RATIO
-        ):
-            raise ValueError(
-                "max_log_ratio must be finite, greater than log(1 + clip_param), "
-                f"and no larger than {_MAX_PPO_LOG_RATIO}."
-            )
         self.adaptation_loss_coef = adaptation_loss_coef
         self.history_rollout_interval = history_rollout_interval
         self.privileged_regularization_coef_end = privileged_regularization_coef_end
@@ -331,7 +302,6 @@ class RegularizedPPO(PPO):
             privileged_regularization_warmup_iterations
         )
         self.max_learning_rate = max_learning_rate
-        self.max_log_ratio = max_log_ratio
         self._history_rollout = False
         self._update_count: int | None = None
 
@@ -378,15 +348,8 @@ class RegularizedPPO(PPO):
         mean_adaptation_loss = 0.0
         mean_entropy = 0.0
         mean_privileged_regularization_loss = 0.0
-        mean_ppo_log_ratio_cap_fraction = 0.0
-        stable_gradient_clip_fallbacks = 0
         mean_surrogate_loss = 0.0
         mean_value_loss = 0.0
-        behavior_actor = None
-        behavior_action_std = None
-        if self.symmetry is not None:
-            behavior_actor = copy.deepcopy(self.policy.actor).requires_grad_(False)
-            behavior_action_std = self.policy.action_std[:1].detach().clone()
         generator = self.storage.mini_batch_generator(  # Yield shuffled rollout splits for each PPO epoch.
             self.num_mini_batches,
             self.num_learning_epochs,
@@ -439,14 +402,13 @@ class RegularizedPPO(PPO):
                         "Symmetry augmentation returned inconsistent observation and action batches."
                     )
                 num_augmentations = augmented_batch_size // original_batch_size
-                with torch.inference_mode():
-                    old_actions_log_prob_batch = self.policy._actions_log_prob(
-                        obs_batch,
-                        actions_batch,
-                        actor=behavior_actor,
-                        action_std=behavior_action_std,
-                        use_history=self._history_rollout,
-                    ).unsqueeze(-1)
+                # Reflection pushes each rollout action through a signed
+                # permutation with unit Jacobian. The reflected behavior density
+                # is therefore the collected action's density, not the old
+                # actor's generally different density at the reflected state.
+                old_actions_log_prob_batch = old_actions_log_prob_batch.repeat(
+                    num_augmentations, 1
+                )
                 target_values_batch = target_values_batch.repeat(num_augmentations, 1)
                 advantages_batch = advantages_batch.repeat(num_augmentations, 1)
                 returns_batch = returns_batch.repeat(num_augmentations, 1)
@@ -471,7 +433,7 @@ class RegularizedPPO(PPO):
                 old_mu_batch,
                 old_sigma_batch,
             )
-            surrogate_loss, value_loss, log_ratio_cap_fraction = self._ppo_losses(
+            surrogate_loss, value_loss = self._ppo_losses(
                 actions_log_prob_batch,
                 advantages_batch,
                 old_actions_log_prob_batch,
@@ -508,7 +470,11 @@ class RegularizedPPO(PPO):
 
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
-            stable_gradient_clip_fallbacks += int(self._clip_gradients())
+            torch.nn.utils.clip_grad_norm_(
+                self.policy.parameters(),
+                self.max_grad_norm,
+                error_if_nonfinite=True,
+            )
             self.optimizer.step()
             self.policy.enforce_action_std_bounds_()
 
@@ -516,9 +482,6 @@ class RegularizedPPO(PPO):
             mean_entropy += float(entropy_batch.mean().detach().item())
             mean_privileged_regularization_loss += float(
                 privileged_regularization_loss.detach().item()
-            )
-            mean_ppo_log_ratio_cap_fraction += float(
-                log_ratio_cap_fraction.detach().item()
             )
             mean_surrogate_loss += float(surrogate_loss.detach().item())
             mean_value_loss += float(value_loss.detach().item())
@@ -534,12 +497,6 @@ class RegularizedPPO(PPO):
             "privileged_regularization": mean_privileged_regularization_loss
             / num_updates,
             "privileged_regularization_coefficient": regularization_coef,
-            "ppo_log_ratio_cap_fraction": (
-                mean_ppo_log_ratio_cap_fraction / num_updates
-            ),
-            "stable_gradient_clip_fallback_fraction": (
-                stable_gradient_clip_fallbacks / num_updates
-            ),
             "surrogate": mean_surrogate_loss / num_updates,
             "value_function": mean_value_loss / num_updates,
         }
@@ -592,7 +549,7 @@ class RegularizedPPO(PPO):
         returns: torch.Tensor,
         target_values: torch.Tensor,
         values: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the clipped policy-surrogate and value-function losses."""
 
         advantages = torch.squeeze(advantages)
@@ -601,30 +558,25 @@ class RegularizedPPO(PPO):
             raise FloatingPointError(
                 "RegularizedPPO received a non-finite action log-probability ratio."
             )
-        hard_cap_active = (advantages < 0.0) & (log_ratio > self.max_log_ratio)
-        forward_capped_log_ratio = log_ratio.clamp_max(self.max_log_ratio)
-        bounded_log_ratio = forward_capped_log_ratio.detach() + (
-            log_ratio - log_ratio.detach()
-        )
-        # Below the numerical tail cap this is algebraically identical to
-        # max(-A*r, -A*clip(r)), but it applies the active PPO bound before
-        # exponentiation. The conventional expression can evaluate
-        # exp(log_ratio)=inf on a branch that clipping subsequently discards;
-        # autograd then produces a hidden 0*inf NaN even though the scalar loss
-        # is finite. The additional high cap affects only the unbounded
-        # wrong-direction tail, where float32 exp would otherwise overflow. Its
-        # straight-through gradient retains the corrective direction before the
-        # combined gradient is clipped globally.
+        # This is algebraically identical to max(-A*r, -A*clip(r)), but chooses
+        # the active PPO branch in log space before exponentiation. That avoids
+        # evaluating an overflowing exponential on an inactive clipped branch
+        # without capping a ratio that the textbook objective leaves unbounded.
         effective_log_ratio = torch.where(
             advantages >= 0.0,
-            bounded_log_ratio.clamp_max(math.log1p(self.clip_param)),
-            bounded_log_ratio.clamp_min(math.log1p(-self.clip_param)),
+            log_ratio.clamp_max(math.log1p(self.clip_param)),
+            log_ratio.clamp_min(math.log1p(-self.clip_param)),
         )
         surrogate_loss = (-advantages * torch.exp(effective_log_ratio)).mean()
-        cap_fraction = hard_cap_active.to(dtype=surrogate_loss.dtype).mean()
+        if not torch.isfinite(surrogate_loss):
+            raise FloatingPointError(
+                "RegularizedPPO produced a non-finite policy surrogate; "
+                "the behavior-policy likelihood ratio left the numerically "
+                "representable PPO domain."
+            )
 
         if not self.use_clipped_value_loss:
-            return surrogate_loss, torch.square(returns - values).mean(), cap_fraction
+            return surrogate_loss, torch.square(returns - values).mean()
 
         values_clipped = target_values + (values - target_values).clamp(
             -self.clip_param,
@@ -634,72 +586,7 @@ class RegularizedPPO(PPO):
             torch.square(values - returns),
             torch.square(values_clipped - returns),
         ).mean()
-        return surrogate_loss, value_loss, cap_fraction
-
-    def _clip_gradients(self) -> bool:
-        """Clip gradients, using a scale-normalized norm after float32 overflow.
-
-        Returns ``True`` only when the numerically stable fallback was needed.
-        Non-finite gradient elements remain fatal.
-        """
-
-        try:
-            torch.nn.utils.clip_grad_norm_(
-                self.policy.parameters(),
-                self.max_grad_norm,
-                error_if_nonfinite=True,
-            )
-        except RuntimeError as error:
-            if "non-finite" not in str(error):
-                raise
-            named_gradients = [
-                (name, parameter.grad)
-                for name, parameter in self.policy.named_parameters()
-                if parameter.grad is not None
-            ]
-            offenders = [
-                name
-                for name, gradient in named_gradients
-                if not torch.isfinite(gradient).all()
-            ]
-            if offenders:
-                raise FloatingPointError(
-                    "RegularizedPPO produced non-finite gradients after a finite loss: "
-                    f"{', '.join(offenders[:8])}."
-                ) from error
-            self._clip_finite_gradients_with_stable_norm(
-                [gradient for _, gradient in named_gradients]
-            )
-            return True
-        return False
-
-    @torch.no_grad()
-    def _clip_finite_gradients_with_stable_norm(
-        self,
-        gradients: list[torch.Tensor],
-    ) -> None:
-        """Clip large finite gradients without overflowing their float32 L2 norm."""
-
-        max_abs = torch.stack(
-            [
-                gradient.detach().abs().max().to(dtype=torch.float64)
-                for gradient in gradients
-            ]
-        ).max()
-        if max_abs <= 0.0:
-            return
-
-        # Normalize first so squaring cannot overflow. Multiplying the normalized
-        # tensors by max_grad_norm / ||g / max_abs|| is algebraically equivalent
-        # to ordinary global L2 clipping, without forming the overflowing norm.
-        for gradient in gradients:
-            gradient.div_(max_abs.to(device=gradient.device, dtype=gradient.dtype))
-        scaled_squared_norm = torch.stack(
-            [gradient.square().sum(dtype=torch.float64) for gradient in gradients]
-        ).sum()
-        scale = self.max_grad_norm / torch.sqrt(scaled_squared_norm)
-        for gradient in gradients:
-            gradient.mul_(scale.to(device=gradient.device, dtype=gradient.dtype))
+        return surrogate_loss, value_loss
 
     def _regularization_coefficient(self, update_count: int) -> float:
         """Return the warmup-and-ramp coefficient for privileged ROA."""

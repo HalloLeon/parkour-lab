@@ -74,6 +74,7 @@ from .reward_terms.safety import (
 from .reward_terms.waypoint import (
     completed_course_reward as completed_course_reward,
     intermediate_milestone_reward as intermediate_milestone_reward,
+    off_route_failure as off_route_failure,
     route_cross_track_excess_l2 as route_cross_track_excess_l2,
     stationary_velocity_tracking_exp as stationary_velocity_tracking_exp,
     waypoint_heading_alignment_exp as waypoint_heading_alignment_exp,

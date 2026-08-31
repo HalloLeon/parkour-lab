@@ -1782,22 +1782,30 @@ def _update_episode_stop_state(
 ) -> None:
     """Advance evaluator-only stop settling, drift, and restart state."""
 
+    # Preserve the normal tensors allocated before the inference-only rollout.
+    # Rebinding a field here would make the replacement unsafe to reset afterward.
     falling = state.previous_moving & stationary
     previously_active = state.stop_elapsed_s >= 0.0
     rising = (~state.previous_moving) & translating & previously_active
     state.stop_window_counts += falling.to(dtype=state.stop_window_counts.dtype)
-    state.stop_elapsed_s = torch.where(
-        falling, torch.zeros_like(state.stop_elapsed_s), state.stop_elapsed_s
+    state.stop_elapsed_s.copy_(
+        torch.where(
+            falling, torch.zeros_like(state.stop_elapsed_s), state.stop_elapsed_s
+        )
     )
-    state.settled_elapsed_s = torch.where(
-        falling,
-        -torch.ones_like(state.settled_elapsed_s),
-        state.settled_elapsed_s,
+    state.settled_elapsed_s.copy_(
+        torch.where(
+            falling,
+            -torch.ones_like(state.settled_elapsed_s),
+            state.settled_elapsed_s,
+        )
     )
-    state.current_drift_max_m = torch.where(
-        falling,
-        torch.zeros_like(state.current_drift_max_m),
-        state.current_drift_max_m,
+    state.current_drift_max_m.copy_(
+        torch.where(
+            falling,
+            torch.zeros_like(state.current_drift_max_m),
+            state.current_drift_max_m,
+        )
     )
 
     active = (state.stop_elapsed_s >= 0.0) & stationary
@@ -1816,17 +1824,23 @@ def _update_episode_stop_state(
     state.settling_time_sums += torch.where(
         newly_settled, settling_time, torch.zeros_like(settling_time)
     )
-    state.settling_time_maxima = torch.maximum(
-        state.settling_time_maxima,
-        torch.where(newly_settled, settling_time, torch.zeros_like(settling_time)),
+    state.settling_time_maxima.copy_(
+        torch.maximum(
+            state.settling_time_maxima,
+            torch.where(newly_settled, settling_time, torch.zeros_like(settling_time)),
+        )
     )
-    state.settle_position_xy = torch.where(
-        newly_settled.unsqueeze(-1), root_position_xy, state.settle_position_xy
+    state.settle_position_xy.copy_(
+        torch.where(
+            newly_settled.unsqueeze(-1), root_position_xy, state.settle_position_xy
+        )
     )
-    state.current_drift_max_m = torch.where(
-        newly_settled,
-        torch.zeros_like(state.current_drift_max_m),
-        state.current_drift_max_m,
+    state.current_drift_max_m.copy_(
+        torch.where(
+            newly_settled,
+            torch.zeros_like(state.current_drift_max_m),
+            state.current_drift_max_m,
+        )
     )
 
     pending_drift = (
@@ -1836,10 +1850,12 @@ def _update_episode_stop_state(
     )
     next_settled_elapsed = state.settled_elapsed_s + step_dt
     drift_m = torch.linalg.norm(root_position_xy - state.settle_position_xy, dim=-1)
-    state.current_drift_max_m = torch.where(
-        pending_drift,
-        torch.maximum(state.current_drift_max_m, drift_m),
-        state.current_drift_max_m,
+    state.current_drift_max_m.copy_(
+        torch.where(
+            pending_drift,
+            torch.maximum(state.current_drift_max_m, drift_m),
+            state.current_drift_max_m,
+        )
     )
     record_drift = pending_drift & (next_settled_elapsed >= STOP_DRIFT_HORIZON_S)
     completed_drift_m = torch.where(
@@ -1849,44 +1865,60 @@ def _update_episode_stop_state(
     )
     state.drift_2s_counts += record_drift.to(dtype=state.drift_2s_counts.dtype)
     state.drift_2s_sums += completed_drift_m
-    state.drift_2s_maxima = torch.maximum(
-        state.drift_2s_maxima,
-        completed_drift_m,
+    state.drift_2s_maxima.copy_(
+        torch.maximum(
+            state.drift_2s_maxima,
+            completed_drift_m,
+        )
     )
-    state.settled_elapsed_s = torch.where(
-        record_drift,
-        torch.full_like(state.settled_elapsed_s, math.inf),
-        torch.where(pending_drift, next_settled_elapsed, state.settled_elapsed_s),
+    state.settled_elapsed_s.copy_(
+        torch.where(
+            record_drift,
+            torch.full_like(state.settled_elapsed_s, math.inf),
+            torch.where(pending_drift, next_settled_elapsed, state.settled_elapsed_s),
+        )
     )
-    state.settled_elapsed_s = torch.where(
-        newly_settled,
-        torch.zeros_like(state.settled_elapsed_s),
-        state.settled_elapsed_s,
+    state.settled_elapsed_s.copy_(
+        torch.where(
+            newly_settled,
+            torch.zeros_like(state.settled_elapsed_s),
+            state.settled_elapsed_s,
+        )
     )
-    state.stop_elapsed_s = torch.where(
-        active, state.stop_elapsed_s + step_dt, state.stop_elapsed_s
+    state.stop_elapsed_s.copy_(
+        torch.where(active, state.stop_elapsed_s + step_dt, state.stop_elapsed_s)
     )
 
     state.had_restart |= rising
-    state.stop_elapsed_s = torch.where(
-        rising, -torch.ones_like(state.stop_elapsed_s), state.stop_elapsed_s
+    state.stop_elapsed_s.copy_(
+        torch.where(
+            rising, -torch.ones_like(state.stop_elapsed_s), state.stop_elapsed_s
+        )
     )
-    state.settled_elapsed_s = torch.where(
-        rising, -torch.ones_like(state.settled_elapsed_s), state.settled_elapsed_s
+    state.settled_elapsed_s.copy_(
+        torch.where(
+            rising, -torch.ones_like(state.settled_elapsed_s), state.settled_elapsed_s
+        )
     )
     pivot_rising = (~state.previous_pivoting) & pivoting
     pivot_restart = state.previous_pivoting & translating
     state.had_pivot |= pivot_rising
-    state.pivot_start_position_xy = torch.where(
-        pivot_rising.unsqueeze(-1), root_position_xy, state.pivot_start_position_xy
+    state.pivot_start_position_xy.copy_(
+        torch.where(
+            pivot_rising.unsqueeze(-1),
+            root_position_xy,
+            state.pivot_start_position_xy,
+        )
     )
     pivot_excursion = torch.linalg.norm(
         root_position_xy - state.pivot_start_position_xy, dim=-1
     )
-    state.pivot_excursion_maxima = torch.where(
-        pivoting | state.previous_pivoting,
-        torch.maximum(state.pivot_excursion_maxima, pivot_excursion),
-        state.pivot_excursion_maxima,
+    state.pivot_excursion_maxima.copy_(
+        torch.where(
+            pivoting | state.previous_pivoting,
+            torch.maximum(state.pivot_excursion_maxima, pivot_excursion),
+            state.pivot_excursion_maxima,
+        )
     )
     state.had_pivot_restart |= pivot_restart
     state.previous_moving.copy_(translating)

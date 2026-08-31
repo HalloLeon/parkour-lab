@@ -233,6 +233,13 @@ def route_cross_track_excess_l2(
     return torch.where(active, excess, torch.zeros_like(excess))
 
 
+def off_route_failure(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return a timestep-independent impulse for an off-route termination."""
+
+    # Isaac Lab computes terminations before rewards, then integrates by step_dt.
+    return env.termination_manager.get_term("off_route").float() / float(env.step_dt)
+
+
 def stationary_velocity_tracking_exp(
     env: ManagerBasedRLEnv,
     planar_speed_std: float = 0.15,
