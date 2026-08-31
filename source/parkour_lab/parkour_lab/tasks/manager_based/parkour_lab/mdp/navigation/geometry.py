@@ -3,6 +3,7 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
 from .._shared.robot import _root_forward_xy_w, _root_lin_vel_xy, _root_pos_env
+from . import route
 from .route import active_waypoint_positions, final_waypoint_positions
 
 # Active-waypoint geometry.
@@ -15,7 +16,7 @@ def _active_waypoint_direction_xy(
 ) -> torch.Tensor:
     """Return the world-aligned unit XY direction to the active waypoint."""
 
-    waypoint_vector_xy = _active_waypoint_vector_xy(
+    waypoint_vector_xy = _active_waypoint_guidance_vector_xy(
         env,
         waypoint_marker_cfg,
         asset_cfg,
@@ -37,7 +38,7 @@ def _active_waypoint_direction_yaw_xy(
 
     direction, _ = _world_vector_to_yaw_direction_xy(
         env,
-        _active_waypoint_vector_xy(env, waypoint_marker_cfg, asset_cfg),
+        _active_waypoint_guidance_vector_xy(env, waypoint_marker_cfg, asset_cfg),
         asset_cfg,
     )
     return direction
@@ -79,6 +80,41 @@ def _active_waypoint_vector_xy(
         waypoint_marker_cfg,
         asset_cfg,
     )[:, :2]
+
+
+def _active_waypoint_guidance_vector_xy(
+    env: ManagerBasedRLEnv,
+    waypoint_marker_cfg: SceneEntityCfg = SceneEntityCfg("waypoint_marker"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Return point guidance, with non-reversing terminal arrival guidance.
+
+    Ordinary targets use their direct point bearing. Within the last root-reach
+    radius of a terminal segment, its longitudinal component is held forward
+    while lateral error remains corrective. Passing the marker therefore cannot
+    flip the oracle direction by 180 degrees during the settling dwell.
+    """
+
+    point_vector = _active_waypoint_vector_xy(env, waypoint_marker_cfg, asset_cfg)
+    terminal = route.active_waypoint_is_terminal_landing(env)
+    inbound = route.active_waypoint_inbound_direction_xy(env).to(
+        device=point_vector.device,
+        dtype=point_vector.dtype,
+    )
+    longitudinal = torch.sum(point_vector * inbound, dim=-1)
+    reach_radius = route.active_waypoint_root_reach_radii(env).to(
+        device=point_vector.device,
+        dtype=point_vector.dtype,
+    )
+    terminal_vector = (
+        point_vector + torch.relu(reach_radius - longitudinal).unsqueeze(-1) * inbound
+    )
+    inside_reach_circle = torch.linalg.norm(point_vector, dim=-1) <= reach_radius
+    return torch.where(
+        (terminal & inside_reach_circle).unsqueeze(-1),
+        terminal_vector,
+        point_vector,
+    )
 
 
 def _active_waypoint_vector_xyz(

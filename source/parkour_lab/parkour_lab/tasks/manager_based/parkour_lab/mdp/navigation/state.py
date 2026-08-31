@@ -17,6 +17,21 @@ if TYPE_CHECKING:
     from ..curriculums.config import ParkourCurriculumCfg
 
 
+TERMINAL_LANDING_PREDICATE_NAMES = (
+    "root_reached",
+    "route_eligible",
+    "support_contact",
+    "support_load",
+    "clearance",
+    "planar_speed",
+    "vertical_speed",
+    "yaw_rate",
+    "roll_pitch_rate",
+    "tilt",
+)
+"""Ordered pass predicates cached by the terminal-landing transition gate."""
+
+
 @dataclass(frozen=True, slots=True)
 class CourseTables:
     """Immutable device-side course data shared by all environments.
@@ -96,6 +111,12 @@ class RouteState:
     # [environment]: uninterrupted time satisfying the terminal-landing support
     # and whole-body stability gate. Non-terminal targets keep this at zero.
     terminal_landing_stable_time_s: torch.Tensor
+    # [environment]: whether the predicates below were evaluated for a
+    # terminal target before any cursor transition on the current step.
+    terminal_landing_active: torch.Tensor
+    # [environment, predicate]: pass masks ordered by
+    # ``TERMINAL_LANDING_PREDICATE_NAMES``.
+    terminal_landing_predicates: torch.Tensor
 
     # Completed-episode evaluation snapshot.
     # [environment]: previous value of ``maximum_progress_m``, copied during
@@ -365,6 +386,16 @@ def _build_route_state(
         active_waypoint_indices=integer_zeros.clone(),
         maximum_progress_m=floating_zeros,
         terminal_landing_stable_time_s=floating_zeros.clone(),
+        terminal_landing_active=torch.zeros(
+            env.num_envs,
+            device=env.device,
+            dtype=torch.bool,
+        ),
+        terminal_landing_predicates=torch.zeros(
+            (env.num_envs, len(TERMINAL_LANDING_PREDICATE_NAMES)),
+            device=env.device,
+            dtype=torch.bool,
+        ),
         previous_episode_maximum_progress_m=floating_zeros.clone(),
         waypoint_changed=torch.zeros(
             env.num_envs,

@@ -7,7 +7,7 @@ from isaaclab.managers import CurriculumTermCfg, ManagerTermBase, SceneEntityCfg
 from isaaclab.terrains import TerrainImporter
 
 from .._shared.runtime import _all_env_ids
-from ..commands import get_target_speed
+from ..commands import get_preferred_speed
 from ..navigation import route
 from . import config
 from .state import ParkourCurriculumState
@@ -177,7 +177,7 @@ class ParkourTerrainCurriculum(ManagerTermBase):
             env,
             env_ids,
         )
-        target_speed = get_target_speed(env)[env_ids].clone()
+        target_speed = get_preferred_speed(env)[env_ids].clone()
         stalled_failure_event = (
             _demotion_transition_mask(
                 normalized_waypoint_progress,

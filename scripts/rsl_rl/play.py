@@ -241,13 +241,16 @@ from parkour_lab.learning.rsl_rl import RslRlHistoryWrapper
 from parkour_lab.tasks.manager_based.parkour_lab.mdp.commands import (
     EVALUATION_PIVOT_WINDOW_DURATION_S,
     PROVISIONAL_ORACLE_RESIDUAL_THRESHOLD_RAD,
-    get_target_speed,
+    get_preferred_speed,
 )
 from parkour_lab.tasks.manager_based.parkour_lab.mdp._shared.go2 import GO2_FOOT_NAMES
 from parkour_lab.tasks.manager_based.parkour_lab.mdp.diagnostics import (
     latest_evaluation_step,
 )
 from parkour_lab.tasks.manager_based.parkour_lab.mdp.navigation import route
+from parkour_lab.tasks.manager_based.parkour_lab.mdp.navigation.state import (
+    TERMINAL_LANDING_PREDICATE_NAMES,
+)
 from parkour_lab.tasks.manager_based.parkour_lab.parkour_lab_env_cfg import (
     ParkourLabEnvCfg,
 )
@@ -482,6 +485,13 @@ class _RolloutResult:
     )
     movement_direction_error_samples_rad: list[float] = field(default_factory=list)
     pivot_yaw_rate_error_samples_rad_s: list[float] = field(default_factory=list)
+    terminal_landing_active_sample_count: int = 0
+    terminal_landing_active_episode_count: int = 0
+    terminal_landing_predicate_pass_counts: dict[str, int] = field(
+        default_factory=lambda: {name: 0 for name in TERMINAL_LANDING_PREDICATE_NAMES}
+    )
+    terminal_landing_episode_max_dwell_s_sum: float = 0.0
+    terminal_landing_max_dwell_s: float = 0.0
 
     def record_completed(
         self,
@@ -496,6 +506,9 @@ class _RolloutResult:
         episode_foot_metrics: dict[str, torch.Tensor] | None = None,
         episode_route_cross_track: _EpisodeRouteCrossTrackState | None = None,
         episode_stop_state: _EpisodeStopState | None = None,
+        episode_terminal_landing_active_steps: torch.Tensor | None = None,
+        episode_terminal_landing_predicate_counts: torch.Tensor | None = None,
+        episode_terminal_landing_max_dwell_s: torch.Tensor | None = None,
     ) -> None:
         """Accumulate newly completed episodes, capped at the requested total."""
 
@@ -594,6 +607,48 @@ class _RolloutResult:
         if episode_stop_state is not None:
             self._record_completed_stops(
                 completed_indices, outcomes["success"], episode_stop_state
+            )
+        if (
+            episode_terminal_landing_active_steps is not None
+            and episode_terminal_landing_predicate_counts is not None
+            and episode_terminal_landing_max_dwell_s is not None
+        ):
+            self._record_completed_terminal_landings(
+                completed_indices,
+                episode_terminal_landing_active_steps,
+                episode_terminal_landing_predicate_counts,
+                episode_terminal_landing_max_dwell_s,
+            )
+
+    def _record_completed_terminal_landings(
+        self,
+        completed_indices: torch.Tensor,
+        active_steps: torch.Tensor,
+        predicate_counts: torch.Tensor,
+        max_dwell_s: torch.Tensor,
+    ) -> None:
+        """Aggregate cached terminal-gate evidence for completed episodes."""
+
+        selected_active_steps = active_steps[completed_indices]
+        active_episodes = selected_active_steps > 0
+        self.terminal_landing_active_sample_count += int(
+            selected_active_steps.sum().item()
+        )
+        active_episode_count = int(active_episodes.sum().item())
+        self.terminal_landing_active_episode_count += active_episode_count
+        selected_predicates = predicate_counts[completed_indices].sum(dim=0)
+        for index, name in enumerate(TERMINAL_LANDING_PREDICATE_NAMES):
+            self.terminal_landing_predicate_pass_counts[name] += int(
+                selected_predicates[index].item()
+            )
+        if active_episode_count > 0:
+            selected_dwell = max_dwell_s[completed_indices][active_episodes]
+            self.terminal_landing_episode_max_dwell_s_sum += float(
+                selected_dwell.sum().item()
+            )
+            self.terminal_landing_max_dwell_s = max(
+                self.terminal_landing_max_dwell_s,
+                float(selected_dwell.max().item()),
             )
 
     def _record_completed_foot_metrics(
@@ -1065,6 +1120,33 @@ class _RolloutResult:
             "waypoint_transition_semantics": "active_waypoint_changed_this_step",
         }
 
+    def terminal_landing_report(self) -> dict[str, object]:
+        """Summarize the exact cached predicates used by the completion gate."""
+
+        samples = self.terminal_landing_active_sample_count
+        episodes = self.terminal_landing_active_episode_count
+        return {
+            "sampling": "post_physics_pre_reset_including_terminal",
+            "active_sample_count": samples,
+            "active_episode_count": episodes,
+            "predicate_pass_fractions": {
+                name: (
+                    self.terminal_landing_predicate_pass_counts[name] / samples
+                    if samples > 0
+                    else None
+                )
+                for name in TERMINAL_LANDING_PREDICATE_NAMES
+            },
+            "mean_episode_max_dwell_s": (
+                self.terminal_landing_episode_max_dwell_s_sum / episodes
+                if episodes > 0
+                else None
+            ),
+            "max_dwell_s": (
+                self.terminal_landing_max_dwell_s if episodes > 0 else None
+            ),
+        }
+
     def oracle_residual_report(self) -> dict[str, object]:
         """Describe the unclamped compatibility diagnostic and its raw tails."""
 
@@ -1299,6 +1381,7 @@ def _build_evaluation_report(
         "requested_episodes": args_cli.eval_episodes,
         "completed_episodes": rollout.completed_episodes,
         "route_cross_track": rollout.route_cross_track_report(),
+        "terminal_landing": rollout.terminal_landing_report(),
         "oracle_residual": rollout.oracle_residual_report(),
         "stop_response": rollout.stop_response_report(),
         "summary": rollout.summary(step_dt),
@@ -1744,7 +1827,7 @@ def _create_episode_stop_state(base_env: ManagerBasedRLEnv) -> _EpisodeStopState
         return torch.zeros(shape, device=base_env.device)
 
     return _EpisodeStopState(
-        previous_moving=get_target_speed(base_env) > 0.0,
+        previous_moving=get_preferred_speed(base_env) > 0.0,
         # Treat an episode-start pivot as a new window so fixed-pivot trials
         # receive the same excursion accounting as sampled mid-episode pivots.
         previous_pivoting=torch.zeros(shape, device=base_env.device, dtype=torch.bool),
@@ -2185,7 +2268,6 @@ def _collect_rollout_statistics(
                 step_metrics["movement_direction_error_rad"],
                 step_metrics["movement_direction_valid"].to(dtype=torch.bool),
             )
-
         rewards = rewards.reshape(-1).to(device=episode_returns.device)
         dones = dones.reshape(-1).to(device=episode_returns.device)
         done_mask = dones.to(dtype=torch.bool)
@@ -2223,6 +2305,9 @@ def _collect_rollout_statistics(
             episode_foot_metrics,
             episode_route_cross_track,
             episode_stop_state,
+            transition.terminal_landing_active_step_count,
+            transition.terminal_landing_predicate_pass_count,
+            transition.terminal_landing_max_dwell_s,
         )
         episode_returns[done_mask] = 0.0
         episode_lengths[done_mask] = 0
@@ -2234,9 +2319,8 @@ def _collect_rollout_statistics(
         _reset_episode_stop_state(
             episode_stop_state,
             done_mask,
-            get_target_speed(base_env) > 0.0,
+            get_preferred_speed(base_env) > 0.0,
         )
-
         sleep_time = step_dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)

@@ -254,11 +254,10 @@ def build_level(
         ray_exit = min(ray_exit, max(distances))
     if ray_entry > ray_exit:
         raise ValueError("The final ramp centerline must point into the landing.")
-    terminal_distance = ray_exit - _WAYPOINT_INSET_M
-    if terminal_distance <= ray_entry:
-        raise ValueError(
-            "The final ramp path through the landing must exceed the waypoint inset."
-        )
+    # Center the root target in the usable landing chord. This maximizes
+    # clearance for the complete Go2 support footprint for every ramp yaw and
+    # avoids coupling terminal safety to a fixed point inset.
+    terminal_distance = 0.5 * (ray_entry + ray_exit)
 
     structures = tuple(
         _ramp_structure(f"tilted_ramp_{index}", ramp)

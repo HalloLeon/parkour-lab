@@ -118,6 +118,57 @@ def active_waypoint_is_terminal_landing(env: ManagerBasedRLEnv) -> torch.Tensor:
     ]
 
 
+def active_waypoint_inbound_direction_xy(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Return the fixed world-XY unit direction of each active route segment."""
+
+    import torch
+
+    from .state import _parkour_runtime
+
+    runtime = _parkour_runtime(env)
+    course_indices = runtime.route.course_indices
+    active_indices = runtime.route.active_waypoint_indices
+    previous_indices = (active_indices - 1).clamp_min(0)
+    previous_waypoints = runtime.courses.waypoints[course_indices, previous_indices, :2]
+    starts = torch.where(
+        (active_indices > 0).unsqueeze(-1),
+        previous_waypoints,
+        torch.zeros_like(previous_waypoints),
+    )
+    vectors = runtime.courses.waypoints[course_indices, active_indices, :2] - starts
+    lengths = torch.linalg.norm(vectors, dim=-1, keepdim=True)
+    fallback = torch.zeros_like(vectors)
+    fallback[:, 0] = 1.0
+    return torch.where(
+        lengths > 1.0e-6,
+        vectors / lengths.clamp_min(1.0e-6),
+        fallback,
+    )
+
+
+def terminal_landing_diagnostics(
+    env: ManagerBasedRLEnv,
+) -> dict[str, torch.Tensor]:
+    """Return cached terminal-gate predicates and dwell without recomputation."""
+
+    import torch
+
+    from .state import TERMINAL_LANDING_PREDICATE_NAMES, _parkour_runtime
+
+    route_state = _parkour_runtime(env).route
+    diagnostics = {
+        name: route_state.terminal_landing_predicates[:, index]
+        for index, name in enumerate(TERMINAL_LANDING_PREDICATE_NAMES)
+    }
+    diagnostics["active"] = route_state.terminal_landing_active
+    diagnostics["stable"] = route_state.terminal_landing_active & torch.all(
+        route_state.terminal_landing_predicates,
+        dim=-1,
+    )
+    diagnostics["dwell_s"] = route_state.terminal_landing_stable_time_s
+    return diagnostics
+
+
 def active_waypoint_positions(
     env: ManagerBasedRLEnv,
     waypoint_marker_cfg: SceneEntityCfg,
@@ -464,36 +515,32 @@ def advance_active_waypoints(
         )
     )
     terminal_landing = courses.terminal_landing_masks[course_indices, active_indices]
-    terminal_stable = (
-        terminal_landing
-        & root_within_radius
-        & route_state_eligible
-        & terminal_load_supported
-        & completion_clearance
-        & (
+    terminal_predicates = torch.stack(
+        (
+            root_within_radius,
+            route_state_eligible,
+            supported,
+            terminal_load_supported,
+            completion_clearance,
             torch.linalg.norm(robot._root_lin_vel_xy(env, asset_cfg), dim=-1)
-            < terminal_max_planar_speed_m_s
-        )
-        & (
+            < terminal_max_planar_speed_m_s,
             torch.abs(robot._root_lin_vel_z(env, asset_cfg))
-            < terminal_max_vertical_speed_m_s
-        )
-        & (
+            < terminal_max_vertical_speed_m_s,
             torch.abs(robot._root_ang_vel_z(env, asset_cfg))
-            < terminal_max_yaw_rate_rad_s
-        )
-        & (
+            < terminal_max_yaw_rate_rad_s,
             torch.linalg.norm(robot._root_ang_vel_xy(env, asset_cfg), dim=-1)
-            < terminal_max_roll_pitch_rate_rad_s
-        )
-        & (
+            < terminal_max_roll_pitch_rate_rad_s,
             torch.linalg.norm(
                 robot._root_projected_gravity_xy(env, asset_cfg),
                 dim=-1,
             )
-            < terminal_max_tilt_sine
-        )
+            < terminal_max_tilt_sine,
+        ),
+        dim=-1,
     )
+    route_state.terminal_landing_active.copy_(terminal_landing)
+    route_state.terminal_landing_predicates.copy_(terminal_predicates)
+    terminal_stable = terminal_landing & torch.all(terminal_predicates, dim=-1)
     route_state.terminal_landing_stable_time_s[:] = torch.where(
         terminal_stable,
         route_state.terminal_landing_stable_time_s + float(env.step_dt),
@@ -655,6 +702,8 @@ def reset_routes(
     )
     route_state.maximum_progress_m[env_ids] = 0.0
     route_state.terminal_landing_stable_time_s[env_ids] = 0.0
+    route_state.terminal_landing_active[env_ids] = False
+    route_state.terminal_landing_predicates[env_ids] = False
     route_state.course_indices[env_ids] = course_indices
     route_state.active_waypoint_indices[env_ids] = 0
     route_state.waypoint_changed[env_ids] = False

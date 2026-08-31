@@ -33,7 +33,7 @@ if TYPE_CHECKING:
 
 # Increment when checkpoint-facing tensor semantics or model wiring change.
 # Checkpoints from another interface version are intentionally incompatible.
-TEACHER_INTERFACE_VERSION = 19
+TEACHER_INTERFACE_VERSION = 20
 
 # Number of delivered deployable-state frames retained by the history wrapper.
 DEPLOYABLE_HISTORY_LENGTH = 10
@@ -257,7 +257,7 @@ def build_teacher_interface(
         # matching. Record only the boundary that is implemented today; future
         # joystick, corridor, and assistance logic owns a separate contract.
         "command_contract": {
-            "schema_version": 2,
+            "schema_version": 3,
             "command_term": "intent",
             "stored_values": [
                 "requested_travel_forward",
@@ -272,7 +272,9 @@ def build_teacher_interface(
             },
             "scripted_training_source": {
                 "flat": "active_course_waypoint",
-                "obstacle": "final_course_waypoint",
+                "obstacle": (
+                    "final_course_waypoint_until_terminal_then_active_terminal_guidance"
+                ),
             },
             "ingress": {
                 "stop_deadband_m_s": float(intent_cfg.stop_deadband_m_s),
@@ -280,6 +282,12 @@ def build_teacher_interface(
                 "yaw_rate_deadband_rad_s": float(intent_cfg.yaw_rate_deadband_rad_s),
                 "max_external_yaw_rate_rad_s": float(
                     intent_cfg.max_external_yaw_rate_rad_s
+                ),
+                "terminal_slowdown_distance_m": float(
+                    intent_cfg.terminal_slowdown_distance_m
+                ),
+                "terminal_min_approach_speed_m_s": float(
+                    intent_cfg.terminal_min_approach_speed_m_s
                 ),
                 "zero_speed_direction": "preserve_last_valid",
                 "invalid_or_stale": "exact_zero_speed_and_yaw_rate",
@@ -292,12 +300,18 @@ def build_teacher_interface(
             "deployable_history_group": ADAPTATION_HISTORY_GROUP,
             "oracle_travel_direction_group": ORACLE_TRAVEL_DIRECTION_GROUP,
             "travel_direction_representation": "yaw_aligned_unit_xy",
-            "preferred_speed": {
+            "translational_target_speed": {
                 "state_term": "desired_speed",
+                "raw_source": "intent.preferred_speed_m_s",
                 "units": "m_s",
                 "domain": "non_negative",
-                "zero_semantics": "stationary_or_pivot_selected_by_yaw_rate",
-                "semantic_version": 1,
+                "zero_semantics": (
+                    "raw_stop_or_pivot_or_terminal_root_inside_reach_radius"
+                ),
+                "terminal_landing_semantics": (
+                    "preferred_speed_tapered_to_minimum_approach_then_exact_zero_inside_reach_radius"
+                ),
+                "semantic_version": 2,
             },
             "preferred_yaw_rate": {
                 "state_term": "desired_yaw_rate",
@@ -318,6 +332,9 @@ def build_teacher_interface(
                 "root_reach_radius_override_source": "course_waypoint.root_reach_radius",
                 "control_waypoint_transition": "current_root_within_radius",
                 "physical_waypoint_transition": "root_radius_and_named_support_contact",
+                "terminal_direction": (
+                    "non_reversing_inbound_segment_inside_reach_circle_direct_point_outside"
+                ),
                 "support_contact_threshold_n": float(
                     success_params["contact_threshold"]
                 ),

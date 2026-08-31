@@ -38,6 +38,7 @@ __all__ = [
     "ParkourIntentCommandCfg",
     "PROVISIONAL_ORACLE_RESIDUAL_THRESHOLD_RAD",
     "active_motion_time_s",
+    "get_preferred_speed",
     "get_requested_travel_direction_yaw_xy",
     "get_target_speed",
     "get_target_yaw_rate",
@@ -353,13 +354,14 @@ class ParkourIntentCommand(CommandTerm):
             self._env
         )
         flat = route.active_difficulty_indices(self._env, env_ids) == 0
+        terminal = route.active_waypoint_is_terminal_landing(self._env)[env_ids]
         active_directions = geometry._active_waypoint_direction_yaw_xy(self._env)
         directions[env_ids] = torch.where(
-            flat.unsqueeze(-1),
+            (flat | terminal).unsqueeze(-1),
             active_directions[env_ids],
             directions[env_ids],
         )
-        valid[env_ids] |= flat
+        valid[env_ids] |= flat | terminal
         valid_ids = env_ids[valid[env_ids]]
         if valid_ids.numel() > 0:
             self._command[valid_ids, :2] = directions[valid_ids]
@@ -377,6 +379,8 @@ class ParkourIntentCommandCfg(CommandTermCfg):
     max_external_speed_m_s: float = 0.70
     yaw_rate_deadband_rad_s: float = 0.05
     max_external_yaw_rate_rad_s: float = 0.80
+    terminal_slowdown_distance_m: float = 0.60
+    terminal_min_approach_speed_m_s: float = 0.20
     stop_window_probability: float = 0.125
     pivot_window_probability: float = 0.05
     # Covers short heading trims through approximately 180-degree turns while
@@ -397,6 +401,8 @@ class ParkourIntentCommandCfg(CommandTermCfg):
             "max_external_speed_m_s",
             "yaw_rate_deadband_rad_s",
             "max_external_yaw_rate_rad_s",
+            "terminal_slowdown_distance_m",
+            "terminal_min_approach_speed_m_s",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
@@ -406,6 +412,14 @@ class ParkourIntentCommandCfg(CommandTermCfg):
         if self.max_external_yaw_rate_rad_s <= self.yaw_rate_deadband_rad_s:
             raise ValueError(
                 "max_external_yaw_rate_rad_s must exceed yaw_rate_deadband_rad_s."
+            )
+        if self.terminal_min_approach_speed_m_s > self.max_external_speed_m_s:
+            raise ValueError(
+                "terminal_min_approach_speed_m_s cannot exceed max_external_speed_m_s."
+            )
+        if self.terminal_min_approach_speed_m_s <= self.stop_deadband_m_s:
+            raise ValueError(
+                "terminal_min_approach_speed_m_s must exceed stop_deadband_m_s."
             )
         for name in ("flat_speed_range_m_s", "obstacle_speed_range_m_s"):
             min_speed, max_speed = _validate_range(
@@ -487,10 +501,42 @@ def get_requested_travel_direction_yaw_xy(env: ManagerBasedRLEnv) -> Tensor:
     return env.command_manager.get_command(INTENT_COMMAND_NAME)[:, :2]
 
 
-def get_target_speed(env: ManagerBasedRLEnv) -> Tensor:
-    """Return deployable preferred speed from the command manager."""
+def get_preferred_speed(env: ManagerBasedRLEnv) -> Tensor:
+    """Return the unmodified speed stored in the external intent packet."""
 
     return env.command_manager.get_command(INTENT_COMMAND_NAME)[:, 2]
+
+
+def get_target_speed(env: ManagerBasedRLEnv) -> Tensor:
+    """Return the route-conditioned translational target seen by the motor.
+
+    A terminal landing tapers the preferred speed toward its root-reach circle,
+    retains a small approach speed outside the circle, and requests an exact
+    stop inside it. Other route phases preserve the intent packet unchanged.
+    """
+
+    preferred_speed = get_preferred_speed(env)
+    terminal_landing = route.active_waypoint_is_terminal_landing(env)
+    term = cast(ParkourIntentCommand, env.command_manager.get_term(INTENT_COMMAND_NAME))
+    distance = geometry._active_waypoint_distance_xy(env).to(
+        device=preferred_speed.device,
+        dtype=preferred_speed.dtype,
+    )
+    reach_radius = route.active_waypoint_root_reach_radii(env).to(
+        device=preferred_speed.device,
+        dtype=preferred_speed.dtype,
+    )
+    approach_scale = (
+        (distance - reach_radius) / term.cfg.terminal_slowdown_distance_m
+    ).clamp(0.0, 1.0)
+    creep_speed = preferred_speed.clamp_max(term.cfg.terminal_min_approach_speed_m_s)
+    approach_speed = torch.maximum(preferred_speed * approach_scale, creep_speed)
+    terminal_speed = torch.where(
+        distance <= reach_radius,
+        torch.zeros_like(preferred_speed),
+        approach_speed,
+    )
+    return torch.where(terminal_landing, terminal_speed, preferred_speed)
 
 
 def get_target_yaw_rate(env: ManagerBasedRLEnv) -> Tensor:

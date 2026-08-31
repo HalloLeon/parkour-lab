@@ -17,6 +17,7 @@ from .commands import (
     ParkourIntentCommand as ParkourIntentCommand,
     ParkourIntentCommandCfg as ParkourIntentCommandCfg,
     active_motion_time_s as active_motion_time_s,
+    get_preferred_speed as get_preferred_speed,
     get_requested_travel_direction_yaw_xy as get_requested_travel_direction_yaw_xy,
     get_target_speed as get_target_speed,
     get_target_yaw_rate as get_target_yaw_rate,

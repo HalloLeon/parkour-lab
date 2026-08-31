@@ -32,7 +32,7 @@ def base_clearance_obs(
 
 def desired_speed_obs(env: ManagerBasedRLEnv) -> torch.Tensor:
     """
-    Per-environment desired forward speed observation.
+    Per-environment route-conditioned translational target speed.
 
     Returns:
         [num_envs, 1]

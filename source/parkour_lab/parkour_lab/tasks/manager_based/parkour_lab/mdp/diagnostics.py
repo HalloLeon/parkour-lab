@@ -27,12 +27,14 @@ from ._shared.runtime import _all_env_ids
 from ._shared.robot import _root_forward_xy_w
 from .commands import (
     PROVISIONAL_ORACLE_RESIDUAL_THRESHOLD_RAD,
+    get_preferred_speed,
     get_requested_travel_direction_yaw_xy,
     get_target_speed,
     get_target_yaw_rate,
     wrapped_heading_residual_rad,
 )
 from .navigation import geometry, route
+from .navigation.state import TERMINAL_LANDING_PREDICATE_NAMES
 
 _MIN_GAIT_DIAGNOSTIC_DURATION_S = 0.5
 """Ignore shorter episode fragments in per-episode gait distributions."""
@@ -52,6 +54,9 @@ class EvaluationStep:
     foot_contact: torch.Tensor
     foot_touchdown: torch.Tensor
     foot_world_z_force: torch.Tensor
+    terminal_landing_active_step_count: torch.Tensor
+    terminal_landing_predicate_pass_count: torch.Tensor
+    terminal_landing_max_dwell_s: torch.Tensor
 
 
 class TrainingDiagnostics(ManagerTermBase):
@@ -231,6 +236,11 @@ class TrainingDiagnostics(ManagerTermBase):
         self._projected_gravity_xy_square_sum = self._buffer(env)
         self._reverse_motion_count = self._buffer(env)
         self._vertical_speed_square_sum = self._buffer(env)
+        self._terminal_landing_active_step_count = self._buffer(env)
+        self._terminal_landing_predicate_pass_count = self._buffer(
+            env, len(TERMINAL_LANDING_PREDICATE_NAMES)
+        )
+        self._terminal_landing_max_dwell_s = self._buffer(env)
 
     def __call__(
         self,
@@ -395,6 +405,26 @@ class TrainingDiagnostics(ManagerTermBase):
             root_velocity_xy - forward_speed.unsqueeze(-1) * waypoint_direction_xy
         )
         target_speed = get_target_speed(env).to(dtype=forward_speed.dtype)
+        terminal_landing = route.terminal_landing_diagnostics(env)
+        terminal_active = terminal_landing["active"]
+        terminal_predicates = torch.stack(
+            [terminal_landing[name] for name in TERMINAL_LANDING_PREDICATE_NAMES],
+            dim=-1,
+        )
+        self._terminal_landing_active_step_count += terminal_active.float()
+        self._terminal_landing_predicate_pass_count += (
+            terminal_predicates & terminal_active.unsqueeze(-1)
+        ).float()
+        self._terminal_landing_max_dwell_s.copy_(
+            torch.maximum(
+                self._terminal_landing_max_dwell_s,
+                torch.where(
+                    terminal_active,
+                    terminal_landing["dwell_s"],
+                    torch.zeros_like(terminal_landing["dwell_s"]),
+                ),
+            )
+        )
 
         self._abs_lateral_speed_sum += torch.linalg.norm(lateral_velocity, dim=-1)
         self._abs_speed_error_sum += torch.abs(forward_speed - target_speed)
@@ -479,8 +509,10 @@ class TrainingDiagnostics(ManagerTermBase):
             geometry._final_waypoint_direction_yaw_xy_components(env)
         )
         flat = route.active_difficulty_indices(env) == 0
+        terminal = route.active_waypoint_is_terminal_landing(env)
+        local_reference = flat | terminal
         requested_travel_direction = torch.where(
-            flat.unsqueeze(-1),
+            local_reference.unsqueeze(-1),
             oracle_travel_direction,
             torch.where(
                 final_reference_valid.unsqueeze(-1),
@@ -492,7 +524,12 @@ class TrainingDiagnostics(ManagerTermBase):
             requested_travel_direction, oracle_travel_direction
         )
         absolute_oracle_residual = torch.abs(oracle_residual)
-        moving = target_speed > 0.0
+        preferred_speed = get_preferred_speed(env).to(
+            device=target_speed.device,
+            dtype=target_speed.dtype,
+        )
+        moving = preferred_speed > 0.0
+        target_moving = target_speed > 0.0
         pivoting = (~moving) & (target_yaw_rate != 0.0)
         stationary = (~moving) & (~pivoting)
         pivot_yaw_rate_error = torch.abs(yaw_rate - target_yaw_rate)
@@ -511,7 +548,7 @@ class TrainingDiagnostics(ManagerTermBase):
         )
         waypoint_changed = route.active_waypoint_changed_this_step(env)
         movement_direction_valid = (
-            moving
+            target_moving
             & (~waypoint_changed)
             & (planar_speed > _MOVEMENT_DIRECTION_MIN_PLANAR_SPEED_M_S)
         )
@@ -559,17 +596,17 @@ class TrainingDiagnostics(ManagerTermBase):
             ),
             "oracle_residual_rad": oracle_residual,
             "absolute_oracle_residual_rad": torch.where(
-                moving,
+                target_moving,
                 absolute_oracle_residual,
                 torch.zeros_like(absolute_oracle_residual),
             ),
             "oracle_residual_threshold_exceedance": (
                 (absolute_oracle_residual > PROVISIONAL_ORACLE_RESIDUAL_THRESHOLD_RAD)
-                & moving
+                & target_moving
             ).to(dtype=forward_speed.dtype),
             "moving_command": moving.to(dtype=forward_speed.dtype),
             "overspeed_ratio": torch.where(
-                moving,
+                target_moving,
                 torch.relu(forward_speed - target_speed)
                 / target_speed.clamp_min(torch.finfo(target_speed.dtype).eps),
                 torch.zeros_like(target_speed),
@@ -590,6 +627,13 @@ class TrainingDiagnostics(ManagerTermBase):
             foot_contact=foot_contact.clone(),
             foot_touchdown=foot_touchdown.clone(),
             foot_world_z_force=foot_world_z_force.clone(),
+            terminal_landing_active_step_count=(
+                self._terminal_landing_active_step_count.clone()
+            ),
+            terminal_landing_predicate_pass_count=(
+                self._terminal_landing_predicate_pass_count.clone()
+            ),
+            terminal_landing_max_dwell_s=self._terminal_landing_max_dwell_s.clone(),
         )
 
     def _cached_raw_reward(
@@ -885,6 +929,34 @@ class TrainingDiagnostics(ManagerTermBase):
                 torque_clip_by_leg_and_type[:, joint_type_index].sum()
                 / joint_type_sample_count
             )
+
+        terminal_active_steps = self._terminal_landing_active_step_count[env_ids].sum()
+        safe_terminal_active_steps = terminal_active_steps.clamp_min(1.0)
+        terminal_active_episodes = (
+            self._terminal_landing_active_step_count[env_ids] > 0.0
+        )
+        terminal_active_episode_count = terminal_active_episodes.sum()
+        safe_terminal_active_episode_count = terminal_active_episode_count.clamp_min(1)
+        predicate_pass_counts = self._terminal_landing_predicate_pass_count[
+            env_ids
+        ].sum(dim=0)
+        metrics["terminal_landing/active_sample_count"] = terminal_active_steps
+        metrics["terminal_landing/active_episode_count"] = terminal_active_episode_count
+        for index, name in enumerate(TERMINAL_LANDING_PREDICATE_NAMES):
+            metrics[f"terminal_landing/{name}_pass_fraction"] = (
+                predicate_pass_counts[index] / safe_terminal_active_steps
+            )
+        active_episode_max_dwell = self._terminal_landing_max_dwell_s[env_ids][
+            terminal_active_episodes
+        ]
+        metrics["terminal_landing/mean_episode_max_dwell_s"] = (
+            active_episode_max_dwell.sum() / safe_terminal_active_episode_count
+        )
+        metrics["terminal_landing/max_episode_dwell_s"] = torch.where(
+            terminal_active_episode_count > 0,
+            self._terminal_landing_max_dwell_s[env_ids].max(),
+            torch.zeros((), device=self._env.device),
+        )
 
         metrics.update(
             {
