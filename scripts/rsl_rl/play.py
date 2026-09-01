@@ -22,6 +22,22 @@ cli_args.require_runtime_versions()
 from isaaclab.app import AppLauncher
 
 
+def _validate_cli_action_noise_std(
+    policy_mode: str,
+    action_noise_std: float | None,
+) -> None:
+    """Validate the simulator-independent part of an action-noise override."""
+
+    if action_noise_std is None:
+        return
+    if not math.isfinite(action_noise_std) or action_noise_std < 0.0:
+        raise ValueError("--action_noise_std must be finite and non-negative.")
+    if not policy_mode.endswith("_sampled"):
+        raise ValueError(
+            "--action_noise_std requires a sampled --policy_mode; mean modes are deterministic."
+        )
+
+
 def _run_isolated_course_matrix(cli_arguments: list[str]) -> None:
     """Resolve the configured matrix, then evaluate each cell in a fresh process."""
 
@@ -137,6 +153,16 @@ parser.add_argument(
     help="Teacher action path used for the diagnostic rollout.",
 )
 parser.add_argument(
+    "--action_noise_std",
+    type=float,
+    default=None,
+    help=(
+        "Evaluation-only isotropic action standard deviation for sampled policy modes. "
+        "Zero provides a deterministic counterfactual; otherwise the value must lie within "
+        "the policy's configured noise bounds. Defaults to the checkpoint's learned standard deviation."
+    ),
+)
+parser.add_argument(
     "--reset_profile",
     choices=("canonical", "jitter"),
     default="canonical",
@@ -172,6 +198,10 @@ AppLauncher.add_app_launcher_args(parser)
 # Split recognized CLI options from the remaining Hydra configuration overrides.
 cli_arguments = sys.argv[1:]
 args_cli, hydra_args = parser.parse_known_args()
+try:
+    _validate_cli_action_noise_std(args_cli.policy_mode, args_cli.action_noise_std)
+except ValueError as error:
+    parser.error(str(error))
 if args_cli.desired_speed is not None and (
     not math.isfinite(args_cli.desired_speed) or args_cli.desired_speed < 0.0
 ):
@@ -238,12 +268,12 @@ from parkour_lab.learning.distillation.teacher.rsl_rl import (
     register_rsl_rl_teacher_actor_critic,
 )
 from parkour_lab.learning.rsl_rl import RslRlHistoryWrapper
+from parkour_lab.tasks.manager_based.parkour_lab.mdp._shared.go2 import GO2_FOOT_NAMES
 from parkour_lab.tasks.manager_based.parkour_lab.mdp.commands import (
     EVALUATION_PIVOT_WINDOW_DURATION_S,
     PROVISIONAL_ORACLE_RESIDUAL_THRESHOLD_RAD,
     get_preferred_speed,
 )
-from parkour_lab.tasks.manager_based.parkour_lab.mdp._shared.go2 import GO2_FOOT_NAMES
 from parkour_lab.tasks.manager_based.parkour_lab.mdp.diagnostics import (
     latest_evaluation_step,
 )
@@ -1299,7 +1329,7 @@ def _evaluate_course(
             checkpoint.path,
             checkpoint.sha256,
         )
-        policy = _load_inference_policy(env, agent_cfg, checkpoint.path)
+        policy, action_noise = _load_inference_policy(env, agent_cfg, checkpoint.path)
         rollout = _collect_rollout_statistics(env, observations, policy)
     finally:
         # Closing also finalizes a partial or completed RecordVideo recording.
@@ -1317,6 +1347,7 @@ def _evaluate_course(
         level_metadata=level_metadata,
         num_envs=num_envs,
         step_dt=step_dt,
+        action_noise=action_noise,
         rollout=rollout,
     )
     report_path = _write_evaluation_report(artifacts.directory, report)
@@ -1351,6 +1382,7 @@ def _build_evaluation_report(
     level_metadata: dict[str, object],
     num_envs: int,
     step_dt: float,
+    action_noise: dict[str, object],
     rollout: _RolloutResult,
 ) -> _EvaluationReport:
     """Build the JSON-compatible report for one fixed evaluation course."""
@@ -1363,6 +1395,7 @@ def _build_evaluation_report(
         "teacher_interface_sha256": interface.teacher_interface_sha256,
         "seed": env_cfg.seed,
         "policy_mode": args_cli.policy_mode,
+        "action_noise": action_noise,
         "reset_profile": args_cli.reset_profile,
         "reset_parameters": env_cfg.events.reset_base.params,
         "training_config": _training_config_provenance(checkpoint.log_dir),
@@ -1447,6 +1480,15 @@ def _prepare_evaluation_artifacts(
     seed_component = _path_component(seed, "default")
     evaluation_kind = "video" if args_cli.video else "metrics"
     evaluation_settings = f"{args_cli.policy_mode}-{args_cli.reset_profile}-episodes_{args_cli.eval_episodes}"
+    noise_suffix = ""
+    if args_cli.policy_mode.endswith("_sampled"):
+        noise_identity = (
+            "checkpoint"
+            if args_cli.action_noise_std is None
+            else _path_component(args_cli.action_noise_std, "checkpoint")
+        )
+        noise_suffix = f"-noise_std_{noise_identity}"
+        evaluation_settings += noise_suffix
     if args_cli.video:
         evaluation_settings += f"-steps_{args_cli.video_length or 'full'}"
     # Build a readable UTC identifier as ``run_YYYYMMDD_HHMMSS``: ``%Y`` is
@@ -1478,6 +1520,7 @@ def _prepare_evaluation_artifacts(
             f"{checkpoint.stem}-{args_cli.policy_mode}-{args_cli.reset_profile}-"
             f"family_{family_component}-level_{level_component}-variant_{variant_component}-"
             f"speed_{speed_component}-yaw_rate_{yaw_rate_component}-seed_{seed_component}"
+            f"{noise_suffix}"
         ),
     )
 
@@ -1546,8 +1589,8 @@ def _load_inference_policy(
     env: RslRlHistoryWrapper,
     agent_cfg: RslRlBaseRunnerCfg,
     checkpoint_path: str,
-) -> Callable[[TensorDict], torch.Tensor]:
-    """Restore an OnPolicyRunner checkpoint and return its inference callable."""
+) -> tuple[Callable[[TensorDict], torch.Tensor], dict[str, object]]:
+    """Restore a checkpoint and return its selected action path and noise provenance."""
 
     print(f"[INFO]: Loading model checkpoint from: {checkpoint_path}")
     if agent_cfg.class_name != "OnPolicyRunner":
@@ -1558,18 +1601,129 @@ def _load_inference_policy(
     runner.load(checkpoint_path, load_optimizer=False)
     inference_policy = runner.get_inference_policy(device=device)
     policy = runner.alg.policy
+    checkpoint_noise = _checkpoint_action_noise_statistics(policy)
+    action_noise = _evaluation_action_noise(
+        policy,
+        checkpoint_noise,
+        args_cli.policy_mode,
+        args_cli.action_noise_std,
+    )
     if args_cli.policy_mode == "privileged_mean":
-        return inference_policy
+        return inference_policy, action_noise
     if args_cli.policy_mode == "privileged_sampled":
-        return policy.act
+        if args_cli.action_noise_std is None:
+            return policy.act, action_noise
+        return (
+            partial(
+                _sample_actions_with_fixed_std,
+                inference_policy,
+                action_noise_std=args_cli.action_noise_std,
+            ),
+            action_noise,
+        )
     history_policy = getattr(policy, "act_inference_from_history", None)
     if not callable(history_policy):
         raise TypeError("History evaluation requires a privileged teacher checkpoint.")
+    if args_cli.policy_mode == "history_mean":
+        return history_policy, action_noise
+    if args_cli.action_noise_std is None:
+        return partial(policy.act, use_history=True), action_noise
     return (
-        history_policy
-        if args_cli.policy_mode == "history_mean"
-        else partial(policy.act, use_history=True)
+        partial(
+            _sample_actions_with_fixed_std,
+            history_policy,
+            action_noise_std=args_cli.action_noise_std,
+        ),
+        action_noise,
     )
+
+
+def _checkpoint_action_noise_statistics(policy: object) -> dict[str, float]:
+    """Return the bounded learned action standard deviation in a compact form."""
+
+    noise_std_type = getattr(policy, "noise_std_type", None)
+    if noise_std_type == "scalar":
+        values = getattr(policy, "std").detach()
+    elif noise_std_type == "log":
+        values = torch.exp(getattr(policy, "log_std").detach())
+    else:
+        raise ValueError(f"Unsupported policy noise_std_type: {noise_std_type!r}.")
+
+    lower_bound = float(getattr(policy, "min_noise_std"))
+    upper_bound = float(getattr(policy, "max_noise_std"))
+    values = values.clamp(min=lower_bound, max=upper_bound)
+    if values.numel() == 0 or not torch.isfinite(values).all():
+        raise FloatingPointError(
+            "The checkpoint contains empty or non-finite action-noise parameters."
+        )
+    return {
+        "min": float(values.min().item()),
+        "mean": float(values.float().mean().item()),
+        "max": float(values.max().item()),
+    }
+
+
+def _evaluation_action_noise(
+    policy: object,
+    checkpoint_statistics: dict[str, float],
+    policy_mode: str,
+    action_noise_std: float | None,
+) -> dict[str, object]:
+    """Resolve and describe the action noise actually used by evaluation."""
+
+    if not policy_mode.endswith("_sampled"):
+        effective_statistics = {"min": 0.0, "mean": 0.0, "max": 0.0}
+        source = "deterministic"
+    elif action_noise_std is None:
+        effective_statistics = dict(checkpoint_statistics)
+        source = "checkpoint"
+    else:
+        _validate_action_noise_std_against_policy(policy, action_noise_std)
+        effective_statistics = {
+            "min": action_noise_std,
+            "mean": action_noise_std,
+            "max": action_noise_std,
+        }
+        source = "override"
+    return {
+        "source": source,
+        "override_std": action_noise_std,
+        "effective_std": effective_statistics,
+        "checkpoint_std": checkpoint_statistics,
+    }
+
+
+def _validate_action_noise_std_against_policy(
+    policy: object,
+    action_noise_std: float,
+) -> None:
+    """Require positive overrides to respect the policy's configured bounds."""
+
+    if not math.isfinite(action_noise_std) or action_noise_std < 0.0:
+        raise ValueError("--action_noise_std must be finite and non-negative.")
+    if action_noise_std == 0.0:
+        return
+    lower_bound = float(getattr(policy, "min_noise_std"))
+    upper_bound = float(getattr(policy, "max_noise_std"))
+    if not lower_bound <= action_noise_std <= upper_bound:
+        raise ValueError(
+            "--action_noise_std must be zero or lie within the policy's configured "
+            f"noise bounds [{lower_bound:g}, {upper_bound:g}]."
+        )
+
+
+def _sample_actions_with_fixed_std(
+    mean_policy: Callable[[TensorDict], torch.Tensor],
+    observations: TensorDict,
+    *,
+    action_noise_std: float,
+) -> torch.Tensor:
+    """Sample isotropic Gaussian actions around a deterministic policy mean."""
+
+    mean = mean_policy(observations)
+    if action_noise_std == 0.0:
+        return mean
+    return mean + action_noise_std * torch.randn_like(mean)
 
 
 def _path_component(value: str | int | None, default: str) -> str:
@@ -1597,6 +1751,14 @@ def _print_evaluation_summary(report: _EvaluationReport, report_path: str) -> No
         f"  Course: {report['terrain_family']} level {report['difficulty_level']} "
         f"variant {report['geometry_variant_index']} | policy={report['policy_mode']} "
         f"reset={report['reset_profile']}"
+    )
+    action_noise = report["action_noise"]
+    effective_std = action_noise["effective_std"]
+    checkpoint_std = action_noise["checkpoint_std"]
+    print(
+        f"  Action noise: {action_noise['source']} | effective std min/mean/max="
+        f"{effective_std['min']:.4f}/{effective_std['mean']:.4f}/{effective_std['max']:.4f} | "
+        f"checkpoint={checkpoint_std['min']:.4f}/{checkpoint_std['mean']:.4f}/{checkpoint_std['max']:.4f}"
     )
     print(
         f"  Episodes: {report['completed_episodes']}/{report['requested_episodes']} | "

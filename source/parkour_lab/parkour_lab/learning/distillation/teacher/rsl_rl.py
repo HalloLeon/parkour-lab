@@ -132,9 +132,12 @@ class PrivilegedTeacherActorCritic(ActorCritic):
             )
         )
 
-        # Persist the ROA schedule position in normal policy checkpoints so a
-        # resumed run does not restart its regularization ramp or rollout cycle.
+        # This name is retained for checkpoint compatibility, but the counter is
+        # the common position for every per-update training schedule. Persisting
+        # it with the policy prevents resumed runs from restarting exploration,
+        # regularization, or the history-rollout cycle.
         self.register_buffer("roa_update_count", torch.zeros((), dtype=torch.long))
+        self._noise_std_upper_bound = max_noise_std
         self.enforce_action_std_bounds_()
         print(f"Modular teacher actor: {self.actor}")
 
@@ -194,11 +197,11 @@ class PrivilegedTeacherActorCritic(ActorCritic):
             if self.noise_std_type == "scalar":
                 parameter = self.std
                 lower_bound = self.min_noise_std
-                upper_bound = self.max_noise_std
+                upper_bound = self._noise_std_upper_bound
             elif self.noise_std_type == "log":
                 parameter = self.log_std
                 lower_bound = math.log(self.min_noise_std)
-                upper_bound = math.log(self.max_noise_std)
+                upper_bound = math.log(self._noise_std_upper_bound)
             else:
                 raise ValueError(
                     f"Unsupported noise_std_type: {self.noise_std_type!r}."
@@ -208,6 +211,27 @@ class PrivilegedTeacherActorCritic(ActorCritic):
                     "The learned action-noise parameter became non-finite."
                 )
             parameter.clamp_(min=lower_bound, max=upper_bound)
+
+    @property
+    def noise_std_upper_bound(self) -> float:
+        """Return the active upper bound used by the action distribution."""
+
+        return self._noise_std_upper_bound
+
+    def set_noise_std_upper_bound_(self, upper_bound: float) -> None:
+        """Set and enforce a rollout-wide action-noise upper bound."""
+
+        if (
+            not math.isfinite(upper_bound)
+            or upper_bound < self.min_noise_std
+            or upper_bound > self.max_noise_std
+        ):
+            raise ValueError(
+                "The active action-noise upper bound must be finite and lie "
+                "within the configured action-noise bounds."
+            )
+        self._noise_std_upper_bound = upper_bound
+        self.enforce_action_std_bounds_()
 
     def load_state_dict(
         self,
@@ -226,12 +250,12 @@ class PrivilegedTeacherActorCritic(ActorCritic):
         if self.noise_std_type == "scalar":
             std = self.std.clamp(
                 min=self.min_noise_std,
-                max=self.max_noise_std,
+                max=self._noise_std_upper_bound,
             )
         elif self.noise_std_type == "log":
             log_std = self.log_std.clamp(
                 min=math.log(self.min_noise_std),
-                max=math.log(self.max_noise_std),
+                max=math.log(self._noise_std_upper_bound),
             )
             std = torch.exp(log_std)
         else:
@@ -254,6 +278,10 @@ class RegularizedPPO(PPO):
         privileged_regularization_coef_start: float = 0.0,
         privileged_regularization_ramp_iterations: int = 300,
         privileged_regularization_warmup_iterations: int = 200,
+        entropy_coef_end: float = 0.0,
+        exploration_anneal_iterations: int = 900,
+        exploration_warmup_iterations: int = 100,
+        final_max_noise_std: float = 0.3,
         max_learning_rate: float = 1.0e-3,
         **kwargs: object,
     ) -> None:
@@ -279,6 +307,29 @@ class RegularizedPPO(PPO):
             raise ValueError(
                 "privileged_regularization_warmup_iterations cannot be negative."
             )
+        if exploration_anneal_iterations <= 0:
+            raise ValueError("exploration_anneal_iterations must be positive.")
+        if exploration_warmup_iterations < 0:
+            raise ValueError("exploration_warmup_iterations cannot be negative.")
+        if (
+            not math.isfinite(final_max_noise_std)
+            or final_max_noise_std < self.policy.min_noise_std
+            or final_max_noise_std > self.policy.max_noise_std
+        ):
+            raise ValueError(
+                "final_max_noise_std must be finite and lie within the policy's "
+                "configured action-noise bounds."
+            )
+        if (
+            not math.isfinite(self.entropy_coef)
+            or not math.isfinite(entropy_coef_end)
+            or entropy_coef_end < 0.0
+            or entropy_coef_end > self.entropy_coef
+        ):
+            raise ValueError(
+                "Entropy coefficients must be finite and satisfy "
+                "0 <= entropy_coef_end <= entropy_coef."
+            )
         if max_learning_rate <= 0.0 or max_learning_rate < self.learning_rate:
             raise ValueError(
                 "max_learning_rate must be positive and no smaller than the initial learning rate."
@@ -301,6 +352,14 @@ class RegularizedPPO(PPO):
         self.privileged_regularization_warmup_iterations = (
             privileged_regularization_warmup_iterations
         )
+        self.entropy_coef_end = entropy_coef_end
+        self.exploration_anneal_iterations = exploration_anneal_iterations
+        self.exploration_warmup_iterations = exploration_warmup_iterations
+        self.final_max_noise_std = final_max_noise_std
+        self._initial_entropy_coef = self.entropy_coef
+        self._initial_max_noise_std = self.policy.max_noise_std
+        self._active_entropy_coef = self._initial_entropy_coef
+        self._exploration_schedule_update_count: int | None = None
         self.max_learning_rate = max_learning_rate
         self._history_rollout = False
         self._update_count: int | None = None
@@ -313,6 +372,7 @@ class RegularizedPPO(PPO):
             # Read the checkpointed counter once; subsequent iterations remain
             # in Python to avoid synchronizing the GPU at every environment step.
             self._update_count = int(self.policy.roa_update_count.item())
+        self._apply_exploration_schedule(self._update_count)
         self._history_rollout = (
             self._update_count + 1
         ) % self.history_rollout_interval == 0
@@ -343,6 +403,7 @@ class RegularizedPPO(PPO):
 
         if self._update_count is None:
             self._update_count = int(self.policy.roa_update_count.item())
+        self._apply_exploration_schedule(self._update_count)
         regularization_coef = self._regularization_coefficient(self._update_count)
 
         mean_adaptation_loss = 0.0
@@ -451,7 +512,7 @@ class RegularizedPPO(PPO):
             loss = (
                 surrogate_loss
                 + self.value_loss_coef * value_loss
-                - self.entropy_coef * entropy_batch.mean()
+                - self._active_entropy_coef * entropy_batch.mean()
                 + self.adaptation_loss_coef * adaptation_loss
                 + regularization_coef * privileged_regularization_loss
             )
@@ -492,7 +553,9 @@ class RegularizedPPO(PPO):
         self.policy.roa_update_count.fill_(self._update_count)
         return {
             "adaptation": mean_adaptation_loss / num_updates,
+            "action_noise_std_upper_bound": self.policy.noise_std_upper_bound,
             "entropy": mean_entropy / num_updates,
+            "entropy_coefficient": self._active_entropy_coef,
             "history_rollout": float(self._history_rollout),
             "privileged_regularization": mean_privileged_regularization_loss
             / num_updates,
@@ -500,6 +563,34 @@ class RegularizedPPO(PPO):
             "surrogate": mean_surrogate_loss / num_updates,
             "value_function": mean_value_loss / num_updates,
         }
+
+    def _apply_exploration_schedule(self, update_count: int) -> None:
+        """Apply one fixed exploration setting to a complete PPO iteration."""
+
+        if self._exploration_schedule_update_count == update_count:
+            return
+        max_noise_std, entropy_coef = self._exploration_schedule(update_count)
+        self.policy.set_noise_std_upper_bound_(max_noise_std)
+        self._active_entropy_coef = entropy_coef
+        self._exploration_schedule_update_count = update_count
+
+    def _exploration_schedule(self, update_count: int) -> tuple[float, float]:
+        """Return the action-noise ceiling and entropy weight for an update."""
+
+        if update_count < 0:
+            raise ValueError("update_count cannot be negative.")
+        progress = min(
+            max(update_count - self.exploration_warmup_iterations, 0)
+            / self.exploration_anneal_iterations,
+            1.0,
+        )
+        max_noise_std = self._initial_max_noise_std + progress * (
+            self.final_max_noise_std - self._initial_max_noise_std
+        )
+        entropy_coef = self._initial_entropy_coef + progress * (
+            self.entropy_coef_end - self._initial_entropy_coef
+        )
+        return max_noise_std, entropy_coef
 
     def _adapt_learning_rate(
         self,

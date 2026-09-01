@@ -61,6 +61,18 @@ class RegularizedPPOCfg(RslRlPpoAlgorithmCfg):
     privileged_regularization_warmup_iterations: int = 200
     privileged_regularization_ramp_iterations: int = 300
 
+    # Keep broad exploration through the initial locomotion bootstrap, then
+    # linearly reduce its ceiling over the rest of the nominal 1,000-update run.
+    # The learned standard deviation may settle below this ceiling, but cannot
+    # remain at the destabilizing 0.8 initial value late in training.
+    exploration_warmup_iterations: int = 100
+    exploration_anneal_iterations: int = 900
+    final_max_noise_std: float = 0.30
+
+    # Remove the entropy pressure over the same schedule so PPO is free to learn
+    # stable obstacle landings instead of being driven back toward broad noise.
+    entropy_coef_end: float = 0.0
+
     # Do not let the adaptive schedule raise the shared optimizer above its
     # initial rate during long runs, including for the adaptation encoders.
     max_learning_rate: float = 3.0e-4
@@ -151,8 +163,8 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # Maximum probability-ratio deviation allowed by the PPO surrogate
         # objective during one update.
         clip_param=0.2,
-        # Retain enough exploration to acquire locomotion before the terrain
-        # curriculum exposes obstacle-specific behavior.
+        # Initial entropy pressure; RegularizedPPO anneals this to the configured
+        # end value after its short locomotion bootstrap.
         entropy_coef=0.01,
         # Number of passes over each collected rollout.
         num_learning_epochs=5,

@@ -500,6 +500,7 @@ class RewardsCfg:
         params={
             "asset_cfg": SceneEntityCfg("robot"),
             "planar_speed_std": 0.15,
+            "roll_pitch_rate_std": 0.35,
             "yaw_rate_std": 0.5,
         },
     )
@@ -667,6 +668,17 @@ class RewardsCfg:
             or params["approach_allowance_distance_m"] <= 0.0
         ):
             raise ValueError("waypoint approach allowance must be finite and positive.")
+
+        stationary_params = self.stationary_velocity_tracking.params
+        stationary_stds = (
+            stationary_params["planar_speed_std"],
+            stationary_params["roll_pitch_rate_std"],
+            stationary_params["yaw_rate_std"],
+        )
+        if any(not math.isfinite(std) or std <= 0.0 for std in stationary_stds):
+            raise ValueError(
+                "stationary velocity tracking stds must be finite and positive."
+            )
 
 
 @configclass

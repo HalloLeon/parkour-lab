@@ -244,16 +244,22 @@ def stationary_velocity_tracking_exp(
     env: ManagerBasedRLEnv,
     planar_speed_std: float = 0.15,
     yaw_rate_std: float = 0.5,
+    roll_pitch_rate_std: float = 0.35,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """Track stationary or pivot velocity whenever translation is zero."""
+    """Track a quiet stop or stable pivot whenever translation is zero."""
 
     planar_speed_sq = torch.sum(robot._root_lin_vel_xy(env, asset_cfg).square(), dim=-1)
     yaw_rate_error_sq = (
         robot._root_ang_vel_z(env, asset_cfg) - get_target_yaw_rate(env)
     ).square()
-    score = torch.exp(-planar_speed_sq / planar_speed_std**2) * torch.exp(
-        -yaw_rate_error_sq / yaw_rate_std**2
+    roll_pitch_rate_sq = torch.sum(
+        robot._root_ang_vel_xy(env, asset_cfg).square(), dim=-1
+    )
+    score = torch.exp(
+        -planar_speed_sq / planar_speed_std**2
+        - yaw_rate_error_sq / yaw_rate_std**2
+        - roll_pitch_rate_sq / roll_pitch_rate_std**2
     )
     nontranslating = get_target_speed(env).eq(0)
     return torch.where(nontranslating, score, torch.zeros_like(score))
