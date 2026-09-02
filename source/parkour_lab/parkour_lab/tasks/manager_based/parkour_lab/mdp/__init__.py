@@ -64,9 +64,11 @@ from .observations import (
     terrain_height_scan as terrain_height_scan,
 )
 from .reward_terms.limb import (
+    excessive_foot_air_time_l2 as excessive_foot_air_time_l2,
     feet_edge as feet_edge,
     feet_stumble as feet_stumble,
     joint_deviation_l2 as joint_deviation_l2,
+    stable_orientation_l2 as stable_orientation_l2,
 )
 from .reward_terms.safety import (
     base_clearance_below_l2 as base_clearance_below_l2,

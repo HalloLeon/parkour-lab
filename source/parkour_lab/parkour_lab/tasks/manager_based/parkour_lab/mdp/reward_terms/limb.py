@@ -8,9 +8,12 @@
 import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.sensors import ContactSensor
 
 from .._shared import contact, robot
+from ..commands import get_target_speed
 from ..curriculums.config import DEFAULT_PARKOUR_CURRICULUM, ParkourCurriculumCfg
+from ..navigation import route
 from ..terrain import edges
 
 
@@ -84,3 +87,61 @@ def joint_deviation_l2(
     joint_error = robot._selected_joint_pos_error(env, asset_cfg)
 
     return torch.sum(joint_error.square(), dim=-1)
+
+
+def stable_orientation_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize roll and pitch only where a level body is unambiguously useful.
+
+    The shared flat curriculum and zero-speed phases provide the ordinary gait
+    and settling practice needed by every course.  Banked-ramp traversal stays
+    under the milder global orientation prior, so this term cannot suppress a
+    necessary obstacle attitude.
+    """
+
+    projected_gravity_xy = robot._root_projected_gravity_xy(env, asset_cfg)
+    penalty = torch.sum(projected_gravity_xy.square(), dim=-1)
+    return penalty * _stable_gait_mask(env).to(dtype=penalty.dtype)
+
+
+def excessive_foot_air_time_l2(
+    env: ManagerBasedRLEnv,
+    max_air_time_s: float = 0.35,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("feet_contact", body_names=".*_foot"),
+) -> torch.Tensor:
+    """Penalize only the tail of an unnecessarily long foot swing.
+
+    Air time up to ``max_air_time_s`` is free.  The normalized excess is
+    squared, capped per foot, and summed over the fixed foot set.  Applying the
+    term only on flat terrain or during an intentional stop leaves gap flight,
+    climbing, and obstacle clearance unconstrained while making a persistently
+    carried leg costly.
+    """
+
+    contact._require_body_ids(sensor_cfg, role="excessive foot air-time penalty")
+    sensor: ContactSensor = env.scene[sensor_cfg.name]
+    current_air_time = sensor.data.current_air_time
+    if current_air_time is None:
+        raise RuntimeError(
+            f"'{sensor_cfg.name}' must enable track_air_time for gait regularization."
+        )
+
+    selected_air_time = current_air_time[:, sensor_cfg.body_ids]
+    normalized_excess = torch.clamp(
+        (selected_air_time - max_air_time_s) / max_air_time_s,
+        min=0.0,
+        max=1.0,
+    )
+    penalty = torch.sum(normalized_excess.square(), dim=-1)
+    return penalty * _stable_gait_mask(env).to(dtype=penalty.dtype)
+
+
+def _stable_gait_mask(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Select obstacle-free locomotion and intentional zero-speed phases."""
+
+    return torch.logical_or(
+        route.active_difficulty_indices(env) == 0,
+        get_target_speed(env) <= 0.0,
+    )
