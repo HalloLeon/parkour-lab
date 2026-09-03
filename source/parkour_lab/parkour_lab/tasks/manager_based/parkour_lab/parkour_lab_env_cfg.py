@@ -553,8 +553,8 @@ class RewardsCfg:
     )
 
     # Motion quality and regularization. Mild global priors price persistent
-    # lean and folded limbs without suppressing obstacle maneuvers. Stronger
-    # gait-quality terms apply only on flat terrain or during a requested stop.
+    # lean and folded limbs without suppressing obstacle maneuvers. A stronger
+    # orientation prior applies only on flat terrain or during a requested stop.
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.025)
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.25)
@@ -572,19 +572,6 @@ class RewardsCfg:
     )
     joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.0002)
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
-
-    excessive_foot_air_time_l2 = RewTerm(
-        func=mdp.excessive_foot_air_time_l2,
-        weight=-0.2,
-        params={
-            "max_air_time_s": 0.35,
-            "sensor_cfg": SceneEntityCfg(
-                "feet_contact",
-                body_names=list(mdp.GO2_FOOT_NAMES),
-                preserve_order=True,
-            ),
-        },
-    )
 
     # Foot-placement safety and contact quality.
     feet_edge = RewTerm(
@@ -694,12 +681,6 @@ class RewardsCfg:
                 "stationary velocity tracking stds must be finite and positive."
             )
 
-        max_air_time_s = self.excessive_foot_air_time_l2.params["max_air_time_s"]
-        if not math.isfinite(max_air_time_s) or max_air_time_s <= 0.0:
-            raise ValueError(
-                "maximum unpenalized foot air time must be finite and positive."
-            )
-
 
 @configclass
 class TerminationsCfg:
@@ -708,7 +689,7 @@ class TerminationsCfg:
     time_out = DoneTerm(
         func=mdp.active_motion_time_out,
         params={"max_active_motion_time_s": 25.0},
-        time_out=True,
+        time_out=False,
     )
     wall_time_out = DoneTerm(func=mdp.time_out, time_out=True)
 

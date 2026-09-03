@@ -70,7 +70,9 @@ class TiltedRampStageSpec:
     ``sequence_anchor_xy`` places the sequence's anchor ramp, ``ramps[0]``.
     Every remaining ramp is placed from its predecessor using the corresponding
     entry in ``transitions``. Consequently, a stage containing ``n`` ramps must
-    contain exactly ``n - 1`` transitions.
+    contain exactly ``n - 1`` transitions. The final landing starts at the
+    final ramp's centerline exit, so the traversed route cannot contain an
+    independently configured seam.
 
     The stage describes the entire ramp sequence uniformly: geometry lives in
     ``ramps`` and only the relationships between adjacent ramps live in
@@ -80,7 +82,6 @@ class TiltedRampStageSpec:
     sequence_anchor_xy: tuple[float, float]
     ramps: tuple[RampSpec, ...]
     transitions: tuple[RampTransitionSpec, ...]
-    landing_start_x: float
     landing_y_range: tuple[float, float]
 
     def __post_init__(self) -> None:
@@ -146,7 +147,10 @@ def build_default_level(
         ),
         difficulty_order=normalized_difficulty * _shared.NUM_OBSTACLE_STAGES,
         ramps=ramps,
-        landing_x_range=(stage_spec.landing_start_x, _shared.TERRAIN_X_RANGE_M[1]),
+        landing_x_range=(
+            ramps[-1].centerline_end[0],
+            _shared.TERRAIN_X_RANGE_M[1],
+        ),
         landing_y_range=stage_spec.landing_y_range,
         target_speed=0.60,
         min_clearance=_shared.DEFAULT_MIN_BASE_CLEARANCE_M,
@@ -486,7 +490,6 @@ def _paired_stage(
     yaw_degrees: tuple[float, float],
     gap: float,
     lateral_offset: float,
-    landing_start_x: float,
     landing_y_range: tuple[float, float],
     lengths: tuple[float, float] = (0.90, 1.10),
 ) -> TiltedRampStageSpec:
@@ -502,12 +505,14 @@ def _paired_stage(
         sequence_anchor_xy=sequence_anchor_xy,
         ramps=ramps,
         transitions=(RampTransitionSpec(gap=gap, lateral_offset=lateral_offset),),
-        landing_start_x=landing_start_x,
         landing_y_range=landing_y_range,
     )
 
 
 DEFAULT_STAGE_SPECS = (
+    # Every first ramp faces terrain-local +X and starts at x=0.55. Relative
+    # redirection remains in the following ramp, so acquisition never adds a
+    # diagonal ground seam to the intended bank, gap, and turn progression.
     # Obstacle stage 0 / curriculum row 1: acquire one wide, straight,
     # gently banked support. Its top begins exactly where the approach ground
     # ends and finishes exactly where the landing begins; introducing a narrow
@@ -523,7 +528,6 @@ DEFAULT_STAGE_SPECS = (
             ),
         ),
         transitions=(),
-        landing_start_x=2.40,
         landing_y_range=(-1.0, 1.0),
     ),
     # Obstacle stage 1 / curriculum row 2: traverse two contiguous,
@@ -537,58 +541,53 @@ DEFAULT_STAGE_SPECS = (
         yaw_degrees=(0.0, 0.0),
         gap=0.0,
         lateral_offset=0.0,
-        landing_start_x=2.60,
         landing_y_range=(-1.0, 1.0),
     ),
     # Obstacle stage 2 / curriculum row 3: introduce a mild opposing bank,
     # inter-ramp gap, and lateral redirection together at wide support width.
     _paired_stage(
-        sequence_anchor_xy=(1.05, -0.15),
+        sequence_anchor_xy=(1.00, -0.15),
         width=1.60,
         incline_degrees=(4.0, -4.0),
-        yaw_degrees=(4.0, 14.0),
+        yaw_degrees=(0.0, 10.0),
         gap=0.12,
         lateral_offset=0.18,
-        landing_start_x=2.72,
         landing_y_range=(-1.0, 1.20),
     ),
     # Obstacle stage 3 / curriculum row 4: increase the opposing banks and
     # redirection while only moderately narrowing both supports.
     _paired_stage(
-        sequence_anchor_xy=(1.10, -0.10),
+        sequence_anchor_xy=(1.00, -0.10),
         width=1.25,
         incline_degrees=(7.0, -7.0),
-        yaw_degrees=(7.0, 23.0),
+        yaw_degrees=(0.0, 16.0),
         gap=0.16,
         lateral_offset=0.28,
-        landing_start_x=2.88,
         landing_y_range=(0.0, 1.60),
     ),
     # Obstacle stage 4 / curriculum row 5: bridge the successful preceding row
     # to the hardest geometry without changing every dimension at once.
     _paired_stage(
-        sequence_anchor_xy=(1.125, -0.05),
+        sequence_anchor_xy=(1.05, -0.05),
         lengths=(1.00, 1.20),
         width=1.125,
         incline_degrees=(9.5, -9.5),
-        yaw_degrees=(8.5, 27.5),
+        yaw_degrees=(0.0, 19.0),
         gap=0.18,
         lateral_offset=0.34,
-        landing_start_x=2.99,
         landing_y_range=(0.20, 1.70),
     ),
     # Obstacle stage 5 / curriculum row 6: combine narrow supports, stronger
     # opposing banks, a larger gap, and a sharper inter-ramp redirection. Keep
     # the first approach aligned with the successful preceding row.
     _paired_stage(
-        sequence_anchor_xy=(1.15, 0.0),
+        sequence_anchor_xy=(1.10, 0.0),
         lengths=(1.10, 1.30),
         width=1.00,
         incline_degrees=(12.0, -12.0),
-        yaw_degrees=(10.0, 32.0),
+        yaw_degrees=(0.0, 22.0),
         gap=0.20,
         lateral_offset=0.40,
-        landing_start_x=3.10,
         # Follow ramp two's redirected exit while retaining a margin from the
         # terrain boundary. The previous centered landing forced an almost
         # right-angle turn after the ramp and only touched one of its corners.
@@ -651,7 +650,6 @@ def _mirrored_stage_spec(
             )
             for transition in stage_spec.transitions
         ),
-        landing_start_x=stage_spec.landing_start_x,
         landing_y_range=(-landing_y_max, -landing_y_min),
     )
 
@@ -684,6 +682,5 @@ def _variant_stage_spec(
             )
             for transition in stage_spec.transitions
         ),
-        landing_start_x=stage_spec.landing_start_x,
         landing_y_range=stage_spec.landing_y_range,
     )
