@@ -836,6 +836,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
     evaluation_geometry_variant: int | None = None
     evaluation_desired_speed: float | None = None
     evaluation_desired_yaw_rate: float | None = None
+    evaluation_command_profile: str | None = None
 
     # Post initialization.
     def __post_init__(self) -> None:
@@ -927,6 +928,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         geometry_variant: int | None = None,
         speed: float | None = None,
         yaw_rate: float | None = None,
+        command_profile: str | None = None,
     ) -> None:
         """Freeze one course and command configuration with a single rebuild."""
 
@@ -942,16 +944,41 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
                 self.commands.intent.yaw_rate_deadband_rad_s,
                 self.commands.intent.max_external_yaw_rate_rad_s,
             )
+        explicit_profile = command_profile is not None
+        if command_profile is None:
+            # Preserve the original API: a nonzero fixed yaw rate implicitly
+            # selected the translate-pivot-restart evaluation sequence.
+            command_profile = (
+                "pivot_restart" if yaw_rate not in (None, 0.0) else "mixed"
+            )
+        if command_profile not in mdp.COMMAND_PROFILES:
+            raise ValueError(
+                f"command profile must be one of {mdp.COMMAND_PROFILES}, got {command_profile!r}."
+            )
+        if yaw_rate not in (None, 0.0) and command_profile != "pivot_restart":
+            qualifier = "Explicit " if explicit_profile else ""
+            raise ValueError(
+                f"{qualifier}nonzero evaluation yaw rate requires the 'pivot_restart' command profile."
+            )
+        if command_profile == "pivot_restart" and yaw_rate in (None, 0.0):
+            raise ValueError(
+                "The 'pivot_restart' command profile requires a nonzero evaluation yaw rate."
+            )
         if family is None:
             family = curriculum_cfg.family_names[0]
         curriculum_cfg.family_index(family)
-        if yaw_rate not in (None, 0.0) and level is None:
+        restart_profile = command_profile in ("stop_restart", "pivot_restart")
+        if restart_profile and level is None:
             level = 0
         if level is None:
             level = curriculum_cfg.max_level
         if not 0 <= level <= curriculum_cfg.max_level:
             raise ValueError(
                 f"difficulty level must be in [0, {curriculum_cfg.max_level}], got {level}."
+            )
+        if restart_profile and level != 0:
+            raise ValueError(
+                f"The {command_profile!r} command profile is supported only at level 0."
             )
         if geometry_variant is None:
             geometry_variant = 0
@@ -970,6 +997,7 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
         self.evaluation_geometry_variant = geometry_variant
         self.evaluation_desired_speed = speed
         self.evaluation_desired_yaw_rate = yaw_rate
+        self.evaluation_command_profile = command_profile
         self.curriculum = None
         self.domain_randomization.stage = "off"
 
@@ -1039,15 +1067,35 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
                 self.commands.intent.yaw_rate_deadband_rad_s,
                 self.commands.intent.max_external_yaw_rate_rad_s,
             )
-        if self.evaluation_desired_yaw_rate not in (None, 0.0):
-            if self.evaluation_level != 0:
+        evaluation_profile = self.evaluation_command_profile
+        if evaluation_profile is not None:
+            if evaluation_profile not in mdp.COMMAND_PROFILES:
                 raise ValueError(
-                    "Nonzero evaluation yaw rate is supported only at level 0."
+                    f"evaluation_command_profile must be one of {mdp.COMMAND_PROFILES}."
+                )
+            restart_profile = evaluation_profile in (
+                "stop_restart",
+                "pivot_restart",
+            )
+            if restart_profile and self.evaluation_level != 0:
+                raise ValueError(
+                    f"The {evaluation_profile!r} command profile is supported only at level 0."
                 )
             speed = self.resolved_evaluation_speed()
-            if speed is None or speed <= self.commands.intent.stop_deadband_m_s:
+            if evaluation_profile != "mixed" and (
+                speed is None or speed <= self.commands.intent.stop_deadband_m_s
+            ):
                 raise ValueError(
-                    "Nonzero evaluation yaw rate requires a positive translation speed for restart trials."
+                    f"The {evaluation_profile!r} command profile requires a positive translation speed."
+                )
+            has_yaw_rate = self.evaluation_desired_yaw_rate not in (None, 0.0)
+            if evaluation_profile == "pivot_restart" and not has_yaw_rate:
+                raise ValueError(
+                    "The 'pivot_restart' command profile requires a nonzero evaluation yaw rate."
+                )
+            if evaluation_profile != "pivot_restart" and has_yaw_rate:
+                raise ValueError(
+                    "A nonzero evaluation yaw rate requires the 'pivot_restart' command profile."
                 )
 
         terrain_generator = self.scene.ground.terrain_generator
@@ -1111,10 +1159,16 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
             fixed_range = (evaluation_speed, evaluation_speed)
             self.commands.intent.flat_speed_range_m_s = fixed_range
             self.commands.intent.obstacle_speed_range_m_s = fixed_range
+        if evaluation_profile is not None:
+            self.commands.intent.command_profile = evaluation_profile
         evaluation_yaw_rate = self.resolved_evaluation_yaw_rate()
         self.commands.intent.fixed_yaw_rate_rad_s = (
-            evaluation_yaw_rate if evaluation_yaw_rate not in (None, 0.0) else None
+            evaluation_yaw_rate
+            if evaluation_profile == "pivot_restart"
+            and evaluation_yaw_rate not in (None, 0.0)
+            else None
         )
+        self.commands.intent.validate_configuration()
         active_budget = float(
             self.terminations.time_out.params["max_active_motion_time_s"]
         )

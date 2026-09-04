@@ -459,6 +459,7 @@ python scripts/rsl_rl/play.py \
   --checkpoint=/absolute/path/to/model_1000.pt \
   --all_courses \
   --desired_speed=0.55 \
+  --command_profile=translation_only \
   --eval_episodes=20 \
   --headless
 ```
@@ -472,6 +473,7 @@ python scripts/rsl_rl/play.py \
   --terrain_family=gap \
   --difficulty_level=1 \
   --desired_speed=0.55 \
+  --command_profile=translation_only \
   --eval_episodes=20 \
   --headless
 ```
@@ -486,6 +488,7 @@ python scripts/rsl_rl/play.py \
   --terrain_family=gap \
   --difficulty_level=1 \
   --desired_speed=0.55 \
+  --command_profile=translation_only \
   --eval_episodes=1 \
   --headless \
   --video
@@ -497,12 +500,17 @@ one complete 28-cell variant slice. At difficulty 0, variants 6/7 select the
 mirrored constant-heading cohort and variants 8/9 select the mirrored
 gentle-turn cohort. `--desired_speed` fixes the scalar command for every reset.
 When omitted, the selected course's nominal speed is retained.
-On level 0, `--desired_yaw_rate=<signed rad/s>` selects deterministic
-translate→two-second-pivot→translate pulses; `--desired_speed` is the positive
-restart speed, or the course nominal when omitted. Ordinary training and
-evaluation sample symmetric `0.25-0.80 rad/s`, `0.75-4.0 s` pivot windows on
-only 5% of eligible flat command transitions; obstacle rows never receive
-them.
+Use `--command_profile=translation_only` for a pure locomotion comparison.
+Level 0 additionally supports the one-shot profiles `stop_restart`
+(translate 2 s → stop 2 s → translate) and `pivot_restart` (translate 2 s →
+signed pivot 2 s → translate). `pivot_restart` requires
+`--desired_yaw_rate=<signed rad/s>`; `--desired_speed` is the positive restart
+speed, or the course nominal when omitted. Omitting the profile preserves the
+mixed training distribution, including its random flat-only stops and pivots.
+Sampled policy modes use an action-only random generator, so action draws no
+longer change the subsequent environment command stream. Set
+`--action_noise_seed` to choose that stream explicitly; it defaults to the
+evaluation seed and is recorded in `metrics.json` and the artifact name.
 Run the same matrix at 0.45, 0.55, and 0.70 m/s to measure command conditioning
 separately from terrain difficulty. `--all_courses` creates all 28 independent
 reports, starting a fresh Isaac Sim
@@ -534,7 +542,7 @@ computation but before Isaac Lab auto-resets completed rows, so the terminal
 state is included and the following reset state is excluded.
 Evaluation writes
 `metrics.json` plus the optional MP4 beneath
-`<run>/evaluation/<checkpoint>-<hash>/family_<family>/level_<n>/variant_<v>/speed_<m_s>/yaw_rate_<rad_s>/seed_<seed>/`, separated
+`<run>/evaluation/<checkpoint>-<hash>/family_<family>/level_<n>/variant_<v>/speed_<m_s>/yaw_rate_<rad_s>/command_<profile>/seed_<seed>/`, separated
 into `metrics/episodes_<n>/` and `video/episodes_<n>-steps_<length>/`.
 Each invocation gets a timestamped `run_*` leaf so before/after results are not
 overwritten. Use `--video_output_dir` to choose another artifact root. Omit
@@ -555,6 +563,7 @@ comparisons:
 
 - evaluate each promising checkpoint on all 28 family/difficulty cells;
 - keep the seed, number of episodes, and environment count unchanged;
+- use an explicit deterministic command profile for causal policy comparisons;
 - do not enable the adaptive training curriculum during evaluation;
 - compare the same metrics before selecting representative clips;
 - record short clips after the numerical run, since rendering reduces throughput.

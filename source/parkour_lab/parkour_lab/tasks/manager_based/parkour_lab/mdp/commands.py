@@ -26,13 +26,24 @@ if TYPE_CHECKING:
 INTENT_COMMAND_NAME = "intent"
 """Command-manager term owning requested travel direction, speed, and pivot rate."""
 
+COMMAND_PROFILES = (
+    "mixed",
+    "translation_only",
+    "stop_restart",
+    "pivot_restart",
+)
+"""Supported scripted command schedules."""
+
 # Provisional fixed-evaluation threshold only. No runtime assistance bound is
 # enforced until the later residual-producing student is implemented.
 PROVISIONAL_ORACLE_RESIDUAL_THRESHOLD_RAD = math.radians(35.0)
 EVALUATION_PIVOT_WINDOW_DURATION_S = 2.0
+EVALUATION_RESTART_WINDOW_DURATION_S = EVALUATION_PIVOT_WINDOW_DURATION_S
 
 __all__ = [
+    "COMMAND_PROFILES",
     "EVALUATION_PIVOT_WINDOW_DURATION_S",
+    "EVALUATION_RESTART_WINDOW_DURATION_S",
     "INTENT_COMMAND_NAME",
     "ParkourIntentCommand",
     "ParkourIntentCommandCfg",
@@ -211,6 +222,18 @@ class ParkourIntentCommand(CommandTerm):
         self._external_override[ids] = True
         self.time_left[ids] = math.inf
 
+    def _resample(self, env_ids: Sequence[int]) -> None:
+        """Resample without touching global RNG for deterministic profiles."""
+
+        if len(env_ids) == 0:
+            return
+        fixed_pivot = self.cfg.fixed_yaw_rate_rad_s not in (None, 0.0)
+        if getattr(self.cfg, "command_profile", "mixed") == "mixed" and not fixed_pivot:
+            super()._resample(env_ids)
+            return
+        self._resample_command(env_ids)
+        self.command_counter[env_ids] += 1
+
     def _resample_command(self, env_ids: Sequence[int]) -> None:
         """Sample translation, stationary stops, and flat-only pivots."""
 
@@ -227,9 +250,13 @@ class ParkourIntentCommand(CommandTerm):
         min_speed = torch.where(flat, flat_min, obstacle_min)
         max_speed = torch.where(flat, flat_max, obstacle_max)
         force_stop = (min_speed == 0.0) & (max_speed == 0.0)
+        profile = getattr(self.cfg, "command_profile", "mixed")
         fixed_yaw_rate = self.cfg.fixed_yaw_rate_rad_s
         fixed_pivot = fixed_yaw_rate not in (None, 0.0)
-        if not fixed_pivot:
+        deterministic_stop = profile == "stop_restart"
+        deterministic_pivot = profile == "pivot_restart" or fixed_pivot
+        deterministic_translation = profile == "translation_only"
+        if profile == "mixed" and not fixed_pivot:
             draw = torch.rand(scripted.numel(), device=self.device)
             # Pivots may occur on the first command so reset-to-pivot is part
             # of the trained domain. Stops still begin only after translation.
@@ -251,13 +278,19 @@ class ParkourIntentCommand(CommandTerm):
                     + self.cfg.pivot_window_probability
                 )
             )
-        else:
-            # Fixed evaluation alternates translation and reproducible pivot
-            # pulses, exercising acquisition and the return to locomotion.
-            choose_pivot = (
-                (~first_command) & (~was_nontranslating) & flat & (~force_stop)
-            )
+        elif deterministic_stop:
+            # One prescribed translate-stop-translate trial per episode.
+            choose_stop = (self.command_counter[scripted] == 1) & flat & (~force_stop)
+            choose_pivot = torch.zeros_like(choose_stop)
+        elif deterministic_pivot:
+            # One prescribed translate-pivot-translate trial per episode.
+            choose_pivot = (self.command_counter[scripted] == 1) & flat & (~force_stop)
             choose_stop = force_stop
+        elif deterministic_translation:
+            choose_stop = force_stop
+            choose_pivot = torch.zeros_like(choose_stop)
+        else:  # Guard direct term construction in addition to config validation.
+            raise ValueError(f"Unsupported command profile: {profile!r}.")
 
         moving = ~(choose_stop | choose_pivot)
         moving_ids = scripted[moving]
@@ -268,33 +301,43 @@ class ParkourIntentCommand(CommandTerm):
         if moving_ids.numel() > 0:
             moving_min = min_speed[moving]
             moving_max = max_speed[moving]
-            self._command[moving_ids, 2] = moving_min + torch.rand(
-                moving_ids.numel(), device=self.device, dtype=self._command.dtype
-            ) * (moving_max - moving_min)
+            if deterministic_translation or deterministic_stop or deterministic_pivot:
+                self._command[moving_ids, 2] = moving_min
+            else:
+                self._command[moving_ids, 2] = moving_min + torch.rand(
+                    moving_ids.numel(), device=self.device, dtype=self._command.dtype
+                ) * (moving_max - moving_min)
             self._command[moving_ids, 3] = 0.0
-            if fixed_pivot:
-                self.time_left[moving_ids] = EVALUATION_PIVOT_WINDOW_DURATION_S
+            if deterministic_stop or deterministic_pivot:
+                self.time_left[moving_ids] = math.inf
+                initial_ids = moving_ids[first_command[moving]]
+                self.time_left[initial_ids] = EVALUATION_RESTART_WINDOW_DURATION_S
+            elif deterministic_translation:
+                self.time_left[moving_ids] = math.inf
             else:
                 self.time_left[moving_ids[~moving_flat]] = math.inf
 
         if stopped_ids.numel() > 0:
             self._command[stopped_ids, 2:] = 0.0
-            long_stop = (
-                torch.rand(stopped_ids.numel(), device=self.device)
-                < self.cfg.long_stop_probability
-            )
-            long_stop_ids = stopped_ids[long_stop]
-            if long_stop_ids.numel() > 0:
-                low, high = self.cfg.long_stop_window_range_s
-                self.time_left[long_stop_ids] = low + torch.rand(
-                    long_stop_ids.numel(),
-                    device=self.device,
-                    dtype=self.time_left.dtype,
-                ) * (high - low)
+            if deterministic_stop:
+                self.time_left[stopped_ids] = EVALUATION_RESTART_WINDOW_DURATION_S
+            elif not deterministic_translation:
+                long_stop = (
+                    torch.rand(stopped_ids.numel(), device=self.device)
+                    < self.cfg.long_stop_probability
+                )
+                long_stop_ids = stopped_ids[long_stop]
+                if long_stop_ids.numel() > 0:
+                    low, high = self.cfg.long_stop_window_range_s
+                    self.time_left[long_stop_ids] = low + torch.rand(
+                        long_stop_ids.numel(),
+                        device=self.device,
+                        dtype=self.time_left.dtype,
+                    ) * (high - low)
 
         if pivot_ids.numel() > 0:
             self._command[pivot_ids, 2] = 0.0
-            if not fixed_pivot:
+            if not deterministic_pivot:
                 low, high = self.cfg.pivot_abs_yaw_rate_range_rad_s
                 magnitude = low + torch.rand(
                     pivot_ids.numel(),
@@ -309,7 +352,7 @@ class ParkourIntentCommand(CommandTerm):
                 self._command[pivot_ids, 3] = sign * magnitude
             else:
                 self._command[pivot_ids, 3] = fixed_yaw_rate
-            if not fixed_pivot:
+            if not deterministic_pivot:
                 low, high = self.cfg.pivot_window_range_s
                 self.time_left[pivot_ids] = low + torch.rand(
                     pivot_ids.numel(),
@@ -317,7 +360,7 @@ class ParkourIntentCommand(CommandTerm):
                     dtype=self.time_left.dtype,
                 ) * (high - low)
             else:
-                self.time_left[pivot_ids] = EVALUATION_PIVOT_WINDOW_DURATION_S
+                self.time_left[pivot_ids] = EVALUATION_RESTART_WINDOW_DURATION_S
 
         # Preserve the previous bearing throughout an ordinary stop. A fresh
         # zero-speed episode still needs a meaningful requested travel direction.
@@ -372,6 +415,7 @@ class ParkourIntentCommandCfg(CommandTermCfg):
     """Training distribution for deployable travel and pivot commands."""
 
     class_type: type = ParkourIntentCommand
+    command_profile: str = "mixed"
     resampling_time_range: tuple[float, float] = (0.5, 1.5)
     flat_speed_range_m_s: tuple[float, float] = (0.20, 0.70)
     obstacle_speed_range_m_s: tuple[float, float] = (0.45, 0.70)
@@ -395,6 +439,11 @@ class ParkourIntentCommandCfg(CommandTermCfg):
 
     def validate_configuration(self) -> None:
         """Validate command ingress and scripted nontranslation scheduling."""
+
+        if self.command_profile not in COMMAND_PROFILES:
+            raise ValueError(
+                f"command_profile must be one of {COMMAND_PROFILES}, got {self.command_profile!r}."
+            )
 
         for name in (
             "stop_deadband_m_s",
@@ -463,6 +512,14 @@ class ParkourIntentCommandCfg(CommandTermCfg):
             raise ValueError(
                 "stop_window_probability + pivot_window_probability cannot exceed 1."
             )
+        deterministic = self.command_profile != "mixed"
+        if deterministic:
+            for name in ("flat_speed_range_m_s", "obstacle_speed_range_m_s"):
+                min_speed, max_speed = getattr(self, name)
+                if min_speed != max_speed or min_speed <= self.stop_deadband_m_s:
+                    raise ValueError(
+                        f"{self.command_profile!r} requires fixed positive speed ranges."
+                    )
         if self.fixed_yaw_rate_rad_s is not None:
             fixed = float(self.fixed_yaw_rate_rad_s)
             if (
@@ -486,6 +543,16 @@ class ParkourIntentCommandCfg(CommandTermCfg):
                 raise ValueError(
                     "A fixed nonzero yaw rate requires positive translation ranges for restart trials."
                 )
+        has_fixed_pivot = self.fixed_yaw_rate_rad_s not in (None, 0.0)
+        if self.command_profile == "pivot_restart" and not has_fixed_pivot:
+            raise ValueError("'pivot_restart' requires a nonzero fixed_yaw_rate_rad_s.")
+        if (
+            self.command_profile in ("translation_only", "stop_restart")
+            and has_fixed_pivot
+        ):
+            raise ValueError(
+                f"{self.command_profile!r} does not permit fixed_yaw_rate_rad_s."
+            )
 
 
 def active_motion_time_s(env: ManagerBasedRLEnv) -> Tensor:

@@ -38,6 +38,22 @@ def _validate_cli_action_noise_std(
         )
 
 
+def _validate_cli_action_noise_seed(
+    policy_mode: str,
+    action_noise_seed: int | None,
+) -> None:
+    """Validate the independent action RNG seed before launching Isaac Sim."""
+
+    if action_noise_seed is None:
+        return
+    if not policy_mode.endswith("_sampled"):
+        raise ValueError(
+            "--action_noise_seed requires a sampled --policy_mode; mean modes do not sample actions."
+        )
+    if not 0 <= action_noise_seed < 2**63:
+        raise ValueError("--action_noise_seed must lie in [0, 2**63).")
+
+
 def _run_isolated_course_matrix(cli_arguments: list[str]) -> None:
     """Resolve the configured matrix, then evaluate each cell in a fresh process."""
 
@@ -133,7 +149,18 @@ parser.add_argument(
     "--desired_yaw_rate",
     type=float,
     default=None,
-    help="Signed rad/s for deterministic level-0 translate-pivot-translate pulses.",
+    help="Signed rad/s for the level-0 pivot_restart command profile.",
+)
+parser.add_argument(
+    "--command_profile",
+    choices=("mixed", "translation_only", "stop_restart", "pivot_restart"),
+    default=None,
+    help=(
+        "Evaluation command schedule. translation_only holds the selected speed; "
+        "stop_restart and pivot_restart run one two-second event between translation "
+        "phases on level 0. Omission preserves legacy mixed behavior, except a nonzero "
+        "--desired_yaw_rate selects pivot_restart."
+    ),
 )
 parser.add_argument(
     "--eval_episodes",
@@ -160,6 +187,15 @@ parser.add_argument(
         "Evaluation-only isotropic action standard deviation for sampled policy modes. "
         "Zero provides a deterministic counterfactual; otherwise the value must lie within "
         "the policy's configured noise bounds. Defaults to the checkpoint's learned standard deviation."
+    ),
+)
+parser.add_argument(
+    "--action_noise_seed",
+    type=int,
+    default=None,
+    help=(
+        "Seed for evaluation action sampling. Defaults to --seed while using an "
+        "independent Torch generator, so sampling cannot perturb environment randomness."
     ),
 )
 parser.add_argument(
@@ -200,6 +236,7 @@ cli_arguments = sys.argv[1:]
 args_cli, hydra_args = parser.parse_known_args()
 try:
     _validate_cli_action_noise_std(args_cli.policy_mode, args_cli.action_noise_std)
+    _validate_cli_action_noise_seed(args_cli.policy_mode, args_cli.action_noise_seed)
 except ValueError as error:
     parser.error(str(error))
 if args_cli.desired_speed is not None and (
@@ -214,6 +251,30 @@ if args_cli.desired_yaw_rate not in (None, 0.0) and args_cli.desired_speed == 0.
     parser.error(
         "A nonzero --desired_yaw_rate requires positive --desired_speed or omission."
     )
+if args_cli.command_profile not in (None, "mixed") and args_cli.desired_speed == 0.0:
+    parser.error("Deterministic command profiles require a positive desired speed.")
+if args_cli.command_profile == "pivot_restart" and args_cli.desired_yaw_rate in (
+    None,
+    0.0,
+):
+    parser.error("--command_profile=pivot_restart requires nonzero --desired_yaw_rate.")
+if (
+    args_cli.command_profile is not None
+    and args_cli.command_profile != "pivot_restart"
+    and args_cli.desired_yaw_rate not in (None, 0.0)
+):
+    parser.error(
+        "A nonzero --desired_yaw_rate requires --command_profile=pivot_restart."
+    )
+if args_cli.command_profile in ("stop_restart", "pivot_restart") and (
+    args_cli.difficulty_level not in (None, 0)
+):
+    parser.error("stop_restart and pivot_restart command profiles require level 0.")
+if args_cli.all_courses and args_cli.command_profile in (
+    "stop_restart",
+    "pivot_restart",
+):
+    parser.error("Restart command profiles cannot be combined with --all_courses.")
 if args_cli.all_courses and args_cli.desired_yaw_rate not in (None, 0.0):
     parser.error("Nonzero --desired_yaw_rate cannot be combined with --all_courses.")
 if args_cli.all_courses and (
@@ -1298,6 +1359,7 @@ def _evaluate_course(
         geometry_variant,
         desired_speed,
         desired_yaw_rate,
+        command_profile,
         level_metadata,
     ) = _configure_evaluation_course(
         env_cfg,
@@ -1306,6 +1368,7 @@ def _evaluate_course(
         args_cli.desired_speed,
         args_cli.desired_yaw_rate,
         args_cli.geometry_variant,
+        args_cli.command_profile,
     )
     artifacts = _prepare_evaluation_artifacts(
         checkpoint,
@@ -1315,6 +1378,7 @@ def _evaluate_course(
         env_cfg.seed,
         desired_speed=desired_speed,
         desired_yaw_rate=desired_yaw_rate,
+        command_profile=command_profile,
     )
     env = _create_evaluation_environment(env_cfg, agent_cfg, artifacts)
     num_envs = env.num_envs
@@ -1329,7 +1393,12 @@ def _evaluate_course(
             checkpoint.path,
             checkpoint.sha256,
         )
-        policy, action_noise = _load_inference_policy(env, agent_cfg, checkpoint.path)
+        policy, action_noise = _load_inference_policy(
+            env,
+            agent_cfg,
+            checkpoint.path,
+            evaluation_seed=env_cfg.seed,
+        )
         rollout = _collect_rollout_statistics(env, observations, policy)
     finally:
         # Closing also finalizes a partial or completed RecordVideo recording.
@@ -1344,6 +1413,7 @@ def _evaluate_course(
         geometry_variant=geometry_variant,
         desired_speed=desired_speed,
         desired_yaw_rate=desired_yaw_rate,
+        command_profile=command_profile,
         level_metadata=level_metadata,
         num_envs=num_envs,
         step_dt=step_dt,
@@ -1379,6 +1449,7 @@ def _build_evaluation_report(
     geometry_variant: int | None,
     desired_speed: float | None,
     desired_yaw_rate: float | None,
+    command_profile: str | None,
     level_metadata: dict[str, object],
     num_envs: int,
     step_dt: float,
@@ -1404,6 +1475,7 @@ def _build_evaluation_report(
         "geometry_variant_index": geometry_variant,
         "desired_speed_m_s": desired_speed,
         "desired_yaw_rate_rad_s": desired_yaw_rate,
+        "command_profile": command_profile,
         "difficulty_metadata": level_metadata,
         "num_envs": num_envs,
         "gait_foot_order": list(GO2_FOOT_NAMES),
@@ -1428,12 +1500,14 @@ def _configure_evaluation_course(
     requested_speed: float | None,
     requested_yaw_rate: float | None,
     requested_geometry_variant: int | None,
+    requested_command_profile: str | None,
 ) -> tuple[
     str | None,
     int | None,
     int | None,
     float | None,
     float | None,
+    str | None,
     dict[str, object],
 ]:
     """Freeze the config to one course and return its resolved metadata."""
@@ -1447,6 +1521,7 @@ def _configure_evaluation_course(
         geometry_variant=requested_geometry_variant,
         speed=requested_speed,
         yaw_rate=requested_yaw_rate,
+        command_profile=requested_command_profile,
     )
     if args_cli.reset_profile != "canonical":
         env_cfg.set_evaluation_reset_profile(args_cli.reset_profile)
@@ -1456,6 +1531,7 @@ def _configure_evaluation_course(
         env_cfg.evaluation_geometry_variant,
         env_cfg.resolved_evaluation_speed(),
         env_cfg.resolved_evaluation_yaw_rate(),
+        env_cfg.evaluation_command_profile,
         env_cfg.evaluation_course_metadata(),
     )
 
@@ -1469,6 +1545,7 @@ def _prepare_evaluation_artifacts(
     *,
     desired_speed: float | None = None,
     desired_yaw_rate: float | None = None,
+    command_profile: str | None = None,
 ) -> _ArtifactInfo:
     """Create one output directory and derive its video filename prefix."""
 
@@ -1477,6 +1554,7 @@ def _prepare_evaluation_artifacts(
     variant_component = _path_component(geometry_variant, "default")
     speed_component = _path_component(desired_speed, "default")
     yaw_rate_component = _path_component(desired_yaw_rate, "default")
+    command_profile_component = _path_component(command_profile, "default")
     seed_component = _path_component(seed, "default")
     evaluation_kind = "video" if args_cli.video else "metrics"
     evaluation_settings = f"{args_cli.policy_mode}-{args_cli.reset_profile}-episodes_{args_cli.eval_episodes}"
@@ -1487,7 +1565,8 @@ def _prepare_evaluation_artifacts(
             if args_cli.action_noise_std is None
             else _path_component(args_cli.action_noise_std, "checkpoint")
         )
-        noise_suffix = f"-noise_std_{noise_identity}"
+        noise_seed, _ = _resolve_action_noise_seed(seed, args_cli.action_noise_seed)
+        noise_suffix = f"-noise_std_{noise_identity}-noise_seed_{noise_seed}"
         evaluation_settings += noise_suffix
     if args_cli.video:
         evaluation_settings += f"-steps_{args_cli.video_length or 'full'}"
@@ -1508,6 +1587,7 @@ def _prepare_evaluation_artifacts(
         f"variant_{variant_component}",
         f"speed_{speed_component}",
         f"yaw_rate_{yaw_rate_component}",
+        f"command_{command_profile_component}",
         f"seed_{seed_component}",
         evaluation_kind,
         evaluation_settings,
@@ -1520,6 +1600,7 @@ def _prepare_evaluation_artifacts(
             f"{checkpoint.stem}-{args_cli.policy_mode}-{args_cli.reset_profile}-"
             f"family_{family_component}-level_{level_component}-variant_{variant_component}-"
             f"speed_{speed_component}-yaw_rate_{yaw_rate_component}-seed_{seed_component}"
+            f"-command_{command_profile_component}"
             f"{noise_suffix}"
         ),
     )
@@ -1589,6 +1670,8 @@ def _load_inference_policy(
     env: RslRlHistoryWrapper,
     agent_cfg: RslRlBaseRunnerCfg,
     checkpoint_path: str,
+    *,
+    evaluation_seed: int | None,
 ) -> tuple[Callable[[TensorDict], torch.Tensor], dict[str, object]]:
     """Restore a checkpoint and return its selected action path and noise provenance."""
 
@@ -1602,44 +1685,72 @@ def _load_inference_policy(
     inference_policy = runner.get_inference_policy(device=device)
     policy = runner.alg.policy
     checkpoint_noise = _checkpoint_action_noise_statistics(policy)
+    action_noise_seed, action_noise_seed_source = _resolve_action_noise_seed(
+        evaluation_seed,
+        args_cli.action_noise_seed,
+    )
     action_noise = _evaluation_action_noise(
         policy,
         checkpoint_noise,
         args_cli.policy_mode,
         args_cli.action_noise_std,
+        seed=action_noise_seed,
+        seed_source=action_noise_seed_source,
+        generator_device=str(device),
     )
     if args_cli.policy_mode == "privileged_mean":
         return inference_policy, action_noise
-    if args_cli.policy_mode == "privileged_sampled":
-        if args_cli.action_noise_std is None:
-            return policy.act, action_noise
-        return (
-            partial(
-                _sample_actions_with_fixed_std,
-                inference_policy,
-                action_noise_std=args_cli.action_noise_std,
-            ),
-            action_noise,
-        )
-    history_policy = getattr(policy, "act_inference_from_history", None)
-    if not callable(history_policy):
-        raise TypeError("History evaluation requires a privileged teacher checkpoint.")
-    if args_cli.policy_mode == "history_mean":
-        return history_policy, action_noise
-    if args_cli.action_noise_std is None:
-        return partial(policy.act, use_history=True), action_noise
+    if args_cli.policy_mode.startswith("privileged_"):
+        mean_policy = inference_policy
+    else:
+        mean_policy = getattr(policy, "act_inference_from_history", None)
+        if not callable(mean_policy):
+            raise TypeError(
+                "History evaluation requires a privileged teacher checkpoint."
+            )
+        if args_cli.policy_mode == "history_mean":
+            return mean_policy, action_noise
+
+    generator = _make_action_noise_generator(device, action_noise_seed)
+    action_noise_std = (
+        _bounded_checkpoint_action_std(policy)
+        if args_cli.action_noise_std is None
+        else args_cli.action_noise_std
+    )
     return (
         partial(
-            _sample_actions_with_fixed_std,
-            history_policy,
-            action_noise_std=args_cli.action_noise_std,
+            _sample_actions_with_noise,
+            mean_policy,
+            action_noise_std=action_noise_std,
+            generator=generator,
         ),
         action_noise,
     )
 
 
-def _checkpoint_action_noise_statistics(policy: object) -> dict[str, float]:
-    """Return the bounded learned action standard deviation in a compact form."""
+def _resolve_action_noise_seed(
+    evaluation_seed: int | None,
+    override_seed: int | None,
+) -> tuple[int, str]:
+    """Resolve a deterministic seed for the evaluation-only action RNG."""
+
+    if override_seed is not None:
+        return override_seed, "cli"
+    if evaluation_seed is not None:
+        return evaluation_seed, "evaluation_seed"
+    return 0, "default"
+
+
+def _make_action_noise_generator(device: str, seed: int) -> "torch.Generator":
+    """Create an action-only generator without advancing Torch's global RNG."""
+
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
+    return generator
+
+
+def _bounded_checkpoint_action_std(policy: object) -> torch.Tensor:
+    """Return the checkpoint's bounded state-independent action deviation."""
 
     noise_std_type = getattr(policy, "noise_std_type", None)
     if noise_std_type == "scalar":
@@ -1650,12 +1761,22 @@ def _checkpoint_action_noise_statistics(policy: object) -> dict[str, float]:
         raise ValueError(f"Unsupported policy noise_std_type: {noise_std_type!r}.")
 
     lower_bound = float(getattr(policy, "min_noise_std"))
-    upper_bound = float(getattr(policy, "max_noise_std"))
+    upper_bound = getattr(policy, "noise_std_upper_bound", None)
+    if upper_bound is None:
+        upper_bound = getattr(policy, "max_noise_std")
+    upper_bound = float(upper_bound)
     values = values.clamp(min=lower_bound, max=upper_bound)
     if values.numel() == 0 or not torch.isfinite(values).all():
         raise FloatingPointError(
             "The checkpoint contains empty or non-finite action-noise parameters."
         )
+    return values
+
+
+def _checkpoint_action_noise_statistics(policy: object) -> dict[str, float]:
+    """Return the bounded learned action standard deviation in a compact form."""
+
+    values = _bounded_checkpoint_action_std(policy)
     return {
         "min": float(values.min().item()),
         "mean": float(values.float().mean().item()),
@@ -1668,6 +1789,10 @@ def _evaluation_action_noise(
     checkpoint_statistics: dict[str, float],
     policy_mode: str,
     action_noise_std: float | None,
+    *,
+    seed: int | None = None,
+    seed_source: str | None = None,
+    generator_device: str | None = None,
 ) -> dict[str, object]:
     """Resolve and describe the action noise actually used by evaluation."""
 
@@ -1690,6 +1815,17 @@ def _evaluation_action_noise(
         "override_std": action_noise_std,
         "effective_std": effective_statistics,
         "checkpoint_std": checkpoint_statistics,
+        "rng": (
+            None
+            if not policy_mode.endswith("_sampled")
+            else {
+                "algorithm": "torch.Generator",
+                "seed": seed,
+                "seed_source": seed_source,
+                "device": generator_device,
+                "independent_from_global_torch_rng": True,
+            }
+        ),
     }
 
 
@@ -1712,18 +1848,25 @@ def _validate_action_noise_std_against_policy(
         )
 
 
-def _sample_actions_with_fixed_std(
+def _sample_actions_with_noise(
     mean_policy: Callable[[TensorDict], torch.Tensor],
     observations: TensorDict,
     *,
-    action_noise_std: float,
+    action_noise_std: float | torch.Tensor,
+    generator: "torch.Generator",
 ) -> torch.Tensor:
-    """Sample isotropic Gaussian actions around a deterministic policy mean."""
+    """Sample Gaussian actions without consuming Torch's global RNG stream."""
 
     mean = mean_policy(observations)
-    if action_noise_std == 0.0:
+    if isinstance(action_noise_std, float) and action_noise_std == 0.0:
         return mean
-    return mean + action_noise_std * torch.randn_like(mean)
+    noise = torch.randn(
+        mean.shape,
+        dtype=mean.dtype,
+        device=mean.device,
+        generator=generator,
+    )
+    return mean + action_noise_std * noise
 
 
 def _path_component(value: str | int | None, default: str) -> str:
@@ -1750,7 +1893,7 @@ def _print_evaluation_summary(report: _EvaluationReport, report_path: str) -> No
     print(
         f"  Course: {report['terrain_family']} level {report['difficulty_level']} "
         f"variant {report['geometry_variant_index']} | policy={report['policy_mode']} "
-        f"reset={report['reset_profile']}"
+        f"reset={report['reset_profile']} | command={report['command_profile']}"
     )
     action_noise = report["action_noise"]
     effective_std = action_noise["effective_std"]

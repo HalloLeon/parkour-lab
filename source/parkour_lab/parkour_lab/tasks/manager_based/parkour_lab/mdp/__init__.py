@@ -11,7 +11,9 @@ from isaaclab_tasks.manager_based.locomotion.velocity.mdp import *  # noqa: F401
 
 from . import config as config
 from .commands import (
+    COMMAND_PROFILES as COMMAND_PROFILES,
     EVALUATION_PIVOT_WINDOW_DURATION_S as EVALUATION_PIVOT_WINDOW_DURATION_S,
+    EVALUATION_RESTART_WINDOW_DURATION_S as EVALUATION_RESTART_WINDOW_DURATION_S,
     INTENT_COMMAND_NAME as INTENT_COMMAND_NAME,
     PROVISIONAL_ORACLE_RESIDUAL_THRESHOLD_RAD as PROVISIONAL_ORACLE_RESIDUAL_THRESHOLD_RAD,
     ParkourIntentCommand as ParkourIntentCommand,
