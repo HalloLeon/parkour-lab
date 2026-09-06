@@ -501,6 +501,8 @@ class RewardsCfg:
             "asset_cfg": SceneEntityCfg("robot"),
             # Two bounded costs keep yaw tracking dominant during pivot steps.
             "pivot_stability_weight": 0.1,
+            # Increase turn credit without strengthening quiet stops or motion costs.
+            "pivot_yaw_tracking_weight": 2.0,
             "planar_speed_std": 0.15,
             "roll_pitch_rate_std": 0.35,
             "yaw_rate_std": 0.5,
@@ -685,6 +687,9 @@ class RewardsCfg:
         pivot_stability_weight = stationary_params["pivot_stability_weight"]
         if not math.isfinite(pivot_stability_weight) or pivot_stability_weight < 0.0:
             raise ValueError("pivot stability weight must be finite and non-negative.")
+        pivot_yaw_tracking_weight = stationary_params["pivot_yaw_tracking_weight"]
+        if not math.isfinite(pivot_yaw_tracking_weight) or pivot_yaw_tracking_weight < 0.0:
+            raise ValueError("pivot yaw tracking weight must be finite and non-negative.")
 
 
 @configclass

@@ -247,13 +247,16 @@ def stationary_velocity_tracking_exp(
     roll_pitch_rate_std: float = 0.35,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     pivot_stability_weight: float = 0.1,
+    pivot_yaw_tracking_weight: float = 1.0,
 ) -> torch.Tensor:
     """Track quiet stops and sustained pivots whenever translation is zero.
 
     Stops retain the joint quiet-body kernel. Pivots score yaw independently:
     the stepping motion needed to turn must not suppress the yaw-tracking
     signal. Planar motion and roll/pitch rates each incur a bounded additive
-    cost, keeping the pivot score in ``[-2 * pivot_stability_weight, 1]``.
+    cost, keeping the pivot score in
+    ``[-2 * pivot_stability_weight, pivot_yaw_tracking_weight]``. The yaw
+    weight changes neither these costs nor the stop score.
     """
 
     target_yaw_rate = get_target_yaw_rate(env)
@@ -270,7 +273,7 @@ def stationary_velocity_tracking_exp(
     planar_motion_cost = 1.0 - torch.exp(-planar_speed_sq / planar_speed_std**2)
     rocking_cost = 1.0 - torch.exp(-roll_pitch_rate_sq / roll_pitch_rate_std**2)
     pivot_score = (
-        torch.exp(-yaw_rate_error_sq / yaw_rate_std**2)
+        pivot_yaw_tracking_weight * torch.exp(-yaw_rate_error_sq / yaw_rate_std**2)
         - pivot_stability_weight * (planar_motion_cost + rocking_cost)
     )
     score = torch.where(target_yaw_rate.ne(0), pivot_score, stop_score)
