@@ -499,6 +499,8 @@ class RewardsCfg:
         weight=1.0,
         params={
             "asset_cfg": SceneEntityCfg("robot"),
+            # Two bounded costs keep yaw tracking dominant during pivot steps.
+            "pivot_stability_weight": 0.1,
             "planar_speed_std": 0.15,
             "roll_pitch_rate_std": 0.35,
             "yaw_rate_std": 0.5,
@@ -680,6 +682,9 @@ class RewardsCfg:
             raise ValueError(
                 "stationary velocity tracking stds must be finite and positive."
             )
+        pivot_stability_weight = stationary_params["pivot_stability_weight"]
+        if not math.isfinite(pivot_stability_weight) or pivot_stability_weight < 0.0:
+            raise ValueError("pivot stability weight must be finite and non-negative.")
 
 
 @configclass
