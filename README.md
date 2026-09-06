@@ -502,7 +502,7 @@ gentle-turn cohort. `--desired_speed` fixes the scalar command for every reset.
 When omitted, the selected course's nominal speed is retained.
 Use `--command_profile=translation_only` for a pure locomotion comparison.
 Level 0 additionally supports the one-shot profiles `stop_restart`
-(translate 2 s → stop 2 s → translate) and `pivot_restart` (translate 2 s →
+(translate 2 s → stop 3.5 s → translate) and `pivot_restart` (translate 2 s →
 signed pivot 2 s → translate). `pivot_restart` requires
 `--desired_yaw_rate=<signed rad/s>`; `--desired_speed` is the positive restart
 speed, or the course nominal when omitted. Omitting the profile preserves the
@@ -521,7 +521,7 @@ maximum course progress, chassis contact, below-course falls, timeout, return,
 episode length, forward speed, overspeed, vertical-velocity RMS, and
 all-feet-airborne fraction for each selected matrix cell. Command diagnostics
 separate moving speed error, stopped planar speed/yaw rate, mean/p95
-movement-direction error, first-threshold-crossing stop settling, maximum XY
+movement-direction error, sustained-dwell stop settling, maximum XY
 excursion during the following two seconds, restart outcomes, and active versus
 wall-only timeouts. Pivot samples are excluded from stop denominators and
 separately report planar speed, mean/p95 yaw-rate error, wrong-way fraction,
@@ -540,6 +540,28 @@ explicit off-route failure that cannot advance route state. Neither distance
 nor width is an actor observation. Evaluation samples after physics and reward
 computation but before Isaac Lab auto-resets completed rows, so the terminal
 state is included and the following reset state is excluded.
+
+Stop-response schema version 2 requires 0.2 s continuously below both
+velocity thresholds before confirming settling. The settling time includes
+this dwell; it is not directly comparable with the old first-crossing metric.
+The 3.5 s fixed stop allows acquisition plus the full two-second post-settle
+drift measurement. Check the drift sample count: missing coverage is not zero
+drift, and a policy that never settles still has no eligible drift sample.
+
+For command and gait diagnosis, add `--telemetry --num_envs=1` on level 0.
+This writes `telemetry.csv` and `command_windows.json` alongside `metrics.json`.
+The CSV contains the actor's pre-step command and the matching pre-reset
+post-physics pose, signed world-Z angular velocity, foot contacts, and foot
+body-origin heights above the flat support plane (not sole clearance).
+Window reports compare integrated yaw commands with unwrapped heading change,
+retain whole-window errors, and additionally report the tail after 0.5 s and
+complete 0.4 s time-average blocks. These blocks are not contact-aligned gait
+cycles. Partial windows are identified explicitly. Compare the same signed
+pivot in `history_mean` and `privileged_mean` before attributing differences to
+the history encoder; eventual course completion alone does not certify a turn.
+Telemetry is opt-in, uses no new sensors, and does not change training rewards
+or the randomized training command schedule.
+
 Evaluation writes
 `metrics.json` plus the optional MP4 beneath
 `<run>/evaluation/<checkpoint>-<hash>/family_<family>/level_<n>/variant_<v>/speed_<m_s>/yaw_rate_<rad_s>/command_<profile>/seed_<seed>/`, separated

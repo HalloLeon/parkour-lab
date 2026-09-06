@@ -16,6 +16,7 @@ import sys
 import tempfile
 
 import cli_args
+from evaluation_telemetry import EvaluationTelemetry
 
 cli_args.require_runtime_versions()
 
@@ -101,6 +102,11 @@ parser.add_argument(
     "--video", action="store_true", default=False, help="Record an evaluation video."
 )
 parser.add_argument(
+    "--telemetry",
+    action="store_true",
+    help="Write command-response and gait traces for one level-0 environment.",
+)
+parser.add_argument(
     "--video_length",
     type=cli_args.positive_int,
     default=None,
@@ -157,8 +163,9 @@ parser.add_argument(
     default=None,
     help=(
         "Evaluation command schedule. translation_only holds the selected speed; "
-        "stop_restart and pivot_restart run one two-second event between translation "
-        "phases on level 0. Omission preserves legacy mixed behavior, except a nonzero "
+        "stop_restart holds for 3.5 seconds and pivot_restart for two seconds between "
+        "translation phases on level 0. Omission preserves legacy mixed behavior, "
+        "except a nonzero "
         "--desired_yaw_rate selects pivot_restart."
     ),
 )
@@ -277,6 +284,12 @@ if args_cli.all_courses and args_cli.command_profile in (
     parser.error("Restart command profiles cannot be combined with --all_courses.")
 if args_cli.all_courses and args_cli.desired_yaw_rate not in (None, 0.0):
     parser.error("Nonzero --desired_yaw_rate cannot be combined with --all_courses.")
+if args_cli.telemetry and (
+    args_cli.all_courses
+    or args_cli.num_envs not in (None, 1)
+    or args_cli.difficulty_level not in (None, 0)
+):
+    parser.error("--telemetry requires a single level-0 environment, not --all_courses.")
 if args_cli.all_courses and (
     args_cli.terrain_family is not None or args_cli.difficulty_level is not None
 ):
@@ -332,8 +345,10 @@ from parkour_lab.learning.rsl_rl import RslRlHistoryWrapper
 from parkour_lab.tasks.manager_based.parkour_lab.mdp._shared.go2 import GO2_FOOT_NAMES
 from parkour_lab.tasks.manager_based.parkour_lab.mdp.commands import (
     EVALUATION_PIVOT_WINDOW_DURATION_S,
+    EVALUATION_STOP_WINDOW_DURATION_S,
     PROVISIONAL_ORACLE_RESIDUAL_THRESHOLD_RAD,
     get_preferred_speed,
+    get_target_yaw_rate,
 )
 from parkour_lab.tasks.manager_based.parkour_lab.mdp.diagnostics import (
     latest_evaluation_step,
@@ -351,6 +366,7 @@ from tensordict import TensorDict
 STOP_SETTLED_PLANAR_SPEED_M_S = 0.10
 STOP_SETTLED_ABS_YAW_RATE_RAD_S = 0.20
 STOP_SETTLED_WITHIN_S = 1.0
+STOP_SETTLED_DWELL_S = 0.20
 STOP_DRIFT_HORIZON_S = 2.0
 
 EPISODE_SUM_METRICS = (
@@ -455,6 +471,7 @@ class _EpisodeStopState:
     previous_moving: torch.Tensor
     previous_pivoting: torch.Tensor
     stop_elapsed_s: torch.Tensor
+    quiet_elapsed_s: torch.Tensor
     settled_elapsed_s: torch.Tensor
     settle_position_xy: torch.Tensor
     current_drift_max_m: torch.Tensor
@@ -1268,6 +1285,7 @@ class _RolloutResult:
         """State evaluator-only stop metric thresholds and eligibility."""
 
         return {
+            "schema_version": 2,
             "transition": "translation_to_zero_speed_and_zero_yaw_to_translation",
             "pivot_commands_excluded": True,
             "sampling": "post_physics_pre_reset_including_terminal",
@@ -1275,7 +1293,9 @@ class _RolloutResult:
             "settled_absolute_yaw_rate_threshold_rad_s": (
                 STOP_SETTLED_ABS_YAW_RATE_RAD_S
             ),
-            "settling_semantics": "first_sample_strictly_below_both_thresholds",
+            "settling_semantics": "first_confirmation_of_sustained_below_threshold_dwell",
+            "settled_dwell_s": STOP_SETTLED_DWELL_S,
+            "fixed_stop_window_duration_s": EVALUATION_STOP_WINDOW_DURATION_S,
             "settled_within_s": STOP_SETTLED_WITHIN_S,
             "drift_horizon_after_settling_s": STOP_DRIFT_HORIZON_S,
             "drift_semantics": (
@@ -1370,6 +1390,11 @@ def _evaluate_course(
         args_cli.geometry_variant,
         args_cli.command_profile,
     )
+    if args_cli.telemetry:
+        if evaluation_level != 0 or env_cfg.scene.num_envs != 1:
+            raise ValueError("--telemetry requires --difficulty_level=0 --num_envs=1.")
+        env_cfg.rewards.training_diagnostics.params["capture_evaluation_step"] = True
+        env_cfg.rewards.training_diagnostics.params["capture_evaluation_telemetry"] = True
     artifacts = _prepare_evaluation_artifacts(
         checkpoint,
         evaluation_family,
@@ -1383,6 +1408,8 @@ def _evaluate_course(
     env = _create_evaluation_environment(env_cfg, agent_cfg, artifacts)
     num_envs = env.num_envs
     step_dt = env.unwrapped.step_dt
+    telemetry = None
+    telemetry_report = None
 
     try:
         observations = env.get_observations()
@@ -1399,10 +1426,16 @@ def _evaluate_course(
             checkpoint.path,
             evaluation_seed=env_cfg.seed,
         )
-        rollout = _collect_rollout_statistics(env, observations, policy)
+        if args_cli.telemetry:
+            telemetry = EvaluationTelemetry(artifacts.directory, step_dt, GO2_FOOT_NAMES)
+        rollout = _collect_rollout_statistics(env, observations, policy, telemetry)
     finally:
         # Closing also finalizes a partial or completed RecordVideo recording.
-        env.close()
+        try:
+            if telemetry is not None:
+                telemetry_report = telemetry.close()
+        finally:
+            env.close()
 
     report = _build_evaluation_report(
         env_cfg=env_cfg,
@@ -1419,6 +1452,7 @@ def _evaluate_course(
         step_dt=step_dt,
         action_noise=action_noise,
         rollout=rollout,
+        telemetry=telemetry_report,
     )
     report_path = _write_evaluation_report(artifacts.directory, report)
     return report, report_path
@@ -1455,6 +1489,7 @@ def _build_evaluation_report(
     step_dt: float,
     action_noise: dict[str, object],
     rollout: _RolloutResult,
+    telemetry: dict[str, object] | None = None,
 ) -> _EvaluationReport:
     """Build the JSON-compatible report for one fixed evaluation course."""
 
@@ -1489,6 +1524,7 @@ def _build_evaluation_report(
         "terminal_landing": rollout.terminal_landing_report(),
         "oracle_residual": rollout.oracle_residual_report(),
         "stop_response": rollout.stop_response_report(),
+        "telemetry": telemetry,
         "summary": rollout.summary(step_dt),
     }
 
@@ -2137,6 +2173,7 @@ def _create_episode_stop_state(base_env: ManagerBasedRLEnv) -> _EpisodeStopState
         # receive the same excursion accounting as sampled mid-episode pivots.
         previous_pivoting=torch.zeros(shape, device=base_env.device, dtype=torch.bool),
         stop_elapsed_s=-torch.ones(shape, device=base_env.device),
+        quiet_elapsed_s=-torch.ones(shape, device=base_env.device),
         settled_elapsed_s=-torch.ones(shape, device=base_env.device),
         settle_position_xy=torch.zeros((base_env.num_envs, 2), device=base_env.device),
         current_drift_max_m=zeros(),
@@ -2197,13 +2234,31 @@ def _update_episode_stop_state(
     )
 
     active = (state.stop_elapsed_s >= 0.0) & stationary
-    newly_settled = (
+    quiet = (
         active
-        & (state.settled_elapsed_s < 0.0)
         & (planar_speed_m_s < STOP_SETTLED_PLANAR_SPEED_M_S)
         & (abs_yaw_rate_rad_s < STOP_SETTLED_ABS_YAW_RATE_RAD_S)
     )
-    settling_time = state.stop_elapsed_s
+    # The first quiet observation starts the dwell clock; it does not prove
+    # that the preceding physics interval was already below the thresholds.
+    state.quiet_elapsed_s.copy_(
+        torch.where(
+            quiet,
+            torch.where(
+                (state.quiet_elapsed_s >= 0.0) & (~falling),
+                state.quiet_elapsed_s + step_dt,
+                torch.zeros_like(state.quiet_elapsed_s),
+            ),
+            -torch.ones_like(state.quiet_elapsed_s),
+        )
+    )
+    newly_settled = (
+        active
+        & (state.settled_elapsed_s < 0.0)
+        & (state.quiet_elapsed_s >= STOP_SETTLED_DWELL_S - 1.0e-6)
+    )
+    # State is sampled at the end of the current control interval.
+    settling_time = state.stop_elapsed_s + step_dt
     settled = newly_settled.to(dtype=state.settled_stop_counts.dtype)
     state.settled_stop_counts += settled
     state.settled_within_1s_counts += (
@@ -2245,7 +2300,9 @@ def _update_episode_stop_state(
             state.current_drift_max_m,
         )
     )
-    record_drift = pending_drift & (next_settled_elapsed >= STOP_DRIFT_HORIZON_S)
+    record_drift = pending_drift & (
+        next_settled_elapsed >= STOP_DRIFT_HORIZON_S - 1.0e-6
+    )
     completed_drift_m = torch.where(
         record_drift,
         state.current_drift_max_m,
@@ -2323,6 +2380,7 @@ def _reset_episode_stop_state(
     state.previous_moving[done_mask] = translating[done_mask]
     state.previous_pivoting[done_mask] = False
     state.stop_elapsed_s[done_mask] = -1.0
+    state.quiet_elapsed_s[done_mask] = -1.0
     state.settled_elapsed_s[done_mask] = -1.0
     state.settle_position_xy[done_mask] = 0.0
     state.current_drift_max_m[done_mask] = 0.0
@@ -2503,6 +2561,7 @@ def _collect_rollout_statistics(
     env: RslRlHistoryWrapper,
     observations: TensorDict,
     policy: Callable[[TensorDict], torch.Tensor],
+    telemetry: EvaluationTelemetry | None = None,
 ) -> _RolloutResult:
     """Aggregate completed episodes for the selected policy mode."""
 
@@ -2537,6 +2596,15 @@ def _collect_rollout_statistics(
     ):
         start_time = time.time()
         with torch.inference_mode():
+            if telemetry is not None:
+                # Capture the command actually presented to the actor, before
+                # commands or route cursors advance inside env.step().
+                asset = base_env.scene["robot"]
+                telemetry_start = torch.cat(
+                    (asset.data.root_pos_w, asset.data.root_quat_w), dim=-1
+                )[0].cpu().tolist()
+                telemetry_speed = float(get_preferred_speed(base_env)[0].item())
+                telemetry_yaw = float(get_target_yaw_rate(base_env)[0].item())
             actions = policy(observations)
             observations, rewards, dones, _ = env.step(actions)
             # The reward-phase diagnostic retains terminal physics before
@@ -2581,6 +2649,23 @@ def _collect_rollout_statistics(
         for name, episode_sum in episode_metric_sums.items():
             episode_sum += step_metrics[name]
         outcomes = _read_termination_outcomes(base_env, done_mask)
+        if telemetry is not None:
+            sample = transition.telemetry
+            if sample is None:
+                raise RuntimeError("Pre-reset evaluation telemetry was not captured.")
+            telemetry.record(
+                command_speed_m_s=telemetry_speed,
+                command_yaw_rate_rad_s=telemetry_yaw,
+                root_start=telemetry_start,
+                root_end=sample["root_pose"][0].cpu().tolist(),
+                yaw_rate_rad_s=float(sample["yaw_rate"][0].item()),
+                foot_contact=transition.foot_contact[0].cpu().tolist(),
+                foot_height_above_support_m=(
+                    sample["foot_height_above_support_m"][0].cpu().tolist()
+                ),
+                done=bool(done_mask[0].item()),
+                success=bool(outcomes["success"][0].item()),
+            )
         # The cursor counts prior targets; success adds its still-active final target.
         episode_max_waypoints_reached = torch.maximum(
             episode_max_waypoints_reached,

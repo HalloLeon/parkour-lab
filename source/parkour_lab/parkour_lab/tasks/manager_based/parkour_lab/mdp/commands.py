@@ -39,11 +39,14 @@ COMMAND_PROFILES = (
 PROVISIONAL_ORACLE_RESIDUAL_THRESHOLD_RAD = math.radians(35.0)
 EVALUATION_PIVOT_WINDOW_DURATION_S = 2.0
 EVALUATION_RESTART_WINDOW_DURATION_S = EVALUATION_PIVOT_WINDOW_DURATION_S
+# Leave time to settle before measuring two full seconds of stationary drift.
+EVALUATION_STOP_WINDOW_DURATION_S = 3.5
 
 __all__ = [
     "COMMAND_PROFILES",
     "EVALUATION_PIVOT_WINDOW_DURATION_S",
     "EVALUATION_RESTART_WINDOW_DURATION_S",
+    "EVALUATION_STOP_WINDOW_DURATION_S",
     "INTENT_COMMAND_NAME",
     "ParkourIntentCommand",
     "ParkourIntentCommandCfg",
@@ -320,7 +323,7 @@ class ParkourIntentCommand(CommandTerm):
         if stopped_ids.numel() > 0:
             self._command[stopped_ids, 2:] = 0.0
             if deterministic_stop:
-                self.time_left[stopped_ids] = EVALUATION_RESTART_WINDOW_DURATION_S
+                self.time_left[stopped_ids] = EVALUATION_STOP_WINDOW_DURATION_S
             elif not deterministic_translation:
                 long_stop = (
                     torch.rand(stopped_ids.numel(), device=self.device)
@@ -360,7 +363,7 @@ class ParkourIntentCommand(CommandTerm):
                     dtype=self.time_left.dtype,
                 ) * (high - low)
             else:
-                self.time_left[pivot_ids] = EVALUATION_RESTART_WINDOW_DURATION_S
+                self.time_left[pivot_ids] = EVALUATION_PIVOT_WINDOW_DURATION_S
 
         # Preserve the previous bearing throughout an ordinary stop. A fresh
         # zero-speed episode still needs a meaningful requested travel direction.

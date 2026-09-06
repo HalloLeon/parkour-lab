@@ -57,6 +57,7 @@ class EvaluationStep:
     terminal_landing_active_step_count: torch.Tensor
     terminal_landing_predicate_pass_count: torch.Tensor
     terminal_landing_max_dwell_s: torch.Tensor
+    telemetry: dict[str, torch.Tensor] | None = None
 
 
 class TrainingDiagnostics(ManagerTermBase):
@@ -100,6 +101,13 @@ class TrainingDiagnostics(ManagerTermBase):
         self._capture_evaluation = bool(
             cfg.params.get("capture_evaluation_step", False)
         )
+        self._capture_telemetry = bool(
+            cfg.params.get("capture_evaluation_telemetry", False)
+        )
+        if self._capture_telemetry and not self._capture_evaluation:
+            raise ValueError(
+                "Evaluation telemetry requires capture_evaluation_step=True."
+            )
 
         asset = env.scene[self._asset_cfg.name]
         if not isinstance(asset, Articulation):
@@ -255,6 +263,7 @@ class TrainingDiagnostics(ManagerTermBase):
         reverse_speed_threshold_mps: float,
         torque_clip_tolerance_nm: float,
         capture_evaluation_step: bool = False,
+        capture_evaluation_telemetry: bool = False,
     ) -> torch.Tensor:
         """Record the current post-physics sample and return zero reward."""
 
@@ -269,6 +278,7 @@ class TrainingDiagnostics(ManagerTermBase):
             reverse_speed_threshold_mps,
             torque_clip_tolerance_nm,
             capture_evaluation_step,
+            capture_evaluation_telemetry,
         )
 
         self._step_count += 1.0
@@ -634,7 +644,38 @@ class TrainingDiagnostics(ManagerTermBase):
                 self._terminal_landing_predicate_pass_count.clone()
             ),
             terminal_landing_max_dwell_s=self._terminal_landing_max_dwell_s.clone(),
+            telemetry=(
+                self._capture_evaluation_telemetry(env)
+                if self._capture_telemetry
+                else None
+            ),
         )
+
+    def _capture_evaluation_telemetry(
+        self, env: ManagerBasedRLEnv
+    ) -> dict[str, torch.Tensor]:
+        """Freeze optional flat-ground kinematics before automatic reset.
+
+        ``root_pose`` is world XYZ followed by the scalar-first quaternion.
+        Foot heights refer to articulation body origins, not sole clearance.
+        Every bootstrap course has a horizontal ground top at tile-local Z=0,
+        enforced by the course catalog and ground-mesh builder. Adding the
+        environment origin therefore gives its exact world support height.
+        This analytic reference is deliberately unavailable on obstacle rows.
+        """
+
+        if bool((route.active_difficulty_indices(env) != 0).any()):
+            raise ValueError("Evaluation telemetry requires flat difficulty level 0.")
+        data = self._asset.data
+        foot_height = (
+            data.body_pos_w[:, self._asset_cfg.body_ids, 2]
+            - env.scene.env_origins[:, 2:3]
+        )
+        return {
+            "root_pose": torch.cat((data.root_pos_w, data.root_quat_w), dim=-1).clone(),
+            "yaw_rate": data.root_ang_vel_w[:, 2].clone(),
+            "foot_height_above_support_m": foot_height.clone(),
+        }
 
     def _cached_raw_reward(
         self, env: ManagerBasedRLEnv, reward_term_name: str
