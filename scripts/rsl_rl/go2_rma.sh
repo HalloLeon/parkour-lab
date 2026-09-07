@@ -13,6 +13,8 @@ fi
 PARKOUR_COMMON=(
   --task=Parkour-Lab-v0
   --seed=42
+  # WebRTC Streaming Client on the local/private network; no host desktop needed.
+  --livestream=2
   '--kit_args=--/physics/collisionApproximateCylinders=true'
 )
 
@@ -22,7 +24,7 @@ case "$PARKOUR_MODE" in
       --warm_start_velocity="$PARKOUR_CHECKPOINT" \
       --run_name=go2_rma_velocity --max_iterations=500 --num_envs=4096 \
       --domain_randomization_stage=off --reset_profile=jitter \
-      --logger=tensorboard --headless \
+      --logger=tensorboard \
       env.commands.intent.pivot_window_probability=0.30 \
       'env.commands.intent.long_stop_window_range_s=[2.0,4.0]' \
       env.rewards.stationary_velocity_tracking.params.pivot_yaw_tracking_weight=2.0 \
@@ -38,7 +40,7 @@ case "$PARKOUR_MODE" in
     # can overrepresent short failures in a small screening run.
     PARKOUR_EVAL=("${PARKOUR_COMMON[@]}" --checkpoint="$PARKOUR_CHECKPOINT"
       --num_envs=1 --eval_episodes=3 --reset_profile=jitter
-      --policy_mode=history_mean --geometry_variant=0 --headless)
+      --policy_mode=history_mean --geometry_variant=0)
     python scripts/rsl_rl/play.py "${PARKOUR_EVAL[@]}" \
       --terrain_family=tilted_ramps --difficulty_level=0 --desired_speed=0.55 \
       --command_profile=stop_restart --desired_yaw_rate=0 --telemetry "$@"

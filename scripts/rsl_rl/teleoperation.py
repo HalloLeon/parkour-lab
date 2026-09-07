@@ -6,7 +6,28 @@
 from __future__ import annotations
 
 import math
+import os
 import time
+
+
+def validate_operator_display(*, headless: bool, livestream: int) -> None:
+    """Allow a local window or WebRTC, but reject a truly windowless session.
+
+    Match AppLauncher's CLI/environment precedence. Streaming intentionally
+    runs headless on the host while exposing the GUI and keyboard remotely.
+    """
+    stream_env = int(os.environ.get("LIVESTREAM", "0"))
+    headless_env = int(os.environ.get("HEADLESS", "0"))
+    if stream_env not in (0, 1, 2) or livestream not in (-1, 0, 1, 2):
+        raise ValueError("LIVESTREAM/--livestream must select mode 0, 1 or 2.")
+    if headless_env not in (0, 1):
+        raise ValueError("HEADLESS must be 0 or 1.")
+    stream = stream_env if livestream == -1 else livestream
+    if (headless or headless_env) and stream == 0:
+        raise ValueError(
+            "--teleop requires a local GUI or --livestream=2 for the Streaming Client; "
+            "headless operation without streaming has no operator input."
+        )
 
 
 class OperatorCommand:
@@ -103,14 +124,16 @@ class OperatorCommand:
 def run_keyboard_control(
     env, policy, simulation_app, *, speed: float, yaw_rate: float
 ) -> None:
-    """Run a visible, real-time, single-environment operator session."""
+    """Run a local or streamed, real-time, single-environment operator session."""
     import carb
     import omni.appwindow
     import torch
 
     window = omni.appwindow.get_default_app_window()
     if window is None or window.get_keyboard() is None:
-        raise RuntimeError("Keyboard operation requires a visible Isaac Sim window.")
+        raise RuntimeError(
+            "Keyboard operation requires an Isaac Sim GUI (local or --livestream=2)."
+        )
     input_interface = carb.input.acquire_input_interface()
     keyboard = window.get_keyboard()
     control = OperatorCommand(speed, yaw_rate, control_dt=env.unwrapped.step_dt)

@@ -101,7 +101,7 @@ parser = argparse.ArgumentParser(description="Evaluate an RSL-RL checkpoint.")
 parser.add_argument(
     "--teleop",
     action="store_true",
-    help="Visible, single-Go2 keyboard control using history_mean; no evaluation sweep.",
+    help="Local or streamed single-Go2 keyboard control using history_mean; no evaluation sweep.",
 )
 parser.add_argument(
     "--teleop_speed",
@@ -260,14 +260,13 @@ cli_arguments = sys.argv[1:]
 args_cli, hydra_args = parser.parse_known_args()
 if args_cli.teleop:
     if (
-        args_cli.headless
-        or args_cli.all_courses
+        args_cli.all_courses
         or args_cli.video
         or args_cli.telemetry
         or args_cli.num_envs not in (None, 1)
     ):
         parser.error(
-            "--teleop requires a visible single environment, without --all_courses, --video or --telemetry."
+            "--teleop requires a single environment, without --all_courses, --video or --telemetry."
         )
     if args_cli.command_profile not in (
         None,
@@ -280,9 +279,12 @@ if args_cli.teleop:
         parser.error(
             "--teleop uses deterministic history_mean actions, without action noise."
         )
-    from teleoperation import OperatorCommand
+    from teleoperation import OperatorCommand, validate_operator_display
 
     try:
+        validate_operator_display(
+            headless=args_cli.headless, livestream=args_cli.livestream
+        )
         OperatorCommand(args_cli.teleop_speed, args_cli.teleop_yaw_rate)
     except ValueError as error:
         parser.error(str(error))

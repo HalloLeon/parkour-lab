@@ -52,6 +52,9 @@ The two task IDs serve different purposes:
 
 For the velocity-conditioned Go2 RMA architecture, v20 checkpoint migration,
 short evaluation and guarded keyboard operation, see [the Go2 RMA workflow](docs/go2_rma.md).
+Its helper commands enable the WebRTC Streaming Client with `--livestream=2`.
+For the direct Python training/play examples below, replace `--headless` with
+`--livestream=2` when using the streaming client instead of a local desktop.
 
 Run PPO training with RSL-RL:
 
