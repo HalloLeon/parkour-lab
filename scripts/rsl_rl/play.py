@@ -99,6 +99,23 @@ def _run_isolated_course_matrix(cli_arguments: list[str]) -> None:
 # Define evaluation arguments.
 parser = argparse.ArgumentParser(description="Evaluate an RSL-RL checkpoint.")
 parser.add_argument(
+    "--teleop",
+    action="store_true",
+    help="Visible, single-Go2 keyboard control using history_mean; no evaluation sweep.",
+)
+parser.add_argument(
+    "--teleop_speed",
+    type=float,
+    default=0.55,
+    help="Forward keyboard speed, in (0.05, 0.70] m/s.",
+)
+parser.add_argument(
+    "--teleop_yaw_rate",
+    type=float,
+    default=0.5,
+    help="Keyboard pivot magnitude, in (0.05, 0.80] rad/s.",
+)
+parser.add_argument(
     "--video", action="store_true", default=False, help="Record an evaluation video."
 )
 parser.add_argument(
@@ -241,6 +258,36 @@ AppLauncher.add_app_launcher_args(parser)
 # Split recognized CLI options from the remaining Hydra configuration overrides.
 cli_arguments = sys.argv[1:]
 args_cli, hydra_args = parser.parse_known_args()
+if args_cli.teleop:
+    if (
+        args_cli.headless
+        or args_cli.all_courses
+        or args_cli.video
+        or args_cli.telemetry
+        or args_cli.num_envs not in (None, 1)
+    ):
+        parser.error(
+            "--teleop requires a visible single environment, without --all_courses, --video or --telemetry."
+        )
+    if args_cli.command_profile not in (
+        None,
+        "translation_only",
+    ) or args_cli.desired_yaw_rate not in (None, 0.0):
+        parser.error(
+            "--teleop supplies operator commands; omit scripted stop/pivot profiles and --desired_yaw_rate."
+        )
+    if args_cli.action_noise_std is not None or args_cli.action_noise_seed is not None:
+        parser.error(
+            "--teleop uses deterministic history_mean actions, without action noise."
+        )
+    from teleoperation import OperatorCommand
+
+    try:
+        OperatorCommand(args_cli.teleop_speed, args_cli.teleop_yaw_rate)
+    except ValueError as error:
+        parser.error(str(error))
+    args_cli.num_envs = 1
+    args_cli.policy_mode = "history_mean"
 try:
     _validate_cli_action_noise_std(args_cli.policy_mode, args_cli.action_noise_std)
     _validate_cli_action_noise_seed(args_cli.policy_mode, args_cli.action_noise_seed)
@@ -289,7 +336,9 @@ if args_cli.telemetry and (
     or args_cli.num_envs not in (None, 1)
     or args_cli.difficulty_level not in (None, 0)
 ):
-    parser.error("--telemetry requires a single level-0 environment, not --all_courses.")
+    parser.error(
+        "--telemetry requires a single level-0 environment, not --all_courses."
+    )
 if args_cli.all_courses and (
     args_cli.terrain_family is not None or args_cli.difficulty_level is not None
 ):
@@ -1348,7 +1397,48 @@ def _run_requested_action(
 
     agent_cfg = _apply_cli_overrides(env_cfg, agent_cfg)
     checkpoint = _resolve_checkpoint(agent_cfg)
+    if args_cli.teleop:
+        _run_operator_session(env_cfg, agent_cfg, checkpoint)
+        return
     _evaluate_requested_course(env_cfg, agent_cfg, checkpoint)
+
+
+def _run_operator_session(env_cfg, agent_cfg, checkpoint) -> None:
+    """Reuse the validated RMA inference path with explicit human authority."""
+    from teleoperation import run_keyboard_control
+
+    _configure_evaluation_course(
+        env_cfg,
+        args_cli.terrain_family,
+        args_cli.difficulty_level or 0,
+        args_cli.teleop_speed,
+        0.0,
+        args_cli.geometry_variant,
+        "translation_only",
+    )
+    env_cfg.commands.intent.external_control = True
+    gym_env = gym.make(args_cli.task, cfg=env_cfg)
+    env = RslRlHistoryWrapper(gym_env, clip_actions=agent_cfg.clip_actions)
+    try:
+        _validate_teacher_interface(
+            env.unwrapped,
+            env.get_observations(),
+            agent_cfg,
+            checkpoint.path,
+            checkpoint.sha256,
+        )
+        policy, _ = _load_inference_policy(
+            env, agent_cfg, checkpoint.path, evaluation_seed=env_cfg.seed
+        )
+        run_keyboard_control(
+            env,
+            policy,
+            simulation_app,
+            speed=args_cli.teleop_speed,
+            yaw_rate=args_cli.teleop_yaw_rate,
+        )
+    finally:
+        env.close()
 
 
 def _evaluate_requested_course(
@@ -1398,7 +1488,9 @@ def _evaluate_course(
         if evaluation_level != 0 or env_cfg.scene.num_envs != 1:
             raise ValueError("--telemetry requires --difficulty_level=0 --num_envs=1.")
         env_cfg.rewards.training_diagnostics.params["capture_evaluation_step"] = True
-        env_cfg.rewards.training_diagnostics.params["capture_evaluation_telemetry"] = True
+        env_cfg.rewards.training_diagnostics.params["capture_evaluation_telemetry"] = (
+            True
+        )
     artifacts = _prepare_evaluation_artifacts(
         checkpoint,
         evaluation_family,
@@ -2616,9 +2708,13 @@ def _collect_rollout_statistics(
                 # Capture the command actually presented to the actor, before
                 # commands or route cursors advance inside env.step().
                 asset = base_env.scene["robot"]
-                telemetry_start = torch.cat(
-                    (asset.data.root_pos_w, asset.data.root_quat_w), dim=-1
-                )[0].cpu().tolist()
+                telemetry_start = (
+                    torch.cat((asset.data.root_pos_w, asset.data.root_quat_w), dim=-1)[
+                        0
+                    ]
+                    .cpu()
+                    .tolist()
+                )
                 telemetry_speed = float(get_preferred_speed(base_env)[0].item())
                 telemetry_yaw = float(get_target_yaw_rate(base_env)[0].item())
             actions = policy(observations)

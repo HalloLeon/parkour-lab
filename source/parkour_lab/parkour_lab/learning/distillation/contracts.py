@@ -14,6 +14,7 @@ groups, source code, and framework versions may change independently.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import math
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
 
 # Increment when checkpoint-facing tensor semantics or model wiring change.
 # Checkpoints from another interface version are intentionally incompatible.
-TEACHER_INTERFACE_VERSION = 20
+TEACHER_INTERFACE_VERSION = 21
 
 # Number of delivered deployable-state frames retained by the history wrapper.
 DEPLOYABLE_HISTORY_LENGTH = 10
@@ -44,6 +45,7 @@ DEPLOYABLE_HISTORY_LENGTH = 10
 DEPLOYABLE_STATE_GROUP = "policy"  # Current hardware-available state and commands.
 # Wrapper-derived state history used to estimate the dynamics latent.
 ADAPTATION_HISTORY_GROUP = "adaptation_history"
+VELOCITY_TARGET_GROUP = "velocity_target"
 # Active-waypoint travel direction supplied only to the privileged teacher.
 ORACLE_TRAVEL_DIRECTION_GROUP = "oracle_travel_direction"
 PRIVILEGED_DYNAMICS_GROUP = "dynamics"  # Randomized simulator physics properties.
@@ -76,6 +78,7 @@ SUPPORTED_TEACHER_OBSERVATION_GROUPS = (
 
 __all__ = [
     "ADAPTATION_HISTORY_GROUP",
+    "VELOCITY_TARGET_GROUP",
     "DEPLOYABLE_HISTORY_LENGTH",
     "InterfaceMismatchError",
     "DEPLOYABLE_STATE_GROUP",
@@ -88,6 +91,7 @@ __all__ = [
     "SUPPORTED_TEACHER_OBSERVATION_GROUPS",
     "TeacherCheckpoint",
     "assert_teacher_interface_matches",
+    "assert_velocity_warm_start_matches",
     "build_teacher_interface",
     "interface_sha256",
     "load_teacher_checkpoint",
@@ -125,6 +129,42 @@ def assert_teacher_interface_matches(
         context=context,
         incompatibility="changed the frozen teacher interface",
     )
+
+
+def assert_velocity_warm_start_matches(
+    legacy: dict[str, object], current: dict[str, object]
+) -> None:
+    """Permit only the documented v20 -> v21 velocity-input extension.
+
+    Robot, action transforms, timestep, terrain scan and every existing input
+    must still match. This is not a general ignore-interface escape hatch.
+    """
+    if legacy.get("interface_version") != 20 or current.get("interface_version") != 21:
+        raise InterfaceMismatchError(
+            "Velocity warm start requires a v20 source and v21 destination."
+        )
+    normalized = copy.deepcopy(current)
+    try:
+        normalized["interface_version"] = 20
+        model = normalized["actor"]["architecture"]["model"]
+        motor = model["motor_actor"]
+        if (
+            motor.pop("estimated_velocity_dim") != 3
+            or model.pop("velocity_estimator") is None
+        ):
+            raise ValueError("A velocity-enabled destination is required.")
+        if motor["input_order"].pop() != "estimated_base_velocity":
+            raise ValueError("Velocity must be appended after the legacy motor inputs.")
+        motor["input_dim"] -= 3
+        normalized.pop("state_estimation")
+        normalized["information_contract"]["oracle_travel_direction_source"].pop(
+            "external_override"
+        )
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise InterfaceMismatchError(
+            "Unexpected velocity warm-start interface."
+        ) from exc
+    assert_teacher_interface_matches(legacy, normalized, context="Velocity warm start")
 
 
 def build_teacher_interface(
@@ -231,6 +271,9 @@ def build_teacher_interface(
             terrain_latent_dim=int(policy_cfg.terrain_latent_dim),
             action_dim=int(action_manager.total_action_dim),
             hidden_dims=tuple(policy_cfg.actor_hidden_dims),
+            estimated_velocity_dim=3
+            if getattr(policy_cfg, "use_velocity_estimator", False)
+            else 0,
         ),
         history_dim=_flat_dimension(observations[ADAPTATION_HISTORY_GROUP]),
         privileged_dynamics_dim=_flat_dimension(
@@ -244,8 +287,29 @@ def build_teacher_interface(
         dynamics_hidden_dims=tuple(policy_cfg.dynamics_encoder_hidden_dims),
         history_hidden_dims=tuple(policy_cfg.history_encoder_hidden_dims),
         scan_hidden_dims=tuple(policy_cfg.scan_encoder_hidden_dims),
+        velocity_hidden_dims=tuple(
+            getattr(policy_cfg, "velocity_estimator_hidden_dims", (128, 64))
+        ),
     )
     teacher_model_cfg.validate()
+    velocity_target_description = None
+    if teacher_model_cfg.motor.estimated_velocity_dim:
+        velocity_target_description = _describe_observation_groups(
+            base_env, observations, (VELOCITY_TARGET_GROUP,)
+        )[0]
+        target_cfg = base_env.cfg.observations.velocity_target
+        target_term = target_cfg.base_lin_vel
+        if (
+            velocity_target_description["dimension"] != 3
+            or velocity_target_description["terms"][0]["name"] != "base_lin_vel"
+            or target_cfg.enable_corruption
+            or target_term.scale not in (None, 1.0)
+            or target_term.clip is not None
+            or target_term.modifiers
+        ):
+            raise InterfaceMismatchError(
+                "Velocity supervision must be an unscaled, unclipped body-velocity label."
+            )
 
     return {
         "interface_version": TEACHER_INTERFACE_VERSION,
@@ -291,6 +355,9 @@ def build_teacher_interface(
                 ),
                 "zero_speed_direction": "preserve_last_valid",
                 "invalid_or_stale": "exact_zero_speed_and_yaw_rate",
+                "external_timeout_s": float(intent_cfg.external_timeout_s),
+                "external_reset": "retain_operator_ownership_with_zero_motion",
+                "external_terminal_slowdown": False,
                 "simultaneous_translation_and_yaw": "yaw_rate_forced_to_zero",
             },
         },
@@ -326,6 +393,7 @@ def build_teacher_interface(
             # Exact ordered routes are archived in the resolved environment.
             "oracle_travel_direction_source": {
                 "kind": "active_course_waypoint",
+                "external_override": "normalized_operator_direction_takes_precedence",
                 "default_root_reach_radius_m": float(
                     curriculum_cfg.waypoint_reach_radius_m
                 ),
@@ -371,6 +439,15 @@ def build_teacher_interface(
             "privileged_dynamics_components": dynamics_component_names,
             "deployable_history": history_group,
             "history_layout": "frame_major_flattened_oldest_to_newest",
+        },
+        "state_estimation": {
+            "enabled": bool(getattr(policy_cfg, "use_velocity_estimator", False)),
+            "target_group": VELOCITY_TARGET_GROUP,
+            "target": "body_frame_linear_velocity_m_s",
+            "input_group": ADAPTATION_HISTORY_GROUP,
+            "motor_input": "estimate_only_in_teacher_and_history_modes",
+            "supervision": "simulator_velocity_mse_stop_gradient_target",
+            "target_observation": velocity_target_description,
         },
         "terrain_scan": terrain_scan,
         # ``env.yaml`` archives the full domain. Only its terrain identity is
@@ -425,6 +502,7 @@ def load_teacher_checkpoint(
     checkpoint_path: str | os.PathLike[str],
     *,
     checkpoint_sha256: str | None = None,
+    allow_velocity_warm_start: bool = False,
 ) -> TeacherCheckpoint:
     """Load one teacher checkpoint identity and its training interface."""
 
@@ -455,7 +533,12 @@ def load_teacher_checkpoint(
     if not isinstance(interface, dict):
         raise ValueError(f"Teacher interface is missing or invalid: {interface_path}")
     teacher_interface = cast(dict[str, object], interface)
-    if teacher_interface.get("interface_version") != TEACHER_INTERFACE_VERSION:
+    supported_versions = (
+        (20, TEACHER_INTERFACE_VERSION)
+        if allow_velocity_warm_start
+        else (TEACHER_INTERFACE_VERSION,)
+    )
+    if teacher_interface.get("interface_version") not in supported_versions:
         raise ValueError(
             "Teacher interface uses an unsupported serialization version: "
             f"{interface_path}"

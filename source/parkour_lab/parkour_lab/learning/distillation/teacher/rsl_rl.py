@@ -26,6 +26,7 @@ from ..contracts import (
     PRIVILEGED_TERRAIN_GROUP,
     SUPPORTED_TEACHER_OBSERVATION_GROUPS,
     TEACHER_OBSERVATION_GROUPS,
+    VELOCITY_TARGET_GROUP,
 )
 from .model import (
     PrivilegedTeacherActor,
@@ -36,7 +37,46 @@ __all__ = [
     "PrivilegedTeacherActorCritic",
     "RegularizedPPO",
     "register_rsl_rl_teacher_actor_critic",
+    "warm_start_velocity_policy",
 ]
+
+
+def warm_start_velocity_policy(
+    policy: "PrivilegedTeacherActorCritic", legacy_state: Mapping[str, torch.Tensor]
+) -> None:
+    """Migrate only the validated velocity-input extension, not optimizer state."""
+    destination = policy.state_dict()
+    estimator_keys = {
+        key for key in destination if key.startswith("actor.velocity_estimator.")
+    }
+    if not estimator_keys or set(legacy_state) != set(destination) - estimator_keys:
+        raise ValueError(
+            "Warm-start state does not match the legacy velocity-free architecture."
+        )
+    first_layer = "actor.motor.network.0.weight"
+    for name, source in legacy_state.items():
+        target = destination[name]
+        if source.dtype != target.dtype:
+            raise ValueError(f"Incompatible warm-start tensor dtype: {name}.")
+        if name == first_layer:
+            if source.shape != (target.shape[0], target.shape[1] - 3):
+                raise ValueError(
+                    "Warm start permits exactly three new motor-input columns."
+                )
+            value = torch.zeros_like(target)
+            value[:, :-3] = source.to(value)
+            destination[name] = value
+        else:
+            if source.shape != target.shape:
+                raise ValueError(f"Incompatible warm-start tensor: {name}.")
+            destination[name] = (
+                torch.zeros_like(target)
+                if name == "roa_update_count"
+                else source.to(target.device)
+            )
+        if not torch.isfinite(source).all():
+            raise ValueError(f"Non-finite warm-start tensor: {name}.")
+    policy.load_state_dict(destination, strict=True)
 
 
 class PrivilegedTeacherActorCritic(ActorCritic):
@@ -62,9 +102,18 @@ class PrivilegedTeacherActorCritic(ActorCritic):
         history_encoder_hidden_dims: Sequence[int] = (256, 128),
         scan_encoder_hidden_dims: Sequence[int] = (128, 64),
         terrain_latent_dim: int = DEFAULT_TERRAIN_LATENT_DIM,
+        use_velocity_estimator: bool = False,
+        velocity_estimator_hidden_dims: Sequence[int] = (128, 64),
         **kwargs: object,
     ) -> None:
         actor_groups = tuple(obs_groups["policy"])
+        if use_velocity_estimator and (
+            VELOCITY_TARGET_GROUP not in obs
+            or obs[VELOCITY_TARGET_GROUP].shape[-1] != 3
+        ):
+            raise ValueError(
+                "Velocity estimation requires an unscaled three-component velocity_target group."
+            )
         if actor_groups not in SUPPORTED_TEACHER_OBSERVATION_GROUPS:
             raise ValueError(
                 "The modular teacher actor requires one of the supported observation routes "
@@ -119,6 +168,7 @@ class PrivilegedTeacherActorCritic(ActorCritic):
             terrain_latent_dim=terrain_latent_dim,
             action_dim=num_actions,
             hidden_dims=tuple(actor_hidden_dims),
+            estimated_velocity_dim=3 if use_velocity_estimator else 0,
         )
         self.actor = PrivilegedTeacherActor(
             PrivilegedTeacherModelCfg(
@@ -129,6 +179,7 @@ class PrivilegedTeacherActorCritic(ActorCritic):
                 dynamics_hidden_dims=tuple(dynamics_encoder_hidden_dims),
                 history_hidden_dims=tuple(history_encoder_hidden_dims),
                 scan_hidden_dims=tuple(scan_encoder_hidden_dims),
+                velocity_hidden_dims=tuple(velocity_estimator_hidden_dims),
             )
         )
 
@@ -165,6 +216,10 @@ class PrivilegedTeacherActorCritic(ActorCritic):
 
         return self._actor_mean(obs, use_history=True)
 
+    def act_inference(self, obs: Mapping[str, torch.Tensor]) -> torch.Tensor:
+        """Teacher dynamics with estimated velocity, identical to PPO collection."""
+        return self._actor_mean(obs, use_history=False)
+
     def _actor_mean(
         self,
         obs: Mapping[str, torch.Tensor],
@@ -177,7 +232,7 @@ class PrivilegedTeacherActorCritic(ActorCritic):
         actor = self.actor if actor is None else actor
         if not use_history:
             actor_obs = self.actor_obs_normalizer(self.get_actor_obs(obs))
-            return actor(actor_obs)
+            return actor(actor_obs, obs[ADAPTATION_HISTORY_GROUP])
         terrain_scan = (
             obs[PRIVILEGED_TERRAIN_GROUP]
             if PRIVILEGED_TERRAIN_GROUP in self.obs_groups["policy"]
@@ -273,6 +328,7 @@ class RegularizedPPO(PPO):
         policy: PrivilegedTeacherActorCritic,
         *,
         adaptation_loss_coef: float = 1.0,
+        velocity_estimation_loss_coef: float = 1.0,
         history_rollout_interval: int = 20,
         privileged_regularization_coef_end: float = 0.1,
         privileged_regularization_coef_start: float = 0.0,
@@ -343,6 +399,14 @@ class RegularizedPPO(PPO):
                 "clip_param must be finite and lie strictly between 0 and 1."
             )
         self.adaptation_loss_coef = adaptation_loss_coef
+        if (
+            not math.isfinite(velocity_estimation_loss_coef)
+            or velocity_estimation_loss_coef <= 0
+        ):
+            raise ValueError(
+                "velocity_estimation_loss_coef must be finite and positive."
+            )
+        self.velocity_estimation_loss_coef = velocity_estimation_loss_coef
         self.history_rollout_interval = history_rollout_interval
         self.privileged_regularization_coef_end = privileged_regularization_coef_end
         self.privileged_regularization_coef_start = privileged_regularization_coef_start
@@ -407,6 +471,7 @@ class RegularizedPPO(PPO):
         regularization_coef = self._regularization_coefficient(self._update_count)
 
         mean_adaptation_loss = 0.0
+        mean_velocity_loss = 0.0
         mean_entropy = 0.0
         mean_privileged_regularization_loss = 0.0
         mean_surrogate_loss = 0.0
@@ -509,12 +574,21 @@ class RegularizedPPO(PPO):
                     obs_batch[PRIVILEGED_DYNAMICS_GROUP],
                 )
             )
+            velocity_loss = (
+                self.policy.actor.velocity_estimation_loss(
+                    obs_batch[ADAPTATION_HISTORY_GROUP],
+                    obs_batch[VELOCITY_TARGET_GROUP],
+                )
+                if self.policy.actor.velocity_estimator is not None
+                else adaptation_loss.new_zeros(())
+            )
             loss = (
                 surrogate_loss
                 + self.value_loss_coef * value_loss
                 - self._active_entropy_coef * entropy_batch.mean()
                 + self.adaptation_loss_coef * adaptation_loss
                 + regularization_coef * privileged_regularization_loss
+                + self.velocity_estimation_loss_coef * velocity_loss
             )
 
             loss_is_finite = torch.isfinite(loss).to(dtype=torch.int32)
@@ -525,6 +599,7 @@ class RegularizedPPO(PPO):
                     f"surrogate={surrogate_loss.detach().item():.6g}, "
                     f"value={value_loss.detach().item():.6g}, "
                     f"adaptation={adaptation_loss.detach().item():.6g}, "
+                    f"velocity_estimation={velocity_loss.detach().item():.6g}, "
                     "privileged_regularization="
                     f"{privileged_regularization_loss.detach().item():.6g}."
                 )
@@ -540,6 +615,7 @@ class RegularizedPPO(PPO):
             self.policy.enforce_action_std_bounds_()
 
             mean_adaptation_loss += float(adaptation_loss.detach().item())
+            mean_velocity_loss += float(velocity_loss.detach().item())
             mean_entropy += float(entropy_batch.mean().detach().item())
             mean_privileged_regularization_loss += float(
                 privileged_regularization_loss.detach().item()
@@ -553,6 +629,7 @@ class RegularizedPPO(PPO):
         self.policy.roa_update_count.fill_(self._update_count)
         return {
             "adaptation": mean_adaptation_loss / num_updates,
+            "velocity_estimation_mse": mean_velocity_loss / num_updates,
             "action_noise_std_upper_bound": self.policy.noise_std_upper_bound,
             "entropy": mean_entropy / num_updates,
             "entropy_coefficient": self._active_entropy_coef,

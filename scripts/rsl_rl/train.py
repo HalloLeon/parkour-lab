@@ -100,6 +100,18 @@ parser.add_argument(
     default=False,
     help="Export IO descriptors.",
 )
+parser.add_argument(
+    "--warm_start_velocity",
+    type=str,
+    default=None,
+    help="Initialize a v21 velocity policy from v20 weights, with fresh optimizer and schedules.",
+)
+parser.add_argument(
+    "--reset_profile",
+    choices=("canonical", "jitter"),
+    default=None,
+    help="Optional initial-state-only reset profile, applied after the domain-randomization stage.",
+)
 # Add RSL-RL command-line arguments.
 cli_args.add_rsl_rl_args(parser)
 # Add the explicit staged domain-randomization selector.
@@ -109,6 +121,12 @@ AppLauncher.add_app_launcher_args(parser)
 # Parse this script's known options into ``args_cli`` and retain unrecognized
 # configuration overrides, such as ``env.decimation=8``, in ``hydra_args``.
 args_cli, hydra_args = parser.parse_known_args()
+if args_cli.warm_start_velocity and (
+    args_cli.resume or args_cli.checkpoint or args_cli.load_run
+):
+    parser.error(
+        "--warm_start_velocity cannot be combined with --resume, --checkpoint or --load_run."
+    )
 _require_tracked_training_sources()
 if os.environ.get("WORLD_SIZE", "1") != "1":
     parser.error("Distributed training is not supported; run one training process.")
@@ -144,6 +162,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 from parkour_lab.learning.distillation.contracts import (
     assert_teacher_interface_matches,
+    assert_velocity_warm_start_matches,
     build_teacher_interface,
     interface_sha256,
     load_teacher_checkpoint,
@@ -152,6 +171,7 @@ from parkour_lab.learning.distillation.contracts import (
 )
 from parkour_lab.learning.distillation.teacher.rsl_rl import (
     register_rsl_rl_teacher_actor_critic,
+    warm_start_velocity_policy,
 )
 from parkour_lab.learning.rsl_rl import RslRlHistoryWrapper
 from parkour_lab.tasks.manager_based.parkour_lab.parkour_lab_env_cfg import (
@@ -297,6 +317,8 @@ def main(
     cli_args.apply_domain_randomization_stage(env_cfg, args_cli)
     env_cfg.synchronize_curriculum_config()
     env_cfg.synchronize_domain_randomization_config()
+    if args_cli.reset_profile is not None:
+        env_cfg.set_evaluation_reset_profile(args_cli.reset_profile)
 
     # Set the seed before constructing the environment because initialization
     # may randomize state.
@@ -375,6 +397,20 @@ def main(
         },
     )
 
+    warm_start_checkpoint = None
+    if args_cli.warm_start_velocity:
+        if agent_cfg.resume:
+            raise ValueError(
+                "Velocity warm start cannot be combined with a resumed agent configuration."
+            )
+        warm_start_checkpoint = load_teacher_checkpoint(
+            retrieve_file_path(args_cli.warm_start_velocity),
+            allow_velocity_warm_start=True,
+        )
+        assert_velocity_warm_start_matches(
+            warm_start_checkpoint.teacher_interface, teacher_interface
+        )
+
     resume_terrain_matches = True
     if agent_cfg.resume:
         resume_checkpoint = load_teacher_checkpoint(resume_path)
@@ -395,6 +431,29 @@ def main(
         env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device
     )
     runner.add_git_repo_to_log(__file__)
+    if warm_start_checkpoint is not None:
+        state = torch.load(
+            warm_start_checkpoint.checkpoint_path,
+            map_location=agent_cfg.device,
+            weights_only=True,
+        )
+        warm_start_velocity_policy(runner.alg.policy, state["model_state_dict"])
+        if terrain_curriculum_matches(
+            warm_start_checkpoint.teacher_interface, teacher_interface
+        ):
+            _restore_parkour_curriculum(env, state.get("infos"))
+        write_json(
+            os.path.join(log_dir, "params", "warm_start.json"),
+            {
+                "source": warm_start_checkpoint.checkpoint_path,
+                "source_sha256": warm_start_checkpoint.checkpoint_sha256,
+                "migration": "v20_to_v21_zero_padded_velocity_input",
+                "optimizer_and_schedules": "fresh",
+            },
+        )
+        print(
+            "[INFO] Warm started v21 policy; new velocity input starts with zero weights. Optimizer and schedules are fresh."
+        )
     # Load the selected checkpoint when continuing an existing run.
     if agent_cfg.resume:
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")

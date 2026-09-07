@@ -34,6 +34,11 @@ class PrivilegedTeacherActorCriticCfg(RslRlPpoActorCriticCfg):
     # buffered by the RSL-RL environment wrapper.
     history_encoder_hidden_dims: list[int] = [256, 128]
 
+    # Explicit fast physical state, separate from the persistent RMA latent.
+    # Simulator velocity supervises this head but never feeds the motor actor.
+    use_velocity_estimator: bool = True
+    velocity_estimator_hidden_dims: list[int] = [128, 64]
+
     # Keep exploration broad enough to discover motion while allowing the
     # learned distribution to settle around a useful deterministic policy.
     min_noise_std: float = 0.10
@@ -48,6 +53,7 @@ class RegularizedPPOCfg(RslRlPpoAlgorithmCfg):
 
     # Scale applied to the history encoder's Smooth L1 regression objective.
     adaptation_loss_coef: float = 1.0
+    velocity_estimation_loss_coef: float = 1.0
 
     # Every twentieth rollout executes actions from the history encoder. This
     # exposes that deployable path to the states induced by its own predictions.

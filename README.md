@@ -50,6 +50,9 @@ The two task IDs serve different purposes:
 
 ## Train
 
+For the velocity-conditioned Go2 RMA architecture, v20 checkpoint migration,
+short evaluation and guarded keyboard operation, see [the Go2 RMA workflow](docs/go2_rma.md).
+
 Run PPO training with RSL-RL:
 
 ```bash

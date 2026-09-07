@@ -332,6 +332,16 @@ class ObservationsCfg:
             self.concatenate_terms = True
 
     @configclass
+    class VelocityTargetCfg(ObsGroup):
+        """Unscaled simulator label for auxiliary estimation, never actor input."""
+
+        base_lin_vel = ObsTerm(func=mdp.base_lin_vel)
+
+        def __post_init__(self) -> None:
+            self.enable_corruption = False
+            self.concatenate_terms = True
+
+    @configclass
     class OracleTravelDirectionCfg(ObsGroup):
         """Wrap-safe active-waypoint direction used by the privileged teacher."""
 
@@ -351,6 +361,7 @@ class ObservationsCfg:
     dynamics: PrivilegedDynamicsCfg = PrivilegedDynamicsCfg()
     policy: DeployablePolicyCfg = DeployablePolicyCfg()
     terrain: PrivilegedTerrainCfg = PrivilegedTerrainCfg()
+    velocity_target: VelocityTargetCfg = VelocityTargetCfg()
 
     # RSL-RL appends this local oracle to the Phase-1 teacher actor input.
     oracle_travel_direction: OracleTravelDirectionCfg = OracleTravelDirectionCfg()

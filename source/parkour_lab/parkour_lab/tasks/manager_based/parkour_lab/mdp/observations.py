@@ -81,15 +81,22 @@ def active_waypoint_direction_yaw_xy(
     """
     Wrap-safe direction to the active waypoint in the robot's yaw-aligned frame.
 
-    The unit vector is ``[forward, left]`` and supplies the privileged teacher's
-    oracle travel-direction input.
+    The unit vector is ``[forward, left]``. Scripted runs use the active
+    waypoint; externally controlled runs use the operator's requested direction.
+    The observation name is retained for migrating the existing teacher.
 
     Returns:
         [num_envs, 2]
     """
 
-    return geometry._active_waypoint_direction_yaw_xy(
+    local_direction = geometry._active_waypoint_direction_yaw_xy(
         env, waypoint_marker_cfg, asset_cfg
+    )
+    intent = env.command_manager.get_term("intent")
+    # Keep scripted training/evaluation unchanged, but never steer a human's
+    # command back toward a hidden waypoint. The stored name is legacy only.
+    return torch.where(
+        intent.external_override.unsqueeze(-1), intent.command[:, :2], local_direction
     )
 
 

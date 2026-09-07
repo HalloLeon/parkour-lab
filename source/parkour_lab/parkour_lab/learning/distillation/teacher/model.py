@@ -68,6 +68,7 @@ class PrivilegedTeacherModelCfg:
     dynamics_hidden_dims: tuple[int, ...] = (128, 64)
     history_hidden_dims: tuple[int, ...] = (256, 128)
     scan_hidden_dims: tuple[int, ...] = (128, 64)
+    velocity_hidden_dims: tuple[int, ...] = (128, 64)
 
     def validate(self) -> None:
         """Validate the scan encoder and shared motor interface."""
@@ -83,6 +84,7 @@ class PrivilegedTeacherModelCfg:
             "dynamics_hidden_dims",
             "history_hidden_dims",
             "scan_hidden_dims",
+            "velocity_hidden_dims",
         ):
             dimensions = getattr(self, name)
             if not dimensions or any(width <= 0 for width in dimensions):
@@ -92,6 +94,18 @@ class PrivilegedTeacherModelCfg:
         """Return a JSON-compatible teacher architecture contract."""
 
         return {
+            "velocity_estimator": (
+                {
+                    "input_dimension": self.history_dim,
+                    "hidden_dimensions": list(self.velocity_hidden_dims),
+                    "output_dimension": 3,
+                    "activation": "elu",
+                    "target": "body_frame_linear_velocity_m_s",
+                    "actor_input": "detached_estimate_in_training_and_inference",
+                }
+                if self.motor.estimated_velocity_dim
+                else None
+            ),
             "dynamics_encoder": {
                 "class_name": PrivilegedDynamicsEncoder.__name__,
                 "input_dimension": self.privileged_dynamics_dim,
@@ -130,6 +144,12 @@ class PrivilegedTeacherActor(nn.Module):
 
     def __init__(self, cfg: PrivilegedTeacherModelCfg) -> None:
         super().__init__()
+        cfg.validate()
+        self.velocity_estimator = (
+            _build_mlp(cfg.history_dim, 3, cfg.velocity_hidden_dims)
+            if cfg.motor.estimated_velocity_dim
+            else None
+        )
         self.dynamics_encoder = PrivilegedDynamicsEncoder(
             cfg.privileged_dynamics_dim,
             cfg.motor.adaptation_latent_dim,
@@ -157,7 +177,9 @@ class PrivilegedTeacherActor(nn.Module):
             cfg.privileged_dynamics_dim,
         )
 
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, observations: torch.Tensor, deployable_history: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Split RSL-RL's concatenated observations and produce motor actions."""
 
         components = torch.split(observations, self._input_dims, dim=-1)
@@ -171,6 +193,7 @@ class PrivilegedTeacherActor(nn.Module):
             oracle_travel_direction,
             terrain_latent,
             adaptation_latent,
+            self.estimate_velocity(deployable_history),
         )
 
     def forward_from_history(
@@ -189,7 +212,33 @@ class PrivilegedTeacherActor(nn.Module):
             oracle_travel_direction,
             terrain_latent,
             adaptation_latent,
+            self.estimate_velocity(deployable_history),
         )
+
+    def estimate_velocity(self, history: torch.Tensor | None) -> torch.Tensor | None:
+        """Supply the same causal estimate to both motor paths, never simulator truth.
+
+        The estimator learns only from its supervised physical target; PPO must
+        not turn a velocity estimate into an unconstrained task latent.
+        """
+        if self.velocity_estimator is None:
+            return None
+        if history is None:
+            raise ValueError(
+                "Velocity-conditioned policies require deployable history."
+            )
+        return self.velocity_estimator(history).detach()
+
+    def velocity_estimation_loss(
+        self, history: torch.Tensor, target: torch.Tensor
+    ) -> torch.Tensor:
+        """Train body velocity in m/s from simulator labels, not actor inputs."""
+        if self.velocity_estimator is None:
+            return history.new_zeros(())
+        prediction = self.velocity_estimator(history)
+        if target.shape != prediction.shape:
+            raise ValueError("Velocity targets must have shape [batch, 3].")
+        return functional.mse_loss(prediction, target.detach())
 
     def roa_losses(
         self,

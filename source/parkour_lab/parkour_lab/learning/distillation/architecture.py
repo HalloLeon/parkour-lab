@@ -35,6 +35,7 @@ MOTOR_INPUT_COMPONENTS = (
     "travel_direction",
     "terrain_latent",
     "adaptation_latent",
+    "estimated_base_velocity",
 )
 """Tensor concatenation order consumed by every transferable motor actor."""
 
@@ -66,6 +67,10 @@ class MotorInterfaceCfg:
     # Output widths of the motor MLP's hidden linear layers, in network order.
     hidden_dims: tuple[int, ...] = (512, 256, 128)
 
+    # Zero is retained only for constructing legacy models during migration.
+    # New Go2 policies append a body-frame velocity estimate in m/s.
+    estimated_velocity_dim: int = 0
+
     @property
     def input_dim(self) -> int:
         """Return the complete concatenated motor-input width."""
@@ -75,6 +80,7 @@ class MotorInterfaceCfg:
             + self.travel_direction_dim
             + self.terrain_latent_dim
             + self.adaptation_latent_dim
+            + self.estimated_velocity_dim
         )
 
     def validate(self) -> None:
@@ -90,6 +96,8 @@ class MotorInterfaceCfg:
             )
         if self.adaptation_latent_dim <= 0:
             raise ValueError("adaptation_latent_dim must be positive.")
+        if self.estimated_velocity_dim not in (0, 3):
+            raise ValueError("estimated_velocity_dim must be 0 (legacy) or 3.")
         if not self.hidden_dims or any(width <= 0 for width in self.hidden_dims):
             raise ValueError("Motor hidden dimensions must be positive.")
 
@@ -101,10 +109,15 @@ class MotorInterfaceCfg:
             "travel_direction_dim": self.travel_direction_dim,
             "terrain_latent_dim": self.terrain_latent_dim,
             "adaptation_latent_dim": self.adaptation_latent_dim,
+            "estimated_velocity_dim": self.estimated_velocity_dim,
             "action_dim": self.action_dim,
             "hidden_dims": list(self.hidden_dims),
             "input_dim": self.input_dim,
-            "input_order": list(MOTOR_INPUT_COMPONENTS),
+            "input_order": list(
+                MOTOR_INPUT_COMPONENTS
+                if self.estimated_velocity_dim
+                else MOTOR_INPUT_COMPONENTS[:-1]
+            ),
         }
 
 
@@ -123,17 +136,25 @@ class MotorActor(nn.Module):
         travel_direction: torch.Tensor,
         terrain_latent: torch.Tensor,
         adaptation_latent: torch.Tensor,
+        estimated_base_velocity: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return actions from tensors supplied in the frozen interface order."""
-        motor_input = torch.cat(
-            (
-                deployable_state,
-                travel_direction,
-                terrain_latent,
-                adaptation_latent,
-            ),
-            dim=-1,
+        components = (
+            deployable_state,
+            travel_direction,
+            terrain_latent,
+            adaptation_latent,
         )
+        if self.cfg.estimated_velocity_dim:
+            if estimated_base_velocity is None or estimated_base_velocity.shape != (
+                *deployable_state.shape[:-1],
+                3,
+            ):
+                raise ValueError(
+                    "The motor requires a three-component body velocity estimate."
+                )
+            components += (estimated_base_velocity,)
+        motor_input = torch.cat(components, dim=-1)
         return self.network(motor_input)
 
 

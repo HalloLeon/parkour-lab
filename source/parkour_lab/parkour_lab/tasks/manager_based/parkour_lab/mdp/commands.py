@@ -117,6 +117,7 @@ class ParkourIntentCommand(CommandTerm):
         self._external_override = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
+        self._external_time_left = torch.zeros(self.num_envs, device=self.device)
         self.active_motion_time_s = torch.zeros(self.num_envs, device=self.device)
 
     @property
@@ -126,14 +127,22 @@ class ParkourIntentCommand(CommandTerm):
         return self._command
 
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
-        """Clear episode-local command state before the inherited resample."""
+        """Reset to zero without surrendering external command ownership."""
 
         ids = _all_env_ids(self._env, env_ids)
         self.active_motion_time_s[ids] = 0.0
-        self._external_override[ids] = False
+        self._external_override[ids] |= self.cfg.external_control
+        self._external_time_left[ids] = 0.0
         self._command[ids, 0] = 1.0
         self._command[ids, 1:] = 0.0
-        return super().reset(env_ids=ids)
+        metrics = super().reset(env_ids=ids)
+        self.time_left[ids[self._external_override[ids]]] = math.inf
+        return metrics
+
+    @property
+    def external_override(self) -> Tensor:
+        """Environments where operator intent takes precedence over the route."""
+        return self._external_override
 
     def set_external_intent(
         self,
@@ -215,6 +224,7 @@ class ParkourIntentCommand(CommandTerm):
             command_valid, yaw_rate, torch.zeros_like(yaw_rate)
         )
         self._external_override[ids] = True
+        self._external_time_left[ids] = self.cfg.external_timeout_s
         self.time_left[ids] = math.inf
 
     def invalidate(self, env_ids: Sequence[int] | Tensor | None = None) -> None:
@@ -223,6 +233,7 @@ class ParkourIntentCommand(CommandTerm):
         ids = _all_env_ids(self._env, env_ids)
         self._command[ids, 2:] = 0.0
         self._external_override[ids] = True
+        self._external_time_left[ids] = 0.0
         self.time_left[ids] = math.inf
 
     def _resample(self, env_ids: Sequence[int]) -> None:
@@ -387,6 +398,9 @@ class ParkourIntentCommand(CommandTerm):
     def _update_command(self) -> None:
         """Track the scripted flat heading or obstacle-course final goal."""
 
+        self._external_time_left.sub_(float(self._env.step_dt)).clamp_min_(0.0)
+        stale = self._external_override & (self._external_time_left <= 0.0)
+        self._command[stale, 2:] = 0.0
         ids = torch.nonzero(
             (~self._external_override) & (self._command[:, 2] > 0.0), as_tuple=False
         ).flatten()
@@ -418,6 +432,10 @@ class ParkourIntentCommandCfg(CommandTermCfg):
     """Training distribution for deployable travel and pivot commands."""
 
     class_type: type = ParkourIntentCommand
+    external_control: bool = False
+    # Simulation-time watchdog for packet producers. GUI control also checks
+    # wall-clock stalls/focus and requires a fresh deadman press after either.
+    external_timeout_s: float = 0.25
     command_profile: str = "mixed"
     resampling_time_range: tuple[float, float] = (0.5, 1.5)
     flat_speed_range_m_s: tuple[float, float] = (0.20, 0.70)
@@ -455,6 +473,7 @@ class ParkourIntentCommandCfg(CommandTermCfg):
             "max_external_yaw_rate_rad_s",
             "terminal_slowdown_distance_m",
             "terminal_min_approach_speed_m_s",
+            "external_timeout_s",
         ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value <= 0.0:
@@ -594,6 +613,7 @@ def get_target_speed(env: ManagerBasedRLEnv) -> Tensor:
 
     terminal_landing = route.active_waypoint_is_terminal_landing(env)
     term = cast(ParkourIntentCommand, env.command_manager.get_term(INTENT_COMMAND_NAME))
+    terminal_landing = terminal_landing & ~term.external_override
     distance = geometry._active_waypoint_distance_xy(env).to(
         device=preferred_speed.device,
         dtype=preferred_speed.dtype,
