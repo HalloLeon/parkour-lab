@@ -23,7 +23,7 @@ case "$PARKOUR_MODE" in
     python scripts/rsl_rl/train.py "${PARKOUR_COMMON[@]}" \
       --warm_start_velocity="$PARKOUR_CHECKPOINT" \
       --run_name=go2_rma_velocity --max_iterations=500 --num_envs=4096 \
-      --domain_randomization_stage=off --reset_profile=jitter \
+      --domain_randomization_stage=off --reset_profile=jitter --kit_args="--/physics/collisionApproximateCylinders=true" \
       --logger=tensorboard \
       env.commands.intent.pivot_window_probability=0.30 \
       'env.commands.intent.long_stop_window_range_s=[2.0,4.0]' \
