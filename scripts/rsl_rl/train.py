@@ -204,7 +204,34 @@ def _parkour_curriculum_term(env: object):
 
 
 class ParkourOnPolicyRunner(OnPolicyRunner):
-    """Store adaptive parkour curriculum memory with ordinary PPO checkpoints."""
+    """Keep curriculum checkpoints and report collected command-phase metrics."""
+
+    def log(self, locs: dict, width: int = 80, pad: int = 35) -> None:
+        """Publish interval diagnostics once per rollout, outside the step loop."""
+
+        logging_enabled = self.writer is not None and not self.disable_logs
+        if logging_enabled:
+            super().log(locs, width=width, pad=pad)
+
+        base_env = getattr(self.env, "unwrapped", self.env)
+        reward_manager = getattr(base_env, "reward_manager", None)
+        if (
+            reward_manager is None
+            or "training_diagnostics" not in reward_manager.active_terms
+        ):
+            return
+        term = reward_manager.get_term_cfg("training_diagnostics").func
+        drain = getattr(term, "drain_phase_metrics", None)
+        if drain is None:
+            return
+        metrics = drain()
+        if not logging_enabled or not metrics:
+            return
+
+        names = tuple(metrics)
+        values = torch.stack(tuple(metrics.values())).detach().cpu().tolist()
+        for name, value in zip(names, values, strict=True):
+            self.writer.add_scalar(f"Phase/{name}", value, locs["it"])
 
     def save(self, path: str, infos: dict | None = None) -> None:
         checkpoint_infos = dict(infos or {})

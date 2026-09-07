@@ -35,6 +35,7 @@ from .commands import (
 )
 from .navigation import geometry, route
 from .navigation.state import TERMINAL_LANDING_PREDICATE_NAMES
+from .phase_diagnostics import CommandPhaseDiagnostics, PHASE_REWARD_TERMS
 
 _MIN_GAIT_DIAGNOSTIC_DURATION_S = 0.5
 """Ignore shorter episode fragments in per-episode gait distributions."""
@@ -58,6 +59,7 @@ class EvaluationStep:
     terminal_landing_predicate_pass_count: torch.Tensor
     terminal_landing_max_dwell_s: torch.Tensor
     telemetry: dict[str, torch.Tensor] | None = None
+    phase_diagnostics: dict[str, torch.Tensor] | None = None
 
 
 class TrainingDiagnostics(ManagerTermBase):
@@ -185,6 +187,10 @@ class TrainingDiagnostics(ManagerTermBase):
         self._feet_sensor = feet_sensor
         self._evaluation_step: EvaluationStep | None = None
         self._evaluation_reward_slots: dict[str, tuple[int, float]] | None = None
+        self._phase_diagnostics = CommandPhaseDiagnostics(
+            env.num_envs, env.device, env.step_dt
+        )
+        self._phase_step: dict[str, torch.Tensor] = {}
 
         self._buffers: list[torch.Tensor] = []
         self._step_count = self._buffer(env)
@@ -467,6 +473,7 @@ class TrainingDiagnostics(ManagerTermBase):
             torch.zeros_like(base_clearance),
         )
 
+        self._record_command_phases(env, target_speed, root_velocity)
         if self._capture_evaluation:
             self._evaluation_step = self._capture_evaluation_step(
                 env,
@@ -649,7 +656,65 @@ class TrainingDiagnostics(ManagerTermBase):
                 if self._capture_telemetry
                 else None
             ),
+            phase_diagnostics=(
+                {name: value.clone() for name, value in self._phase_step.items()}
+                if self._capture_telemetry
+                else None
+            ),
         )
+
+    def _record_command_phases(
+        self,
+        env: ManagerBasedRLEnv,
+        target_speed: torch.Tensor,
+        root_velocity: torch.Tensor,
+    ) -> None:
+        """Read this step's weighted reward rates; never invoke reward terms again."""
+        rates = {
+            f"reward_{name}_rate": self._cached_reward_rate(env, name)
+            for name in PHASE_REWARD_TERMS
+        }
+        # This term is last and returns zero: all preceding slots comprise
+        # the full objective, including sparse events, not just selected costs.
+        rates["reward_total_rate"] = env.reward_manager._step_reward[:, :-1].sum(dim=-1)
+        target_yaw = get_target_yaw_rate(env)
+        achieved_yaw = self._asset.data.root_ang_vel_w[:, 2]
+        pivot_yaw = torch.zeros_like(target_yaw)
+        name = "stationary_velocity_tracking"
+        if name in self._evaluation_reward_slots:
+            cfg = env.reward_manager.get_term_cfg(name)
+            # This component is stateless and mirrors the independent yaw
+            # kernel. Subtraction recovers its local stability cost exactly
+            # from the cached combined score (including the outer weight).
+            pivot_yaw = (
+                float(cfg.weight)
+                * float(cfg.params.get("pivot_yaw_tracking_weight", 1.0))
+                * torch.exp(
+                    -(
+                        (achieved_yaw - target_yaw)
+                        / float(cfg.params.get("yaw_rate_std", 0.5))
+                    ).square()
+                )
+            )
+        pivot = target_speed.eq(0) & target_yaw.ne(0)
+        rates["reward_pivot_yaw_rate"] = torch.where(pivot, pivot_yaw, 0.0)
+        rates["reward_pivot_stability_rate"] = torch.where(
+            pivot,
+            rates["reward_stationary_velocity_tracking_rate"] - pivot_yaw,
+            0.0,
+        )
+        self._phase_step = self._phase_diagnostics.update(
+            get_preferred_speed(env),
+            target_speed,
+            target_yaw,
+            achieved_yaw,
+            torch.linalg.norm(root_velocity[:, :2], dim=-1),
+            rates,
+        )
+
+    def drain_phase_metrics(self) -> dict[str, torch.Tensor]:
+        """Drain rollout diagnostics, independently of completed-episode resets."""
+        return self._phase_diagnostics.drain()
 
     def _capture_evaluation_telemetry(
         self, env: ManagerBasedRLEnv
@@ -682,6 +747,21 @@ class TrainingDiagnostics(ManagerTermBase):
     ) -> torch.Tensor:
         """Read an already-evaluated reward term without invoking it twice."""
 
+        rate = self._cached_reward_rate(env, reward_term_name)
+        slot = self._evaluation_reward_slots.get(reward_term_name)
+        if slot is None or slot[1] == 0.0:
+            raise RuntimeError(
+                f"Evaluation requires nonzero reward term '{reward_term_name}'."
+            )
+        return rate / slot[1]
+
+    def _cached_reward_rate(
+        self,
+        env: ManagerBasedRLEnv,
+        reward_term_name: str,
+    ) -> torch.Tensor:
+        """Isaac Lab stores weighted rates (value / dt) in _step_reward."""
+
         if self._evaluation_reward_slots is None:
             term_names = tuple(env.reward_manager.active_terms)
             diagnostic_indices = [
@@ -694,33 +774,31 @@ class TrainingDiagnostics(ManagerTermBase):
                     "TrainingDiagnostics must be registered exactly once in the reward manager."
                 )
             diagnostic_index = diagnostic_indices[0]
+            if diagnostic_index != len(term_names) - 1:
+                raise RuntimeError("All reward terms must precede TrainingDiagnostics.")
             slots: dict[str, tuple[int, float]] = {}
-            for name in ("feet_edge", "undesired_contact"):
-                if name not in term_names:
-                    raise RuntimeError(
-                        f"Evaluation requires active reward term '{name}'."
-                    )
-                index = term_names.index(name)
+            for index, name in enumerate(term_names):
+                if name not in PHASE_REWARD_TERMS:
+                    continue
                 weight = float(env.reward_manager.get_term_cfg(name).weight)
-                if (
-                    index >= diagnostic_index
-                    or not math.isfinite(weight)
-                    or weight == 0.0
-                ):
+                if index >= diagnostic_index or not math.isfinite(weight):
                     raise RuntimeError(
-                        f"Evaluation reward term '{name}' must precede TrainingDiagnostics and have a finite nonzero weight."
+                        f"Diagnostic reward term '{name}' must precede TrainingDiagnostics and have a finite weight."
                     )
                 slots[name] = (index, weight)
             self._evaluation_reward_slots = slots
 
-        index, weight = self._evaluation_reward_slots[reward_term_name]
+        slot = self._evaluation_reward_slots.get(reward_term_name)
+        if slot is None or slot[1] == 0.0:
+            return torch.zeros(env.num_envs, device=env.device)
+        index, _ = slot
         try:
             weighted_step_reward = env.reward_manager._step_reward[:, index]
         except (AttributeError, IndexError) as error:
             raise RuntimeError(
                 "Evaluation requires Isaac Lab RewardManager._step_reward to expose current per-term values."
             ) from error
-        return weighted_step_reward / weight
+        return weighted_step_reward
 
     def episode_metrics(
         self, env_ids: Sequence[int] | slice | None
@@ -1058,6 +1136,7 @@ class TrainingDiagnostics(ManagerTermBase):
         env_ids = _all_env_ids(self._env, env_ids)
         for buffer in self._buffers:
             buffer[env_ids] = 0.0
+        self._phase_diagnostics.reset(env_ids)
 
     def _buffer(self, env: ManagerBasedRLEnv, width: int | None = None) -> torch.Tensor:
         shape = (env.num_envs,) if width is None else (env.num_envs, width)

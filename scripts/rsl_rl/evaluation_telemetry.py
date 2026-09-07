@@ -7,7 +7,7 @@ from __future__ import annotations
 import csv
 import json
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 
@@ -59,15 +59,31 @@ class EvaluationTelemetry:
     ACQUISITION_S = 0.5
     TIME_AVERAGE_S = 0.4
 
-    def __init__(self, directory: str, step_dt: float, foot_names: Sequence[str]):
+    def __init__(
+        self,
+        directory: str,
+        step_dt: float,
+        foot_names: Sequence[str],
+        *,
+        phase_names: Sequence[str] = (),
+        phase_signal_names: Sequence[str] = (),
+    ):
         if not math.isfinite(step_dt) or step_dt <= 0.0:
             raise ValueError("Telemetry step_dt must be positive and finite.")
         if len(set(foot_names)) != len(foot_names):
             raise ValueError("Telemetry foot names must be unique.")
+        if len(set(phase_names)) != len(phase_names) or len(set(phase_signal_names)) != len(phase_signal_names):
+            raise ValueError("Telemetry diagnostic names must be unique.")
+        if phase_signal_names and not phase_names:
+            raise ValueError("Telemetry diagnostic signals require phase names.")
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.step_dt = step_dt
         self.foot_names = tuple(foot_names)
+        self.phase_names = tuple(phase_names)
+        self._phase_signal_columns = {
+            name: name if name.startswith("reward_") else f"diagnostic_{name}" for name in phase_signal_names
+        }
         self._file = (self.directory / "telemetry.csv").open("w", newline="", encoding="utf-8")
         columns = [
             "step",
@@ -91,6 +107,9 @@ class EvaluationTelemetry:
         ]
         for name in self.foot_names:
             columns.extend((f"{name}_contact", f"{name}_body_origin_height_above_support_m"))
+        if self.phase_names:
+            columns.extend(("diagnostic_phase_id", "diagnostic_phase", "diagnostic_phase_time_s"))
+            columns.extend(self._phase_signal_columns.values())
         self._writer = csv.DictWriter(self._file, fieldnames=columns)
         self._writer.writeheader()
         self._rows: list[dict] = []
@@ -114,6 +133,7 @@ class EvaluationTelemetry:
         foot_height_above_support_m: Sequence[float],
         done: bool,
         success: bool,
+        phase_diagnostics: Mapping[str, float | int] | None = None,
     ) -> None:
         if self._metadata is not None:
             raise RuntimeError("Cannot record telemetry after close().")
@@ -133,6 +153,7 @@ class EvaluationTelemetry:
             )
         ):
             raise ValueError("Telemetry samples must be finite.")
+        diagnostic_row = self._diagnostic_row(phase_diagnostics)
         start_yaw = _euler(root_start)[2]
         roll, pitch, end_yaw = _euler(root_end)
         start_heading = (
@@ -174,6 +195,7 @@ class EvaluationTelemetry:
         for name, contact, height in zip(self.foot_names, foot_contact, foot_height_above_support_m):
             row[f"{name}_contact"] = bool(contact)
             row[f"{name}_body_origin_height_above_support_m"] = height
+        row.update(diagnostic_row)
         self._writer.writerow(row)
         self._rows.append(row)
         self._step += 1
@@ -183,6 +205,45 @@ class EvaluationTelemetry:
             self._episode += 1
             self._episode_step = 0
             self._previous_yaw = None
+
+    def _diagnostic_row(self, sample: Mapping[str, float | int] | None) -> dict:
+        """Validate the optional fixed schema before changing recorder state."""
+        if not self.phase_names:
+            if sample is not None:
+                raise ValueError("Configure telemetry phase names before recording diagnostics.")
+            return {}
+        expected = {"phase_id", "phase_time_s", *self._phase_signal_columns}
+        if sample is None or set(sample) != expected:
+            raise ValueError("Telemetry phase diagnostics must match the configured signal schema.")
+        if not all(math.isfinite(value) for value in sample.values()):
+            raise ValueError("Telemetry phase diagnostics must be finite.")
+        phase_id = int(sample["phase_id"])
+        if phase_id != sample["phase_id"] or not 0 <= phase_id < len(self.phase_names):
+            raise ValueError("Telemetry diagnostic phase_id is outside the configured phases.")
+        if sample["phase_time_s"] < 0.0:
+            raise ValueError("Telemetry diagnostic phase time must be non-negative.")
+        return {
+            "diagnostic_phase_id": phase_id,
+            "diagnostic_phase": self.phase_names[phase_id],
+            "diagnostic_phase_time_s": sample["phase_time_s"],
+            **{column: sample[name] for name, column in self._phase_signal_columns.items()},
+        }
+
+    def _phase_summaries(self, rows: list[dict]) -> dict:
+        """Summarize observed subphases without splitting legacy command windows."""
+        summaries = {}
+        for phase_id, phase in enumerate(self.phase_names):
+            samples = [row for row in rows if row["diagnostic_phase_id"] == phase_id]
+            if not samples:
+                continue
+            summaries[phase] = {
+                "sample_count": len(samples),
+                "duration_s": len(samples) * self.step_dt,
+                "signal_means": {
+                    name: _mean([row[column] for row in samples]) for name, column in self._phase_signal_columns.items()
+                },
+            }
+        return summaries
 
     def _time_averages(self, rows: list[dict]) -> dict:
         """Average complete, nonoverlapping 0.4 s blocks (not detected strides)."""
@@ -261,6 +322,8 @@ class EvaluationTelemetry:
                 },
             }
         )
+        if self.phase_names:
+            self._windows[-1]["phase_diagnostics"] = self._phase_summaries(rows)
         self._rows = []
 
     def close(self) -> dict:
@@ -272,7 +335,7 @@ class EvaluationTelemetry:
         self._file.close()
         pivots = [window for window in self._windows if window["phase"] == "pivot" and window["complete"]]
         self._metadata = {
-            "schema_version": 1,
+            "schema_version": 2 if self.phase_names else 1,
             "samples_file": "telemetry.csv",
             "command_windows_file": "command_windows.json",
             "step_dt_s": self.step_dt,
@@ -298,6 +361,26 @@ class EvaluationTelemetry:
                 ),
             },
         }
+        if self.phase_names:
+            self._metadata["phase_diagnostics"] = {
+                "phase_names": list(self.phase_names),
+                "signal_columns": self._phase_signal_columns,
+                "phase_definition": (
+                    "Diagnostic subphases are independent of legacy command windows. Restart and pivot acquisition "
+                    "cover the first second; the command-mode clock does not reset at their end."
+                ),
+                "reward_definition": (
+                    "Signed weighted reward rates under the evaluated runtime config, before multiplying by step_dt. "
+                    "reward_total_rate is the full objective, excluding the zero-valued logging term; selected terms "
+                    "are not an exhaustive decomposition. "
+                    "Pivot yaw and stability components decompose stationary_velocity_tracking; do not add them twice."
+                ),
+                "summary_definition": (
+                    "Means use only observed samples in each diagnostic phase; missing phases are omitted. "
+                    "Sample sums equal signal_means times sample_count; rate integrals also multiply by step_dt_s. "
+                    "Command-window completeness still applies, including recording-stopped partial windows."
+                ),
+            }
         with (self.directory / "command_windows.json").open("w", encoding="utf-8") as handle:
             json.dump({"metadata": self._metadata, "windows": self._windows}, handle, indent=2, allow_nan=False)
             handle.write("\n")

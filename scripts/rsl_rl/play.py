@@ -357,6 +357,10 @@ from parkour_lab.tasks.manager_based.parkour_lab.mdp.navigation import route
 from parkour_lab.tasks.manager_based.parkour_lab.mdp.navigation.state import (
     TERMINAL_LANDING_PREDICATE_NAMES,
 )
+from parkour_lab.tasks.manager_based.parkour_lab.mdp.phase_diagnostics import (
+    PHASE_NAMES,
+    PHASE_SIGNAL_NAMES,
+)
 from parkour_lab.tasks.manager_based.parkour_lab.parkour_lab_env_cfg import (
     ParkourLabEnvCfg,
 )
@@ -1412,6 +1416,9 @@ def _evaluate_course(
     telemetry_report = None
 
     try:
+        evaluation_reward_config = _evaluation_reward_config(
+            env.unwrapped.reward_manager
+        )
         observations = env.get_observations()
         interface = _validate_teacher_interface(
             env.unwrapped,
@@ -1427,7 +1434,13 @@ def _evaluate_course(
             evaluation_seed=env_cfg.seed,
         )
         if args_cli.telemetry:
-            telemetry = EvaluationTelemetry(artifacts.directory, step_dt, GO2_FOOT_NAMES)
+            telemetry = EvaluationTelemetry(
+                artifacts.directory,
+                step_dt,
+                GO2_FOOT_NAMES,
+                phase_names=PHASE_NAMES,
+                phase_signal_names=PHASE_SIGNAL_NAMES,
+            )
         rollout = _collect_rollout_statistics(env, observations, policy, telemetry)
     finally:
         # Closing also finalizes a partial or completed RecordVideo recording.
@@ -1453,6 +1466,7 @@ def _evaluate_course(
         action_noise=action_noise,
         rollout=rollout,
         telemetry=telemetry_report,
+        evaluation_reward_config=evaluation_reward_config,
     )
     report_path = _write_evaluation_report(artifacts.directory, report)
     return report, report_path
@@ -1490,6 +1504,7 @@ def _build_evaluation_report(
     action_noise: dict[str, object],
     rollout: _RolloutResult,
     telemetry: dict[str, object] | None = None,
+    evaluation_reward_config: dict[str, object] | None = None,
 ) -> _EvaluationReport:
     """Build the JSON-compatible report for one fixed evaluation course."""
 
@@ -1505,6 +1520,7 @@ def _build_evaluation_report(
         "reset_profile": args_cli.reset_profile,
         "reset_parameters": env_cfg.events.reset_base.params,
         "training_config": _training_config_provenance(checkpoint.log_dir),
+        "evaluation_reward_config": evaluation_reward_config,
         "terrain_family": evaluation_family,
         "difficulty_level": evaluation_level,
         "geometry_variant_index": geometry_variant,
@@ -2653,6 +2669,14 @@ def _collect_rollout_statistics(
             sample = transition.telemetry
             if sample is None:
                 raise RuntimeError("Pre-reset evaluation telemetry was not captured.")
+            phase_diagnostics = transition.phase_diagnostics
+            if phase_diagnostics is not None:
+                values = (
+                    torch.stack([value[0] for value in phase_diagnostics.values()])
+                    .cpu()
+                    .tolist()
+                )
+                phase_diagnostics = dict(zip(phase_diagnostics, values))
             telemetry.record(
                 command_speed_m_s=telemetry_speed,
                 command_yaw_rate_rad_s=telemetry_yaw,
@@ -2665,6 +2689,7 @@ def _collect_rollout_statistics(
                 ),
                 done=bool(done_mask[0].item()),
                 success=bool(outcomes["success"][0].item()),
+                phase_diagnostics=phase_diagnostics,
             )
         # The cursor counts prior targets; success adds its still-active final target.
         episode_max_waypoints_reached = torch.maximum(
@@ -2776,6 +2801,29 @@ def _to_jsonable(value: object) -> object:
         except (TypeError, ValueError):
             pass
     return str(value)
+
+
+def _evaluation_reward_config(reward_manager: object) -> dict[str, object]:
+    """Record active evaluation rewards, independently of checkpoint training provenance."""
+
+    terms = {}
+    for name in reward_manager.active_terms:
+        config = reward_manager.get_term_cfg(name)
+        function = config.func
+        if not isinstance(function, str):
+            implementation = (
+                function if hasattr(function, "__qualname__") else type(function)
+            )
+            function = f"{implementation.__module__}:{implementation.__qualname__}"
+        terms[name] = {
+            "function": function,
+            "weight": float(config.weight),
+            "params": _to_jsonable(config.params),
+        }
+    return {
+        "source": "Active runtime evaluation reward-manager configuration; not the checkpoint training configuration.",
+        "terms": terms,
+    }
 
 
 def _training_config_provenance(log_dir: str) -> dict[str, dict[str, str]]:
