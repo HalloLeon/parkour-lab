@@ -13,17 +13,16 @@ fi
 PARKOUR_COMMON=(
   --task=Parkour-Lab-v0
   --seed=42
-  # WebRTC Streaming Client on the local/private network; no host desktop needed.
-  --livestream=2
   '--kit_args=--/physics/collisionApproximateCylinders=true'
 )
 
 case "$PARKOUR_MODE" in
   train)
     python scripts/rsl_rl/train.py "${PARKOUR_COMMON[@]}" \
+      --headless --livestream=0 \
       --warm_start_velocity="$PARKOUR_CHECKPOINT" \
       --run_name=go2_rma_velocity --max_iterations=500 --num_envs=4096 \
-      --domain_randomization_stage=off --reset_profile=jitter --kit_args="--/physics/collisionApproximateCylinders=true" \
+      --domain_randomization_stage=off --reset_profile=jitter \
       --logger=tensorboard \
       env.commands.intent.pivot_window_probability=0.30 \
       'env.commands.intent.long_stop_window_range_s=[2.0,4.0]' \
@@ -38,7 +37,8 @@ case "$PARKOUR_MODE" in
     # 21 complete episodes total: three per case, no video, one environment.
     # Do not use first-completed episodes from many async environments: that
     # can overrepresent short failures in a small screening run.
-    PARKOUR_EVAL=("${PARKOUR_COMMON[@]}" --checkpoint="$PARKOUR_CHECKPOINT"
+    # Keep WebRTC streaming for checks and operator control only.
+    PARKOUR_EVAL=("${PARKOUR_COMMON[@]}" --livestream=2 --checkpoint="$PARKOUR_CHECKPOINT"
       --num_envs=1 --eval_episodes=3 --reset_profile=jitter
       --policy_mode=history_mean --geometry_variant=0)
     python scripts/rsl_rl/play.py "${PARKOUR_EVAL[@]}" \
@@ -63,7 +63,7 @@ case "$PARKOUR_MODE" in
     ;;
   teleop)
     python scripts/rsl_rl/play.py "${PARKOUR_COMMON[@]}" \
-      --checkpoint="$PARKOUR_CHECKPOINT" --teleop \
+      --livestream=2 --checkpoint="$PARKOUR_CHECKPOINT" --teleop \
       --terrain_family=tilted_ramps --difficulty_level=0 "$@"
     ;;
   *)
