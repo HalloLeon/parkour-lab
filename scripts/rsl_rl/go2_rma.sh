@@ -42,10 +42,12 @@ case "$PARKOUR_MODE" in
       --num_envs=1 --eval_episodes=3 --reset_profile=jitter
       --policy_mode=history_mean --geometry_variant=0)
     python scripts/rsl_rl/play.py "${PARKOUR_EVAL[@]}" \
+      --headless \
       --terrain_family=tilted_ramps --difficulty_level=0 --desired_speed=0.55 \
       --command_profile=stop_restart --desired_yaw_rate=0 --telemetry "$@"
     for PARKOUR_YAW in -0.5 0.5; do
       python scripts/rsl_rl/play.py "${PARKOUR_EVAL[@]}" \
+        --headless \
         --terrain_family=tilted_ramps --difficulty_level=0 --desired_speed=0.55 \
         --command_profile=pivot_restart --desired_yaw_rate="$PARKOUR_YAW" --telemetry "$@"
     done
@@ -56,6 +58,7 @@ case "$PARKOUR_MODE" in
         *) PARKOUR_SPEED=0.60 ;;
       esac
       python scripts/rsl_rl/play.py "${PARKOUR_EVAL[@]}" \
+        --headless \
         --terrain_family="$PARKOUR_FAMILY" --difficulty_level=6 \
         --desired_speed="$PARKOUR_SPEED" --desired_yaw_rate=0 \
         --command_profile=translation_only "$@"
