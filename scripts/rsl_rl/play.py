@@ -354,13 +354,9 @@ if args_cli.all_courses and args_cli._course_manifest is None:
 if args_cli.video:
     args_cli.enable_cameras = True
 
-# ``hydra_task_config`` reads the global ``sys.argv`` when the decorated
-# ``main`` is called later. Leave it only the script name and unparsed Hydra
-# overrides, excluding options already consumed by argparse and AppLauncher.
-sys.argv = [sys.argv[0]] + hydra_args
-
-# Launch the Omniverse application.
-app_launcher = AppLauncher(args_cli)
+# Preserve --info/--verbose for Kit startup, then leave only Hydra overrides in
+# sys.argv for the decorated main() below.
+app_launcher = cli_args.launch_app(AppLauncher, args_cli, hydra_args)
 simulation_app = app_launcher.app
 
 # The remaining imports require the running simulation application.

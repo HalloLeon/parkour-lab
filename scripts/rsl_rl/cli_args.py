@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import random
+import sys
 from typing import TYPE_CHECKING
 
 from parkour_lab import runtime_versions
@@ -18,6 +19,28 @@ if TYPE_CHECKING:
 DOMAIN_RANDOMIZATION_STAGES = ("off", "narrow", "wide")
 REQUIRED_RUNTIME_VERSIONS = runtime_versions.REQUIRED_RUNTIME_VERSIONS
 require_runtime_versions = runtime_versions.require_runtime_versions
+
+
+def launch_app(launcher_type, args_cli: argparse.Namespace, hydra_args: list[str]):
+    """Keep Kit logging flags visible during startup, then restore Hydra's argv.
+
+    Isaac Lab 2.3.2 reads --info/--verbose from sys.argv, not the parsed
+    namespace. Removing them before AppLauncher silently suppresses startup
+    output. Conversely, Kit must not consume Hydra's env/agent overrides.
+    """
+
+    script_name = sys.argv[0]
+    hydra_argv = [script_name, *hydra_args]
+    sys.argv = [script_name]
+    if getattr(args_cli, "verbose", False):
+        sys.argv.append("--verbose")
+    elif getattr(args_cli, "info", False):
+        sys.argv.append("--info")
+    try:
+        return launcher_type(args_cli)
+    finally:
+        # Strip logging flags and any Kit arguments injected by AppLauncher.
+        sys.argv = hydra_argv
 
 
 def positive_int(value: str) -> int:

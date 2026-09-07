@@ -10,7 +10,6 @@
 import argparse
 import os
 import subprocess
-import sys
 
 import cli_args
 
@@ -57,6 +56,11 @@ def _require_tracked_training_sources() -> None:
 
 
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
+parser.add_argument(
+    "--startup_check",
+    action="store_true",
+    help="Start Isaac Sim, run 60 application updates and exit without loading a task or checkpoint; preserve crash diagnostics.",
+)
 parser.add_argument(
     "--video", action="store_true", default=False, help="Record videos during training."
 )
@@ -127,7 +131,8 @@ if args_cli.warm_start_velocity and (
     parser.error(
         "--warm_start_velocity cannot be combined with --resume, --checkpoint or --load_run."
     )
-_require_tracked_training_sources()
+if not args_cli.startup_check:
+    _require_tracked_training_sources()
 if os.environ.get("WORLD_SIZE", "1") != "1":
     parser.error("Distributed training is not supported; run one training process.")
 
@@ -135,15 +140,32 @@ if os.environ.get("WORLD_SIZE", "1") != "1":
 if args_cli.video:
     args_cli.enable_cameras = True
 
-# Replace the process-wide argument list with only the script name and Hydra
-# overrides. When the decorated ``main()`` is called later, Isaac Lab's wrapper
-# invokes ``hydra.main()``, which reads these overrides from ``sys.argv`` and
-# applies them to the environment and agent configurations.
-sys.argv = [sys.argv[0]] + hydra_args
+if args_cli.startup_check:
+    args_cli.info = True
+    args_cli.kit_args += (
+        " --/crashreporter/preserveDump=true --/crashreporter/skipOldDumpUpload=true"
+    )
+    print(
+        "[INFO] Checking Isaac Sim startup only; no task, checkpoint or training will be loaded.",
+        flush=True,
+    )
 
-# Launch the Omniverse application.
-app_launcher = AppLauncher(args_cli)
+# Keep startup logging options visible to Kit, then leave only Hydra overrides
+# in sys.argv for the decorated main() below.
+app_launcher = cli_args.launch_app(AppLauncher, args_cli, hydra_args)
 simulation_app = app_launcher.app
+
+if args_cli.startup_check:
+    try:
+        for _ in range(60):
+            simulation_app.update()
+    finally:
+        simulation_app.close()
+    print(
+        "[INFO] Isaac Sim startup check passed (60 application updates; no training run).",
+        flush=True,
+    )
+    raise SystemExit(0)
 
 # The remaining imports require the running simulation application.
 
