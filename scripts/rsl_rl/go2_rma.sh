@@ -37,17 +37,15 @@ case "$PARKOUR_MODE" in
     # 21 complete episodes total: three per case, no video, one environment.
     # Do not use first-completed episodes from many async environments: that
     # can overrepresent short failures in a small screening run.
-    # Keep WebRTC streaming for checks and operator control only.
-    PARKOUR_EVAL=("${PARKOUR_COMMON[@]}" --livestream=2 --checkpoint="$PARKOUR_CHECKPOINT"
+    # Batch evaluation needs no GUI or streaming client.
+    PARKOUR_EVAL=("${PARKOUR_COMMON[@]}" --headless --livestream=0 --checkpoint="$PARKOUR_CHECKPOINT"
       --num_envs=1 --eval_episodes=3 --reset_profile=jitter
       --policy_mode=history_mean --geometry_variant=0)
     python scripts/rsl_rl/play.py "${PARKOUR_EVAL[@]}" \
-      --headless \
       --terrain_family=tilted_ramps --difficulty_level=0 --desired_speed=0.55 \
       --command_profile=stop_restart --desired_yaw_rate=0 --telemetry "$@"
     for PARKOUR_YAW in -0.5 0.5; do
       python scripts/rsl_rl/play.py "${PARKOUR_EVAL[@]}" \
-        --headless \
         --terrain_family=tilted_ramps --difficulty_level=0 --desired_speed=0.55 \
         --command_profile=pivot_restart --desired_yaw_rate="$PARKOUR_YAW" --telemetry "$@"
     done
@@ -58,7 +56,6 @@ case "$PARKOUR_MODE" in
         *) PARKOUR_SPEED=0.60 ;;
       esac
       python scripts/rsl_rl/play.py "${PARKOUR_EVAL[@]}" \
-        --headless \
         --terrain_family="$PARKOUR_FAMILY" --difficulty_level=6 \
         --desired_speed="$PARKOUR_SPEED" --desired_yaw_rate=0 \
         --command_profile=translation_only "$@"

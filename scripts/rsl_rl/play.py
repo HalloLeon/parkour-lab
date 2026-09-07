@@ -1485,10 +1485,16 @@ def _evaluate_course(
     if args_cli.telemetry:
         if evaluation_level != 0 or env_cfg.scene.num_envs != 1:
             raise ValueError("--telemetry requires --difficulty_level=0 --num_envs=1.")
-        env_cfg.rewards.training_diagnostics.params["capture_evaluation_step"] = True
-        env_cfg.rewards.training_diagnostics.params["capture_evaluation_telemetry"] = (
-            True
+    # Every evaluation consumes post-physics, pre-reset snapshots, including
+    # metrics-only runs using the training task's default configuration.
+    # Detailed flat-ground telemetry is a separate, optional capture.
+    diagnostics_cfg = env_cfg.rewards.training_diagnostics
+    if diagnostics_cfg is None or diagnostics_cfg.weight == 0.0:
+        raise ValueError(
+            "Evaluation requires rewards.training_diagnostics with a nonzero weight."
         )
+    diagnostics_cfg.params["capture_evaluation_step"] = True
+    diagnostics_cfg.params["capture_evaluation_telemetry"] = args_cli.telemetry
     artifacts = _prepare_evaluation_artifacts(
         checkpoint,
         evaluation_family,
