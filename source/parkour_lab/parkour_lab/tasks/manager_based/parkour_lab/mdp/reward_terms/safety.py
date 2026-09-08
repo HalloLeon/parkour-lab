@@ -14,6 +14,22 @@ from ..navigation import route
 from ..terrain import queries
 
 
+def physical_failure(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Charge one impulse for physical failure, never a sum of failure reasons.
+
+    Success and time limits are not physical failures. Read the already
+    evaluated termination bits; do not repeat contact or route computations.
+    Use instead of (not in addition to) the chassis/off-route reward terms.
+    """
+    manager = env.termination_manager
+    failed = (
+        manager.get_term("chassis_contact")
+        | manager.get_term("off_route")
+        | manager.get_term("fell_below_course")
+    )
+    return failed.float() / float(env.step_dt)
+
+
 def base_clearance_below_l2(
     env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")
 ) -> torch.Tensor:

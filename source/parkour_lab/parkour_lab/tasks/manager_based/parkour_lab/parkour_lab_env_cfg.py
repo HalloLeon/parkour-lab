@@ -520,12 +520,21 @@ class RewardsCfg:
         },
     )
 
+    # Behavioral ablations are dormant until explicitly selected. Keep braking
+    # separate from yaw credit so each component is directly observable.
+    stationary_planar_motion = RewTerm(
+        func=mdp.stationary_planar_motion_cost,
+        weight=0.0,
+        params={"transition_speed_m_s": 0.3, "asset_cfg": SceneEntityCfg("robot")},
+    )
+
     route_cross_track_excess = RewTerm(
         func=mdp.route_cross_track_excess_l2,
         weight=-1.0,
         params={
             "soft_half_width_m": PARKOUR_CURRICULUM.soft_route_half_width_m,
             "hard_half_width_m": PARKOUR_CURRICULUM.hard_route_half_width_m,
+            "normalize_by_margin": False,
         },
     )
     # A hard envelope violation is a real failure, not a cheap way to truncate
@@ -557,6 +566,10 @@ class RewardsCfg:
             "timestep_independent": True,
         },
     )
+
+    # Alternative failure accounting: replace both contact/off-route penalties
+    # with one physical-failure impulse, also covering fell_below_course.
+    physical_failure = RewTerm(func=mdp.physical_failure, weight=0.0)
 
     undesired_contact = RewTerm(
         func=mdp.undesired_contacts,
@@ -595,6 +608,36 @@ class RewardsCfg:
     )
     joint_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-0.0002)
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-0.5)
+
+    # Opt-in replacements, not additional regularizers. No sensor, observation,
+    # action or network changes are needed to resume an existing checkpoint.
+    upright_orientation_l2 = RewTerm(func=mdp.upright_orientation_l2, weight=0.0)
+    supported_orientation_l2 = RewTerm(
+        func=mdp.supported_orientation_l2,
+        weight=0.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
+            "feet_sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+            "support_radius_m": 0.35,
+            "max_support_height_variation_m": 0.02,
+            "support_force_threshold_n": 5.0,
+            "min_support_feet": 2,
+        },
+    )
+    supported_vertical_velocity_l2 = RewTerm(
+        func=mdp.supported_vertical_velocity_l2,
+        weight=0.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
+            "feet_sensor_cfg": SceneEntityCfg("feet_contact", body_names=".*_foot"),
+            "support_radius_m": 0.35,
+            "max_support_height_variation_m": 0.02,
+            "support_force_threshold_n": 5.0,
+            "min_support_feet": 2,
+        },
+    )
 
     # Foot-placement safety and contact quality.
     feet_edge = RewTerm(
@@ -707,8 +750,63 @@ class RewardsCfg:
         if not math.isfinite(pivot_stability_weight) or pivot_stability_weight < 0.0:
             raise ValueError("pivot stability weight must be finite and non-negative.")
         pivot_yaw_tracking_weight = stationary_params["pivot_yaw_tracking_weight"]
-        if not math.isfinite(pivot_yaw_tracking_weight) or pivot_yaw_tracking_weight < 0.0:
-            raise ValueError("pivot yaw tracking weight must be finite and non-negative.")
+        if (
+            not math.isfinite(pivot_yaw_tracking_weight)
+            or pivot_yaw_tracking_weight < 0.0
+        ):
+            raise ValueError(
+                "pivot yaw tracking weight must be finite and non-negative."
+            )
+
+        speed_scale = self.stationary_planar_motion.params["transition_speed_m_s"]
+        if not math.isfinite(speed_scale) or speed_scale <= 0.0:
+            raise ValueError("braking transition speed must be finite and positive.")
+        corridor = self.route_cross_track_excess.params
+        soft, hard = corridor["soft_half_width_m"], corridor["hard_half_width_m"]
+        if not (math.isfinite(soft) and math.isfinite(hard) and 0.0 <= soft < hard):
+            raise ValueError(
+                "route widths must be finite and satisfy 0 <= soft < hard."
+            )
+        if not isinstance(corridor["normalize_by_margin"], bool):
+            raise ValueError("normalize_by_margin must be boolean.")
+
+        for name in (
+            "stationary_planar_motion",
+            "upright_orientation_l2",
+            "supported_orientation_l2",
+            "supported_vertical_velocity_l2",
+            "physical_failure",
+        ):
+            weight = getattr(self, name).weight
+            if not math.isfinite(weight) or weight > 0.0:
+                raise ValueError(f"{name} weight must be finite and non-positive.")
+        for name in ("supported_orientation_l2", "supported_vertical_velocity_l2"):
+            support = getattr(self, name).params
+            for key in ("support_radius_m", "support_force_threshold_n"):
+                if not math.isfinite(support[key]) or support[key] <= 0.0:
+                    raise ValueError(f"{name}.{key} must be finite and positive.")
+            span = support["max_support_height_variation_m"]
+            if not math.isfinite(span) or span < 0.0:
+                raise ValueError(
+                    f"{name} height variation must be finite and non-negative."
+                )
+            feet = support["min_support_feet"]
+            if type(feet) is not int or not 1 <= feet <= 4:
+                raise ValueError(
+                    f"{name}.min_support_feet must be an integer in [1, 4]."
+                )
+        for replacement, originals in (
+            ("upright_orientation_l2", ("flat_orientation_l2",)),
+            ("supported_orientation_l2", ("stable_orientation_l2",)),
+            ("supported_vertical_velocity_l2", ("lin_vel_z_l2",)),
+            ("physical_failure", ("chassis_contact", "off_route_failure")),
+        ):
+            if getattr(self, replacement).weight != 0.0 and any(
+                getattr(self, original).weight != 0.0 for original in originals
+            ):
+                raise ValueError(
+                    f"{replacement} replaces {originals}; disable their weights first."
+                )
 
 
 @configclass
@@ -1259,6 +1357,22 @@ class ParkourLabEnvCfg(ManagerBasedRLEnvCfg):
 
         # Hydra mutates the constructed config in place. Revalidate fixed term
         # scalars here, once after all overrides and curriculum wiring.
+        if any(
+            term.weight != 0.0
+            for term in (
+                self.rewards.supported_orientation_l2,
+                self.rewards.supported_vertical_velocity_l2,
+            )
+        ):
+            scanner = self.scene.height_scanner
+            if (
+                scanner.ray_alignment != "yaw"
+                or tuple(scanner.pattern_cfg.direction) != (0.0, 0.0, -1.0)
+                or tuple(scanner.offset.rot) != (1.0, 0.0, 0.0, 0.0)
+            ):
+                raise ValueError(
+                    "Support rewards require the yaw-aligned downward height scan."
+                )
         self.rewards.__post_init__()
         self.terminations.__post_init__()
 

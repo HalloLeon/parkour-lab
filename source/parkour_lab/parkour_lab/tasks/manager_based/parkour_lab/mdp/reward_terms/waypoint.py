@@ -80,9 +80,9 @@ def waypoint_heading_alignment_exp(
 ) -> torch.Tensor:
     """Score heading alignment with signed waypoint-directed motion.
 
-    The exponential heading kernel is multiplied by the signed fraction of
-    commanded forward speed. Standing still therefore earns zero, while
-    retreating with the same heading cancels forward-only alignment credit.
+    The heading kernel discounts forward credit only. Reverse motion retains
+    its full penalty: turning away must not make retreat less costly.
+    Standing still earns zero.
     Speed regulation remains the responsibility of
     :func:`waypoint_velocity_tracking_exp`.
 
@@ -119,7 +119,8 @@ def waypoint_heading_alignment_exp(
     )
     reward = torch.where(
         moving,
-        signed_progress * torch.exp(-torch.abs(heading_error)),
+        signed_progress.clamp_min(0.0) * torch.exp(-torch.abs(heading_error))
+        + signed_progress.clamp_max(0.0),
         torch.zeros_like(signed_progress),
     )
     return _mask_waypoint_change(env, reward)
@@ -136,12 +137,12 @@ def waypoint_velocity_tracking_exp(
     """Reward signed waypoint progress with bounded speed adaptation.
 
     Forward reward saturates at the base command on every terrain, while
-    reverse motion receives a symmetric penalty. On obstacle rows, a
-    phase-local ceiling permits bounded speed adaptation near an approach
-    waypoint and during traversal::
+    reverse motion retains its full penalty regardless of lateral motion.
+    On obstacle rows, a phase-local ceiling permits bounded speed adaptation
+    near an approach waypoint and during traversal::
 
-        reward = clamp(v_parallel / command, -1, 1)
-                 * exp(-||v_perpendicular||^2 / std^2)
+        s = clamp(v_parallel / command, -1, 1)
+        reward = max(s, 0) * exp(-||v_perpendicular||^2 / std^2) + min(s, 0)
                  - relu((v_parallel - phase_ceiling) / command)^2
 
     The phase ceiling equals the command on flat terrain. This makes standing
@@ -203,7 +204,9 @@ def waypoint_velocity_tracking_exp(
     )
     tracking = torch.where(
         moving,
-        forward_fraction * lateral_alignment - normalized_overspeed.square(),
+        forward_fraction.clamp_min(0.0) * lateral_alignment
+        + forward_fraction.clamp_max(0.0)
+        - normalized_overspeed.square(),
         torch.zeros_like(forward_fraction),
     )
     return _mask_waypoint_change(
@@ -219,8 +222,13 @@ def route_cross_track_excess_l2(
     env: ManagerBasedRLEnv,
     soft_half_width_m: float,
     hard_half_width_m: float,
+    normalize_by_margin: bool = False,
 ) -> torch.Tensor:
-    """Penalize only the moving distance outside the soft route envelope."""
+    """Penalize moving outside the soft envelope, optionally in margin units.
+
+    Normalized excess is one at the hard boundary, independent of corridor
+    width. This changes the reward scale, so it is an explicit opt-in.
+    """
 
     error = route.route_cross_track_error_m(env)
     bounded_error = torch.where(
@@ -228,7 +236,10 @@ def route_cross_track_excess_l2(
         error.clamp_max(hard_half_width_m),
         torch.full_like(error, soft_half_width_m),
     )
-    excess = torch.relu(bounded_error - soft_half_width_m).square()
+    excess = torch.relu(bounded_error - soft_half_width_m)
+    if normalize_by_margin:
+        excess = excess / (hard_half_width_m - soft_half_width_m)
+    excess = excess.square()
     active = (get_target_speed(env) > 0.0) & torch.isfinite(error)
     return torch.where(active, excess, torch.zeros_like(excess))
 
@@ -279,6 +290,28 @@ def stationary_velocity_tracking_exp(
     score = torch.where(target_yaw_rate.ne(0), pivot_score, stop_score)
     nontranslating = get_target_speed(env).eq(0)
     return torch.where(nontranslating, score, torch.zeros_like(score))
+
+
+def stationary_planar_motion_cost(
+    env: ManagerBasedRLEnv,
+    transition_speed_m_s: float = 0.3,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Price stop/pivot drift with smooth-L1 speed in explicit physical units.
+
+    Quadratic below ``transition_speed_m_s``, linear above it. Unlike the
+    quiet-body exponential, this cost still distinguishes 0.3 from 0.7 m/s.
+    Use with a negative weight; it neither changes yaw credit nor penalizes
+    commanded translation. The existing quiet-stop score supplies settling
+    credit, while this separate term supplies the braking incentive. A 4 m/s
+    numerical ceiling is well beyond the supported command range and bounds
+    the cost of an extreme terminal sample.
+    """
+    speed = torch.linalg.vector_norm(robot._root_lin_vel_xy(env, asset_cfg), dim=-1)
+    scaled = speed.clamp_max(4.0) / transition_speed_m_s
+    quadratic = scaled.clamp_max(1.0)
+    cost = 0.5 * quadratic.square() + (scaled - quadratic)
+    return torch.where(get_target_speed(env).eq(0), cost, torch.zeros_like(cost))
 
 
 # Sparse course events.

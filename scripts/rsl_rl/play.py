@@ -16,6 +16,7 @@ import sys
 import tempfile
 
 import cli_args
+from evaluation_screen import check_metrics_file
 from evaluation_telemetry import EvaluationTelemetry
 
 cli_args.require_runtime_versions()
@@ -122,6 +123,12 @@ parser.add_argument(
     "--telemetry",
     action="store_true",
     help="Write command-response and gait traces for one level-0 environment.",
+)
+parser.add_argument(
+    "--screen",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help="Exit nonzero on failed physical regression targets; requires >=3 complete history_mean jitter episodes.",
 )
 parser.add_argument(
     "--video_length",
@@ -258,6 +265,22 @@ AppLauncher.add_app_launcher_args(parser)
 # Split recognized CLI options from the remaining Hydra configuration overrides.
 cli_arguments = sys.argv[1:]
 args_cli, hydra_args = parser.parse_known_args()
+if args_cli.screen and (
+    args_cli.teleop
+    or args_cli.video
+    or args_cli.all_courses
+    or args_cli.num_envs != 1
+    or args_cli.eval_episodes < 3
+    or args_cli.policy_mode != "history_mean"
+    or args_cli.reset_profile != "jitter"
+    or args_cli.command_profile not in ("translation_only", "stop_restart", "pivot_restart")
+    or (args_cli.command_profile == "pivot_restart" and not args_cli.telemetry)
+):
+    parser.error(
+        "--screen requires one environment, >=3 history_mean jitter episodes, an explicit "
+        "translation_only/stop_restart/pivot_restart profile, no video/teleop/matrix, "
+        "and --telemetry for pivots. Use --no-screen for unrestricted diagnostics."
+    )
 if args_cli.teleop:
     if (
         args_cli.all_courses
@@ -1454,6 +1477,13 @@ def _evaluate_requested_course(
         args_cli.difficulty_level,
     )
     _print_evaluation_summary(report, report_path)
+    if args_cli.screen:
+        from pathlib import Path
+
+        if not check_metrics_file(Path(report_path)):
+            # The report and telemetry have already been saved and env closed.
+            # main's finally block still closes the simulator before exit.
+            raise SystemExit(1)
 
 
 def _evaluate_course(

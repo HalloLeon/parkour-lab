@@ -14,18 +14,23 @@ PHASE_NAMES = (
 )
 PHASE_REWARD_TERMS = (
     "stationary_velocity_tracking",
+    "stationary_planar_motion",
     "action_rate_l2",
     "joint_torques_l2",
     "ang_vel_xy_l2",
     "flat_orientation_l2",
     "stable_orientation_l2",
+    "upright_orientation_l2",
+    "supported_orientation_l2",
     "joint_deviation_l2",
     "lin_vel_z_l2",
+    "supported_vertical_velocity_l2",
     "feet_slide",
     "feet_stumble",
     "feet_edge",
     "undesired_contact",
     "chassis_contact",
+    "physical_failure",
     "base_clearance_below",
 )
 PHASE_SIGNAL_NAMES = (

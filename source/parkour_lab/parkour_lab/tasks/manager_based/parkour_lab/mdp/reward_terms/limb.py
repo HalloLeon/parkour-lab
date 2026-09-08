@@ -134,3 +134,104 @@ def _stable_gait_mask(
         route.active_difficulty_indices(env) == 0,
         get_target_speed(env) <= 0.0,
     )
+
+
+def upright_orientation_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Squared chord distance from upright: zero upright, four upside down.
+
+    ``2 * (1 + gravity_z)`` has the same small-angle curvature as the usual
+    gravity-XY square, without treating an inverted base as level.
+    """
+    gravity_z = env.scene[asset_cfg.name].data.projected_gravity_b[:, 2]
+    return 2.0 * (1.0 + gravity_z.clamp(-1.0, 1.0))
+
+
+def _level_support_mask(
+    env: ManagerBasedRLEnv,
+    terrain_sensor_cfg: SceneEntityCfg,
+    feet_sensor_cfg: SceneEntityCfg,
+    support_radius_m: float,
+    max_support_height_variation_m: float,
+    support_force_threshold_n: float,
+    min_support_feet: int,
+) -> torch.Tensor:
+    """Recognize loaded, level terrain under the base, not future obstacles.
+
+    Reuse the existing yaw-aligned downward scan. Select rays by their local
+    *origins*, including the scanner's forward offset, so a missed selected
+    ray cannot silently disappear from the flatness test. No level/command
+    shortcut can certify a slope or flight as steady support.
+    """
+    scanner = env.scene[terrain_sensor_cfg.name]
+    heights = scanner.data.ray_hits_w[..., 2]
+    selected = scanner.ray_starts[..., :2].square().sum(dim=-1) <= support_radius_m**2
+    valid = torch.isfinite(heights)
+    high = torch.where(selected & valid, heights, -torch.inf).amax(dim=-1)
+    low = torch.where(selected & valid, heights, torch.inf).amin(dim=-1)
+    level = (
+        (selected.sum(dim=-1) >= 3)
+        & (~selected | valid).all(dim=-1)
+        & (high - low <= max_support_height_variation_m)
+    )
+    # Current world-Z load, not a recent impact or a contact-history latch.
+    forces = contact._selected_contact_forces_w(env, feet_sensor_cfg)
+    loaded = (forces[..., 2] > support_force_threshold_n).sum(dim=-1)
+    return level & (loaded >= min_support_feet)
+
+
+def supported_orientation_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    terrain_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    feet_sensor_cfg: SceneEntityCfg = SceneEntityCfg(
+        "feet_contact", body_names=".*_foot"
+    ),
+    support_radius_m: float = 0.35,
+    max_support_height_variation_m: float = 0.02,
+    support_force_threshold_n: float = 5.0,
+    min_support_feet: int = 2,
+) -> torch.Tensor:
+    """Additional upright prior only on loaded, locally level support."""
+    supported = _level_support_mask(
+        env,
+        terrain_sensor_cfg,
+        feet_sensor_cfg,
+        support_radius_m,
+        max_support_height_variation_m,
+        support_force_threshold_n,
+        min_support_feet,
+    )
+    return torch.where(supported, upright_orientation_l2(env, asset_cfg), 0.0)
+
+
+def supported_vertical_velocity_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    terrain_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    feet_sensor_cfg: SceneEntityCfg = SceneEntityCfg(
+        "feet_contact", body_names=".*_foot"
+    ),
+    support_radius_m: float = 0.35,
+    max_support_height_variation_m: float = 0.02,
+    support_force_threshold_n: float = 5.0,
+    min_support_feet: int = 2,
+) -> torch.Tensor:
+    """Regularize world-Z heave on level support; relax for flight/climbing.
+
+    Unlike body-Z velocity, this does not count forward travel projected onto
+    a pitched body axis as vertical motion. It is a separate opt-in replacement
+    for the unconditional body-frame term, not an additional cost.
+    """
+    supported = _level_support_mask(
+        env,
+        terrain_sensor_cfg,
+        feet_sensor_cfg,
+        support_radius_m,
+        max_support_height_variation_m,
+        support_force_threshold_n,
+        min_support_feet,
+    )
+    return torch.where(supported, robot._root_lin_vel_z(env, asset_cfg).square(), 0.0)

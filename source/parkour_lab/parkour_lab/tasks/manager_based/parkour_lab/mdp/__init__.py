@@ -70,10 +70,14 @@ from .reward_terms.limb import (
     feet_stumble as feet_stumble,
     joint_deviation_l2 as joint_deviation_l2,
     stable_orientation_l2 as stable_orientation_l2,
+    supported_orientation_l2 as supported_orientation_l2,
+    supported_vertical_velocity_l2 as supported_vertical_velocity_l2,
+    upright_orientation_l2 as upright_orientation_l2,
 )
 from .reward_terms.safety import (
     base_clearance_below_l2 as base_clearance_below_l2,
     chassis_contact as chassis_contact,
+    physical_failure as physical_failure,
 )
 from .reward_terms.waypoint import (
     completed_course_reward as completed_course_reward,
@@ -81,6 +85,7 @@ from .reward_terms.waypoint import (
     off_route_failure as off_route_failure,
     route_cross_track_excess_l2 as route_cross_track_excess_l2,
     stationary_velocity_tracking_exp as stationary_velocity_tracking_exp,
+    stationary_planar_motion_cost as stationary_planar_motion_cost,
     waypoint_heading_alignment_exp as waypoint_heading_alignment_exp,
     waypoint_velocity_tracking_exp as waypoint_velocity_tracking_exp,
 )
