@@ -55,6 +55,24 @@ def _require_tracked_training_sources() -> None:
         )
 
 
+def _validate_curriculum_restart_args(args: argparse.Namespace) -> None:
+    """Require an explicit, paired opt-in to a selective resume restart."""
+
+    family = args.reset_curriculum_family
+    level = args.reset_curriculum_level
+    if (family is None) != (level is None):
+        raise ValueError(
+            "--reset_curriculum_family and --reset_curriculum_level must be supplied together."
+        )
+    if family is not None:
+        if not args.resume or args.warm_start_velocity:
+            raise ValueError(
+                "A selective curriculum restart requires --resume, not a warm start."
+            )
+        if level < 0:
+            raise ValueError("--reset_curriculum_level must be non-negative.")
+
+
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
 parser.add_argument(
     "--startup_check",
@@ -116,6 +134,18 @@ parser.add_argument(
     default=None,
     help="Optional initial-state-only reset profile, applied after the domain-randomization stage.",
 )
+parser.add_argument(
+    "--reset_curriculum_family",
+    type=str,
+    default=None,
+    help="On --resume, clear only this terrain family's frontier/evidence; requires --reset_curriculum_level.",
+)
+parser.add_argument(
+    "--reset_curriculum_level",
+    type=int,
+    default=None,
+    help="Replacement frontier for --reset_curriculum_family; all other families retain saved progress.",
+)
 # Add RSL-RL command-line arguments.
 cli_args.add_rsl_rl_args(parser)
 # Add the explicit staged domain-randomization selector.
@@ -131,6 +161,10 @@ if args_cli.warm_start_velocity and (
     parser.error(
         "--warm_start_velocity cannot be combined with --resume, --checkpoint or --load_run."
     )
+try:
+    _validate_curriculum_restart_args(args_cli)
+except ValueError as exc:
+    parser.error(str(exc))
 if not args_cli.startup_check:
     _require_tracked_training_sources()
 if os.environ.get("WORLD_SIZE", "1") != "1":
@@ -299,9 +333,17 @@ class ParkourOnPolicyRunner(OnPolicyRunner):
         return infos
 
 
-def _restore_parkour_curriculum(env: object, infos: object) -> None:
+def _restore_parkour_curriculum(
+    env: object,
+    infos: object,
+    *,
+    reset_family: str | None = None,
+    reset_level: int | None = None,
+) -> dict[str, object] | None:
     """Restore curriculum memory and begin fresh episodes at that frontier."""
 
+    if (reset_family is None) != (reset_level is None):
+        raise ValueError("Curriculum reset family and level must be supplied together.")
     term = _parkour_curriculum_term(env.unwrapped)
     if not isinstance(infos, dict) or _CURRICULUM_STATE_KEY not in infos:
         raise ValueError("Checkpoint has no parkour curriculum state.")
@@ -309,7 +351,13 @@ def _restore_parkour_curriculum(env: object, infos: object) -> None:
     if not isinstance(state, dict):
         raise TypeError("Checkpoint parkour curriculum state must be a dictionary.")
     term.load_state_dict(state)
+    restart = (
+        term.reset_family_frontier(reset_family, reset_level)
+        if reset_family is not None
+        else None
+    )
     env.reset()
+    return restart
 
 
 # Capture the task ID and agent entry-point name now. The returned wrapper later
@@ -445,6 +493,11 @@ def main(
             resume_checkpoint.teacher_interface,
             teacher_interface,
         )
+        if args_cli.reset_curriculum_family is not None and not resume_terrain_matches:
+            raise ValueError(
+                "Selective curriculum restart requires matching checkpoint/runtime terrain; "
+                "otherwise the other families' progress cannot be preserved."
+            )
 
     if agent_cfg.class_name != "OnPolicyRunner":
         raise ValueError("train.py supports only OnPolicyRunner.")
@@ -481,8 +534,26 @@ def main(
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         checkpoint_infos = runner.load(resume_path)
         if resume_terrain_matches:
-            _restore_parkour_curriculum(env, checkpoint_infos)
+            restart = _restore_parkour_curriculum(
+                env,
+                checkpoint_infos,
+                reset_family=args_cli.reset_curriculum_family,
+                reset_level=args_cli.reset_curriculum_level,
+            )
             print("[INFO] Restored adaptive parkour curriculum state.")
+            if restart is not None:
+                write_json(
+                    os.path.join(log_dir, "params", "curriculum_restart.json"),
+                    {
+                        **restart,
+                        "source": resume_checkpoint.checkpoint_path,
+                        "source_sha256": resume_checkpoint.checkpoint_sha256,
+                        "optimizer_and_schedules": "restored",
+                    },
+                )
+                print(
+                    f"[INFO] Selective curriculum restart: {json.dumps(restart, sort_keys=True)}"
+                )
         else:
             print(
                 "[WARNING] Checkpoint curriculum belongs to a different terrain; "

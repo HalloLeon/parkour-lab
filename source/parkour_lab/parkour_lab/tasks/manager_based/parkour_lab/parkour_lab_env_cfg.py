@@ -569,11 +569,19 @@ class RewardsCfg:
 
     # Motion quality and regularization. Mild global priors price persistent
     # lean and folded limbs without suppressing obstacle maneuvers. A stronger
-    # orientation prior applies only on flat terrain or during a requested stop.
+    # orientation prior also covers scanned-flat approaches/platforms within
+    # obstacle courses, and requested stops, without requiring level-zero terrain.
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.025)
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.25)
-    stable_orientation_l2 = RewTerm(func=mdp.stable_orientation_l2, weight=-1.0)
+    stable_orientation_l2 = RewTerm(
+        func=mdp.stable_orientation_l2,
+        weight=-1.0,
+        params={
+            "terrain_sensor_cfg": SceneEntityCfg("height_scanner"),
+            "max_support_height_variation_m": 0.02,
+        },
+    )
     joint_deviation_l2 = RewTerm(
         func=mdp.joint_deviation_l2,
         weight=-0.02,

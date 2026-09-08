@@ -91,24 +91,46 @@ def joint_deviation_l2(
 def stable_orientation_l2(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    terrain_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    max_support_height_variation_m: float = 0.02,
 ) -> torch.Tensor:
     """Penalize roll and pitch only where a level body is unambiguously useful.
 
-    The shared flat curriculum and zero-speed phases provide the ordinary gait
-    and settling practice needed by every course.  Banked-ramp traversal stays
-    under the milder global orientation prior, so this term cannot suppress a
-    necessary obstacle attitude.
+    Include flat approaches and platforms on obstacle courses, not just the
+    level-zero curriculum. A height change anywhere in the nearby scan relaxes
+    this additional prior during locomotion, leaving the milder global prior
+    for steps, gaps and banked ramps. Intentional stops retain the settling prior.
     """
 
     projected_gravity_xy = robot._root_projected_gravity_xy(env, asset_cfg)
     penalty = torch.sum(projected_gravity_xy.square(), dim=-1)
-    return penalty * _stable_gait_mask(env).to(dtype=penalty.dtype)
+    return penalty * _stable_gait_mask(
+        env, terrain_sensor_cfg, max_support_height_variation_m
+    ).to(dtype=penalty.dtype)
 
 
-def _stable_gait_mask(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Select obstacle-free locomotion and intentional zero-speed phases."""
+def _stable_gait_mask(
+    env: ManagerBasedRLEnv,
+    terrain_sensor_cfg: SceneEntityCfg = SceneEntityCfg("height_scanner"),
+    max_support_height_variation_m: float = 0.02,
+) -> torch.Tensor:
+    """Select verified flat support and the existing flat/stop practice phases."""
 
-    return torch.logical_or(
+    if not 0.0 <= max_support_height_variation_m < float("inf"):
+        raise ValueError(
+            "max_support_height_variation_m must be finite and non-negative."
+        )
+
+    # World hit heights do not change when the robot pitches or heaves. Reuse
+    # the policy's dense scan; a missing ray cannot certify flat support over a
+    # gap. Keep all reductions on the simulation device.
+    heights = env.scene[terrain_sensor_cfg.name].data.ray_hits_w[..., 2]
+    finite = torch.isfinite(heights)
+    safe_heights = torch.where(finite, heights, 0.0)
+    height_span = safe_heights.amax(dim=-1) - safe_heights.amin(dim=-1)
+    flat_support = finite.all(dim=-1) & (height_span <= max_support_height_variation_m)
+
+    return flat_support | torch.logical_or(
         route.active_difficulty_indices(env) == 0,
         get_target_speed(env) <= 0.0,
     )

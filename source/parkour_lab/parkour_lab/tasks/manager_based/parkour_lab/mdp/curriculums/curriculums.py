@@ -114,6 +114,43 @@ class ParkourTerrainCurriculum(ManagerTermBase):
 
         self.state.load_state_dict(state, self.cfg.params["curriculum_cfg"])
 
+    def reset_family_frontier(self, family_name: str, level: int) -> dict[str, object]:
+        """Restart one family's mastery evidence after restoring a checkpoint.
+
+        Call before the next environment reset, which samples fresh episodes
+        from these frontiers. Other families and the replay policy are unchanged.
+        Resolve ownership through physical terrain columns, not environment ID
+        ordering, so every geometry variant of the selected family is covered.
+        """
+
+        curriculum_cfg = self.cfg.params["curriculum_cfg"]
+        if not isinstance(level, int) or not 0 <= level <= curriculum_cfg.max_level:
+            raise ValueError(
+                f"Curriculum restart level must be in [0, {curriculum_cfg.max_level}]."
+            )
+        family_index = curriculum_cfg.family_index(family_name)
+        env = self._env
+        population_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
+        family_indices = _family_indices_for_terrain_columns(
+            env, env.scene.terrain, population_ids, self.cfg.params["terrain_layout"]
+        )
+        env_ids = population_ids[family_indices == family_index]
+        if env_ids.numel() == 0:
+            raise ValueError(
+                f"No environments belong to curriculum family {family_name!r}."
+            )
+
+        self.state.frontier_levels[env_ids] = level
+        self.state.success_history[env_ids] = False
+        self.state.stalled_history[env_ids] = False
+        self.state.demotion_grace_episodes_remaining[env_ids] = 0
+        return {
+            "family": family_name,
+            "frontier_level": level,
+            "reset_num_envs": env_ids.numel(),
+            "preserved_num_envs": env.num_envs - env_ids.numel(),
+        }
+
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         """Preserve curriculum evidence across ordinary episode resets."""
 
