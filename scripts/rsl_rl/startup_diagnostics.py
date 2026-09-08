@@ -1,0 +1,178 @@
+"""Bounded, single-episode startup capture; no simulator imports or policy changes.
+
+The estimator hook observes the *actual* inference call. Post-step state must be
+supplied by the reward-time snapshot, because a vector wrapper auto-resets done
+environments before returning from ``step``.
+"""
+
+from __future__ import annotations
+
+import math
+
+
+OBSERVATION_GROUPS = (
+    "policy",
+    "oracle_travel_direction",
+    "terrain",
+    "dynamics",
+    "adaptation_history",
+    "velocity_target",
+)
+MAX_STARTUP_STEPS = 500
+
+
+def validate_startup_arguments(args) -> None:
+    """Reject conflicting modes before launching the simulator."""
+    if not args.startup_diagnostics:
+        if args.startup_steps is not None or args.startup_output_dir is not None:
+            raise ValueError(
+                "--startup_steps/--startup_output_dir require --startup_diagnostics."
+            )
+        return
+    if args.startup_steps is None:
+        args.startup_steps = 100
+    if not 1 <= args.startup_steps <= MAX_STARTUP_STEPS:
+        raise ValueError(f"--startup_steps must be between 1 and {MAX_STARTUP_STEPS}.")
+    if (
+        args.num_envs != 1
+        or args.eval_episodes != 1
+        or args.reset_profile != "canonical"
+        or args.policy_mode not in ("history_mean", "privileged_mean")
+        or args.command_profile != "translation_only"
+        or args.terrain_family is None
+        or args.difficulty_level is None
+        or args.geometry_variant is None
+        or args.seed is None
+        or args.desired_speed is None
+        or not math.isfinite(args.desired_speed)
+        or args.desired_speed <= 0
+        or args.desired_yaw_rate not in (None, 0.0)
+        or args.action_noise_std is not None
+        or args.action_noise_seed is not None
+        or args.teleop
+        or args.video
+        or args.telemetry
+        or args.screen
+        or args.all_courses
+        or args._course_manifest is not None
+        or args.real_time
+    ):
+        raise ValueError(
+            "--startup_diagnostics requires --num_envs=1 --eval_episodes=1 "
+            "--reset_profile=canonical, a deterministic mean policy, explicit family/level/variant/seed, "
+            "positive speed and translation_only with zero yaw; no video, screen, telemetry, "
+            "teleop, matrix, real-time or action noise."
+        )
+
+
+def _single_environment(value):
+    """Copy one batch row to JSON data; never retain mutable simulator views."""
+    if value.ndim < 1 or value.shape[0] != 1:
+        raise ValueError(
+            "Startup capture requires tensors with exactly one environment."
+        )
+    return value.detach()[0].cpu().tolist()
+
+
+def collect_startup_diagnostics(
+    env,
+    policy,
+    *,
+    max_steps,
+    snapshot_state,
+    latest_step,
+    termination_outcomes,
+    is_running,
+    report,
+) -> None:
+    """Fill a report in place, retaining partial samples if an exception occurs.
+
+    Callers own serialization and environment lifetime. No second inference,
+    observation recomputation, reset, action modification, or RNG draw is made.
+    """
+    import torch
+
+    if env.num_envs != 1 or not 1 <= max_steps <= MAX_STARTUP_STEPS:
+        raise ValueError(
+            "Startup capture requires one environment and a bounded step count."
+        )
+    owner = getattr(policy, "__self__", None)
+    estimator = getattr(getattr(owner, "actor", None), "velocity_estimator", None)
+    if estimator is None:
+        raise ValueError(
+            "Startup capture requires the velocity-estimator teacher's bound mean policy."
+        )
+    estimates = []
+
+    def observe_estimator(_module, _inputs, output):
+        estimates.append(output.detach().clone())
+        # Returning None preserves the module output exactly.
+
+    handle = estimator.register_forward_hook(observe_estimator)
+    report["samples"] = []
+    report["stop_reason"] = "step_limit"
+    try:
+        with torch.inference_mode():
+            obs = env.get_observations()
+            for step in range(max_steps):
+                if not is_running():
+                    report["stop_reason"] = "application_stopped"
+                    break
+                # Serialize pre-state before step() can overwrite shared buffers.
+                pre = {
+                    "observations": {
+                        name: _single_environment(obs[name])
+                        for name in OBSERVATION_GROUPS
+                    },
+                    "state": {
+                        name: _single_environment(value)
+                        for name, value in snapshot_state(env.unwrapped).items()
+                    },
+                }
+                estimates.clear()
+                actions = policy(obs)
+                if len(estimates) != 1 or estimates[0].shape != (1, 3):
+                    raise ValueError(
+                        "Expected exactly one body-velocity estimate of shape (1, 3) per action."
+                    )
+                pre["estimated_velocity_body_m_s"] = _single_environment(estimates[0])
+                action_values = _single_environment(actions)
+                obs, _, dones, _ = env.step(actions)
+                transition = latest_step(env.unwrapped)
+                if transition is None or transition.startup is None:
+                    raise RuntimeError(
+                        "Missing post-physics, pre-reset startup snapshot."
+                    )
+                done_mask = dones.to(dtype=torch.bool)
+                done = bool(done_mask[0].item())
+                report["samples"].append(
+                    {
+                        "step": step,
+                        "time_before_s": step * env.unwrapped.step_dt,
+                        "time_after_s": (step + 1) * env.unwrapped.step_dt,
+                        "pre": pre,
+                        "policy_action": action_values,
+                        "post": {
+                            "state": {
+                                name: _single_environment(value)
+                                for name, value in transition.startup.items()
+                            },
+                            "done": done,
+                            "termination": {
+                                name: bool(_single_environment(value))
+                                for name, value in termination_outcomes(
+                                    env.unwrapped, done_mask
+                                ).items()
+                            },
+                        },
+                    }
+                )
+                if done:
+                    report["stop_reason"] = "episode_terminated"
+                    break
+    except Exception as error:
+        report["stop_reason"] = "error"
+        report["error"] = f"{type(error).__name__}: {error}"
+        raise
+    finally:
+        handle.remove()

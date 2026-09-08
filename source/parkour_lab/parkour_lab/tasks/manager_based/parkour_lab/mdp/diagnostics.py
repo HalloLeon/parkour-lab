@@ -36,6 +36,7 @@ from .commands import (
 from .navigation import geometry, route
 from .navigation.state import TERMINAL_LANDING_PREDICATE_NAMES
 from .phase_diagnostics import CommandPhaseDiagnostics, PHASE_REWARD_TERMS
+from .startup_capture import capture_startup_state, validate_startup_capture
 
 _MIN_GAIT_DIAGNOSTIC_DURATION_S = 0.5
 """Ignore shorter episode fragments in per-episode gait distributions."""
@@ -60,6 +61,7 @@ class EvaluationStep:
     terminal_landing_max_dwell_s: torch.Tensor
     telemetry: dict[str, torch.Tensor] | None = None
     phase_diagnostics: dict[str, torch.Tensor] | None = None
+    startup: dict[str, torch.Tensor] | None = None
 
 
 class TrainingDiagnostics(ManagerTermBase):
@@ -105,6 +107,14 @@ class TrainingDiagnostics(ManagerTermBase):
         )
         self._capture_telemetry = bool(
             cfg.params.get("capture_evaluation_telemetry", False)
+        )
+        self._capture_startup = bool(
+            cfg.params.get("capture_startup_diagnostics", False)
+        )
+        validate_startup_capture(
+            self._capture_startup,
+            capture_evaluation_step=self._capture_evaluation,
+            num_envs=env.num_envs,
         )
         if self._capture_telemetry and not self._capture_evaluation:
             raise ValueError(
@@ -270,6 +280,7 @@ class TrainingDiagnostics(ManagerTermBase):
         torque_clip_tolerance_nm: float,
         capture_evaluation_step: bool = False,
         capture_evaluation_telemetry: bool = False,
+        capture_startup_diagnostics: bool = False,
     ) -> torch.Tensor:
         """Record the current post-physics sample and return zero reward."""
 
@@ -285,6 +296,7 @@ class TrainingDiagnostics(ManagerTermBase):
             torque_clip_tolerance_nm,
             capture_evaluation_step,
             capture_evaluation_telemetry,
+            capture_startup_diagnostics,
         )
 
         self._step_count += 1.0
@@ -661,6 +673,7 @@ class TrainingDiagnostics(ManagerTermBase):
                 if self._capture_telemetry
                 else None
             ),
+            startup=(capture_startup_state(env) if self._capture_startup else None),
         )
 
     def _record_command_phases(

@@ -2,7 +2,7 @@
 # Focused Go2 RMA workflow. Run from the repository root in the Isaac Lab env.
 set -euo pipefail
 
-PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
+PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|startup|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
 PARKOUR_CHECKPOINT="${2:?Pass an explicit checkpoint path}"
 shift 2
 if [[ ! -f "$PARKOUR_CHECKPOINT" ]]; then
@@ -94,6 +94,31 @@ case "$PARKOUR_MODE" in
       agent.algorithm.entropy_coef=0.003 \
       "$@"
     ;;
+  startup)
+    # Compare the first causal inputs on a canonical flat tile and an easy
+    # step. Fresh processes avoid sharing an Isaac stage between geometries.
+    # This is a bounded diagnostic, not an episode-success evaluation.
+    PARKOUR_CHECKPOINT_DIR="$(dirname -- "$PARKOUR_CHECKPOINT")"
+    PARKOUR_STARTUP_DIR="$(mktemp -d "$PARKOUR_CHECKPOINT_DIR/startup_diagnostics_XXXXXX")"
+    echo "Startup diagnostics: $PARKOUR_STARTUP_DIR"
+    for PARKOUR_LEVEL in 0 1; do
+      # The step budget may be overridden; play.py validates its hard bound.
+      # Keep the paired-case settings last so extra arguments cannot silently
+      # turn this comparison into different policies, resets, or checkpoints.
+      python scripts/rsl_rl/play.py --startup_steps=100 "$@" \
+        "${PARKOUR_COMMON[@]}" --headless --livestream=0 \
+        --checkpoint="$PARKOUR_CHECKPOINT" --startup_diagnostics \
+        --num_envs=1 --eval_episodes=1 --reset_profile=canonical --no-screen \
+        --policy_mode=history_mean --geometry_variant=0 \
+        --terrain_family=high_step --difficulty_level="$PARKOUR_LEVEL" \
+        --desired_speed=0.55 --desired_yaw_rate=0 \
+        --command_profile=translation_only \
+        --startup_output_dir="$PARKOUR_STARTUP_DIR/level_$PARKOUR_LEVEL"
+    done
+    python scripts/rsl_rl/startup_report.py \
+      "$PARKOUR_STARTUP_DIR/level_0/startup_diagnostics.json" \
+      "$PARKOUR_STARTUP_DIR/level_1/startup_diagnostics.json"
+    ;;
   check-step)
     # Start with three complete easy high-step episodes, not a full sweep.
     # Append --difficulty_level=6 only after the easy approach/traversal passes.
@@ -142,7 +167,7 @@ case "$PARKOUR_MODE" in
       --terrain_family=tilted_ramps --difficulty_level=0 "$@"
     ;;
   *)
-    echo "Unknown mode: $PARKOUR_MODE (use train, recover, resume, check-step, check-control, check or teleop)." >&2
+    echo "Unknown mode: $PARKOUR_MODE (use train, recover, resume, startup, check-step, check-control, check or teleop)." >&2
     exit 2
     ;;
 esac

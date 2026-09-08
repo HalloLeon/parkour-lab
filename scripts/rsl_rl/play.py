@@ -18,6 +18,7 @@ import tempfile
 import cli_args
 from evaluation_screen import check_metrics_file
 from evaluation_telemetry import EvaluationTelemetry
+from startup_diagnostics import validate_startup_arguments
 
 cli_args.require_runtime_versions()
 
@@ -99,6 +100,22 @@ def _run_isolated_course_matrix(cli_arguments: list[str]) -> None:
 
 # Define evaluation arguments.
 parser = argparse.ArgumentParser(description="Evaluate an RSL-RL checkpoint.")
+parser.add_argument(
+    "--startup_diagnostics",
+    action="store_true",
+    help="Capture bounded first-episode actor inputs and pre-reset physics; no course metrics.",
+)
+parser.add_argument(
+    "--startup_steps",
+    type=cli_args.positive_int,
+    default=None,
+    help="Startup diagnostic step cap (default 100, maximum 500); never shortens ordinary evaluation.",
+)
+parser.add_argument(
+    "--startup_output_dir",
+    default=None,
+    help="New directory for startup_diagnostics.json; existing directories are rejected.",
+)
 parser.add_argument(
     "--teleop",
     action="store_true",
@@ -265,6 +282,10 @@ AppLauncher.add_app_launcher_args(parser)
 # Split recognized CLI options from the remaining Hydra configuration overrides.
 cli_arguments = sys.argv[1:]
 args_cli, hydra_args = parser.parse_known_args()
+try:
+    validate_startup_arguments(args_cli)
+except ValueError as error:
+    parser.error(str(error))
 if args_cli.screen and (
     args_cli.teleop
     or args_cli.video
@@ -510,6 +531,9 @@ class _InterfaceInfo:
 
     # Hash of ``teacher_interface`` used to identify its exact contents.
     teacher_interface_sha256: str
+
+    # Archived checkpoint interface, unlike the runtime hash, is stable across courses.
+    checkpoint_teacher_interface_sha256: str | None = None
 
 
 @dataclass
@@ -1418,10 +1442,134 @@ def _run_requested_action(
 
     agent_cfg = _apply_cli_overrides(env_cfg, agent_cfg)
     checkpoint = _resolve_checkpoint(agent_cfg)
+    if getattr(args_cli, "startup_diagnostics", False):
+        _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint)
+        return
     if args_cli.teleop:
         _run_operator_session(env_cfg, agent_cfg, checkpoint)
         return
     _evaluate_requested_course(env_cfg, agent_cfg, checkpoint)
+
+
+def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
+    """Capture a bounded approach without treating an unfinished episode as a result."""
+    from parkour_lab.tasks.manager_based.parkour_lab.mdp.startup_capture import (
+        capture_startup_state,
+        startup_capture_metadata,
+    )
+    from startup_diagnostics import collect_startup_diagnostics
+    from startup_report import write_startup_report
+
+    family, level, variant, speed, yaw, profile, level_metadata = (
+        _configure_evaluation_course(
+            env_cfg,
+            args_cli.terrain_family,
+            args_cli.difficulty_level,
+            args_cli.desired_speed,
+            args_cli.desired_yaw_rate,
+            args_cli.geometry_variant,
+            args_cli.command_profile,
+        )
+    )
+    if env_cfg.scene.num_envs != 1:
+        raise ValueError("Startup diagnostics require exactly one environment.")
+    diagnostics_cfg = env_cfg.rewards.training_diagnostics
+    if diagnostics_cfg is None or diagnostics_cfg.weight == 0.0:
+        raise ValueError(
+            "Startup diagnostics require a nonzero training_diagnostics term."
+        )
+    diagnostics_cfg.params.update(
+        capture_evaluation_step=True,
+        capture_evaluation_telemetry=False,
+        capture_startup_diagnostics=True,
+    )
+    if args_cli.startup_output_dir is None:
+        directory = tempfile.mkdtemp(
+            prefix=f"startup_{checkpoint.stem}_level_{level}_", dir=checkpoint.log_dir
+        )
+    else:
+        directory = os.path.abspath(args_cli.startup_output_dir)
+        os.makedirs(directory, exist_ok=False)
+    print(f"[INFO] Startup diagnostic directory: {directory}", flush=True)
+    env = _create_evaluation_environment(
+        env_cfg, agent_cfg, _ArtifactInfo(directory, "startup")
+    )
+    try:
+        interface = _validate_teacher_interface(
+            env.unwrapped,
+            env.get_observations(),
+            agent_cfg,
+            checkpoint.path,
+            checkpoint.sha256,
+        )
+        policy, action_noise = _load_inference_policy(
+            env,
+            agent_cfg,
+            checkpoint.path,
+            evaluation_seed=env_cfg.seed,
+        )
+        # configclass.to_dict() gives callable names rather than process-local
+        # repr addresses. Logging paths are provenance, not paired physics.
+        physics = env_cfg.sim.to_dict()
+        physics.pop("log_dir", None)
+        report = {
+            "schema_version": 1,
+            "kind": "startup_diagnostic",
+            "metadata": {
+                "checkpoint": checkpoint.path,
+                "checkpoint_sha256": checkpoint.sha256,
+                "teacher_interface_sha256": interface.checkpoint_teacher_interface_sha256,
+                "runtime_teacher_interface_sha256": interface.teacher_interface_sha256,
+                "runtime_teacher_interface": interface.teacher_interface,
+                "task": args_cli.task,
+                "policy_mode": args_cli.policy_mode,
+                "reset_profile": args_cli.reset_profile,
+                "seed": env_cfg.seed,
+                "terrain_family": family,
+                "difficulty_level": level,
+                "geometry_variant": variant,
+                "desired_speed_m_s": speed,
+                "desired_yaw_rate_rad_s": yaw,
+                "command_profile": profile,
+                "termination_semantics": "Prioritized evaluation outcomes, not simultaneous raw termination flags.",
+                "level_metadata": level_metadata,
+                "step_dt_s": env.unwrapped.step_dt,
+                "max_steps": args_cli.startup_steps,
+                "num_envs": env.num_envs,
+                "capture_metadata": startup_capture_metadata(env.unwrapped),
+                "action_clip": agent_cfg.clip_actions,
+                "action_noise": action_noise,
+                "environment_physics": _to_jsonable(physics),
+                "kit_args": args_cli.kit_args,
+                "evaluation_reward_config": _evaluation_reward_config(
+                    env.unwrapped.reward_manager
+                ),
+                "training_config_provenance": _training_config_provenance(
+                    checkpoint.log_dir
+                ),
+                "purpose": "Bounded diagnostic only; a step limit is not course success or failure.",
+            },
+        }
+        try:
+            collect_startup_diagnostics(
+                env,
+                policy,
+                max_steps=args_cli.startup_steps,
+                snapshot_state=capture_startup_state,
+                latest_step=latest_evaluation_step,
+                termination_outcomes=_read_termination_outcomes,
+                is_running=simulation_app.is_running,
+                report=report,
+            )
+        finally:
+            if "samples" in report:
+                path = write_startup_report(directory, _to_jsonable(report))
+                print(
+                    f"[INFO] Saved {len(report['samples'])} startup steps ({report['stop_reason']}): {path}",
+                    flush=True,
+                )
+    finally:
+        env.close()
 
 
 def _run_operator_session(env_cfg, agent_cfg, checkpoint) -> None:
@@ -2995,7 +3143,11 @@ def _validate_teacher_interface(
             "[WARNING] Evaluation terrain/curriculum provenance differs from the teacher's training domain; "
             "loading is safe, but the result is out-of-distribution."
         )
-    return _InterfaceInfo(teacher_interface, teacher_interface_hash)
+    return _InterfaceInfo(
+        teacher_interface,
+        teacher_interface_hash,
+        interface_sha256(teacher_checkpoint.teacher_interface),
+    )
 
 
 def _write_evaluation_report(artifact_dir: str, report: _EvaluationReport) -> str:
