@@ -2,7 +2,7 @@
 # Focused Go2 RMA workflow. Run from the repository root in the Isaac Lab env.
 set -euo pipefail
 
-PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|startup|check-repair|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
+PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|diagnose|startup|check-repair|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
 PARKOUR_CHECKPOINT="${2:?Pass an explicit checkpoint path}"
 shift 2
 if [[ ! -f "$PARKOUR_CHECKPOINT" ]]; then
@@ -64,6 +64,43 @@ case "$PARKOUR_REWARD_PROFILE" in
 esac
 
 case "$PARKOUR_MODE" in
+  diagnose)
+    # Two bounded first-episode traces, not another training run or success
+    # sweep. Preserve the failed screen's checkpoint, jitter and mean actions.
+    # An optional exact metrics path verifies archived configuration hashes.
+    if (( $# )); then
+      echo "diagnose has fixed capture settings and accepts no extra arguments. Use PARKOUR_DIAGNOSTIC_METRICS for an exact existing metrics.json." >&2
+      exit 2
+    fi
+    PARKOUR_CHECKPOINT_DIR="$(dirname -- "$PARKOUR_CHECKPOINT")"
+    PARKOUR_DIAGNOSTIC_DIR="$(mktemp -d "$PARKOUR_CHECKPOINT_DIR/failure_diagnostics_XXXXXX")"
+    echo "Failure diagnostics: $PARKOUR_DIAGNOSTIC_DIR"
+    PARKOUR_RECIPE_ARGS=(--verify --json)
+    if [[ -n "${PARKOUR_DIAGNOSTIC_METRICS:-}" ]]; then
+      PARKOUR_RECIPE_ARGS+=(--metrics="$PARKOUR_DIAGNOSTIC_METRICS")
+    fi
+    python scripts/rsl_rl/training_recipe_report.py "$PARKOUR_CHECKPOINT" \
+      "${PARKOUR_RECIPE_ARGS[@]}" > "$PARKOUR_DIAGNOSTIC_DIR/training_recipe.json"
+    PARKOUR_CAPTURE=("${PARKOUR_COMMON[@]}" --headless --livestream=0
+      --checkpoint="$PARKOUR_CHECKPOINT" --startup_diagnostics --no-screen
+      --num_envs=1 --eval_episodes=1 --reset_profile=jitter
+      --policy_mode=history_mean --geometry_variant=0 --desired_speed=0.55)
+    python scripts/rsl_rl/play.py "${PARKOUR_CAPTURE[@]}" \
+      --terrain_family=high_step --difficulty_level=6 --desired_yaw_rate=0 \
+      --command_profile=translation_only --startup_steps=100 \
+      --startup_output_dir="$PARKOUR_DIAGNOSTIC_DIR/high_step_L6"
+    python scripts/rsl_rl/play.py "${PARKOUR_CAPTURE[@]}" \
+      --terrain_family=tilted_ramps --difficulty_level=0 --desired_yaw_rate=0.5 \
+      --command_profile=pivot_restart --startup_steps=250 \
+      --startup_output_dir="$PARKOUR_DIAGNOSTIC_DIR/pivot_positive"
+    for PARKOUR_CASE in high_step_L6 pivot_positive; do
+      python scripts/rsl_rl/failure_trace_report.py \
+        "$PARKOUR_DIAGNOSTIC_DIR/$PARKOUR_CASE/startup_diagnostics.json" --json \
+        > "$PARKOUR_DIAGNOSTIC_DIR/$PARKOUR_CASE/trace_summary.json"
+    done
+    echo "Captured at most 350 control steps total; these are failure traces, not an acceptance PASS."
+    echo "Inspect training_recipe.json and both trace_summary.json files under $PARKOUR_DIAGNOSTIC_DIR"
+    ;;
   repair)
     if [[ "$PARKOUR_REWARD_PROFILE" != control ]]; then
       echo "repair requires PARKOUR_REWARD_PROFILE=control (unset it to use the repair default)." >&2
@@ -232,7 +269,7 @@ case "$PARKOUR_MODE" in
       --terrain_family=tilted_ramps --difficulty_level=0 "$@"
     ;;
   *)
-    echo "Unknown mode: $PARKOUR_MODE (use train, recover, resume, repair, startup, check-repair, check-step, check-control, check or teleop)." >&2
+    echo "Unknown mode: $PARKOUR_MODE (use train, recover, resume, repair, diagnose, startup, check-repair, check-step, check-control, check or teleop)." >&2
     exit 2
     ;;
 esac

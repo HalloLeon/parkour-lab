@@ -36,9 +36,10 @@ def validate_startup_arguments(args) -> None:
     if (
         args.num_envs != 1
         or args.eval_episodes != 1
-        or args.reset_profile != "canonical"
+        or args.reset_profile not in ("canonical", "jitter")
         or args.policy_mode not in ("history_mean", "privileged_mean")
-        or args.command_profile != "translation_only"
+        or args.command_profile
+        not in ("translation_only", "stop_restart", "pivot_restart")
         or args.terrain_family is None
         or args.difficulty_level is None
         or args.geometry_variant is None
@@ -46,7 +47,18 @@ def validate_startup_arguments(args) -> None:
         or args.desired_speed is None
         or not math.isfinite(args.desired_speed)
         or args.desired_speed <= 0
-        or args.desired_yaw_rate not in (None, 0.0)
+        or (
+            args.command_profile == "pivot_restart"
+            and (
+                args.desired_yaw_rate is None
+                or not math.isfinite(args.desired_yaw_rate)
+                or args.desired_yaw_rate == 0.0
+            )
+        )
+        or (
+            args.command_profile != "pivot_restart"
+            and args.desired_yaw_rate not in (None, 0.0)
+        )
         or args.action_noise_std is not None
         or args.action_noise_seed is not None
         or args.teleop
@@ -59,8 +71,9 @@ def validate_startup_arguments(args) -> None:
     ):
         raise ValueError(
             "--startup_diagnostics requires --num_envs=1 --eval_episodes=1 "
-            "--reset_profile=canonical, a deterministic mean policy, explicit family/level/variant/seed, "
-            "positive speed and translation_only with zero yaw; no video, screen, telemetry, "
+            "--reset_profile=canonical or jitter, a deterministic mean policy, explicit family/level/variant/seed, "
+            "positive speed and an explicit command profile (pivot_restart needs finite nonzero yaw; "
+            "translation_only/stop_restart need zero yaw); no video, screen, telemetry, "
             "teleop, matrix, real-time or action noise."
         )
 

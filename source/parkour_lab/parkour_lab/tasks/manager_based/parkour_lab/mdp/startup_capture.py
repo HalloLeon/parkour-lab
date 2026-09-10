@@ -106,6 +106,9 @@ def capture_startup_state(env: ManagerBasedRLEnv) -> dict[str, torch.Tensor]:
         # the leading environment dimension used by every other snapshot field.
         "safe_joint_target_limits_rad": safe_limits.unsqueeze(0),
         "foot_position_w_m": data.body_pos_w[:, foot_ids],
+        # body_lin_vel_w is COM velocity in Isaac Lab, whereas body_pos_w is
+        # link-origin position. Use the matching link velocity for this trace.
+        "foot_linear_velocity_w_m_s": data.body_link_lin_vel_w[:, foot_ids],
         "foot_position_env_m": data.body_pos_w[:, foot_ids] - origins.unsqueeze(1),
         "foot_force_w_n": feet_sensor.data.net_forces_w[:, sensor_foot_ids],
         "undesired_contact_force_w_n": env.scene["undesired_contact"].data.net_forces_w,
@@ -162,6 +165,7 @@ def startup_capture_metadata(env: ManagerBasedRLEnv) -> dict:
             "body": "robot root body frame",
             "wxyz": "quaternion scalar first",
             "root_relative_height_m": "root world z minus ray-hit world z; validity mask required",
+            "foot_linear_velocity_w_m_s": "foot rigid-body origin velocity in world axes; not contact-point slip velocity",
             "ray_starts_pattern_m": "RayCaster.ray_starts including configured pattern offset, before world transform",
         },
         "action_semantics": {

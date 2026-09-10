@@ -11,7 +11,13 @@ import hashlib
 import json
 from pathlib import Path
 
-from evaluation_screen import screen_failures
+from evaluation_screen import (
+    OperatorThresholds,
+    add_operator_threshold_arguments,
+    load_command_windows,
+    operator_thresholds_from_args,
+    screen_failures,
+)
 
 
 CASES = {
@@ -22,7 +28,12 @@ CASES = {
 }
 
 
-def inspect_bundle(root: Path, checkpoint_sha256: str, seed: int) -> list[str]:
+def inspect_bundle(
+    root: Path,
+    checkpoint_sha256: str,
+    seed: int,
+    thresholds: OperatorThresholds | None = None,
+) -> list[str]:
     """Reject partial, duplicate, mixed-checkpoint or physically failing bundles."""
     failures = []
     seen = set()
@@ -56,19 +67,8 @@ def inspect_bundle(root: Path, checkpoint_sha256: str, seed: int) -> list[str]:
                 value = report.get(key)
                 if isinstance(value, bool) or value != expected:
                     case_failures.append(f"{key} must be {expected!r}")
-            windows = None
-            if report.get("command_profile") == "pivot_restart":
-                trace = json.loads(
-                    path.with_name("command_windows.json").read_text(encoding="utf-8")
-                )
-                windows = trace["windows"]
-                # The fresh-directory helper produces both files together.
-                # Check counters too, rather than accepting an incomplete trace.
-                if trace["metadata"].get("completed_episode_count") != 3:
-                    case_failures.append(
-                        "command trace must contain three completed episodes"
-                    )
-            case_failures.extend(screen_failures(report, windows))
+            windows = load_command_windows(path, report)
+            case_failures.extend(screen_failures(report, windows, thresholds))
             print(f"[CONTROL SCREEN] {'FAIL' if case_failures else 'PASS'} {case}")
             failures.extend(f"{case}: {failure}" for failure in case_failures)
         except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
@@ -83,11 +83,17 @@ def main() -> int:
     parser.add_argument("root", type=Path)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=42)
+    add_operator_threshold_arguments(parser)
     args = parser.parse_args()
+    try:
+        thresholds = operator_thresholds_from_args(args)
+    except ValueError as error:
+        parser.error(str(error))
+    print(f"Engineering screen thresholds (not stability certification): {thresholds}")
     try:
         with args.checkpoint.open("rb") as stream:
             digest = hashlib.file_digest(stream, "sha256").hexdigest()
-        failures = inspect_bundle(args.root, digest, args.seed)
+        failures = inspect_bundle(args.root, digest, args.seed, thresholds)
     except OSError as error:
         failures = [str(error)]
     for failure in failures:

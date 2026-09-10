@@ -294,13 +294,17 @@ if args_cli.screen and (
     or args_cli.eval_episodes < 3
     or args_cli.policy_mode != "history_mean"
     or args_cli.reset_profile != "jitter"
-    or args_cli.command_profile not in ("translation_only", "stop_restart", "pivot_restart")
-    or (args_cli.command_profile == "pivot_restart" and not args_cli.telemetry)
+    or args_cli.command_profile
+    not in ("translation_only", "stop_restart", "pivot_restart")
+    or (
+        args_cli.command_profile in ("stop_restart", "pivot_restart")
+        and not args_cli.telemetry
+    )
 ):
     parser.error(
         "--screen requires one environment, >=3 history_mean jitter episodes, an explicit "
         "translation_only/stop_restart/pivot_restart profile, no video/teleop/matrix, "
-        "and --telemetry for pivots. Use --no-screen for unrestricted diagnostics."
+        "and --telemetry for stops/pivots. Use --no-screen for unrestricted diagnostics."
     )
 if args_cli.teleop:
     if (
@@ -1452,7 +1456,7 @@ def _run_requested_action(
 
 
 def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
-    """Capture a bounded approach without treating an unfinished episode as a result."""
+    """Capture a bounded approach/control trace, not an episode-success result."""
     from parkour_lab.tasks.manager_based.parkour_lab.mdp.startup_capture import (
         capture_startup_state,
         startup_capture_metadata,
@@ -2642,7 +2646,9 @@ def _update_episode_stop_state(
     state.pivot_start_position_xy.copy_(
         torch.where(
             pivot_rising.unsqueeze(-1),
-            root_position_xy if root_start_position_xy is None else root_start_position_xy,
+            root_position_xy
+            if root_start_position_xy is None
+            else root_start_position_xy,
             state.pivot_start_position_xy,
         )
     )
@@ -2889,7 +2895,9 @@ def _collect_rollout_statistics(
         with torch.inference_mode():
             # Same command-onset anchor as command_windows.json. Clone before
             # stepping: the simulator may mutate asset buffers or auto-reset.
-            root_start_position_xy = base_env.scene["robot"].data.root_pos_w[:, :2].clone()
+            root_start_position_xy = (
+                base_env.scene["robot"].data.root_pos_w[:, :2].clone()
+            )
             if telemetry is not None:
                 # Capture the command actually presented to the actor, before
                 # commands or route cursors advance inside env.step().

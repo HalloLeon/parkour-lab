@@ -110,8 +110,10 @@ def validate_startup_report(
     ):
         if type(meta[key]) is not int or meta[key] < 0:
             raise ValueError(f"metadata.{key}: expected a nonnegative integer")
-    if meta["num_envs"] != 1 or meta["max_steps"] < 1:
-        raise ValueError("startup diagnostics require num_envs=1 and max_steps >= 1")
+    if meta["num_envs"] != 1 or not 1 <= meta["max_steps"] <= 500:
+        raise ValueError(
+            "startup diagnostics require num_envs=1 and max_steps in [1, 500]"
+        )
     for key in ("desired_speed_m_s", "desired_yaw_rate_rad_s", "step_dt_s"):
         if not _finite_number(meta[key]):
             raise ValueError(f"metadata.{key}: expected a finite number")
@@ -226,7 +228,7 @@ def _trace_info(report: dict) -> dict:
 
 
 def compare_startup_reports(left: dict, right: dict, atol: float = 1e-5) -> dict:
-    """Compare initial actor inputs/actions in a controlled canonical L0/L1 pair.
+    """Compare initial actor inputs/actions in a controlled canonical flat/obstacle pair.
 
     Returns JSON-safe evidence. Invalid artifacts or incompatible configurations
     cannot produce MATCH, even when their vectors happen to be identical.
@@ -264,8 +266,11 @@ def compare_startup_reports(left: dict, right: dict, atol: float = 1e-5) -> dict
         result["errors"].append(
             "startup parity requires deterministic history_mean or privileged_mean"
         )
-    if {lm["difficulty_level"], rm["difficulty_level"]} != {0, 1}:
-        result["errors"].append("compare exactly one level-0 and one level-1 trace")
+    levels = {lm["difficulty_level"], rm["difficulty_level"]}
+    if len(levels) != 2 or 0 not in levels:
+        result["errors"].append(
+            "compare exactly one level-0 and one positive-level trace"
+        )
     for key in (
         "command_profile",
         "capture_metadata",
@@ -342,7 +347,7 @@ def main() -> int:
     parser.add_argument(
         "left",
         type=Path,
-        help="Exact level-0 or level-1 startup_diagnostics.json path.",
+        help="Exact flat or obstacle startup_diagnostics.json path (one must be level 0).",
     )
     parser.add_argument(
         "right", type=Path, help="Exact other-level startup_diagnostics.json path."
