@@ -5,6 +5,8 @@
 
 """Active-waypoint task rewards."""
 
+import math
+
 import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
@@ -251,6 +253,55 @@ def off_route_failure(env: ManagerBasedRLEnv) -> torch.Tensor:
     return env.termination_manager.get_term("off_route").float() / float(env.step_dt)
 
 
+def pivot_yaw_tracking_score(
+    achieved_yaw_rate: torch.Tensor,
+    target_yaw_rate: torch.Tensor,
+    *,
+    yaw_rate_std: float = 0.5,
+    objective: str = "exponential",
+    overspeed_weight: float = 1.0,
+) -> torch.Tensor:
+    """Pure yaw credit shared by the reward and its diagnostic decomposition.
+
+    ``exponential`` preserves the established kernel exactly. The opt-in
+    ``signed_progress`` scores the achieved/commanded yaw ratio: zero at stall,
+    negative for the wrong sign, and at most one at the requested rate. Above
+    that rate, a continuous quadratic cost penalizes overspeed. The normalized
+    excess is capped at four only as a numerical guard, so the score lies in
+    ``[min(-1, 1 - 16 * overspeed_weight), 1]``. Invalid or effectively zero
+    commands and nonfinite measurements earn no signed-progress credit.
+
+    No environment state is read or changed; outer reward weights and the
+    separate planar/rocking costs are deliberately not applied here.
+    """
+    if not math.isfinite(yaw_rate_std) or yaw_rate_std <= 0.0:
+        raise ValueError("pivot yaw standard deviation must be finite and positive.")
+    if not math.isfinite(overspeed_weight) or overspeed_weight <= 0.0:
+        raise ValueError("pivot yaw overspeed weight must be finite and positive.")
+    if objective == "exponential":
+        return torch.exp(
+            -(achieved_yaw_rate - target_yaw_rate).square() / yaw_rate_std**2
+        )
+    if objective != "signed_progress":
+        raise ValueError("pivot yaw objective must be 'exponential' or 'signed_progress'.")
+    if overspeed_weight > torch.finfo(achieved_yaw_rate.dtype).max / 32.0:
+        raise ValueError("pivot yaw overspeed weight is too large for the tensor dtype.")
+
+    command_magnitude = target_yaw_rate.abs()
+    valid_command = torch.isfinite(target_yaw_rate) & (
+        command_magnitude > torch.finfo(target_yaw_rate.dtype).eps
+    )
+    safe_command = torch.where(
+        valid_command, command_magnitude, torch.ones_like(command_magnitude)
+    )
+    ratio = achieved_yaw_rate * target_yaw_rate.sign() / safe_command
+    # Bounds also handle floating-point overflow in otherwise finite inputs.
+    ratio = torch.nan_to_num(ratio, nan=0.0, posinf=5.0, neginf=-1.0).clamp(-1.0, 5.0)
+    score = ratio.clamp(max=1.0) - overspeed_weight * torch.relu(ratio - 1.0).square()
+    valid = valid_command & torch.isfinite(achieved_yaw_rate)
+    return torch.where(valid, score, torch.zeros_like(score))
+
+
 def stationary_velocity_tracking_exp(
     env: ManagerBasedRLEnv,
     planar_speed_std: float = 0.15,
@@ -259,20 +310,24 @@ def stationary_velocity_tracking_exp(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     pivot_stability_weight: float = 0.1,
     pivot_yaw_tracking_weight: float = 1.0,
+    pivot_yaw_objective: str = "exponential",
+    pivot_yaw_overspeed_weight: float = 1.0,
 ) -> torch.Tensor:
     """Track quiet stops and sustained pivots whenever translation is zero.
 
     Stops retain the joint quiet-body kernel. Pivots score yaw independently:
     the stepping motion needed to turn must not suppress the yaw-tracking
     signal. Planar motion and roll/pitch rates each incur a bounded additive
-    cost, keeping the pivot score in
-    ``[-2 * pivot_stability_weight, pivot_yaw_tracking_weight]``. The yaw
-    weight changes neither these costs nor the stop score.
+    cost. The default exponential yaw objective keeps the pivot score in
+    ``[-2 * pivot_stability_weight, pivot_yaw_tracking_weight]``; the opt-in
+    signed-progress objective additionally prices reverse yaw and overspeed.
+    Neither yaw objective nor yaw weight changes these costs or the stop score.
     """
 
     target_yaw_rate = get_target_yaw_rate(env)
     planar_speed_sq = torch.sum(robot._root_lin_vel_xy(env, asset_cfg).square(), dim=-1)
-    yaw_rate_error_sq = (robot._root_ang_vel_z(env, asset_cfg) - target_yaw_rate).square()
+    achieved_yaw_rate = robot._root_ang_vel_z(env, asset_cfg)
+    yaw_rate_error_sq = (achieved_yaw_rate - target_yaw_rate).square()
     roll_pitch_rate_sq = torch.sum(
         robot._root_ang_vel_xy(env, asset_cfg).square(), dim=-1
     )
@@ -284,7 +339,14 @@ def stationary_velocity_tracking_exp(
     planar_motion_cost = 1.0 - torch.exp(-planar_speed_sq / planar_speed_std**2)
     rocking_cost = 1.0 - torch.exp(-roll_pitch_rate_sq / roll_pitch_rate_std**2)
     pivot_score = (
-        pivot_yaw_tracking_weight * torch.exp(-yaw_rate_error_sq / yaw_rate_std**2)
+        pivot_yaw_tracking_weight
+        * pivot_yaw_tracking_score(
+            achieved_yaw_rate,
+            target_yaw_rate,
+            yaw_rate_std=yaw_rate_std,
+            objective=pivot_yaw_objective,
+            overspeed_weight=pivot_yaw_overspeed_weight,
+        )
         - pivot_stability_weight * (planar_motion_cost + rocking_cost)
     )
     score = torch.where(target_yaw_rate.ne(0), pivot_score, stop_score)

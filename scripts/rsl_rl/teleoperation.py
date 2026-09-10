@@ -34,8 +34,14 @@ class OperatorCommand:
     """Testable forward/stop/pivot interlock, independent of Kit and PyTorch.
 
     R arms a new episode. Shift is a hold-to-run deadman. Loss of focus,
-    a stalled producer, X, or an episode end requires a new R/reset.
-    This is a command safeguard, not a guarantee of physical stopping.
+    a stalled producer, stale motion-key events, X, or an episode end requires
+    a new R/reset. Only actual input callbacks renew the input lease, never
+    polling the cached key state. A new direction press has bounded grace for
+    the initial repeat delay; real repeats then use the shorter input lease.
+    This best-effort keyboard liveness is not a transport-level heartbeat: a
+    client that does not deliver repeats fails closed, and a provider that
+    synthesizes them after disconnect cannot certify client presence.
+    This is a simulation command safeguard, not a guarantee of physical stopping.
     """
 
     def __init__(
@@ -43,37 +49,121 @@ class OperatorCommand:
         speed: float = 0.55,
         yaw_rate: float = 0.5,
         timeout_s: float = 0.25,
+        input_timeout_s: float = 0.25,
+        initial_input_grace_s: float = 0.75,
         control_dt: float = 0.02,
     ):
-        if not all(math.isfinite(v) for v in (speed, yaw_rate, timeout_s, control_dt)):
+        if not all(
+            math.isfinite(v)
+            for v in (
+                speed,
+                yaw_rate,
+                timeout_s,
+                input_timeout_s,
+                initial_input_grace_s,
+                control_dt,
+            )
+        ):
             raise ValueError("Operator limits must be finite.")
         if (
-            not 0.05 < speed <= 0.7
-            or not 0.05 < yaw_rate <= 0.8
-            or min(timeout_s, control_dt) <= 0
+            not 0.45 <= speed <= 0.7
+            or not 0.25 <= yaw_rate <= 0.8
+            or timeout_s <= 0
+            or control_dt <= 0
         ):
             raise ValueError(
-                "Operator limits must remain inside the trained command range."
+                "Operator commands require speed in [0.45, 0.7] m/s and yaw rate "
+                "in [0.25, 0.8] rad/s, with positive timeout and control timestep."
+            )
+        if not 0 < input_timeout_s <= initial_input_grace_s <= 1.0:
+            raise ValueError(
+                "Keyboard leases require 0 < input timeout <= initial grace <= 1 second."
             )
         self.speed = speed
         self.yaw_rate = yaw_rate
         self.timeout_s = timeout_s
+        self.input_timeout_s = input_timeout_s
+        self.initial_input_grace_s = initial_input_grace_s
         self.control_dt = control_dt
         self.keys: set[str] = set()
         self.latched = True
         self._last_time: float | None = None
+        self._last_motion_input_time: float | None = None
+        self._motion_input_deadline: float | None = None
         self._speed = 0.0
+        self._yaw_rate = 0.0
+        self._pivot_direction: str | None = None
+        self._pivot_braking_elapsed_s: float | None = None
+        self._pivot_active = False
+
+    def _clear_pivot(self) -> None:
+        """Return the braking/pivot state machine to its idle state."""
+        self._pivot_direction = None
+        self._pivot_braking_elapsed_s = None
+        self._pivot_active = False
         self._yaw_rate = 0.0
 
     def stop(self) -> None:
         self.latched = True
         self.keys.clear()
+        self._last_motion_input_time = None
+        self._motion_input_deadline = None
         self._speed = self._yaw_rate = 0.0
+        self._clear_pivot()
 
     def reset(self, now: float) -> None:
         self.stop()
-        self.latched = False
+        self.latched = not math.isfinite(now)
         self._last_time = now
+
+    def key_event(
+        self,
+        key: str,
+        now: float,
+        *,
+        pressed: bool,
+        repeat: bool = False,
+        shift_held: bool = False,
+    ) -> None:
+        """Consume a real press/release/repeat; repeats cannot arm stale keys.
+
+        The event's modifier state confirms the deadman on every direction
+        refresh. A lost Shift release therefore cannot be hidden by subsequent
+        arrow repeats. Unrelated key traffic never renews the motion lease.
+        """
+        if not math.isfinite(now) or (
+            self._last_motion_input_time is not None
+            and (
+                now < self._last_motion_input_time or now > self._motion_input_deadline
+            )
+        ):
+            self.stop()
+            return
+        if not pressed:
+            self.keys.discard(key)
+            if key in {"UP", "LEFT", "RIGHT", "LEFT_SHIFT"}:
+                self._clear_pivot()
+            if not self.keys & {"UP", "LEFT", "RIGHT"}:
+                self._last_motion_input_time = None
+                self._motion_input_deadline = None
+            return
+        if self.latched or (repeat and key not in self.keys):
+            return
+        new_press = key not in self.keys
+        self.keys.add(key)
+        if new_press and key in {"UP", "LEFT", "RIGHT"}:
+            self._clear_pivot()
+        if key in {"UP", "LEFT", "RIGHT"}:
+            if not shift_held:
+                self.keys.discard("LEFT_SHIFT")
+                self._speed = self._yaw_rate = 0.0
+                self._clear_pivot()
+                return
+            if new_press or repeat:
+                self._last_motion_input_time = now
+                self._motion_input_deadline = now + (
+                    self.initial_input_grace_s if new_press else self.input_timeout_s
+                )
 
     def command(
         self, now: float, *, focused: bool, planar_speed: float
@@ -84,14 +174,20 @@ class OperatorCommand:
             not focused
             or not math.isfinite(now)
             or not math.isfinite(planar_speed)
+            or planar_speed < 0.0
             or dt < 0
             or dt > self.timeout_s
         ):
             self.stop()
         directions = self.keys & {"UP", "LEFT", "RIGHT"}
-        # A slow GUI must not accelerate the requested motion faster per
-        # physics step. Wall time above is only the producer watchdog.
-        ramp_dt = min(dt, self.control_dt)
+        if len(directions) > 1:
+            self.stop()
+        if directions and (
+            self._last_motion_input_time is None
+            or now - self._last_motion_input_time < 0.0
+            or now > self._motion_input_deadline
+        ):
+            self.stop()
         if (
             self.latched
             or "LEFT_SHIFT" not in self.keys
@@ -99,26 +195,51 @@ class OperatorCommand:
             or len(directions) != 1
         ):
             self._speed = self._yaw_rate = 0.0
+            self._clear_pivot()
             return 0.0, 0.0
         if "UP" in directions:
-            self._yaw_rate = 0.0
-            self._speed = min(self.speed, self._speed + 0.8 * ramp_dt)
+            self._clear_pivot()
+            # Match the trained command steps. A command ramp through positive
+            # sub-minimum speeds is not an actuator rate limiter and introduces
+            # a deployment-only command distribution.
+            self._speed = self.speed
         else:
             self._speed = 0.0
-            # Brake before rotating; do not turn a translation request into
-            # an untrained combined command while the body is still moving.
-            target = (
-                (self.yaw_rate if "LEFT" in directions else -self.yaw_rate)
-                if planar_speed <= 0.15
-                else 0.0
+            self._yaw_rate = self._pivot_command(
+                next(iter(directions)), planar_speed, dt
             )
-            if target == 0.0 or target * self._yaw_rate < 0.0:
-                self._yaw_rate = 0.0
-            else:
-                self._yaw_rate += max(
-                    -1.5 * ramp_dt, min(1.5 * ramp_dt, target - self._yaw_rate)
-                )
         return self._speed, self._yaw_rate
+
+    def _pivot_command(self, direction: str, planar_speed: float, dt: float) -> float:
+        """Brake, establish a quiet interval, then hold one nonchattering pivot.
+
+        Entry requires speed <=0.15 m/s for 0.10 s of observed control steps.
+        Wall-clock delays cannot fill this dwell faster than physics advances.
+        Once active, ordinary stepping between 0.15 and 0.25 m/s does not toggle
+        yaw off/on. Exceeding 0.25 m/s during the pivot is an abort that latches
+        stop, requiring R.
+        Any release, new direction, translation, or reset clears this state.
+        These speed checks do not certify stable terrain or body attitude.
+        """
+        if direction != self._pivot_direction:
+            self._clear_pivot()
+            self._pivot_direction = direction
+        if self._pivot_active:
+            if planar_speed > 0.25:
+                self.stop()
+                return 0.0
+            return self.yaw_rate if direction == "LEFT" else -self.yaw_rate
+        if planar_speed > 0.15:
+            self._pivot_braking_elapsed_s = None
+            return 0.0
+        if self._pivot_braking_elapsed_s is None:
+            self._pivot_braking_elapsed_s = 0.0
+            return 0.0
+        self._pivot_braking_elapsed_s += min(dt, self.control_dt)
+        if self._pivot_braking_elapsed_s < 0.10 - 1.0e-9:
+            return 0.0
+        self._pivot_active = True
+        return self.yaw_rate if direction == "LEFT" else -self.yaw_rate
 
 
 def run_keyboard_control(
@@ -143,7 +264,9 @@ def run_keyboard_control(
     def on_key(event, *_):
         nonlocal reset_requested, quit_requested
         key = event.input.name
-        if event.type == carb.input.KeyboardEventType.KEY_PRESS:
+        pressed = event.type == carb.input.KeyboardEventType.KEY_PRESS
+        repeated = event.type == carb.input.KeyboardEventType.KEY_REPEAT
+        if pressed:
             if key == "R":
                 reset_requested = True
             elif key == "X":
@@ -153,10 +276,20 @@ def run_keyboard_control(
                 reset_requested = False
                 control.stop()
                 quit_requested = True
-            else:
-                control.keys.add(key)
-        elif event.type == carb.input.KeyboardEventType.KEY_RELEASE:
-            control.keys.discard(key)
+        if key not in {"R", "X", "ESCAPE"} and (
+            pressed
+            or repeated
+            or event.type == carb.input.KeyboardEventType.KEY_RELEASE
+        ):
+            # Carbonite's documented KeyboardModifierFlags defines Shift as
+            # bit zero. Missing modifier metadata cannot certify the deadman.
+            control.key_event(
+                key,
+                time.monotonic(),
+                pressed=pressed or repeated,
+                repeat=repeated,
+                shift_held=bool(getattr(event, "modifiers", 0) & 1),
+            )
         return True
 
     def on_focus_change(_event):
@@ -179,7 +312,13 @@ def run_keyboard_control(
         "[TELEOP] R: reset/arm; hold LEFT SHIFT + UP: forward; SHIFT + LEFT/RIGHT: pivot; DOWN: stop; X: latch stop; ESC: exit."
     )
     print(
-        "[TELEOP] Release Shift to stop. Conflicting arrows stop. Focus loss/stall/episode end requires R. Pivots only on stable ground."
+        "[TELEOP] Release Shift to stop. Conflicting arrows, focus loss, expired input, server stalls >0.25s or episode end latch stop and require R, then fresh keys. Brake-before-pivot; operator must choose stable ground."
+    )
+    print(
+        "[TELEOP] Fresh direction presses allow 0.75s for initial repeat, then real repeats renew a 0.25s input lease with Shift held. Non-repeating streams fail closed. This is best-effort keyboard liveness, not certified network connectivity; client repeat delivery must be verified. Commands use trained fixed amplitudes."
+    )
+    print(
+        "[TELEOP] Pivot entry waits for planar speed <=0.15 m/s for 0.10s of observed control steps; an active pivot aborts above 0.25 m/s and requires R. The operator must choose stable ground."
     )
     try:
         with torch.inference_mode():
@@ -201,7 +340,9 @@ def run_keyboard_control(
                     env.reset()
                     control.reset(time.monotonic())
                     reset_requested = False
-                velocity = base_env.scene["robot"].data.root_lin_vel_b[0, :2]
+                # Match the gravity-aligned planar speed used by evaluation;
+                # body-frame XY would change this interlock when the base tilts.
+                velocity = base_env.scene["robot"].data.root_lin_vel_w[0, :2]
                 forward, yaw = control.command(
                     time.monotonic(),
                     focused=focused,

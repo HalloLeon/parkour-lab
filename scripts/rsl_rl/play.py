@@ -125,13 +125,13 @@ parser.add_argument(
     "--teleop_speed",
     type=float,
     default=0.55,
-    help="Forward keyboard speed, in (0.05, 0.70] m/s.",
+    help="Forward keyboard speed, in [0.45, 0.70] m/s (trained obstacle range).",
 )
 parser.add_argument(
     "--teleop_yaw_rate",
     type=float,
     default=0.5,
-    help="Keyboard pivot magnitude, in (0.05, 0.80] rad/s.",
+    help="Keyboard pivot magnitude, in [0.25, 0.80] rad/s (trained pivot range).",
 )
 parser.add_argument(
     "--video", action="store_true", default=False, help="Record an evaluation video."
@@ -1383,7 +1383,7 @@ class _RolloutResult:
         """State evaluator-only stop metric thresholds and eligibility."""
 
         return {
-            "schema_version": 2,
+            "schema_version": 3,
             "transition": "translation_to_zero_speed_and_zero_yaw_to_translation",
             "pivot_commands_excluded": True,
             "sampling": "post_physics_pre_reset_including_terminal",
@@ -1403,7 +1403,7 @@ class _RolloutResult:
                 "completed_episodes_containing_a_stop_to_move_transition"
             ),
             "pivot_excursion_semantics": (
-                "maximum_root_xy_excursion_from_pivot_onset_per_episode"
+                "maximum_root_xy_excursion_from_pre_action_pivot_onset_during_pivot_only"
             ),
             "fixed_pivot_window_duration_s": EVALUATION_PIVOT_WINDOW_DURATION_S,
             "pivot_yaw_rate_error_sampling": (
@@ -2494,6 +2494,7 @@ def _update_episode_stop_state(
     abs_yaw_rate_rad_s: torch.Tensor,
     root_position_xy: torch.Tensor,
     step_dt: float,
+    root_start_position_xy: torch.Tensor | None = None,
 ) -> None:
     """Advance evaluator-only stop settling, drift, and restart state."""
 
@@ -2641,7 +2642,7 @@ def _update_episode_stop_state(
     state.pivot_start_position_xy.copy_(
         torch.where(
             pivot_rising.unsqueeze(-1),
-            root_position_xy,
+            root_position_xy if root_start_position_xy is None else root_start_position_xy,
             state.pivot_start_position_xy,
         )
     )
@@ -2650,7 +2651,7 @@ def _update_episode_stop_state(
     )
     state.pivot_excursion_maxima.copy_(
         torch.where(
-            pivoting | state.previous_pivoting,
+            pivoting,
             torch.maximum(state.pivot_excursion_maxima, pivot_excursion),
             state.pivot_excursion_maxima,
         )
@@ -2886,6 +2887,9 @@ def _collect_rollout_statistics(
     ):
         start_time = time.time()
         with torch.inference_mode():
+            # Same command-onset anchor as command_windows.json. Clone before
+            # stepping: the simulator may mutate asset buffers or auto-reset.
+            root_start_position_xy = base_env.scene["robot"].data.root_pos_w[:, :2].clone()
             if telemetry is not None:
                 # Capture the command actually presented to the actor, before
                 # commands or route cursors advance inside env.step().
@@ -2917,6 +2921,7 @@ def _collect_rollout_statistics(
                 step_metrics["abs_yaw_rate_rad_s"],
                 transition.root_position_xy,
                 step_dt,
+                root_start_position_xy=root_start_position_xy,
             )
             _update_episode_foot_gait(
                 episode_foot_gait,

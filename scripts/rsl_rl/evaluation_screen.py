@@ -76,6 +76,9 @@ def screen_failures(report: dict, windows: list[dict] | None = None) -> list[str
             failures.append(label + "pivot did not finish before restart")
             continue
         bounded(window, "duration_s", 1.9, math.inf, label)
+        # Window telemetry anchors before the first pivot action, including
+        # its braking displacement. Older summary metrics started one step late.
+        bounded(window, "max_planar_excursion_m", 0, 0.15, label)
         tracking = window.get("post_acquisition_world_yaw_rate_tracking") or {}
         bounded(tracking, "excluded_initial_s", 0.5, 0.5, label)
         bounded(tracking, "sample_count", 1, math.inf, label)

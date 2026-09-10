@@ -36,6 +36,7 @@ from .commands import (
 from .navigation import geometry, route
 from .navigation.state import TERMINAL_LANDING_PREDICATE_NAMES
 from .phase_diagnostics import CommandPhaseDiagnostics, PHASE_REWARD_TERMS
+from .reward_terms.waypoint import pivot_yaw_tracking_score
 from .startup_capture import capture_startup_state, validate_startup_capture
 
 _MIN_GAIT_DIAGNOSTIC_DURATION_S = 0.5
@@ -696,17 +697,18 @@ class TrainingDiagnostics(ManagerTermBase):
         name = "stationary_velocity_tracking"
         if name in self._evaluation_reward_slots:
             cfg = env.reward_manager.get_term_cfg(name)
-            # This component is stateless and mirrors the independent yaw
-            # kernel. Subtraction recovers its local stability cost exactly
-            # from the cached combined score (including the outer weight).
+            # Share the actual stateless yaw objective. Subtraction recovers
+            # its local stability cost from the cached combined reward,
+            # including the outer weight, without rerunning reward terms.
             pivot_yaw = (
                 float(cfg.weight)
                 * float(cfg.params.get("pivot_yaw_tracking_weight", 1.0))
-                * torch.exp(
-                    -(
-                        (achieved_yaw - target_yaw)
-                        / float(cfg.params.get("yaw_rate_std", 0.5))
-                    ).square()
+                * pivot_yaw_tracking_score(
+                    achieved_yaw,
+                    target_yaw,
+                    yaw_rate_std=float(cfg.params.get("yaw_rate_std", 0.5)),
+                    objective=cfg.params.get("pivot_yaw_objective", "exponential"),
+                    overspeed_weight=float(cfg.params.get("pivot_yaw_overspeed_weight", 1.0)),
                 )
             )
         pivot = target_speed.eq(0) & target_yaw.ne(0)

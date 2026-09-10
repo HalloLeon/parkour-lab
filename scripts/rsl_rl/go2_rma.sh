@@ -2,7 +2,7 @@
 # Focused Go2 RMA workflow. Run from the repository root in the Isaac Lab env.
 set -euo pipefail
 
-PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|startup|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
+PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|startup|check-repair|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
 PARKOUR_CHECKPOINT="${2:?Pass an explicit checkpoint path}"
 shift 2
 if [[ ! -f "$PARKOUR_CHECKPOINT" ]]; then
@@ -16,13 +16,23 @@ PARKOUR_COMMON=(
   '--kit_args=--/physics/collisionApproximateCylinders=true'
 )
 
-# One objective change per experiment. The resolved scalar weights/parameters
-# are archived in env.yaml and evaluation_reward_config by the existing entrypoints.
-PARKOUR_REWARD_PROFILE="${PARKOUR_REWARD_PROFILE:-baseline}"
+# Isolated reward ablations, plus an explicitly combined control repair. Resolved
+# weights/parameters are archived in env.yaml and evaluation_reward_config.
+PARKOUR_DEFAULT_PROFILE=baseline
+if [[ "$PARKOUR_MODE" == repair ]]; then
+  PARKOUR_DEFAULT_PROFILE=control
+fi
+PARKOUR_REWARD_PROFILE="${PARKOUR_REWARD_PROFILE:-$PARKOUR_DEFAULT_PROFILE}"
 case "$PARKOUR_REWARD_PROFILE" in
   baseline) ;; # Existing objective, with the signed-progress bug corrected.
   stationary)
     PARKOUR_COMMON+=(env.rewards.stationary_planar_motion.weight=-0.5)
+    ;;
+  control)
+    PARKOUR_COMMON+=(
+      env.rewards.stationary_velocity_tracking.params.pivot_yaw_objective=signed_progress
+      env.rewards.stationary_velocity_tracking.params.pivot_yaw_overspeed_weight=1.0
+      env.rewards.stationary_planar_motion.weight=-0.5)
     ;;
   support)
     PARKOUR_COMMON+=(
@@ -48,12 +58,67 @@ case "$PARKOUR_REWARD_PROFILE" in
       env.rewards.physical_failure.weight=-10.0)
     ;;
   *)
-    echo "Unknown PARKOUR_REWARD_PROFILE: $PARKOUR_REWARD_PROFILE (use baseline, stationary, support, vertical, corridor or failure)." >&2
+    echo "Unknown PARKOUR_REWARD_PROFILE: $PARKOUR_REWARD_PROFILE (use baseline, control, stationary, support, vertical, corridor or failure)." >&2
     exit 2
     ;;
 esac
 
 case "$PARKOUR_MODE" in
+  repair)
+    if [[ "$PARKOUR_REWARD_PROFILE" != control ]]; then
+      echo "repair requires PARKOUR_REWARD_PROFILE=control (unset it to use the repair default)." >&2
+      exit 2
+    fi
+    # Bounded v21 continuation, not a new architecture/warm start. Keep saved
+    # optimizer, curriculum frontiers, entropy and exploration schedules. Jitter
+    # covers the failing startup distribution; longer, more frequent pivots and
+    # on-policy history rollouts cover sustained operator control. This is a
+    # combined repair, not a causal single-variable ablation.
+    python scripts/rsl_rl/train.py "${PARKOUR_COMMON[@]}" \
+      --resume --checkpoint="$PARKOUR_CHECKPOINT" \
+      --run_name=go2_rma_control_repair --max_iterations=100 --num_envs=4096 \
+      --domain_randomization_stage=off --reset_profile=jitter --logger=tensorboard \
+      env.commands.intent.pivot_window_probability=0.30 \
+      'env.commands.intent.pivot_window_range_s=[2.0,4.0]' \
+      agent.algorithm.history_rollout_interval=4 \
+      agent.algorithm.learning_rate=0.0001 \
+      agent.algorithm.max_learning_rate=0.0001 \
+      "$@" --headless --livestream=0
+    ;;
+  check-repair)
+    # Four fixed history-mean cases, three complete episodes each. Collect all
+    # behavioral failures, then fail the aggregate gate. No GUI/video startup.
+    for PARKOUR_ARG in "$@"; do
+      case "$PARKOUR_ARG" in
+        --video|--video=*|--video_length*|--teleop*|--startup*|--enable_cameras*|--domain_randomization_stage*)
+          echo "check-repair is a fixed metrics-only screen; incompatible argument: $PARKOUR_ARG" >&2
+          exit 2
+          ;;
+      esac
+    done
+    PARKOUR_CHECKPOINT_DIR="$(dirname -- "$PARKOUR_CHECKPOINT")"
+    PARKOUR_REPAIR_DIR="$(mktemp -d "$PARKOUR_CHECKPOINT_DIR/control_screen_XXXXXX")"
+    PARKOUR_EVAL_SEED="${PARKOUR_EVAL_SEED:-42}"
+    echo "Control screen artifacts: $PARKOUR_REPAIR_DIR"
+    PARKOUR_EVAL=("${PARKOUR_COMMON[@]}"
+      --headless --livestream=0 --checkpoint="$PARKOUR_CHECKPOINT"
+      --num_envs=1 --eval_episodes=3 --reset_profile=jitter --no-screen
+      --policy_mode=history_mean --geometry_variant=0 --seed="$PARKOUR_EVAL_SEED"
+      --video_output_dir="$PARKOUR_REPAIR_DIR")
+    python scripts/rsl_rl/play.py "$@" "${PARKOUR_EVAL[@]}" \
+      --terrain_family=high_step --difficulty_level=6 --desired_speed=0.55 \
+      --command_profile=translation_only --desired_yaw_rate=0
+    python scripts/rsl_rl/play.py "$@" "${PARKOUR_EVAL[@]}" \
+      --terrain_family=tilted_ramps --difficulty_level=0 --desired_speed=0.55 \
+      --command_profile=stop_restart --desired_yaw_rate=0 --telemetry
+    for PARKOUR_YAW in -0.5 0.5; do
+      python scripts/rsl_rl/play.py "$@" "${PARKOUR_EVAL[@]}" \
+        --terrain_family=tilted_ramps --difficulty_level=0 --desired_speed=0.55 \
+        --command_profile=pivot_restart --desired_yaw_rate="$PARKOUR_YAW" --telemetry
+    done
+    python scripts/rsl_rl/control_repair_report.py "$PARKOUR_REPAIR_DIR" \
+      --checkpoint="$PARKOUR_CHECKPOINT" --seed="$PARKOUR_EVAL_SEED"
+    ;;
   train)
     python scripts/rsl_rl/train.py "${PARKOUR_COMMON[@]}" \
       --headless --livestream=0 \
@@ -167,7 +232,7 @@ case "$PARKOUR_MODE" in
       --terrain_family=tilted_ramps --difficulty_level=0 "$@"
     ;;
   *)
-    echo "Unknown mode: $PARKOUR_MODE (use train, recover, resume, startup, check-step, check-control, check or teleop)." >&2
+    echo "Unknown mode: $PARKOUR_MODE (use train, recover, resume, repair, startup, check-repair, check-step, check-control, check or teleop)." >&2
     exit 2
     ;;
 esac

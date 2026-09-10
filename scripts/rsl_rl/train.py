@@ -8,10 +8,12 @@
 # Launch Isaac Sim before importing modules that depend on it.
 
 import argparse
+import math
 import os
 import subprocess
 
 import cli_args
+from run_provenance import write_run_provenance
 
 cli_args.require_runtime_versions()
 
@@ -313,6 +315,10 @@ class ParkourOnPolicyRunner(OnPolicyRunner):
         checkpoint_infos = dict(infos or {})
         term = _parkour_curriculum_term(self.env.unwrapped)
         checkpoint_infos[_CURRICULUM_STATE_KEY] = term.state_dict()
+        # Always attribute a new checkpoint to this run, not its resume source.
+        provenance = getattr(self, "run_provenance", None)
+        if provenance is not None:
+            checkpoint_infos["run_provenance"] = provenance
         super().save(path, checkpoint_infos)
 
     def load(
@@ -321,7 +327,7 @@ class ParkourOnPolicyRunner(OnPolicyRunner):
         load_optimizer: bool = True,
         map_location: str | None = None,
     ) -> dict:
-        """Restore a checkpoint and RSL-RL's Python-side adaptive LR state."""
+        """Restore adaptive LR state without exceeding the configured resume cap."""
 
         infos = super().load(
             path,
@@ -329,7 +335,21 @@ class ParkourOnPolicyRunner(OnPolicyRunner):
             map_location=map_location,
         )
         if load_optimizer:
-            self.alg.learning_rate = self.alg.optimizer.param_groups[0]["lr"]
+            groups = self.alg.optimizer.param_groups
+            restored_lr = groups[0]["lr"]
+            if not math.isfinite(restored_lr) or restored_lr <= 0.0:
+                raise ValueError("Checkpoint learning rate must be finite and positive.")
+            maximum_lr = getattr(self.alg, "max_learning_rate", None)
+            if maximum_lr is not None:
+                if not math.isfinite(maximum_lr) or maximum_lr <= 0.0:
+                    raise ValueError("Configured max_learning_rate must be finite and positive.")
+                # PPO uses one adaptive rate. Keep a lower saved rate, cap an
+                # excessive one, and synchronize every group before any update.
+                # Assigning only lr leaves Adam moments and schedules intact.
+                restored_lr = min(restored_lr, maximum_lr)
+                for group in groups:
+                    group["lr"] = restored_lr
+            self.alg.learning_rate = restored_lr
         return infos
 
 
@@ -409,6 +429,17 @@ def main(
     if agent_cfg.run_name:
         log_dir += f"_{agent_cfg.run_name}"
     log_dir = os.path.join(log_root_path, log_dir)
+
+    # RSL-RL's status/diff file does not include HEAD. Archive explicit identity
+    # before constructing the environment or producing the first checkpoint.
+    # Its later diff logger skips our existing project diff, preserving the SHA.
+    run_provenance = write_run_provenance(log_dir, __file__)
+    print(
+        f"[INFO] Run Git commit: {run_provenance['commit_sha']} "
+        f"(branch={run_provenance['branch'] or 'detached'}, "
+        f"tracked_dirty={run_provenance['tracked_dirty']}, "
+        f"untracked_files={len(run_provenance['untracked_paths'])})"
+    )
 
     # Configure optional environment-interface export.
     env_cfg.export_io_descriptors = args_cli.export_io_descriptors
@@ -505,6 +536,7 @@ def main(
     runner = ParkourOnPolicyRunner(
         env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device
     )
+    runner.run_provenance = run_provenance
     runner.add_git_repo_to_log(__file__)
     if warm_start_checkpoint is not None:
         state = torch.load(

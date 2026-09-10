@@ -514,6 +514,9 @@ class RewardsCfg:
             "pivot_stability_weight": 0.1,
             # Increase turn credit without strengthening quiet stops or motion costs.
             "pivot_yaw_tracking_weight": 2.0,
+            # Explicit opt-in for signed progress: retain old checkpoints' objective.
+            "pivot_yaw_objective": "exponential",
+            "pivot_yaw_overspeed_weight": 1.0,
             "planar_speed_std": 0.15,
             "roll_pitch_rate_std": 0.35,
             "yaw_rate_std": 0.5,
@@ -757,6 +760,12 @@ class RewardsCfg:
             raise ValueError(
                 "pivot yaw tracking weight must be finite and non-negative."
             )
+
+        if stationary_params["pivot_yaw_objective"] not in ("exponential", "signed_progress"):
+            raise ValueError("pivot_yaw_objective must be exponential or signed_progress.")
+        overspeed_weight = stationary_params["pivot_yaw_overspeed_weight"]
+        if not math.isfinite(overspeed_weight) or overspeed_weight <= 0.0:
+            raise ValueError("pivot yaw overspeed weight must be finite and positive.")
 
         speed_scale = self.stationary_planar_motion.params["transition_speed_m_s"]
         if not math.isfinite(speed_scale) or speed_scale <= 0.0:
