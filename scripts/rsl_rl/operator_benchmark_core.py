@@ -199,8 +199,8 @@ def config_differences(saved: dict, current: dict) -> list[str]:
     return differences(contract(saved), contract(current), "env")
 
 
-def load_reference_actor(checkpoint: Path, agent: dict):
-    """Load only the validated deterministic 48→12 ELU motor, without unpickling.
+def load_reference_checkpoint(checkpoint: Path, agent: dict):
+    """Load the narrow stock actor/critic contract with restricted unpickling.
 
     A deliberately narrow contract prevents accidentally loading a parkour/RMA
     checkpoint, normalization state, recurrent policy, or another action interface.
@@ -241,6 +241,30 @@ def load_reference_actor(checkpoint: Path, agent: dict):
         not torch.isfinite(v).all() for v in state.values()
     ):
         raise ValueError("Unexpected or nonfinite reference checkpoint tensors")
+    for prefix, last_dim in (("actor", 12), ("critic", 1)):
+        for index, (inputs, outputs) in enumerate(
+            zip((48, 128, 128, 128), (128, 128, 128, last_dim))
+        ):
+            if state[f"{prefix}.{2 * index}.weight"].shape != (
+                outputs,
+                inputs,
+            ) or state[f"{prefix}.{2 * index}.bias"].shape != (outputs,):
+                raise ValueError(f"Invalid reference {prefix} layer {index} shape")
+    if state["std"].shape != (12,) or (state["std"] <= 0).any():
+        raise ValueError("Reference action standard deviations must be positive")
+    if type(data.get("iter")) is not int or data["iter"] < 0:
+        raise ValueError(
+            "Reference checkpoint must have a nonnegative integer iteration"
+        )
+    return data
+
+
+def load_reference_actor(checkpoint: Path, agent: dict):
+    """Load just the validated deterministic 48→12 ELU motor."""
+    import torch
+
+    data = load_reference_checkpoint(checkpoint, agent)
+    state = data["model_state_dict"]
     layers = []
     for index, (inputs, outputs) in enumerate(
         zip((48, 128, 128, 128), (128, 128, 128, 12))

@@ -128,7 +128,8 @@ def command_observation(env, desired):
     return observation
 
 
-def prepare_config(saved, *, seed, num_envs, device):
+def reference_config(saved):
+    """Validate the installed physical/motor contract before any task overrides."""
     from isaaclab_tasks.manager_based.locomotion.velocity.config.go2.flat_env_cfg import (
         UnitreeGo2FlatEnvCfg,
     )
@@ -145,6 +146,11 @@ def prepare_config(saved, *, seed, num_envs, device):
             "Installed stock environment differs from training: "
             + ", ".join(differences)
         )
+    return cfg
+
+
+def prepare_config(saved, *, seed, num_envs, device):
+    cfg = reference_config(saved)
     command = cfg.commands.base_velocity
     command.heading_command = False
     command.rel_heading_envs = 0.0
@@ -242,7 +248,7 @@ def run_benchmark(args, output, agent, saved):
                 "observation corruption disabled",
                 "scripted body-twist commands",
                 "parallel environment count",
-                "held-out seed",
+                "evaluation seed",
                 "timeout moved one step beyond 20-s benchmark",
             ],
         }
@@ -281,30 +287,44 @@ def run_benchmark(args, output, agent, saved):
                     )
 
 
-def supervise(command, output, *, timeout_s=300):
+def supervise(
+    command,
+    output,
+    *,
+    timeout_s=300,
+    report_filename="measurement_report.json",
+    valid_statuses=("PASS", "FAIL", "ERROR"),
+):
     """Fail closed on incomplete/native-failed workers, including exit(0) in Kit."""
     try:
         process = subprocess.run(command, timeout=timeout_s, check=False)
         worker = {"returncode": process.returncode, "timed_out": False}
     except subprocess.TimeoutExpired:
         worker = {"returncode": None, "timed_out": True}
+    except OSError as error:
+        worker = {"returncode": None, "timed_out": False, "error": str(error)}
     write_json(output / "worker_status.json", worker)
     try:
-        report = json.loads((output / "measurement_report.json").read_text())
+        report = json.loads((output / report_filename).read_text())
+        if not isinstance(report, dict):
+            raise ValueError("Worker report must be an object")
     except (OSError, ValueError):
         report = {
             "status": "ERROR",
             "error": "Worker did not publish a complete report",
         }
-    cleanup = {
-        name: json.loads(path.read_text())
-        for name in ("environment", "application")
-        if (path := output / f"{name}_cleanup_error.json").exists()
-    }
+    cleanup = {}
+    for name in ("environment", "application"):
+        path = output / f"{name}_cleanup_error.json"
+        if path.exists():
+            try:
+                cleanup[name] = json.loads(path.read_text())
+            except (OSError, ValueError):
+                cleanup[name] = {"error": "Unreadable cleanup failure report"}
     if (
         worker["returncode"] != 0
         or cleanup
-        or report.get("status") not in ("PASS", "FAIL", "ERROR")
+        or report.get("status") not in valid_statuses
     ):
         report = {
             "status": "ERROR",
@@ -329,7 +349,7 @@ def main(argv=None):
         "--seed",
         type=int,
         default=43,
-        help="Held-out seed, separate from training seed 42",
+        help="Development/regression seed 43; reserve 44/45 for confirmation",
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output-parent", type=Path)
