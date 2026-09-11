@@ -444,6 +444,15 @@ class StartupActionProbe:
             (1, 12, 3),
             "joint_friction_static_dynamic_viscous",
         )
+        properties["joint_legacy_friction_coefficient"] = _optional_tensor(
+            lambda: _action_order(
+                asset.root_physx_view.get_dof_friction_coefficients(),
+                joint_ids,
+                len(asset.joint_names),
+            ),
+            (1, 12),
+            "joint_legacy_friction_coefficient",
+        )
         return {
             "joint_names": list(action._joint_names),
             "body_names": list(asset.body_names),
@@ -468,6 +477,7 @@ class StartupActionProbe:
                 "joint_submitted_effort_nm": "Isaac Lab _joint_effort_target_sim submission buffer in action joint order; not a measured net joint torque",
                 "joint_physx_actuation_force_nm": "PhysX get_dof_actuation_forces backend command in action joint order; excludes implicit drives and constraint/contact forces; not net joint torque",
                 "joint_friction_static_dynamic_viscous": "Per action joint: static friction effort (Nm), dynamic friction effort (Nm), viscous friction coefficient; not surface friction",
+                "joint_legacy_friction_coefficient": "Deprecated backend coefficient in action joint order; independent fallback channel when the new friction parameters are zero; not surface friction",
                 "generalized_dynamics": "Raw floating-base mass and compensation arrays at initial capture and first pre-physics only; optional availability, no refresh/step and no causal verdict",
                 "targets": "Articulation target buffer and action processed target; explicit PD uses these, not a PhysX position drive",
             },

@@ -26,6 +26,21 @@ def validate_startup_arguments(args) -> None:
     """Reject conflicting modes before launching the simulator."""
     replay = getattr(args, "startup_action_replay", None)
     centered = getattr(args, "startup_center_scene", False)
+    legacy_friction = getattr(args, "startup_legacy_friction", None)
+    if legacy_friction is not None and (
+        legacy_friction not in ("observe", "zero")
+        or not args.startup_diagnostics
+        or not replay
+        or centered
+        or args.terrain_family != "high_step"
+        or args.difficulty_level not in (0, 6)
+        or args.geometry_variant != 0
+        or args.command_profile != "translation_only"
+    ):
+        raise ValueError(
+            "--startup_legacy_friction requires uncentered high_step L0/L6 variant 0 "
+            "translation_only action replay; it is not a policy evaluation."
+        )
     if centered and (
         not args.startup_diagnostics
         or not replay

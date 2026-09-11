@@ -2,7 +2,7 @@
 # Focused Go2 RMA workflow. Run from the repository root in the Isaac Lab env.
 set -euo pipefail
 
-PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|diagnose|probe-startup|probe-centered|startup|check-repair|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
+PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|diagnose|probe-startup|probe-centered|probe-friction|startup|check-repair|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
 PARKOUR_CHECKPOINT="${2:?Pass an explicit checkpoint path}"
 shift 2
 if [[ ! -f "$PARKOUR_CHECKPOINT" ]]; then
@@ -64,6 +64,45 @@ case "$PARKOUR_REWARD_PROFILE" in
 esac
 
 case "$PARKOUR_MODE" in
+  probe-friction)
+    if (( $# != 2 )) || [[ ! -f "$1" ]] || [[ ! -f "$2" ]]; then
+      echo "Usage: go2_rma.sh probe-friction CHECKPOINT SOURCE_STARTUP_JSON PREVIOUS_UNCENTERED_L6_JSON (no extra overrides)" >&2
+      exit 2
+    fi
+    PARKOUR_PROBE_SOURCE="$1"
+    PARKOUR_PROBE_BASELINE="$2"
+    PARKOUR_CHECKPOINT_DIR="$(dirname -- "$PARKOUR_CHECKPOINT")"
+    PARKOUR_PROBE_DIR="$(mktemp -d "$PARKOUR_CHECKPOINT_DIR/friction_probe_XXXXXX")"
+    echo "Conditional legacy-friction probe: $PARKOUR_PROBE_DIR"
+    for PARKOUR_CASE in native_L6 zero_L0 zero_L6; do
+      PARKOUR_FRICTION_MODE=zero
+      PARKOUR_LEVEL=6
+      if [[ "$PARKOUR_CASE" == native_L6 ]]; then PARKOUR_FRICTION_MODE=observe; fi
+      if [[ "$PARKOUR_CASE" == zero_L0 ]]; then PARKOUR_LEVEL=0; fi
+      python scripts/rsl_rl/play.py "${PARKOUR_COMMON[@]}" \
+        --headless --livestream=0 --checkpoint="$PARKOUR_CHECKPOINT" \
+        --startup_diagnostics --startup_steps=10 \
+        --startup_action_replay="$PARKOUR_PROBE_SOURCE" \
+        --startup_legacy_friction="$PARKOUR_FRICTION_MODE" \
+        --startup_output_dir="$PARKOUR_PROBE_DIR/$PARKOUR_CASE" \
+        --num_envs=1 --eval_episodes=1 --no-screen --reset_profile=jitter \
+        --policy_mode=history_mean --terrain_family=high_step \
+        --difficulty_level="$PARKOUR_LEVEL" --geometry_variant=0 \
+        --desired_speed=0.55 --desired_yaw_rate=0 --command_profile=translation_only
+      if [[ "$PARKOUR_CASE" == native_L6 ]]; then
+        if ! python scripts/rsl_rl/startup_friction_report.py "$PARKOUR_PROBE_DIR" \
+          --baseline="$PARKOUR_PROBE_BASELINE" --reference="$PARKOUR_PROBE_SOURCE" \
+          --preflight > "$PARKOUR_PROBE_DIR/preflight_report.json"; then
+          echo "Friction preflight stopped this branch; no zeroing runs launched. See $PARKOUR_PROBE_DIR/preflight_report.json" >&2
+          exit 2
+        fi
+      fi
+    done
+    python scripts/rsl_rl/startup_friction_report.py "$PARKOUR_PROBE_DIR" \
+      --baseline="$PARKOUR_PROBE_BASELINE" --reference="$PARKOUR_PROBE_SOURCE" \
+      > "$PARKOUR_PROBE_DIR/friction_report.json"
+    echo "Saved $PARKOUR_PROBE_DIR/friction_report.json (diagnostic only; no production physics changed)."
+    ;;
   probe-centered)
     if (( $# != 2 )) || [[ ! -f "$1" ]] || \
        [[ ! -f "$2/level_0/startup_diagnostics.json" ]] || \
@@ -334,7 +373,7 @@ case "$PARKOUR_MODE" in
       --terrain_family=tilted_ramps --difficulty_level=0 "$@"
     ;;
   *)
-    echo "Unknown mode: $PARKOUR_MODE (use train, recover, resume, repair, diagnose, probe-startup, probe-centered, startup, check-repair, check-step, check-control, check or teleop)." >&2
+    echo "Unknown mode: $PARKOUR_MODE (use train, recover, resume, repair, diagnose, probe-startup, probe-centered, probe-friction, startup, check-repair, check-step, check-control, check or teleop)." >&2
     exit 2
     ;;
 esac

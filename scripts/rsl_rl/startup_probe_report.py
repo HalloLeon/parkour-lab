@@ -77,7 +77,10 @@ SOLVER_STATE_FIELDS = (
     "joint_physx_actuation_force_nm",
     "generalized_dynamics",
 )
-SOLVER_PROPERTY_FIELDS = ("joint_friction_static_dynamic_viscous",)
+SOLVER_PROPERTY_FIELDS = (
+    "joint_friction_static_dynamic_viscous",
+    "joint_legacy_friction_coefficient",
+)
 
 
 def _availability(value):
@@ -107,6 +110,7 @@ def validate_solver_inputs(mapping, label, joint_names=None):
         ("joint_submitted_effort_nm", (12,)),
         ("joint_physx_actuation_force_nm", (12,)),
         ("joint_friction_static_dynamic_viscous", (12, 3)),
+        ("joint_legacy_friction_coefficient", (12,)),
     ):
         value = mapping.get(key)
         if _availability(value) == "AVAILABLE":

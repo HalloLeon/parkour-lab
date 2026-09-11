@@ -128,6 +128,12 @@ parser.add_argument(
     help="Replay-only intervention: translate the complete terrain to center the selected high-step tile at world origin.",
 )
 parser.add_argument(
+    "--startup_legacy_friction",
+    choices=("observe", "zero"),
+    default=None,
+    help="Replay-only legacy joint-friction readback or conditional zeroing; never a training preset.",
+)
+parser.add_argument(
     "--teleop",
     action="store_true",
     help="Local or streamed single-Go2 keyboard control using history_mean; no evaluation sweep.",
@@ -1588,6 +1594,20 @@ def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
                 report["metadata"]["scene_intervention"] = centered_scene
             report["metadata"]["action_replay"] = action_probe.metadata()
             action_probe.validate_runtime(report["metadata"])
+            if getattr(args_cli, "startup_legacy_friction", None) is not None:
+                from startup_legacy_friction import configure_legacy_friction_probe
+
+                friction = configure_legacy_friction_probe(
+                    env.unwrapped, args_cli.startup_legacy_friction, action_replay=True
+                )
+                report["metadata"]["legacy_friction_probe"] = friction
+                if args_cli.startup_legacy_friction == "zero" and friction["status"] != "APPLIED":
+                    with open(os.path.join(directory, "legacy_friction_status.json"), "w", encoding="utf-8") as stream:
+                        json.dump(friction, stream, indent=2, allow_nan=False)
+                    raise ValueError(
+                        f"Legacy friction intervention not applied: {friction['status']}; "
+                        f"see {directory}/legacy_friction_status.json"
+                    )
         try:
             collect_startup_diagnostics(
                 env,

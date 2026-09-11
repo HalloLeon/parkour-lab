@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 from pathlib import Path
 
 try:
@@ -84,7 +85,113 @@ def _centering(report, level):
     return meta
 
 
-def _same_original_physics(left, right, label):
+TRANSLATED_POSITION_HARD_CAP_M = 1e-5
+
+
+def _float32_ulp(value):
+    """Spacing of the float32 bin containing a finite captured world coordinate."""
+    value = abs(value)
+    probe._require(
+        math.isfinite(value) and value <= (2.0 - 2.0**-23) * 2.0**127,
+        "position outside finite float32 coordinate range",
+    )
+    exponent = math.frexp(value)[1] - 24 if value else -149
+    return math.ldexp(1.0, max(-149, exponent))
+
+
+def _translated_initial_positions(a, b, left_initial, right_initial, label):
+    """Allow only a bounded, reported XYZ normalization precision budget.
+
+    One float32 ULP per stored world coordinate and origin is a conservative
+    diagnostic budget for world-space pose construction and origin subtraction.
+    It is not a claim that all simulator state errors obey this bound.
+    """
+    left_origin, right_origin = a["environment_origin_w_m"], b["environment_origin_w_m"]
+    translated = [x != y for x, y in zip(left_origin, right_origin)]
+    origin_ulps = [
+        [_float32_ulp(x) for x in origin] for origin in (left_origin, right_origin)
+    ]
+    result = {
+        "status": "NUMERICALLY_CLOSE",
+        "interpretation": "Numerical closeness of initial positions, not bitwise equality, equal hidden simulator state, or a causal verdict.",
+        "base_abs_tolerance_m": probe.INITIAL_TOLERANCE,
+        "translated_position_hard_cap_m": TRANSLATED_POSITION_HARD_CAP_M,
+        "translated_axes_xyz": translated,
+        "origin_float32_ulp_m": {"left": origin_ulps[0], "right": origin_ulps[1]},
+        "rule": "Unchanged-origin axes retain 2e-6 m. Changed-origin axes use min(1e-5 m, 2e-6 m + ulp32(left world coordinate) + ulp32(right world coordinate) + ulp32(left origin) + ulp32(right origin)).",
+        "non_position_initial_state_abs_tolerance": probe.INITIAL_TOLERANCE,
+        "fields": {},
+    }
+    for field in ("root_transform_w_xyzw", "link_transform_w_xyzw"):
+        left_raw = a["initial_authoritative_state"][field]
+        right_raw = b["initial_authoritative_state"][field]
+        if not isinstance(left_raw, list) or not isinstance(right_raw, list):
+            probe._match(left_raw, right_raw, f"{label}.initial_state.{field}")
+            result["fields"][field] = {
+                "status": "UNAVAILABLE",
+                "left": left_raw,
+                "right": right_raw,
+            }
+            continue
+        root = field.startswith("root_")
+        raw_rows = ([left_raw], [right_raw]) if root else (left_raw, right_raw)
+        local_rows = (
+            ([left_initial[field]], [right_initial[field]])
+            if root
+            else (left_initial[field], right_initial[field])
+        )
+        probe._require(
+            len(raw_rows[0]) == len(raw_rows[1]), f"{label}.{field}: pose count differs"
+        )
+        differences, tolerances, coordinate_ulps = [], [], []
+        for index, (raw_left, raw_right, local_left, local_right) in enumerate(
+            zip(*raw_rows, *local_rows, strict=True)
+        ):
+            probe._match(
+                local_left[3:],
+                local_right[3:],
+                f"{label}.initial_state.{field}[{index}].quaternion",
+                probe.INITIAL_TOLERANCE,
+            )
+            error_row, tolerance_row, ulp_row = [], [], []
+            for axis in range(3):
+                ulps = [_float32_ulp(raw_left[axis]), _float32_ulp(raw_right[axis])]
+                budget = sum(ulps) + origin_ulps[0][axis] + origin_ulps[1][axis]
+                tolerance = (
+                    min(
+                        TRANSLATED_POSITION_HARD_CAP_M, probe.INITIAL_TOLERANCE + budget
+                    )
+                    if translated[axis]
+                    else probe.INITIAL_TOLERANCE
+                )
+                error = local_left[axis] - local_right[axis]
+                probe._require(
+                    abs(error) <= tolerance,
+                    f"{label}.initial_state.{field}[{index}][{axis}]: position difference {error:g} m exceeds bounded tolerance {tolerance:g} m",
+                )
+                error_row.append(error)
+                tolerance_row.append(tolerance)
+                ulp_row.append(ulps)
+            differences.append(error_row)
+            tolerances.append(tolerance_row)
+            coordinate_ulps.append(ulp_row)
+        result["fields"][field] = {
+            "row_names": ["root"] if root else a["body_names"],
+            "left_minus_right_xyz_m": differences,
+            "component_tolerances_xyz_m": tolerances,
+            "world_coordinate_float32_ulp_m_left_right": coordinate_ulps,
+            "per_axis_max_abs_difference_m": [
+                max(abs(row[j]) for row in differences) for j in range(3)
+            ],
+            "per_axis_max_tolerance_m": [
+                max(row[j] for row in tolerances) for j in range(3)
+            ],
+            "max_abs_difference_m": max(abs(x) for row in differences for x in row),
+        }
+    return result
+
+
+def _same_original_physics(left, right, label, *, translation_rounding=False):
     """Keep the established input contract independent of new solver readings."""
     a, b = left["physical_metadata"], right["physical_metadata"]
     for key in ("joint_names", "body_names", "foot_names", "physics_dt_s"):
@@ -107,9 +214,23 @@ def _same_original_physics(left, right, label):
             value["environment_origin_w_m"],
         )
 
+    left_initial, right_initial = initial(a), initial(b)
+    if not translation_rounding:
+        probe._match(
+            left_initial,
+            right_initial,
+            f"{label}.initial_state",
+            probe.INITIAL_TOLERANCE,
+        )
+        return None
+    positions = {"root_transform_w_xyzw", "link_transform_w_xyzw"}
     probe._match(
-        initial(a), initial(b), f"{label}.initial_state", probe.INITIAL_TOLERANCE
+        {k: v for k, v in left_initial.items() if k not in positions},
+        {k: v for k, v in right_initial.items() if k not in positions},
+        f"{label}.initial_state",
+        probe.INITIAL_TOLERANCE,
     )
+    return _translated_initial_positions(a, b, left_initial, right_initial, label)
 
 
 def _solver_comparison(left, right):
@@ -164,8 +285,10 @@ def compare_centered_reports(
         flat, obstacle, reference, reference_sha256=reference_sha256
     )
     _same_original_physics(control, old_obstacle, "fresh control vs previous replay")
-    _same_original_physics(obstacle, control, "centered L6 vs fresh control")
     a, b = _centering(flat, 0), _centering(obstacle, 6)
+    initial_pose_comparison = _same_original_physics(
+        obstacle, control, "centered L6 vs fresh control", translation_rounding=True
+    )
     for key in (
         "source_mesh_sha256",
         "mesh_vertex_count",
@@ -187,7 +310,9 @@ def compare_centered_reports(
         state = value["physics_substeps"][0]["pre"]
         for key in probe.SOLVER_STATE_FIELDS:
             probe._require(key in state, f"{label}: missing newly instrumented {key}")
-        for key in probe.SOLVER_PROPERTY_FIELDS:
+        # Later optional probes may add fields (e.g. a legacy friction getter).
+        # They must not invalidate captures made with the original boundary.
+        for key in ("joint_friction_static_dynamic_viscous",):
             probe._require(
                 key in value["physical_metadata"]["properties"],
                 f"{label}: missing newly instrumented {key}",
@@ -216,6 +341,7 @@ def compare_centered_reports(
         "new_control_steps_total": 30,
         "new_simulated_duration_s": 30 * reference["metadata"]["step_dt_s"],
         "scene_interventions": {"L0": a, "L6": b},
+        "initial_pose_centered_L6_vs_fresh_uncentered_L6": initial_pose_comparison,
         "control_step_comparisons": comparisons,
         "physics_substep_centered_L6_minus_fresh_uncentered_L6": probe._substep_outcomes(
             obstacle, control
@@ -232,6 +358,7 @@ def compare_centered_reports(
             "Convergence does not promote recentering to a robot repair; divergence does not alone prove a PhysX defect.",
             "Backend actuation readback is the submitted command, not net constraint torque; inspect solver-input deltas and unavailable readings.",
             "Previous traces lack the new force-delivery and generalized-dynamics fields; missing data are not evidence of equal physics.",
+            "Only centered-versus-uncentered initial root/link XYZ uses a reported float32-coordinate rounding budget capped at 10 micrometers; same-origin axes, quaternions, joints and other initial fields retain the original strict tolerance. Numerical closeness is not equality or a causal explanation.",
         ],
     }
 
