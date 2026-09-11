@@ -23,6 +23,10 @@ except ImportError:
 
 CASES = {"origin": (0.0, 0.0), "translated": (24.0, 24.0), "teleported": (0.0, 24.0)}
 DT = 0.005
+# The simulator reports time accumulated from a float32 physics dt. A nominal
+# 5-ms step reads back as 0.004999999888241291 s in Isaac Sim 5.1. Use the same
+# 1-ns clock tolerance in the worker and offline validator; counters stay exact.
+CLOCK_ATOL_S = 1e-9
 INITIAL_ATOL = 2e-6
 POSITION_ATOL = 1e-5
 EFFORT_ATOL = 1e-6
@@ -463,7 +467,7 @@ def validate_case(report, source):
         chronology["post_step"]["sim_time_s"] - anchor["sim_time_s"],
         DT,
         "Measured dt",
-        1e-10,
+        CLOCK_ATOL_S,
     )
     _require(
         chronology["post_step"]["physics_step_index"]

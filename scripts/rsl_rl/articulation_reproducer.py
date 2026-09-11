@@ -169,6 +169,27 @@ def _write(path, value):
         stream.write("\n")
 
 
+def _worker_status(case, trace_bytes):
+    """Receipt for validated measurement and simulation cleanup, not app shutdown."""
+    return {
+        "kind": "articulation_reproducer_worker_status",
+        "schema_version": 1,
+        "case": case,
+        "status": "MEASUREMENT_AND_SIMULATION_CLEANUP_COMPLETE",
+        "trace_sha256": hashlib.sha256(trace_bytes).hexdigest(),
+    }
+
+
+def _validate_worker_status(directory, case, trace_bytes):
+    # Isaac Sim fast shutdown may exit zero instead of returning to Python and
+    # propagating a pending exception. A zero process code alone is not success.
+    # Do not use the tolerant failure-log reader to decide evidence validity.
+    if (directory / "errors.jsonl").read_bytes():
+        raise ValueError(f"{case}: worker recorded errors; see errors.jsonl")
+    if read_json(directory / "worker_status.json") != _worker_status(case, trace_bytes):
+        raise ValueError(f"{case}: missing or mismatched worker completion receipt")
+
+
 def run_worker(source, case, directory):
     """Launch Kit only in the child, with no task-specific argv left for Kit."""
     directory.mkdir(exist_ok=False)
@@ -196,12 +217,14 @@ def run_worker(source, case, directory):
             }
             journal.progress("trace_write_begin")
             _write(directory / "trace.json", report)
-            captured = True
             journal.progress("trace_saved")
             # Preserve the raw trace even if its contract fails. Neither its
             # presence nor clean simulator cleanup implies valid evidence.
-            validate_case(report, source)
+            # Config dictionaries contain tuples (notably gravity). Validate the
+            # exact saved JSON that the parent reads, not Python-only containers.
+            validate_case(read_json(directory / "trace.json"), source)
             journal.progress("trace_validated")
+            captured = True
 
         try:
             journal.progress("app_import_begin")
@@ -258,6 +281,16 @@ def run_worker(source, case, directory):
                         return False
 
                 attempt_close_operation(lambda: journal.progress("app_close_begin"))
+                if primary_error is None and not cleanup_errors:
+                    # Save before close: fast shutdown need not return to Python.
+                    attempt_close_operation(
+                        lambda: _write(
+                            directory / "worker_status.json",
+                            _worker_status(
+                                case, (directory / "trace.json").read_bytes()
+                            ),
+                        )
+                    )
                 if attempt_close_operation(launcher.app.close):
                     attempt_close_operation(
                         lambda: journal.progress("app_close_complete")
@@ -315,7 +348,9 @@ def run_triplet(source_path, output_parent, *, run_process=None):
                     f"{case}: simulator process exited {completed.returncode}; "
                     f"see {case}.console.log. Remaining cases not launched."
                 )
-            report = read_json(directory / case / "trace.json")
+            trace_bytes = (directory / case / "trace.json").read_bytes()
+            _validate_worker_status(directory / case, case, trace_bytes)
+            report = parse_json(trace_bytes)
             if report.get("implementation_sha256") != hashes:
                 raise ValueError("Reproducer implementation changed between processes")
             validate_case(report, source)

@@ -12,9 +12,9 @@ import math
 from types import SimpleNamespace
 
 try:
-    from .articulation_reproducer_core import validate_reproducer_source
+    from .articulation_reproducer_core import CLOCK_ATOL_S, validate_reproducer_source
 except ImportError:
-    from articulation_reproducer_core import validate_reproducer_source
+    from articulation_reproducer_core import CLOCK_ATOL_S, validate_reproducer_source
 
 
 _CASES = {"origin": (0.0, 0.0), "translated": (24.0, 24.0), "teleported": (0.0, 24.0)}
@@ -484,7 +484,7 @@ def _run_case(source, case, directory, progress, capture, record_error):
                 - chronology["pre_step"]["sim_time_s"],
                 0.005,
                 rel_tol=0,
-                abs_tol=1e-9,
+                abs_tol=CLOCK_ATOL_S,
             ),
             "Measured step did not advance exactly one 5-ms physics step",
         )
