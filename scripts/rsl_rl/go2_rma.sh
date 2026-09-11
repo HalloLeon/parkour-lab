@@ -2,7 +2,7 @@
 # Focused Go2 RMA workflow. Run from the repository root in the Isaac Lab env.
 set -euo pipefail
 
-PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|diagnose|probe-startup|probe-centered|probe-friction|probe-solver|probe-collision|check-centered|startup|check-repair|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
+PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|diagnose|probe-startup|probe-centered|probe-friction|probe-solver|probe-collision|check-centered|startup|check-repair|check-step|check-control|check|check-operator-reference|teleop CHECKPOINT [extra arguments]}"
 PARKOUR_CHECKPOINT="${2:?Pass an explicit checkpoint path}"
 shift 2
 if [[ ! -f "$PARKOUR_CHECKPOINT" ]]; then
@@ -64,6 +64,15 @@ case "$PARKOUR_REWARD_PROFILE" in
 esac
 
 case "$PARKOUR_MODE" in
+  check-operator-reference)
+    if [[ "$PARKOUR_REWARD_PROFILE" != baseline ]]; then
+      echo "check-operator-reference uses the stock task, not parkour reward profiles." >&2
+      exit 2
+    fi
+    # No PARKOUR_COMMON: this is a different, explicitly validated checkpoint
+    # interface. The runner forces headless=True and livestream=0 internally.
+    python scripts/rsl_rl/operator_benchmark.py "$PARKOUR_CHECKPOINT" "$@"
+    ;;
   probe-collision)
     if (( $# != 2 )) || [[ ! -f "$1" ]] || \
        [[ ! -f "$2/level_0/startup_diagnostics.json" ]] || \
