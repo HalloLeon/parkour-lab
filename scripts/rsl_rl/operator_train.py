@@ -29,7 +29,12 @@ try:
         load_reference_checkpoint,
         read_yaml_data,
     )
-    from .operator_curriculum import OperatorExposureWrapper, curriculum_manifest
+    from .operator_curriculum import (
+        OperatorExposureWrapper,
+        VERSIONS,
+        VERSION,
+        curriculum_manifest,
+    )
     from .run_provenance import write_run_provenance
 except ImportError:
     from operator_benchmark import reference_config, supervise, write_json
@@ -40,7 +45,12 @@ except ImportError:
         load_reference_checkpoint,
         read_yaml_data,
     )
-    from operator_curriculum import OperatorExposureWrapper, curriculum_manifest
+    from operator_curriculum import (
+        OperatorExposureWrapper,
+        VERSIONS,
+        VERSION,
+        curriculum_manifest,
+    )
     from run_provenance import write_run_provenance
 
 
@@ -50,9 +60,9 @@ def training_configs(saved, agent, args):
     )
 
     try:
-        from .operator_command import OperatorVelocityCommand
+        from .operator_command import OperatorTransitionCommand, OperatorVelocityCommand
     except ImportError:
-        from operator_command import OperatorVelocityCommand
+        from operator_command import OperatorTransitionCommand, OperatorVelocityCommand
 
     cfg = reference_config(saved)
     runner_cfg = UnitreeGo2FlatPPORunnerCfg().to_dict()
@@ -67,7 +77,11 @@ def training_configs(saved, agent, args):
         ) != known_algorithm.get(key):
             raise ValueError(f"Unsupported source algorithm.{key}")
     command = cfg.commands.base_velocity
-    command.class_type = OperatorVelocityCommand
+    version = getattr(args, "curriculum", VERSION)
+    curriculum_manifest(version)
+    command.class_type = (
+        OperatorVelocityCommand if version == VERSION else OperatorTransitionCommand
+    )
     command.heading_command = False
     command.rel_heading_envs = 0.0
     command.rel_standing_envs = 0.0
@@ -87,7 +101,7 @@ def training_configs(saved, agent, args):
         device=args.device,
         max_iterations=args.iterations,
         experiment_name="go2_operator_refinement",
-        run_name="operator_modes_v1",
+        run_name=version,
         logger="tensorboard",
         save_interval=50,
         resume=False,
@@ -172,7 +186,7 @@ def run_training(args, output, agent, saved):
             environment_transitions=args.num_envs
             * runner.num_steps_per_env
             * args.iterations,
-            curriculum=curriculum_manifest(),
+            curriculum=curriculum_manifest(getattr(args, "curriculum", VERSION)),
             command_metric_warning=(
                 "Stock error_vel_xy/error_vel_yaw accumulators divide by max command duration: "
                 "12 s here versus 4 s in the original reference. Identical physical errors "
@@ -304,6 +318,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument(
+        "--curriculum",
+        choices=VERSIONS,
+        default=VERSION,
+        help="Versioned command distribution; v2 focuses on live stops and reverse",
+    )
+    parser.add_argument(
         "--iterations",
         type=int,
         default=300,
@@ -410,6 +430,8 @@ def main(argv=None):
             str(args.seed),
             "--device",
             args.device,
+            "--curriculum",
+            args.curriculum,
         ],
         output,
         timeout_s=args.timeout,
