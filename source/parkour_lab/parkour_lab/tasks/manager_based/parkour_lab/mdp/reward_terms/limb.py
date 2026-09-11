@@ -5,6 +5,8 @@
 
 """Limb-level joint, contact, and motion rewards."""
 
+import math
+
 import torch
 from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
@@ -86,6 +88,36 @@ def joint_deviation_l2(
     joint_error = robot._selected_joint_pos_error(env, asset_cfg)
 
     return torch.sum(joint_error.square(), dim=-1)
+
+
+def action_target_overflow_l2(
+    env: ManagerBasedRLEnv,
+    action_term_name: str = "joint_pos",
+    normalization_rad: float = 0.25,
+) -> torch.Tensor:
+    """Price impossible target requests, not normal joint tracking lag.
+
+    Sum squared requested-minus-final-target excess in normalized radians and
+    apply a negative external reward weight. The action term records excess
+    after selecting the physically executed delayed request, so the newest
+    queued action is not charged before execution. Both configured and safe
+    target clipping contribute; actuator gains, limits and outputs are intact.
+    This learning cost alone does not establish successful gait acquisition.
+    """
+
+    if not math.isfinite(normalization_rad) or normalization_rad <= 0.0:
+        raise ValueError("target overflow normalization must be finite and positive.")
+    action = env.action_manager.get_term(action_term_name)
+    overflow = action.joint_target_overflow_rad
+    if (
+        not isinstance(overflow, torch.Tensor)
+        or not torch.is_floating_point(overflow)
+        or overflow.shape != (env.num_envs, action.action_dim)
+    ):
+        raise ValueError(
+            "joint target overflow must be floating [environment, action joint] data."
+        )
+    return torch.sum((overflow / normalization_rad).square(), dim=-1)
 
 
 def stable_orientation_l2(

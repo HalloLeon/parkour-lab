@@ -16,6 +16,7 @@ PHASE_REWARD_TERMS = (
     "stationary_velocity_tracking",
     "stationary_planar_motion",
     "action_rate_l2",
+    "action_target_overflow_l2",
     "joint_torques_l2",
     "ang_vel_xy_l2",
     "flat_orientation_l2",
@@ -117,12 +118,17 @@ class CommandPhaseDiagnostics:
             **reward_rates,
         }
         samples = torch.stack(
-            [torch.ones_like(target_speed)] + [signals[name] for name in PHASE_SIGNAL_NAMES],
+            [torch.ones_like(target_speed)]
+            + [signals[name] for name in PHASE_SIGNAL_NAMES],
             dim=-1,
         ).to(dtype=self._sums.dtype)
         # Fixed-size GPU reduction. No .item(), CPU copy, or per-environment loop.
         self._sums.index_add_(0, phase, samples)
-        return {"phase_id": phase, "phase_time_s": self._age_steps * self.step_dt, **signals}
+        return {
+            "phase_id": phase,
+            "phase_time_s": self._age_steps * self.step_dt,
+            **signals,
+        }
 
     def reset(self, env_ids: object = slice(None)) -> None:
         """Reset episode clocks without dropping samples collected for logging."""

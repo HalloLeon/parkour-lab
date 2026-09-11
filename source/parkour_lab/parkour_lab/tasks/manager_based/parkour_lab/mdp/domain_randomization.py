@@ -111,6 +111,20 @@ class DelayedJointPositionAction(JointPositionAction):
             batch_size=self.num_envs,
             device=self.device,
         )
+        self._joint_target_overflow_rad = torch.zeros_like(self.raw_actions)
+
+    @property
+    def joint_target_overflow_rad(self) -> torch.Tensor:
+        """Signed requested-minus-applied target, shaped [environment, joint].
+
+        The request is the affine target of the *executed delayed action*, not
+        the newest action entering the delay queue. Both configured clipping
+        and the final safe-target clamp contribute. This is not actual joint
+        tracking error and does not change the targets sent to the actuator.
+        The returned device-local buffer is read-only for consumers.
+        """
+
+        return self._joint_target_overflow_rad
 
     @property
     def IO_descriptor(self) -> GenericActionIODescriptor:
@@ -129,17 +143,26 @@ class DelayedJointPositionAction(JointPositionAction):
     def process_actions(self, actions: torch.Tensor) -> None:
         """Delay, transform, then clamp targets before they reach the actuator."""
 
-        super().process_actions(self._delay_buffer.compute(actions))
+        delayed_actions = self._delay_buffer.compute(actions)
+        # Preserve the affine request before either configured or safe clipping.
+        self._joint_target_overflow_rad.copy_(
+            delayed_actions * self._scale + self._offset
+        )
+        super().process_actions(delayed_actions)
         self._processed_actions.clamp_(
             min=self._safe_target_limits[:, 0],
             max=self._safe_target_limits[:, 1],
         )
+        self._joint_target_overflow_rad.sub_(self._processed_actions)
 
     def reset(self, env_ids: Sequence[int] | slice | None = None) -> None:
         """Clear selected histories and sample their next episode delays."""
 
         super().reset(env_ids)
         batch_ids, count = _batch_selection(env_ids, self.num_envs)
+        self._joint_target_overflow_rad[
+            slice(None) if batch_ids is None else batch_ids
+        ] = 0.0
         time_lags = _sample_lags(
             count,
             self.cfg.min_delay_steps,
@@ -374,8 +397,10 @@ def _batch_selection(
 ) -> tuple[Sequence[int] | slice | None, int]:
     """Return DelayBuffer indices and the number of lags to sample."""
 
-    if env_ids is None or isinstance(env_ids, slice):
+    if env_ids is None:
         return env_ids, num_envs
+    if isinstance(env_ids, slice):
+        return env_ids, len(range(num_envs)[env_ids])
     return env_ids, len(env_ids)
 
 

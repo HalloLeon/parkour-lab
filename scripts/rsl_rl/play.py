@@ -109,12 +109,18 @@ parser.add_argument(
     "--startup_steps",
     type=cli_args.positive_int,
     default=None,
-    help="Startup diagnostic step cap (default 100, maximum 500); never shortens ordinary evaluation.",
+    help="Startup step cap (default 100/max 500; action replay default/max 10); never shortens ordinary evaluation.",
 )
 parser.add_argument(
     "--startup_output_dir",
     default=None,
     help="New directory for startup_diagnostics.json; existing directories are rejected.",
+)
+parser.add_argument(
+    "--startup_action_replay",
+    type=str,
+    default=None,
+    help="Diagnostic only: replay at most 10 actions from an explicit startup trace; never an evaluation result.",
 )
 parser.add_argument(
     "--teleop",
@@ -1464,6 +1470,14 @@ def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
     from startup_diagnostics import collect_startup_diagnostics
     from startup_report import write_startup_report
 
+    action_probe = None
+    if args_cli.startup_action_replay is not None:
+        from startup_action_probe import StartupActionProbe
+
+        action_probe = StartupActionProbe(
+            args_cli.startup_action_replay, max_steps=args_cli.startup_steps
+        )
+
     family, level, variant, speed, yaw, profile, level_metadata = (
         _configure_evaluation_course(
             env_cfg,
@@ -1552,8 +1566,14 @@ def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
                     checkpoint.log_dir
                 ),
                 "purpose": "Bounded diagnostic only; a step limit is not course success or failure.",
+                "action_source": "policy"
+                if action_probe is None
+                else "recorded_action_replay",
             },
         }
+        if action_probe is not None:
+            report["metadata"]["action_replay"] = action_probe.metadata()
+            action_probe.validate_runtime(report["metadata"])
         try:
             collect_startup_diagnostics(
                 env,
@@ -1564,8 +1584,13 @@ def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
                 termination_outcomes=_read_termination_outcomes,
                 is_running=simulation_app.is_running,
                 report=report,
+                action_probe=action_probe,
             )
         finally:
+            if action_probe is not None:
+                report["metadata"]["action_replay"] = action_probe.metadata()
+                report["physics_substeps"] = action_probe.physics_substeps
+                report["physical_metadata"] = action_probe.physical_metadata
             if "samples" in report:
                 path = write_startup_report(directory, _to_jsonable(report))
                 print(

@@ -254,6 +254,11 @@ def compare_startup_reports(left: dict, right: dict, atol: float = 1e-5) -> dict
     if result["errors"]:
         return result
     lm, rm = left["metadata"], right["metadata"]
+    if any(meta.get("action_source", "policy") != "policy" for meta in (lm, rm)):
+        result["errors"].append(
+            "Action-replay probes require startup_probe_report.py, not policy input parity."
+        )
+        return result
     result["traces"] = [_trace_info(left), _trace_info(right)]
     for key in MATCHED_METADATA:
         if lm[key] != rm[key]:

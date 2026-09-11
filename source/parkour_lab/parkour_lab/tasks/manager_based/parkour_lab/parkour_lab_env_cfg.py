@@ -588,6 +588,12 @@ class RewardsCfg:
     # orientation prior also covers scanned-flat approaches/platforms within
     # obstacle courses, and requested stops, without requiring level-zero terrain.
     action_rate_l2 = RewTerm(func=mdp.action_rate_l2, weight=-0.01)
+    # Opt-in anti-overflow learning cost; retain all physical target clamps.
+    action_target_overflow_l2 = RewTerm(
+        func=mdp.action_target_overflow_l2,
+        weight=0.0,
+        params={"action_term_name": "joint_pos", "normalization_rad": 0.25},
+    )
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.025)
     flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-0.25)
     stable_orientation_l2 = RewTerm(
@@ -770,6 +776,9 @@ class RewardsCfg:
         speed_scale = self.stationary_planar_motion.params["transition_speed_m_s"]
         if not math.isfinite(speed_scale) or speed_scale <= 0.0:
             raise ValueError("braking transition speed must be finite and positive.")
+        overflow_scale = self.action_target_overflow_l2.params["normalization_rad"]
+        if not math.isfinite(overflow_scale) or overflow_scale <= 0.0:
+            raise ValueError("target overflow normalization must be finite and positive.")
         corridor = self.route_cross_track_excess.params
         soft, hard = corridor["soft_half_width_m"], corridor["hard_half_width_m"]
         if not (math.isfinite(soft) and math.isfinite(hard) and 0.0 <= soft < hard):
@@ -780,6 +789,7 @@ class RewardsCfg:
             raise ValueError("normalize_by_margin must be boolean.")
 
         for name in (
+            "action_target_overflow_l2",
             "stationary_planar_motion",
             "upright_orientation_l2",
             "supported_orientation_l2",

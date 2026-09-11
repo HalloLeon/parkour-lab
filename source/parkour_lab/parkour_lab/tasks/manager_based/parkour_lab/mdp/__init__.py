@@ -66,6 +66,7 @@ from .observations import (
     terrain_height_scan as terrain_height_scan,
 )
 from .reward_terms.limb import (
+    action_target_overflow_l2 as action_target_overflow_l2,
     feet_edge as feet_edge,
     feet_stumble as feet_stumble,
     joint_deviation_l2 as joint_deviation_l2,

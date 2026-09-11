@@ -216,6 +216,12 @@ def _summarize(samples, *, phase_anchor, foot_names, contact_threshold):
         for sample, state in zip(samples, pre)
     ]
     actions = [sample["policy_action"] for sample in samples]
+    # Use the delayed affine request and the executed processed target, not
+    # target-minus-joint tracking error. This includes both target clamps.
+    target_overflow = [
+        _delta(state["affine_joint_target_rad"], state["processed_joint_target_rad"])
+        for state in post
+    ]
     masks = [
         [math.hypot(*force) > contact_threshold for force in state["foot_force_w_n"]]
         for state in post
@@ -266,6 +272,19 @@ def _summarize(samples, *, phase_anchor, foot_names, contact_threshold):
             "error_norm_m_s_max": max(math.hypot(*row) for row in errors),
         },
         "action_and_motion": {
+            "requested_to_processed_target_overflow": {
+                "abs_rad": _abs_stats(target_overflow),
+                "sum_square_rad2_mean": _mean(
+                    [sum(value * value for value in row) for row in target_overflow]
+                ),
+                # Same resolved action-joint order as the top-level joint_names.
+                "per_joint_abs_rad_mean": [
+                    _mean([abs(row[j]) for row in target_overflow]) for j in range(12)
+                ],
+                "per_joint_abs_rad_max": [
+                    max(abs(row[j]) for row in target_overflow) for j in range(12)
+                ],
+            },
             "policy_action_abs": _abs_stats(actions),
             "policy_action_adjacent_delta_abs": _abs_stats(
                 [_delta(b, a) for a, b in zip(actions, actions[1:])]
@@ -404,6 +423,10 @@ def analyze_failure_trace(
     torque_difference_threshold=None,
 ):
     validate_failure_trace(report)
+    if report["metadata"].get("action_source", "policy") != "policy":
+        raise ValueError(
+            "Action-replay probes are not policy rollouts; use startup_probe_report.py."
+        )
     _threshold(contact_threshold, "contact_threshold")
     _threshold(estimate_error_threshold, "estimate_error_threshold", optional=True)
     _threshold(

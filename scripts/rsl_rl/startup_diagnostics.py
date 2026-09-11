@@ -1,4 +1,4 @@
-"""Bounded, single-episode startup capture; no simulator imports or policy changes.
+"""Bounded, single-episode startup capture; no simulator imports.
 
 The estimator hook observes the *actual* inference call. Post-step state must be
 supplied by the reward-time snapshot, because a vector wrapper auto-resets done
@@ -8,6 +8,7 @@ environments before returning from ``step``.
 from __future__ import annotations
 
 import math
+from contextlib import nullcontext
 
 
 OBSERVATION_GROUPS = (
@@ -23,16 +24,31 @@ MAX_STARTUP_STEPS = 500
 
 def validate_startup_arguments(args) -> None:
     """Reject conflicting modes before launching the simulator."""
+    replay = getattr(args, "startup_action_replay", None)
     if not args.startup_diagnostics:
-        if args.startup_steps is not None or args.startup_output_dir is not None:
+        if (
+            args.startup_steps is not None
+            or args.startup_output_dir is not None
+            or replay is not None
+        ):
             raise ValueError(
-                "--startup_steps/--startup_output_dir require --startup_diagnostics."
+                "--startup_steps/--startup_output_dir/--startup_action_replay require --startup_diagnostics."
             )
         return
     if args.startup_steps is None:
-        args.startup_steps = 100
+        args.startup_steps = 10 if replay is not None else 100
     if not 1 <= args.startup_steps <= MAX_STARTUP_STEPS:
         raise ValueError(f"--startup_steps must be between 1 and {MAX_STARTUP_STEPS}.")
+    if replay is not None and (
+        not replay
+        or args.startup_steps > 10
+        or args.command_profile != "translation_only"
+        or args.policy_mode != "history_mean"
+    ):
+        raise ValueError(
+            "--startup_action_replay requires an explicit source trace, at most 10 steps, "
+            "history_mean and translation_only; it is not a policy evaluation."
+        )
     if (
         args.num_envs != 1
         or args.eval_episodes != 1
@@ -97,11 +113,14 @@ def collect_startup_diagnostics(
     termination_outcomes,
     is_running,
     report,
+    action_probe=None,
 ) -> None:
     """Fill a report in place, retaining partial samples if an exception occurs.
 
     Callers own serialization and environment lifetime. No second inference,
-    observation recomputation, reset, action modification, or RNG draw is made.
+    observation recomputation, reset or RNG draw is made. The optional explicit
+    action probe replaces executed actions with a recorded prefix; current
+    policy outputs remain separately recorded and this is not policy evaluation.
     """
     import torch
 
@@ -150,7 +169,15 @@ def collect_startup_diagnostics(
                     )
                 pre["estimated_velocity_body_m_s"] = _single_environment(estimates[0])
                 action_values = _single_environment(actions)
-                obs, _, dones, _ = env.step(actions)
+                if action_probe is not None:
+                    actions = action_probe.action(step, actions, pre)
+                    replayed_values = _single_environment(actions)
+                with (
+                    nullcontext()
+                    if action_probe is None
+                    else action_probe.capture_physics(env.unwrapped, step)
+                ):
+                    obs, _, dones, _ = env.step(actions)
                 transition = latest_step(env.unwrapped)
                 if transition is None or transition.startup is None:
                     raise RuntimeError(
@@ -180,6 +207,10 @@ def collect_startup_diagnostics(
                         },
                     }
                 )
+                if action_probe is not None:
+                    sample = report["samples"][-1]
+                    sample["replayed_action"] = replayed_values
+                    action_probe.validate_post(step, sample["post"]["state"])
                 if done:
                     report["stop_reason"] = "episode_terminated"
                     break

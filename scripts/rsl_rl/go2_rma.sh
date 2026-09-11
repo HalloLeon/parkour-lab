@@ -2,7 +2,7 @@
 # Focused Go2 RMA workflow. Run from the repository root in the Isaac Lab env.
 set -euo pipefail
 
-PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|diagnose|startup|check-repair|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
+PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|diagnose|probe-startup|startup|check-repair|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
 PARKOUR_CHECKPOINT="${2:?Pass an explicit checkpoint path}"
 shift 2
 if [[ ! -f "$PARKOUR_CHECKPOINT" ]]; then
@@ -64,6 +64,35 @@ case "$PARKOUR_REWARD_PROFILE" in
 esac
 
 case "$PARKOUR_MODE" in
+  probe-startup)
+    # Counterfactual dynamics probe, not a new policy rollout/acceptance screen.
+    # Remove the small first-action difference by replaying one explicit source
+    # prefix through the normal mapping, delay, safe clamp and actuator pipeline.
+    if (( $# != 1 )) || [[ ! -f "$1" ]]; then
+      echo "Usage: go2_rma.sh probe-startup CHECKPOINT SOURCE_STARTUP_DIAGNOSTICS_JSON (no extra overrides)" >&2
+      exit 2
+    fi
+    PARKOUR_PROBE_SOURCE="$1"
+    PARKOUR_CHECKPOINT_DIR="$(dirname -- "$PARKOUR_CHECKPOINT")"
+    PARKOUR_PROBE_DIR="$(mktemp -d "$PARKOUR_CHECKPOINT_DIR/action_probe_XXXXXX")"
+    echo "Matched-action probe: $PARKOUR_PROBE_DIR"
+    for PARKOUR_LEVEL in 0 6; do
+      python scripts/rsl_rl/play.py "${PARKOUR_COMMON[@]}" \
+        --headless --livestream=0 --checkpoint="$PARKOUR_CHECKPOINT" \
+        --startup_diagnostics --startup_steps=10 \
+        --startup_action_replay="$PARKOUR_PROBE_SOURCE" \
+        --startup_output_dir="$PARKOUR_PROBE_DIR/level_$PARKOUR_LEVEL" \
+        --num_envs=1 --eval_episodes=1 --no-screen --reset_profile=jitter \
+        --policy_mode=history_mean --terrain_family=high_step \
+        --difficulty_level="$PARKOUR_LEVEL" --geometry_variant=0 \
+        --desired_speed=0.55 --desired_yaw_rate=0 --command_profile=translation_only
+    done
+    python scripts/rsl_rl/startup_probe_report.py \
+      "$PARKOUR_PROBE_DIR/level_0/startup_diagnostics.json" \
+      "$PARKOUR_PROBE_DIR/level_6/startup_diagnostics.json" \
+      --reference="$PARKOUR_PROBE_SOURCE" --json > "$PARKOUR_PROBE_DIR/probe_report.json"
+    echo "Saved $PARKOUR_PROBE_DIR/probe_report.json (valid probe does not mean the robot passes)."
+    ;;
   diagnose)
     # Two bounded first-episode traces, not another training run or success
     # sweep. Preserve the failed screen's checkpoint, jitter and mean actions.
@@ -269,7 +298,7 @@ case "$PARKOUR_MODE" in
       --terrain_family=tilted_ramps --difficulty_level=0 "$@"
     ;;
   *)
-    echo "Unknown mode: $PARKOUR_MODE (use train, recover, resume, repair, diagnose, startup, check-repair, check-step, check-control, check or teleop)." >&2
+    echo "Unknown mode: $PARKOUR_MODE (use train, recover, resume, repair, diagnose, probe-startup, startup, check-repair, check-step, check-control, check or teleop)." >&2
     exit 2
     ;;
 esac

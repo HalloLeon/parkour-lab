@@ -46,6 +46,9 @@ FIELDS = {
             "rewards.upright_orientation_l2.weight",
             "rewards.supported_orientation_l2.weight",
             "rewards.supported_vertical_velocity_l2.weight",
+            "rewards.action_target_overflow_l2.weight",
+            "rewards.action_target_overflow_l2.params.normalization_rad",
+            "rewards.action_target_overflow_l2.params.action_term_name",
         ),
         "commands": (
             "commands.intent.command_profile",
