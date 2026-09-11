@@ -1,9 +1,10 @@
-"""Opt-in world centering for a bounded startup action-replay diagnostic.
+"""Opt-in world centering for bounded replay and normal-policy diagnostics.
 
 Importing this module does not import Isaac Lab, NumPy, Torch or the simulator.
-The caller must separately enforce the action-replay-only CLI contract. This is
-not a training preset: the generated class and its evidence belong to one
-configuration in the current process.
+The two entry points have separate scope and evidence contracts; the caller
+must also enforce the corresponding CLI contract. Neither is a training preset:
+the generated class and its evidence belong to one configuration in the current
+process.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import math
 
 
 CENTERING_TOLERANCE_M = 1e-9
+RUNTIME_ORIGIN_TOLERANCE_M = 2e-6
 
 
 def _require(condition, message):
@@ -158,19 +160,8 @@ def _centered_generator_class(base_class, selected_row, evidence):
     return CenteredStartupTerrainGenerator
 
 
-def configure_centered_startup_scene(env_cfg):
-    """Install replay-only centering after fixed-course configuration.
-
-    Returns a mutable JSON-compatible evidence dictionary. Keep this object:
-    the generated class fills its *actual* origin and translation after scene
-    generation, even if the environment copies the configuration. ``applied``
-    stays false until all mesh, origin and patch validation has succeeded.
-
-    No robot state, actuator, policy, reset event or random generator is changed.
-    Translating terrain before construction does change which course surrounds
-    world zero during simulator initialization. Thus this is a centered-world
-    scene intervention, not proof of translation invariance or robot readiness.
-    """
+def _configure_centered_scene(env_cfg, *, evaluation):
+    """Shared generation, with distinct replay and feedback scope contracts."""
     scene = getattr(env_cfg, "scene", None)
     ground = getattr(scene, "ground", None)
     generator_cfg = getattr(ground, "terrain_generator", None)
@@ -180,12 +171,16 @@ def configure_centered_startup_scene(env_cfg):
         and scene.num_envs == 1
         and getattr(env_cfg, "evaluation_family", None) == "high_step"
         and type(level) is int
-        and level in (0, 6)
+        and level in ((6,) if evaluation else (0, 6))
         and type(getattr(env_cfg, "evaluation_geometry_variant", None)) is int
         and env_cfg.evaluation_geometry_variant == 0
         and getattr(env_cfg, "evaluation_command_profile", None) == "translation_only"
         and getattr(env_cfg, "curriculum", None) is None,
-        "Centered startup replay requires one fixed high_step environment, level 0 or 6, variant 0, translation_only.",
+        (
+            "Centered policy evaluation requires one fixed high_step environment, level 6, variant 0, translation_only."
+            if evaluation
+            else "Centered startup replay requires one fixed high_step environment, level 0 or 6, variant 0, translation_only."
+        ),
     )
     _require(
         getattr(ground, "terrain_type", None) == "generator"
@@ -196,7 +191,7 @@ def configure_centered_startup_scene(env_cfg):
         and generator_cfg.num_rows > level
         and type(getattr(generator_cfg, "num_cols", None)) is int
         and generator_cfg.num_cols == 1,
-        "Centered startup replay requires a curriculum-generated single-column terrain with terrain origins enabled.",
+        "Centered scene diagnostics require a curriculum-generated single-column terrain with terrain origins enabled.",
     )
     base_class = getattr(generator_cfg, "class_type", None)
     if base_class is None:
@@ -208,7 +203,7 @@ def configure_centered_startup_scene(env_cfg):
     )
     _require(
         not getattr(base_class, "_startup_centered_generator", False),
-        "Centered startup scene configuration must not be applied twice.",
+        "Centered scene configuration must not be applied twice.",
     )
     robot_init = getattr(getattr(scene, "robot", None), "init_state", None)
     construction_position = getattr(robot_init, "pos", None)
@@ -219,7 +214,7 @@ def configure_centered_startup_scene(env_cfg):
             type(value) in (int, float) and math.isfinite(value)
             for value in construction_position
         ),
-        "Centered startup replay requires a finite robot construction position.",
+        "Centered scene diagnostics require a finite robot construction position.",
     )
     construction_rotation = getattr(robot_init, "rot", None)
     if construction_rotation is not None:
@@ -233,7 +228,9 @@ def configure_centered_startup_scene(env_cfg):
             "Robot construction orientation must be a finite wxyz quaternion.",
         )
     evidence = {
-        "kind": "startup_centered_terrain",
+        "kind": "evaluation_centered_terrain"
+        if evaluation
+        else "startup_centered_terrain",
         "schema_version": 1,
         "configured": True,
         "applied": False,
@@ -259,7 +256,244 @@ def configure_centered_startup_scene(env_cfg):
             "Matching or diverging replay outcomes alone do not establish a simulator bug or robot readiness.",
         ],
     }
+    if evaluation:
+        evidence.update(
+            purpose="normal_policy_evaluation",
+            runtime_origin_verified=False,
+            runtime_environment_origin_w_m=None,
+            runtime_origin_abs_tolerance_m=RUNTIME_ORIGIN_TOLERANCE_M,
+        )
+        evidence["limitations"][0] = (
+            "Normal-policy evaluation with an explicit scene intervention; not a training preset or production fix."
+        )
+        evidence["limitations"][-1] = (
+            "Performance differences alone do not establish a simulator bug or reliable robot operation."
+        )
     generator_class = _centered_generator_class(base_class, level, evidence)
     generator_class._startup_centered_generator = True
     generator_cfg.class_type = generator_class
     return evidence
+
+
+def configure_centered_startup_scene(env_cfg):
+    """Install replay-only centering after fixed-course configuration.
+
+    Returns a mutable JSON-compatible evidence dictionary. Keep this object:
+    the generated class fills its *actual* origin and translation after scene
+    generation, even if the environment copies the configuration. ``applied``
+    stays false until all mesh, origin and patch validation has succeeded.
+
+    No robot state, actuator, policy, reset event or random generator is changed.
+    Translating terrain before construction does change which course surrounds
+    world zero during simulator initialization. Thus this is a centered-world
+    scene intervention, not proof of translation invariance or robot readiness.
+    """
+    return _configure_centered_scene(env_cfg, evaluation=False)
+
+
+def configure_centered_evaluation_scene(env_cfg):
+    """Install explicit high-step L6 centering for a normal-policy comparison.
+
+    Unlike the replay entry point, this admits only the single fixed L6 course.
+    It does not change actions, reset events or control. After scene construction
+    and fixed-course initialization, the caller must validate the live origin
+    with :func:`validate_centered_evaluation_scene` before policy rollout.
+
+    This intervention changes placement, initialization context and mesh cooking
+    coordinates together. It is an experiment, not a production physics fix.
+    """
+    return _configure_centered_scene(env_cfg, evaluation=True)
+
+
+def _finite_vector(value, size, field):
+    _require(
+        isinstance(value, list)
+        and len(value) == size
+        and all(type(item) in (int, float) and math.isfinite(item) for item in value),
+        f"{field} must be a finite {size}-element numeric list.",
+    )
+    return value
+
+
+def validate_centered_evaluation_evidence(evidence, require_runtime=True):
+    """Fail closed on incomplete or inconsistent captured centering evidence.
+
+    This pure report validator checks generator evidence and, when required,
+    the captured live origin. It does not reread the mesh from USD, attest to
+    simulator internals, or qualify the robot's behavior.
+    """
+    _require(
+        isinstance(evidence, dict), "Centered evaluation evidence must be a dictionary."
+    )
+    try:
+        json.dumps(evidence, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "Centered evaluation evidence must be finite JSON data."
+        ) from error
+    _require(
+        evidence.get("kind") == "evaluation_centered_terrain"
+        and evidence.get("purpose") == "normal_policy_evaluation"
+        and type(evidence.get("schema_version")) is int
+        and evidence["schema_version"] == 1
+        and evidence.get("configured") is True
+        and evidence.get("applied") is True
+        and type(evidence.get("selected_row")) is int
+        and evidence["selected_row"] == 6
+        and type(evidence.get("selected_column")) is int
+        and evidence["selected_column"] == 0,
+        "Evidence must describe an applied, fixed high-step L6 centered normal-policy evaluation.",
+    )
+    _require(
+        type(evidence.get("centering_abs_tolerance_m")) in (int, float)
+        and evidence["centering_abs_tolerance_m"] == CENTERING_TOLERANCE_M
+        and type(evidence.get("runtime_origin_abs_tolerance_m")) in (int, float)
+        and evidence["runtime_origin_abs_tolerance_m"] == RUNTIME_ORIGIN_TOLERANCE_M,
+        "Centered evaluation evidence must retain the declared geometry and runtime origin tolerances.",
+    )
+    source = _finite_vector(evidence.get("source_origin_w_m"), 3, "source_origin_w_m")
+    shift = _finite_vector(evidence.get("translation_w_m"), 3, "translation_w_m")
+    centered = _finite_vector(
+        evidence.get("centered_origin_w_m"), 3, "centered_origin_w_m"
+    )
+    _require(
+        max(abs(item) for item in centered) <= CENTERING_TOLERANCE_M
+        and max(abs(a + b - c) for a, b, c in zip(source, shift, centered))
+        <= CENTERING_TOLERANCE_M,
+        "Terrain origin and translation evidence do not consistently center the selected course.",
+    )
+    error = evidence.get("local_geometry_max_abs_error_m")
+    _require(
+        type(error) in (int, float) and 0 <= error <= CENTERING_TOLERANCE_M,
+        "Centering evidence does not demonstrate local geometry preservation.",
+    )
+    for key in ("mesh_vertex_count", "mesh_face_count"):
+        _require(
+            type(evidence.get(key)) is int and evidence[key] > 0,
+            f"{key} must be a positive integer.",
+        )
+    for key in ("source_mesh_sha256", "centered_mesh_sha256"):
+        digest = evidence.get(key)
+        _require(
+            isinstance(digest, str)
+            and len(digest) == 64
+            and all(c in "0123456789abcdef" for c in digest),
+            f"{key} must be a lowercase SHA-256 digest.",
+        )
+    _require(
+        isinstance(evidence.get("original_generator_class"), str)
+        and bool(evidence["original_generator_class"]),
+        "Original generator class evidence is missing.",
+    )
+    patches = evidence.get("translated_flat_patch_names")
+    _require(
+        isinstance(patches, list)
+        and all(isinstance(name, str) for name in patches)
+        and len(set(patches)) == len(patches),
+        "Translated flat patch evidence must contain unique names.",
+    )
+    _finite_vector(
+        evidence.get("construction_robot_position_w_m"),
+        3,
+        "construction_robot_position_w_m",
+    )
+    rotation = evidence.get("construction_robot_orientation_wxyz")
+    if isinstance(rotation, dict):
+        _require(
+            rotation.get("status") == "UNAVAILABLE"
+            and isinstance(rotation.get("reason"), str)
+            and bool(rotation["reason"]),
+            "Missing construction orientation needs an explicit unavailable reason.",
+        )
+    else:
+        _finite_vector(rotation, 4, "construction_robot_orientation_wxyz")
+    _require(
+        isinstance(evidence.get("construction_pose_basis"), str)
+        and bool(evidence["construction_pose_basis"])
+        and isinstance(evidence.get("limitations"), list)
+        and bool(evidence["limitations"])
+        and all(
+            isinstance(item, str) and bool(item) for item in evidence["limitations"]
+        ),
+        "Construction pose basis and scene intervention limitations must be recorded.",
+    )
+    verified = evidence.get("runtime_origin_verified")
+    _require(
+        type(verified) is bool, "Runtime origin verification status must be explicit."
+    )
+    if verified:
+        runtime = _finite_vector(
+            evidence.get("runtime_environment_origin_w_m"),
+            3,
+            "runtime_environment_origin_w_m",
+        )
+        _require(
+            max(abs(item) for item in runtime) <= RUNTIME_ORIGIN_TOLERANCE_M
+            and max(abs(a - b) for a, b in zip(runtime, centered))
+            <= RUNTIME_ORIGIN_TOLERANCE_M,
+            "The captured environment origin does not match the centered course at world zero.",
+        )
+    else:
+        _require(
+            evidence.get("runtime_environment_origin_w_m") is None
+            and not require_runtime,
+            "Centered evaluation requires a verified live environment origin.",
+        )
+    return evidence
+
+
+def validate_centered_evaluation_scene(env, evidence):
+    """Validate the generated evidence and capture the live origin, read-only.
+
+    Call after fixed-course initialization, before rollout. Only the evidence
+    dictionary is updated; no scene, robot state, reset, step or config is written.
+    A failed revalidation clears prior runtime verification in this dictionary.
+    """
+    _require(
+        isinstance(evidence, dict)
+        and evidence.get("kind") == "evaluation_centered_terrain"
+        and evidence.get("purpose") == "normal_policy_evaluation",
+        "Runtime evaluation validation requires evaluation-specific centering evidence.",
+    )
+    evidence["runtime_origin_verified"] = False
+    evidence["runtime_environment_origin_w_m"] = None
+    validate_centered_evaluation_evidence(evidence, require_runtime=False)
+    cfg = getattr(env, "cfg", None)
+    scene_cfg = getattr(cfg, "scene", None)
+    _require(
+        type(getattr(env, "num_envs", None)) is int
+        and env.num_envs == 1
+        and type(getattr(scene_cfg, "num_envs", None)) is int
+        and scene_cfg.num_envs == 1
+        and getattr(cfg, "evaluation_family", None) == "high_step"
+        and type(getattr(cfg, "evaluation_level", None)) is int
+        and cfg.evaluation_level == 6
+        and type(getattr(cfg, "evaluation_geometry_variant", None)) is int
+        and cfg.evaluation_geometry_variant == 0
+        and getattr(cfg, "evaluation_command_profile", None) == "translation_only"
+        and getattr(cfg, "curriculum", None) is None,
+        "Live centered policy evaluation must retain the single fixed high-step L6 translation-only scope.",
+    )
+    import torch
+
+    origins = getattr(getattr(env, "scene", None), "env_origins", None)
+    _require(
+        isinstance(origins, torch.Tensor)
+        and origins.is_floating_point()
+        and tuple(origins.shape) == (1, 3)
+        and torch.isfinite(origins).all().item(),
+        "Live environment origins must be a finite floating-point (1, 3) tensor.",
+    )
+    runtime_origin = origins.detach().cpu().clone()[0].tolist()
+    centered = evidence["centered_origin_w_m"]
+    _require(
+        max(abs(item) for item in runtime_origin) <= RUNTIME_ORIGIN_TOLERANCE_M
+        and max(abs(a - b) for a, b in zip(runtime_origin, centered))
+        <= RUNTIME_ORIGIN_TOLERANCE_M,
+        "Live environment origin does not match the centered course at world zero.",
+    )
+    evidence.update(
+        runtime_origin_verified=True,
+        runtime_environment_origin_w_m=runtime_origin,
+    )
+    return validate_centered_evaluation_evidence(evidence)

@@ -146,6 +146,12 @@ parser.add_argument(
     help="Diagnostic-only three-episode high_step L6 PGS feedback screen after matched replay.",
 )
 parser.add_argument(
+    "--evaluation_scene_probe",
+    choices=("native", "centered"),
+    default=None,
+    help="Diagnostic-only native/centered high_step L6 feedback comparison under unchanged TGS.",
+)
+parser.add_argument(
     "--teleop",
     action="store_true",
     help="Local or streamed single-Go2 keyboard control using history_mean; no evaluation sweep.",
@@ -1776,6 +1782,24 @@ def _evaluate_course(
         from startup_solver_probe import configure_solver_probe
 
         solver_probe = configure_solver_probe(env_cfg, args_cli.evaluation_solver_probe)
+    scene_probe = None
+    scene_capture = None
+    if getattr(args_cli, "evaluation_scene_probe", None) is not None:
+        from scene_feedback_capture import SceneFeedbackCapture
+        from startup_solver_probe import configure_solver_probe
+
+        solver_probe = configure_solver_probe(env_cfg, "tgs")
+        scene_probe = {
+            "kind": "scene_feedback",
+            "schema_version": 1,
+            "placement": args_cli.evaluation_scene_probe,
+            "centering": None,
+        }
+        if args_cli.evaluation_scene_probe == "centered":
+            from startup_centered_scene import configure_centered_evaluation_scene
+
+            scene_probe["centering"] = configure_centered_evaluation_scene(env_cfg)
+        scene_capture = SceneFeedbackCapture()
     env = _create_evaluation_environment(env_cfg, agent_cfg, artifacts)
     num_envs = env.num_envs
     step_dt = env.unwrapped.step_dt
@@ -1787,6 +1811,14 @@ def _evaluate_course(
             from startup_solver_probe import validate_solver_probe_readback
 
             validate_solver_probe_readback(env.unwrapped, solver_probe)
+        if scene_probe is not None:
+            if scene_probe["centering"] is not None:
+                from startup_centered_scene import validate_centered_evaluation_scene
+
+                validate_centered_evaluation_scene(env.unwrapped, scene_probe["centering"])
+            scene_probe["environment_origin_w_m"] = _to_jsonable(
+                env.unwrapped.scene.env_origins[0]
+            )
         evaluation_reward_config = _evaluation_reward_config(
             env.unwrapped.reward_manager
         )
@@ -1812,7 +1844,12 @@ def _evaluate_course(
                 phase_names=PHASE_NAMES,
                 phase_signal_names=PHASE_SIGNAL_NAMES,
             )
-        rollout = _collect_rollout_statistics(env, observations, policy, telemetry)
+        if scene_capture is None:
+            rollout = _collect_rollout_statistics(env, observations, policy, telemetry)
+        else:
+            rollout = _collect_rollout_statistics(
+                env, observations, policy, telemetry, scene_capture=scene_capture
+            )
     finally:
         # Closing also finalizes a partial or completed RecordVideo recording.
         try:
@@ -1844,6 +1881,11 @@ def _evaluate_course(
         physics = env_cfg.sim.to_dict()
         physics.pop("log_dir", None)
         report["environment_physics"] = _to_jsonable(physics)
+    if scene_probe is not None:
+        scene_probe["episodes"] = scene_capture.episodes
+        scene_probe["incomplete_episode"] = scene_capture.pending
+        report["scene_probe"] = scene_probe
+        report["kit_args"] = args_cli.kit_args
     report_path = _write_evaluation_report(artifacts.directory, report)
     return report, report_path
 
@@ -2957,6 +2999,8 @@ def _collect_rollout_statistics(
     observations: TensorDict,
     policy: Callable[[TensorDict], torch.Tensor],
     telemetry: EvaluationTelemetry | None = None,
+    *,
+    scene_capture=None,
 ) -> _RolloutResult:
     """Aggregate completed episodes for the selected policy mode."""
 
@@ -3009,7 +3053,11 @@ def _collect_rollout_statistics(
                 )
                 telemetry_speed = float(get_preferred_speed(base_env)[0].item())
                 telemetry_yaw = float(get_target_yaw_rate(base_env)[0].item())
+            if scene_capture is not None and int(episode_lengths[0].item()) == 0:
+                scene_capture.begin(base_env, observations)
             actions = policy(observations)
+            if scene_capture is not None and int(episode_lengths[0].item()) == 0:
+                scene_capture.record_action(actions)
             observations, rewards, dones, _ = env.step(actions)
             # The reward-phase diagnostic retains terminal physics before
             # Isaac Lab auto-resets completed environments.
@@ -3089,6 +3137,14 @@ def _collect_rollout_statistics(
         episode_max_course_progress_m = route.last_episode_max_course_progress_m(
             base_env
         )
+        if scene_capture is not None and bool(done_mask[0].item()):
+            scene_capture.finish(
+                base_env,
+                int(episode_lengths[0].item()),
+                outcomes,
+                episode_max_course_progress_m,
+                episode_max_waypoints_reached,
+            )
         episode_foot_metrics = _episode_foot_gait_metrics(
             contact_step_counts=episode_foot_gait.contact_step_counts,
             touchdown_counts=episode_foot_gait.touchdown_counts,

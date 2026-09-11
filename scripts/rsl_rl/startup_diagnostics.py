@@ -29,8 +29,11 @@ def validate_startup_arguments(args) -> None:
     legacy_friction = getattr(args, "startup_legacy_friction", None)
     solver = getattr(args, "startup_solver_probe", None)
     evaluation_solver = getattr(args, "evaluation_solver_probe", None)
-    if evaluation_solver is not None and (
-        evaluation_solver != "pgs"
+    evaluation_scene = getattr(args, "evaluation_scene_probe", None)
+    if (evaluation_solver is not None or evaluation_scene is not None) and (
+        evaluation_solver not in (None, "pgs")
+        or evaluation_scene not in (None, "native", "centered")
+        or (evaluation_solver is not None and evaluation_scene is not None)
         or args.startup_diagnostics
         or replay
         or centered
@@ -57,7 +60,8 @@ def validate_startup_arguments(args) -> None:
         or args.action_noise_seed is not None
     ):
         raise ValueError(
-            "--evaluation_solver_probe is only for the fixed three-episode PGS high_step L6 feedback screen"
+            "--evaluation_solver_probe / --evaluation_scene_probe require one explicit "
+            "intervention and the fixed three-episode high_step L6 feedback screen"
         )
     if solver is not None and (
         solver not in ("tgs", "pgs")

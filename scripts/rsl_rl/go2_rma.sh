@@ -2,7 +2,7 @@
 # Focused Go2 RMA workflow. Run from the repository root in the Isaac Lab env.
 set -euo pipefail
 
-PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|diagnose|probe-startup|probe-centered|probe-friction|probe-solver|startup|check-repair|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
+PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|diagnose|probe-startup|probe-centered|probe-friction|probe-solver|check-centered|startup|check-repair|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
 PARKOUR_CHECKPOINT="${2:?Pass an explicit checkpoint path}"
 shift 2
 if [[ ! -f "$PARKOUR_CHECKPOINT" ]]; then
@@ -64,6 +64,39 @@ case "$PARKOUR_REWARD_PROFILE" in
 esac
 
 case "$PARKOUR_MODE" in
+  check-centered)
+    if (( $# )); then
+      echo "check-centered has fixed paired evaluation settings and accepts no extra overrides." >&2
+      exit 2
+    fi
+    PARKOUR_CHECKPOINT_DIR="$(dirname -- "$PARKOUR_CHECKPOINT")"
+    PARKOUR_PAIR_DIR="$(mktemp -d "$PARKOUR_CHECKPOINT_DIR/scene_feedback_XXXXXX")"
+    echo "Native versus centered normal-policy evaluation: $PARKOUR_PAIR_DIR"
+    for PARKOUR_PLACEMENT in native centered; do
+      # Apply the behavioral screens only after BOTH runs. Native falling is
+      # an outcome, whereas a simulator/configuration failure stops immediately.
+      python scripts/rsl_rl/play.py "${PARKOUR_COMMON[@]}" \
+        --headless --livestream=0 --checkpoint="$PARKOUR_CHECKPOINT" \
+        --evaluation_scene_probe="$PARKOUR_PLACEMENT" \
+        --no-screen --num_envs=1 --eval_episodes=3 --reset_profile=jitter \
+        --policy_mode=history_mean --terrain_family=high_step \
+        --difficulty_level=6 --geometry_variant=0 \
+        --desired_speed=0.55 --desired_yaw_rate=0 --command_profile=translation_only \
+        --video_output_dir="$PARKOUR_PAIR_DIR/${PARKOUR_PLACEMENT}_L6"
+      if [[ "$PARKOUR_PLACEMENT" == native ]]; then
+        if ! python scripts/rsl_rl/scene_feedback_report.py "$PARKOUR_PAIR_DIR" \
+          --native-only > "$PARKOUR_PAIR_DIR/native_report.json"; then
+          echo "Native evidence is incomplete or invalid; centered run not launched. See $PARKOUR_PAIR_DIR/native_report.json" >&2
+          exit 2
+        fi
+      fi
+    done
+    PARKOUR_PAIR_EXIT=0
+    python scripts/rsl_rl/scene_feedback_report.py "$PARKOUR_PAIR_DIR" \
+      > "$PARKOUR_PAIR_DIR/comparison.json" || PARKOUR_PAIR_EXIT=$?
+    echo "Paired feedback report: $PARKOUR_PAIR_DIR/comparison.json (exit $PARKOUR_PAIR_EXIT; not operator acceptance)."
+    exit "$PARKOUR_PAIR_EXIT"
+    ;;
   probe-solver)
     if (( $# != 3 )) || [[ ! -f "$1" ]] || [[ ! -f "$2" ]] || \
        [[ ! -f "$3/level_0/startup_diagnostics.json" ]] || \
