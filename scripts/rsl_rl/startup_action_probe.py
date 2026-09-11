@@ -142,7 +142,17 @@ def _action_order(value, joint_ids, raw_count, *, suffix=()):
 class StartupActionProbe:
     """Replay at most ten source actions, failing closed on contract mismatch."""
 
-    def __init__(self, source_path, max_steps=MAX_REPLAY_STEPS, *, solver_probe=None):
+    def __init__(
+        self,
+        source_path,
+        max_steps=MAX_REPLAY_STEPS,
+        *,
+        solver_probe=None,
+        record_clock=False,
+    ):
+        if type(record_clock) is not bool:
+            raise ValueError("Clock capture selection must be boolean")
+        self.record_clock = record_clock
         if solver_probe not in (None, "tgs", "pgs"):
             raise ValueError("Solver probe must be explicitly tgs or pgs")
         self.solver_probe = solver_probe
@@ -553,7 +563,17 @@ class StartupActionProbe:
                 ),
             }
             self.physics_substeps.append(record)
+            if self.record_clock:
+                record["clock_before"] = {
+                    "time_s": float(sim.current_time),
+                    "step_index": sim.current_time_step_index,
+                }
             result = original(*args, **kwargs)
+            if self.record_clock:
+                record["clock_after"] = {
+                    "time_s": float(sim.current_time),
+                    "step_index": sim.current_time_step_index,
+                }
             record["post"] = self._physics_state(env, asset, action, joint_ids)
             return result
 

@@ -30,6 +30,29 @@ def validate_startup_arguments(args) -> None:
     solver = getattr(args, "startup_solver_probe", None)
     evaluation_solver = getattr(args, "evaluation_solver_probe", None)
     evaluation_scene = getattr(args, "evaluation_scene_probe", None)
+    collision = getattr(args, "startup_ground_collision", None)
+    if collision is not None and (
+        collision not in ("native", "ground_off")
+        or not args.startup_diagnostics
+        or not replay
+        or centered
+        or solver is not None
+        or legacy_friction is not None
+        or evaluation_solver is not None
+        or evaluation_scene is not None
+        or args.terrain_family != "high_step"
+        or args.difficulty_level not in (0, 6)
+        or args.geometry_variant != 0
+        or args.command_profile != "translation_only"
+        or args.seed != 42
+        or args.reset_profile != "jitter"
+        or args.startup_steps not in (None, 1)
+    ):
+        raise ValueError(
+            "--startup_ground_collision requires the fixed one-action, uncentered high_step L0/L6 replay, without other interventions"
+        )
+    if collision is not None:
+        args.startup_steps = 1
     if (evaluation_solver is not None or evaluation_scene is not None) and (
         evaluation_solver not in (None, "pgs")
         or evaluation_scene not in (None, "native", "centered")

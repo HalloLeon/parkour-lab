@@ -140,6 +140,11 @@ parser.add_argument(
     help="Diagnostic-only solver selection for a matched startup replay; no training defaults change.",
 )
 parser.add_argument(
+    "--startup_ground_collision",
+    choices=("native", "ground_off"),
+    help="One-action diagnostic only: keep or disable terrain collisions before initialization; never a training or evaluation preset.",
+)
+parser.add_argument(
     "--evaluation_solver_probe",
     choices=("pgs",),
     default=None,
@@ -1507,6 +1512,7 @@ def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
             args_cli.startup_action_replay,
             max_steps=args_cli.startup_steps,
             solver_probe=getattr(args_cli, "startup_solver_probe", None),
+            record_clock=getattr(args_cli, "startup_ground_collision", None) is not None,
         )
 
     family, level, variant, speed, yaw, profile, level_metadata = (
@@ -1524,6 +1530,13 @@ def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
         raise ValueError("Startup diagnostics require exactly one environment.")
     centered_scene = None
     solver_probe = None
+    collision_probe = None
+    if getattr(args_cli, "startup_ground_collision", None) is not None:
+        from startup_collision_probe import configure_collision_probe
+
+        collision_probe = configure_collision_probe(
+            env_cfg, args_cli.startup_ground_collision
+        )
     if getattr(args_cli, "startup_solver_probe", None) is not None:
         from startup_solver_probe import configure_solver_probe
 
@@ -1613,6 +1626,12 @@ def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
             },
         }
         if action_probe is not None:
+            if collision_probe is not None:
+                from startup_collision_probe import verify_collision_probe
+
+                report["metadata"]["ground_collision_probe"] = verify_collision_probe(
+                    env.unwrapped, collision_probe
+                )
             if solver_probe is not None:
                 from startup_solver_probe import validate_solver_probe_readback
 
@@ -1651,6 +1670,10 @@ def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
                 report=report,
                 action_probe=action_probe,
             )
+            if collision_probe is not None:
+                report["metadata"]["ground_collision_probe"] = verify_collision_probe(
+                    env.unwrapped, collision_probe
+                )
         finally:
             if action_probe is not None:
                 report["metadata"]["action_replay"] = action_probe.metadata()
@@ -1664,6 +1687,12 @@ def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
                 )
     finally:
         env.close()
+    if collision_probe is not None:
+        # Fast application shutdown may exit before propagating exceptions.
+        # Attest completion only after capture AND environment cleanup return.
+        from startup_collision_report import write_completion
+
+        write_completion(directory)
 
 
 def _run_operator_session(env_cfg, agent_cfg, checkpoint) -> None:

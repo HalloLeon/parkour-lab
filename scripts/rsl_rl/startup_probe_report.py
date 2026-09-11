@@ -320,9 +320,26 @@ def _physical_state(state, origin):
     return result
 
 
-def _validate_probe(report, source, source_sha256, label, *, allow_solver_probe=False):
+def _validate_probe(
+    report,
+    source,
+    source_sha256,
+    label,
+    *,
+    allow_solver_probe=False,
+    allow_collision_probe=False,
+    prefix_steps=PREFIX_STEPS,
+):
     validate_failure_trace(report)
     meta, source_meta = report["metadata"], source["metadata"]
+    _require(
+        type(prefix_steps) is int and 1 <= prefix_steps <= PREFIX_STEPS,
+        "Invalid replay prefix length",
+    )
+    _require(
+        allow_collision_probe or "ground_collision_probe" not in meta,
+        f"{label}: ground collision probe requires its dedicated reader",
+    )
     solver_meta = meta.get("solver_probe")
     if allow_solver_probe:
         try:
@@ -349,7 +366,7 @@ def _validate_probe(report, source, source_sha256, label, *, allow_solver_probe=
         "source_sha256": source_sha256,
         "source_checkpoint_sha256": source_meta["checkpoint_sha256"],
         "source_teacher_interface_sha256": source_meta["teacher_interface_sha256"],
-        "prefix_steps": PREFIX_STEPS,
+        "prefix_steps": prefix_steps,
         "runtime_validated": True,
         "initial_state_validated": True,
         "initial_state_abs_tolerance": INITIAL_TOLERANCE,
@@ -366,10 +383,10 @@ def _validate_probe(report, source, source_sha256, label, *, allow_solver_probe=
         f"{label}: source path missing",
     )
     _require(
-        meta["max_steps"] == PREFIX_STEPS
-        and len(report["samples"]) == PREFIX_STEPS
+        meta["max_steps"] == prefix_steps
+        and len(report["samples"]) == prefix_steps
         and report["stop_reason"] == "step_limit",
-        f"{label}: requires complete ten-step capture",
+        f"{label}: requires complete {prefix_steps}-step capture",
     )
     for key in (
         "checkpoint_sha256",
@@ -435,7 +452,7 @@ def _validate_probe(report, source, source_sha256, label, *, allow_solver_probe=
             INITIAL_TOLERANCE,
         )
     for index, (sample, original) in enumerate(
-        zip(report["samples"], source["samples"][:PREFIX_STEPS], strict=True)
+        zip(report["samples"], source["samples"][:prefix_steps], strict=True)
     ):
         _require(
             not sample["post"]["done"]
