@@ -113,6 +113,32 @@ def _unavailable(error):
     return {"status": "UNAVAILABLE", "reason": f"{type(error).__name__}: {error}"}
 
 
+def _checked_tensor(value, shape, label):
+    if tuple(value.shape) != shape:
+        raise ValueError(
+            f"{label}: expected tensor shape {shape}, got {tuple(value.shape)}"
+        )
+    return _copy_tensor(value)
+
+
+def _optional_tensor(getter, shape, label):
+    try:
+        value = getter()
+    except (AttributeError, RuntimeError, NotImplementedError) as error:
+        return _unavailable(error)
+    # A present but malformed/nonfinite measurement is not 'unavailable'.
+    return _checked_tensor(value, shape, label)
+
+
+def _action_order(value, joint_ids, raw_count, *, suffix=()):
+    shape = (1, raw_count, *suffix)
+    if tuple(value.shape) != shape:
+        raise ValueError(
+            f"Raw joint tensor: expected shape {shape}, got {tuple(value.shape)}"
+        )
+    return value[:, joint_ids]
+
+
 class StartupActionProbe:
     """Replay at most ten source actions, failing closed on contract mismatch."""
 
@@ -276,7 +302,35 @@ class StartupActionProbe:
         self._awaiting_post = None
         self._next_step += 1
 
-    def _physics_state(self, env, asset, action, joint_ids):
+    def _generalized_dynamics(self, asset):
+        """Raw floating-base arrays; never drop the root or permute just one axis.
+
+        Getter names/shapes follow Omni Physics 107.3's ArticulationView API.
+        No kinematic refresh or simulator step is used to obtain these arrays.
+        """
+        names = list(asset.joint_names)
+        size = len(names) + 6
+        view = asset.root_physx_view
+        result = {
+            "raw_dof_names": names,
+            "floating_base_root_components": 6,
+            "ordering": "Raw PhysX generalized order: root six components then raw_dof_names. No action-order permutation or root-frame conversion.",
+        }
+        for name, getter, shape in (
+            ("mass_matrix", "get_generalized_mass_matrices", (1, size, size)),
+            ("gravity_compensation", "get_gravity_compensation_forces", (1, size)),
+            (
+                "coriolis_centrifugal_compensation",
+                "get_coriolis_and_centrifugal_compensation_forces",
+                (1, size),
+            ),
+        ):
+            result[name] = _optional_tensor(
+                lambda method=getter: getattr(view, method)(), shape, name
+            )
+        return result
+
+    def _physics_state(self, env, asset, action, joint_ids, *, generalized=False):
         view = asset.root_physx_view
         result = {
             "joint_position_rad": _copy_tensor(view.get_dof_positions()[:, joint_ids]),
@@ -294,6 +348,23 @@ class StartupActionProbe:
                 asset.data.applied_torque[:, joint_ids]
             ),
         }
+        for name, getter in (
+            (
+                "joint_submitted_effort_nm",
+                lambda: _action_order(
+                    asset._joint_effort_target_sim, joint_ids, len(asset.joint_names)
+                ),
+            ),
+            (
+                "joint_physx_actuation_force_nm",
+                lambda: _action_order(
+                    view.get_dof_actuation_forces(), joint_ids, len(asset.joint_names)
+                ),
+            ),
+        ):
+            result[name] = _optional_tensor(getter, (1, 12), name)
+        if generalized:
+            result["generalized_dynamics"] = self._generalized_dynamics(asset)
         for key, getter in (
             ("root_transform_w_xyzw", "get_root_transforms"),
             ("root_com_velocity_w_m_s_rad_s", "get_root_velocities"),
@@ -363,6 +434,16 @@ class StartupActionProbe:
                 )
             except (AttributeError, RuntimeError, NotImplementedError) as error:
                 properties[f"joint_operative_{name}"] = _unavailable(error)
+        properties["joint_friction_static_dynamic_viscous"] = _optional_tensor(
+            lambda: _action_order(
+                asset.root_physx_view.get_dof_friction_properties(),
+                joint_ids,
+                len(asset.joint_names),
+                suffix=(3,),
+            ),
+            (1, 12, 3),
+            "joint_friction_static_dynamic_viscous",
+        )
         return {
             "joint_names": list(action._joint_names),
             "body_names": list(asset.body_names),
@@ -372,7 +453,7 @@ class StartupActionProbe:
             "environment_origin_w_m": _copy_tensor(env.scene.env_origins),
             "physics_dt_s": env.physics_dt,
             "initial_authoritative_state": self._physics_state(
-                env, asset, action, joint_ids
+                env, asset, action, joint_ids, generalized=True
             ),
             "properties": properties,
             "unavailable": {
@@ -384,6 +465,10 @@ class StartupActionProbe:
                 "body_com_pose": "PhysX local COM pose relative to each body link: xyz + quaternion xyzw",
                 "contacts": "Direct PhysX net force query at physics_dt; sensor body_names order; not friction/slip measurement",
                 "torques": "Explicit actuator computed/applied caches written immediately before the physics step",
+                "joint_submitted_effort_nm": "Isaac Lab _joint_effort_target_sim submission buffer in action joint order; not a measured net joint torque",
+                "joint_physx_actuation_force_nm": "PhysX get_dof_actuation_forces backend command in action joint order; excludes implicit drives and constraint/contact forces; not net joint torque",
+                "joint_friction_static_dynamic_viscous": "Per action joint: static friction effort (Nm), dynamic friction effort (Nm), viscous friction coefficient; not surface friction",
+                "generalized_dynamics": "Raw floating-base mass and compensation arrays at initial capture and first pre-physics only; optional availability, no refresh/step and no causal verdict",
                 "targets": "Articulation target buffer and action processed target; explicit PD uses these, not a PhysX position drive",
             },
         }
@@ -433,7 +518,9 @@ class StartupActionProbe:
                 "physics_dt_s": env.physics_dt,
                 "time_before_s": index * env.physics_dt,
                 "time_after_s": (index + 1) * env.physics_dt,
-                "pre": self._physics_state(env, asset, action, joint_ids),
+                "pre": self._physics_state(
+                    env, asset, action, joint_ids, generalized=index == 0
+                ),
             }
             self.physics_substeps.append(record)
             result = original(*args, **kwargs)

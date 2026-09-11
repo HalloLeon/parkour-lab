@@ -70,6 +70,118 @@ PHYSICAL_PROPERTY_WIDTHS = {
     "joint_operative_stiffness": 12,
     "joint_operative_damping": 12,
 }
+# These are newly observed potential causes, not assumptions of equal dynamics.
+# Keep kinematics/action equivalence strict, but report solver-input differences.
+SOLVER_STATE_FIELDS = (
+    "joint_submitted_effort_nm",
+    "joint_physx_actuation_force_nm",
+    "generalized_dynamics",
+)
+SOLVER_PROPERTY_FIELDS = ("joint_friction_static_dynamic_viscous",)
+
+
+def _availability(value):
+    if value is None:
+        return "MISSING"
+    return "UNAVAILABLE" if _unavailable(value) else "AVAILABLE"
+
+
+def _numeric_shape(value, shape, label):
+    if not shape:
+        _require(
+            type(value) in (int, float) and math.isfinite(value),
+            f"{label}: expected finite numeric value",
+        )
+        return
+    _require(
+        isinstance(value, list) and len(value) == shape[0],
+        f"{label}: expected numeric array shape {shape}",
+    )
+    for index, child in enumerate(value):
+        _numeric_shape(child, shape[1:], f"{label}[{index}]")
+
+
+def validate_solver_inputs(mapping, label, joint_names=None):
+    """Validate available additive telemetry; absence is evidence, not equality."""
+    for key, shape in (
+        ("joint_submitted_effort_nm", (12,)),
+        ("joint_physx_actuation_force_nm", (12,)),
+        ("joint_friction_static_dynamic_viscous", (12, 3)),
+    ):
+        value = mapping.get(key)
+        if _availability(value) == "AVAILABLE":
+            _numeric_shape(value, shape, f"{label}.{key}")
+    value = mapping.get("generalized_dynamics")
+    if _availability(value) != "AVAILABLE":
+        return
+    _require(isinstance(value, dict), f"{label}.generalized_dynamics: expected object")
+    names = value.get("raw_dof_names")
+    _require(
+        isinstance(names, list)
+        and len(names) == 12
+        and all(isinstance(name, str) and name for name in names)
+        and len(set(names)) == 12,
+        f"{label}.generalized_dynamics.raw_dof_names: expected twelve unique names",
+    )
+    if joint_names is not None:
+        _require(
+            set(names) == set(joint_names),
+            f"{label}.generalized_dynamics.raw_dof_names: joint map differs",
+        )
+    _require(
+        type(value.get("floating_base_root_components")) is int
+        and value["floating_base_root_components"] == 6,
+        f"{label}.generalized_dynamics: expected six floating-base root components",
+    )
+    _require(
+        isinstance(value.get("ordering"), str) and value["ordering"],
+        f"{label}.generalized_dynamics.ordering: missing",
+    )
+    for key, shape in (
+        ("mass_matrix", (18, 18)),
+        ("gravity_compensation", (18,)),
+        ("coriolis_centrifugal_compensation", (18,)),
+    ):
+        child = value.get(key)
+        if _availability(child) == "AVAILABLE":
+            _numeric_shape(child, shape, f"{label}.generalized_dynamics.{key}")
+
+
+def solver_input_differences(left, right):
+    """Compare optional solver readings without mistaking absence for equality."""
+    validate_solver_inputs(left, "left solver input")
+    validate_solver_inputs(right, "right solver input")
+    results = {}
+
+    def visit(a, b, name):
+        if a is None or b is None or _unavailable(a) or _unavailable(b):
+            results[name] = {
+                "status": "MISSING" if a is None or b is None else "UNAVAILABLE",
+                "left_status": _availability(a),
+                "right_status": _availability(b),
+                "left": a,
+                "right": b,
+            }
+        elif isinstance(a, dict) and isinstance(b, dict):
+            for key in sorted(a.keys() | b.keys()):
+                visit(a.get(key), b.get(key), f"{name}.{key}".strip("."))
+        elif isinstance(a, list) and isinstance(b, list):
+            try:
+                stats = _delta_stats([a], [b])
+            except ValueError:
+                _match(a, b, f"solver input metadata {name}")
+                results[name] = {"status": "MATCHED_METADATA"}
+            else:
+                results[name] = {
+                    "max_abs_difference": stats["max_abs_difference"],
+                    "difference": stats["first_post_difference"],
+                }
+        else:
+            _match(a, b, f"solver input metadata {name}")
+            results[name] = {"status": "MATCHED_METADATA"}
+
+    visit(left, right, "")
+    return results
 
 
 def _require(condition, message):
@@ -123,8 +235,9 @@ def _unavailable(value):
     return False
 
 
-def _validate_authoritative_state(state, bodies, label):
+def _validate_authoritative_state(state, bodies, label, joint_names=None):
     _require(isinstance(state, dict), f"{label}: expected state object")
+    validate_solver_inputs(state, label, joint_names)
     for key in (
         "joint_position_rad",
         "joint_velocity_rad_s",
@@ -378,10 +491,14 @@ def _validate_probe(report, source, source_sha256, label):
                 len(numbers) == expected_count,
                 f"{label}.{key}: property/map shape mismatch",
             )
+    validate_solver_inputs(
+        physical["properties"], label + ".physical.properties", physical["joint_names"]
+    )
     _validate_authoritative_state(
         physical["initial_authoritative_state"],
         len(bodies),
         label + ".initial_authoritative",
+        physical["joint_names"],
     )
     initial = physical["initial_authoritative_state"]
     recorded_initial = report["samples"][0]["pre"]["state"]
@@ -444,7 +561,9 @@ def _validate_probe(report, source, source_sha256, label):
             )
         for when in ("pre", "post"):
             state = _field(substep, when, label)
-            _validate_authoritative_state(state, len(bodies), f"{label}.substep.{when}")
+            _validate_authoritative_state(
+                state, len(bodies), f"{label}.substep.{when}", physical["joint_names"]
+            )
             for key in ("joint_position_target_rad", "processed_joint_target_rad"):
                 _match(
                     state[key],
@@ -472,21 +591,31 @@ def _substep_outcomes(left, right):
     ]
 
     def visit(a, b, prefix):
-        if isinstance(a[0], dict) and isinstance(b[0], dict):
-            if (
-                a[0].get("status") == "UNAVAILABLE"
-                or b[0].get("status") == "UNAVAILABLE"
+        if any(_availability(value) != "AVAILABLE" for value in a + b):
+            # Preserve the legacy all-UNAVAILABLE representation exactly.
+            unavailable[prefix] = {"left": a[0], "right": b[0]}
+            if not all(
+                isinstance(value, dict) and value.get("status") == "UNAVAILABLE"
+                for value in a + b
             ):
-                unavailable[prefix] = {"left": a[0], "right": b[0]}
-                return
+                unavailable[prefix].update(
+                    status="MISSING"
+                    if any(value is None for value in a + b)
+                    else "UNAVAILABLE",
+                    left_statuses=[_availability(value) for value in a],
+                    right_statuses=[_availability(value) for value in b],
+                )
+            return
+        if isinstance(a[0], dict) and isinstance(b[0], dict):
             _require(
-                all(x.keys() == a[0].keys() for x in a + b),
-                f"substep {prefix}: fields differ",
+                all(isinstance(value, dict) for value in a + b),
+                f"substep {prefix}: inconsistent object shape",
             )
-            for key in a[0]:
+            keys = dict.fromkeys(key for value in a + b for key in value)
+            for key in keys:
                 visit(
-                    [x[key] for x in a],
-                    [x[key] for x in b],
+                    [x.get(key) for x in a],
+                    [x.get(key) for x in b],
                     f"{prefix}.{key}".strip("."),
                 )
         else:
@@ -543,9 +672,7 @@ def compare_probe_reports(flat, obstacle, reference, *, reference_sha256):
         "joint_names",
         "body_names",
         "foot_names",
-        "properties",
         "unavailable",
-        "frames",
         "physics_dt_s",
     ):
         _match(
@@ -554,13 +681,44 @@ def compare_probe_reports(flat, obstacle, reference, *, reference_sha256):
             f"matched physical metadata.{key}",
             TARGET_TOLERANCE,
         )
+    solver_frames = set(SOLVER_STATE_FIELDS + SOLVER_PROPERTY_FIELDS)
+    _match(
+        {
+            key: value
+            for key, value in left_physics["frames"].items()
+            if key not in solver_frames
+        },
+        {
+            key: value
+            for key, value in right_physics["frames"].items()
+            if key not in solver_frames
+        },
+        "matched physical metadata.frames",
+    )
+    # The original property set remains a required equivalence contract. New
+    # friction/solver observations may explain divergence and must be reported.
+    for key in PHYSICAL_PROPERTY_WIDTHS:
+        _match(
+            left_physics["properties"][key],
+            right_physics["properties"][key],
+            f"matched physical metadata.properties.{key}",
+            TARGET_TOLERANCE,
+        )
     _match(
         _physical_state(
-            left_physics["initial_authoritative_state"],
+            {
+                k: v
+                for k, v in left_physics["initial_authoritative_state"].items()
+                if k not in SOLVER_STATE_FIELDS
+            },
             left_physics["environment_origin_w_m"],
         ),
         _physical_state(
-            right_physics["initial_authoritative_state"],
+            {
+                k: v
+                for k, v in right_physics["initial_authoritative_state"].items()
+                if k not in SOLVER_STATE_FIELDS
+            },
             right_physics["environment_origin_w_m"],
         ),
         "matched authoritative initial state",
@@ -578,7 +736,7 @@ def compare_probe_reports(flat, obstacle, reference, *, reference_sha256):
             )
             for key in OUTCOME_FIELDS
         }
-    return {
+    result = {
         "kind": "startup_action_probe_comparison",
         "schema_version": 1,
         "evidence_status": "VALID_PROBE",
@@ -606,6 +764,56 @@ def compare_probe_reports(flat, obstacle, reference, *, reference_sha256):
             "This ten-step open-loop probe is not a locomotion or operator acceptance test.",
         ],
     }
+    if any(
+        key in state
+        for state in (
+            left_physics["initial_authoritative_state"],
+            right_physics["initial_authoritative_state"],
+            flat["physics_substeps"][0]["pre"],
+            obstacle["physics_substeps"][0]["pre"],
+        )
+        for key in SOLVER_STATE_FIELDS
+    ) or any(
+        key in physical["properties"]
+        for physical in (left_physics, right_physics)
+        for key in SOLVER_PROPERTY_FIELDS
+    ):
+        result["initial_solver_inputs_flat_minus_obstacle"] = solver_input_differences(
+            {
+                key: left_physics["initial_authoritative_state"].get(key)
+                for key in SOLVER_STATE_FIELDS
+            },
+            {
+                key: right_physics["initial_authoritative_state"].get(key)
+                for key in SOLVER_STATE_FIELDS
+            },
+        )
+        result["first_pre_physics_solver_inputs_flat_minus_obstacle"] = (
+            solver_input_differences(
+                {
+                    key: flat["physics_substeps"][0]["pre"].get(key)
+                    for key in SOLVER_STATE_FIELDS
+                },
+                {
+                    key: obstacle["physics_substeps"][0]["pre"].get(key)
+                    for key in SOLVER_STATE_FIELDS
+                },
+            )
+        )
+        result["solver_properties_flat_minus_obstacle"] = solver_input_differences(
+            {
+                key: left_physics["properties"].get(key)
+                for key in SOLVER_PROPERTY_FIELDS
+            },
+            {
+                key: right_physics["properties"].get(key)
+                for key in SOLVER_PROPERTY_FIELDS
+            },
+        )
+        result["limitations"].append(
+            "New force-delivery and generalized-dynamics readings are compared, not required equal; inspect solver input differences and UNAVAILABLE entries."
+        )
+    return result
 
 
 def main(argv=None):

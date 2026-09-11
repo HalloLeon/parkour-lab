@@ -25,6 +25,18 @@ MAX_STARTUP_STEPS = 500
 def validate_startup_arguments(args) -> None:
     """Reject conflicting modes before launching the simulator."""
     replay = getattr(args, "startup_action_replay", None)
+    centered = getattr(args, "startup_center_scene", False)
+    if centered and (
+        not args.startup_diagnostics
+        or not replay
+        or args.terrain_family != "high_step"
+        or args.difficulty_level not in (0, 6)
+        or args.geometry_variant != 0
+    ):
+        raise ValueError(
+            "--startup_center_scene is only for high_step L0/L6 variant 0 action replay; "
+            "it changes the physical scene and is not a policy evaluation."
+        )
     if not args.startup_diagnostics:
         if (
             args.startup_steps is not None

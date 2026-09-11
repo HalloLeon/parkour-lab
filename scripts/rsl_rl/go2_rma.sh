@@ -2,7 +2,7 @@
 # Focused Go2 RMA workflow. Run from the repository root in the Isaac Lab env.
 set -euo pipefail
 
-PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|diagnose|probe-startup|startup|check-repair|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
+PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|diagnose|probe-startup|probe-centered|startup|check-repair|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
 PARKOUR_CHECKPOINT="${2:?Pass an explicit checkpoint path}"
 shift 2
 if [[ ! -f "$PARKOUR_CHECKPOINT" ]]; then
@@ -64,6 +64,42 @@ case "$PARKOUR_REWARD_PROFILE" in
 esac
 
 case "$PARKOUR_MODE" in
+  probe-centered)
+    if (( $# != 2 )) || [[ ! -f "$1" ]] || \
+       [[ ! -f "$2/level_0/startup_diagnostics.json" ]] || \
+       [[ ! -f "$2/level_6/startup_diagnostics.json" ]]; then
+      echo "Usage: go2_rma.sh probe-centered CHECKPOINT SOURCE_STARTUP_JSON ORIGINAL_PROBE_DIR (no extra overrides)" >&2
+      exit 2
+    fi
+    PARKOUR_PROBE_SOURCE="$1"
+    PARKOUR_ORIGINAL_PROBE="$2"
+    PARKOUR_CHECKPOINT_DIR="$(dirname -- "$PARKOUR_CHECKPOINT")"
+    PARKOUR_PROBE_DIR="$(mktemp -d "$PARKOUR_CHECKPOINT_DIR/centered_probe_XXXXXX")"
+    echo "Scene-placement probe: $PARKOUR_PROBE_DIR"
+    # Keep a fresh uncentered L6 control: new getters/runtime must reproduce
+    # before differences can be attributed to the scene intervention.
+    for PARKOUR_CASE in uncentered_L6 centered_L0 centered_L6; do
+      PARKOUR_CENTER_ARGS=()
+      PARKOUR_LEVEL=6
+      if [[ "$PARKOUR_CASE" == centered_* ]]; then
+        PARKOUR_CENTER_ARGS+=(--startup_center_scene)
+      fi
+      if [[ "$PARKOUR_CASE" == centered_L0 ]]; then PARKOUR_LEVEL=0; fi
+      python scripts/rsl_rl/play.py "${PARKOUR_COMMON[@]}" \
+        --headless --livestream=0 --checkpoint="$PARKOUR_CHECKPOINT" \
+        --startup_diagnostics --startup_steps=10 \
+        --startup_action_replay="$PARKOUR_PROBE_SOURCE" ${PARKOUR_CENTER_ARGS[@]+"${PARKOUR_CENTER_ARGS[@]}"} \
+        --startup_output_dir="$PARKOUR_PROBE_DIR/$PARKOUR_CASE" \
+        --num_envs=1 --eval_episodes=1 --no-screen --reset_profile=jitter \
+        --policy_mode=history_mean --terrain_family=high_step \
+        --difficulty_level="$PARKOUR_LEVEL" --geometry_variant=0 \
+        --desired_speed=0.55 --desired_yaw_rate=0 --command_profile=translation_only
+    done
+    python scripts/rsl_rl/startup_centered_report.py \
+      "$PARKOUR_PROBE_DIR" --original-probe="$PARKOUR_ORIGINAL_PROBE" \
+      --reference="$PARKOUR_PROBE_SOURCE" > "$PARKOUR_PROBE_DIR/centered_report.json"
+    echo "Saved $PARKOUR_PROBE_DIR/centered_report.json (diagnostic evidence, not robot acceptance)."
+    ;;
   probe-startup)
     # Counterfactual dynamics probe, not a new policy rollout/acceptance screen.
     # Remove the small first-action difference by replaying one explicit source
@@ -298,7 +334,7 @@ case "$PARKOUR_MODE" in
       --terrain_family=tilted_ramps --difficulty_level=0 "$@"
     ;;
   *)
-    echo "Unknown mode: $PARKOUR_MODE (use train, recover, resume, repair, diagnose, probe-startup, startup, check-repair, check-step, check-control, check or teleop)." >&2
+    echo "Unknown mode: $PARKOUR_MODE (use train, recover, resume, repair, diagnose, probe-startup, probe-centered, startup, check-repair, check-step, check-control, check or teleop)." >&2
     exit 2
     ;;
 esac

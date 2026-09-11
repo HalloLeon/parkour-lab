@@ -123,6 +123,11 @@ parser.add_argument(
     help="Diagnostic only: replay at most 10 actions from an explicit startup trace; never an evaluation result.",
 )
 parser.add_argument(
+    "--startup_center_scene",
+    action="store_true",
+    help="Replay-only intervention: translate the complete terrain to center the selected high-step tile at world origin.",
+)
+parser.add_argument(
     "--teleop",
     action="store_true",
     help="Local or streamed single-Go2 keyboard control using history_mean; no evaluation sweep.",
@@ -1491,6 +1496,11 @@ def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
     )
     if env_cfg.scene.num_envs != 1:
         raise ValueError("Startup diagnostics require exactly one environment.")
+    centered_scene = None
+    if getattr(args_cli, "startup_center_scene", False):
+        from startup_centered_scene import configure_centered_startup_scene
+
+        centered_scene = configure_centered_startup_scene(env_cfg)
     diagnostics_cfg = env_cfg.rewards.training_diagnostics
     if diagnostics_cfg is None or diagnostics_cfg.weight == 0.0:
         raise ValueError(
@@ -1572,6 +1582,10 @@ def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
             },
         }
         if action_probe is not None:
+            if centered_scene is not None:
+                if not centered_scene.get("applied"):
+                    raise RuntimeError("Centered replay terrain was not generated.")
+                report["metadata"]["scene_intervention"] = centered_scene
             report["metadata"]["action_replay"] = action_probe.metadata()
             action_probe.validate_runtime(report["metadata"])
         try:
