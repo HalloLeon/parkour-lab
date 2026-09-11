@@ -310,17 +310,57 @@ def _state(robot, contacts, rt):
     return state
 
 
-def run_case(source, case, directory=None):
-    """Construct once, restore source state, and measure exactly one physics step."""
+def run_case(
+    source, case, directory=None, *, progress=None, capture=None, record_error=None
+):
+    """Measure one step, persist evidence before cleanup, and preserve failures.
+
+    The coordinator supplies durable progress/error/capture callbacks. They are
+    optional for direct callers; ``capture`` receives the completed report before
+    any simulation cleanup. An error recorder failure must not mask the original
+    physics/readback error.
+    """
+    recorded = {}
+
+    def on_error(error):
+        if id(error) not in recorded and record_error is not None:
+            # Retain exceptions as well as their IDs so later distinct failures
+            # cannot be mistaken for an already recorded object after ID reuse.
+            recorded[id(error)] = error
+            try:
+                record_error(error)
+            except BaseException as callback_error:
+                error.add_note(f"Could not persist worker error: {callback_error!r}")
+
+    try:
+        return _run_case(
+            source,
+            case,
+            directory,
+            progress or (lambda stage: None),
+            capture or (lambda report: None),
+            on_error,
+        )
+    except BaseException as error:
+        on_error(error)
+        raise
+
+
+def _run_case(source, case, directory, progress, capture, record_error):
+    progress("source_validation")
     validate_reproducer_source(source)
     _require(case in _CASES, "Unknown articulation reproducer case")
+    progress("runtime_import")
     rt = _load_runtime()
+    progress("runtime_validation")
     for name in ("isaaclab", "isaacsim"):
         _require(
             rt.versions[name] == source["source_versions"][name],
             f"Installed {name} version differs from source",
         )
+    progress("simulation_configuration")
     cfg = _configure_simulation(source, rt, directory)
+    progress("robot_configuration")
     robot_cfg = rt.go2_cfg.copy()
     _require(
         robot_cfg.spawn.usd_path == source["robot"]["asset_path"],
@@ -336,9 +376,13 @@ def run_case(source, case, directory=None):
         and props.solver_velocity_iteration_count == 0,
         "Installed Go2 articulation defaults differ",
     )
+    progress("simulation_construction")
     sim = rt.SimulationContext(cfg)
+    primary_error = None
     try:
+        progress("robot_construction")
         robot = rt.Articulation(cfg=robot_cfg)
+        progress("construction_position_readback")
         construction_position = _construction_position(robot, rt)
         _require(
             all(
@@ -347,9 +391,13 @@ def run_case(source, case, directory=None):
             ),
             "Spawned robot world position differs from intended construction placement",
         )
+        progress("pre_reset_clock")
         chronology = {"before_sim_reset": _clock(sim, 0)}
+        progress("simulation_reset")
         sim.reset()
+        progress("post_reset_clock")
         chronology["after_sim_reset"] = _clock(sim, 0)
+        progress("joint_body_order_validation")
         _require(
             list(robot.joint_names)
             == source["joint_names"]
@@ -357,9 +405,13 @@ def run_case(source, case, directory=None):
             and list(robot.body_names) == source["body_names"],
             "Installed Go2 joint/body order differs from source",
         )
+        progress("contact_view_construction")
         contacts = _contact_views(robot, rt)
+        progress("physical_property_readback")
         physical_properties = _properties(robot, rt)
+        progress("scene_readback")
         scene_readback = _scene_evidence(sim, robot, rt)
+        progress("post_reset_state_readback")
         after_sim_reset_state = _state(robot, contacts, rt)
 
         def tensor(values):
@@ -374,6 +426,7 @@ def run_case(source, case, directory=None):
         root_wxyz = rt.torch.cat(
             (root_xyzw[:, :3], root_xyzw[:, 6:7], root_xyzw[:, 3:6]), dim=-1
         )
+        progress("source_state_restoration")
         robot.reset()
         robot.write_root_pose_to_sim(root_wxyz)
         robot.write_root_com_velocity_to_sim(
@@ -383,18 +436,23 @@ def run_case(source, case, directory=None):
             tensor(initial["joint_position_rad"]),
             tensor(initial["joint_velocity_rad_s"]),
         )
+        progress("post_restore_clock")
         chronology["after_state_writes"] = _clock(sim, 0)
         _require(
             chronology["after_state_writes"] == chronology["after_sim_reset"],
             "Unexpected physics advance between initialization and state writes",
         )
+        progress("simulation_forward")
         sim.forward()  # Kinematics/Fabric only; clock invariance checked below.
+        progress("post_forward_clock")
         chronology["after_sim_forward"] = _clock(sim, 0)
         effort = tensor(source["effort_nm"])
         indices = rt.torch.tensor([0], device=robot.device, dtype=rt.torch.int32)
+        progress("effort_submission")
         robot.root_physx_view.set_dof_actuation_forces(effort, indices)
         # Do NOT write_data_to_sim(): that would overwrite the prescribed effort
         # with the DCMotor calculation using the asset's position-target buffers.
+        progress("pre_step_state_readback")
         pre = _state(robot, contacts, rt)
         _require(
             rt.torch.allclose(
@@ -402,6 +460,7 @@ def run_case(source, case, directory=None):
             ),
             "Backend effort readback does not match the prescribed source effort",
         )
+        progress("pre_step_clock")
         chronology["pre_step"] = _clock(sim, 0)
         _require(
             chronology["after_state_writes"]
@@ -409,9 +468,13 @@ def run_case(source, case, directory=None):
             == chronology["pre_step"],
             "Unexpected physics advance after state writes and before measured step",
         )
+        progress("measured_physics_step")
         sim.step(render=False)
+        progress("robot_buffer_update")
         robot.update(0.005)
+        progress("post_step_state_readback")
         post = _state(robot, contacts, rt)
+        progress("post_step_clock")
         chronology["post_step"] = _clock(sim, 1)
         _require(
             chronology["post_step"]["physics_step_index"]
@@ -425,9 +488,10 @@ def run_case(source, case, directory=None):
             ),
             "Measured step did not advance exactly one 5-ms physics step",
         )
+        progress("report_construction")
         physics = cfg.to_dict()
         physics.pop("log_dir", None)
-        return {
+        report = {
             "kind": "articulation_reproducer_case",
             "schema_version": 1,
             "case": case,
@@ -459,8 +523,51 @@ def run_case(source, case, directory=None):
                 "Source effort is reused numerically; this is not a source closed-loop trajectory or robot acceptance test.",
             ],
         }
+        progress("report_capture")
+        capture(report)
+        progress("report_captured")
+        return report
+    except BaseException as error:
+        primary_error = error
+        record_error(error)  # Persist the failure before cleanup can stall/fail.
+        raise
     finally:
-        # The coordinator owns AppLauncher.app.close(). Do not step during cleanup.
-        sim.stop()
-        sim.clear_all_callbacks()
-        sim.clear_instance()
+        # The coordinator owns AppLauncher.app.close(). Do not stop the timeline:
+        # Isaac Lab 2.3.2's STOP callback can block waiting for it to play again.
+        # clear_instance explicitly unsubscribes that callback; neither operation
+        # below intentionally advances physics. Still attempt both if one fails.
+        cleanup_errors = []
+        for stage, operation in (
+            ("cleanup_callbacks", sim.clear_all_callbacks),
+            ("cleanup_instance", sim.clear_instance),
+        ):
+            try:
+                progress(stage)
+            except BaseException as error:
+                cleanup_errors.append(error)
+                record_error(error)
+            try:
+                operation()
+            except BaseException as error:
+                cleanup_errors.append(error)
+                record_error(error)
+        if cleanup_errors:
+            error = primary_error or cleanup_errors[0]
+            for cleanup_error in cleanup_errors:
+                if cleanup_error is not error:
+                    error.add_note(
+                        f"Additional simulation cleanup failure: {cleanup_error!r}"
+                    )
+            if primary_error is None:
+                record_error(error)
+                raise error
+        else:
+            try:
+                progress("cleanup_complete")
+            except BaseException as error:
+                record_error(error)
+                if primary_error is None:
+                    raise
+                primary_error.add_note(
+                    f"Could not record cleanup completion: {error!r}"
+                )

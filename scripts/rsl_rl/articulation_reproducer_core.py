@@ -87,10 +87,14 @@ def _require(condition, message):
         raise ValueError(message)
 
 
-def read_json(path):
-    value = json.loads(Path(path).read_bytes(), object_pairs_hook=_unique_object)
+def parse_json(raw):
+    value = json.loads(raw, object_pairs_hook=_unique_object)
     _require(isinstance(value, dict) and _finite(value), "Expected finite JSON object")
     return value
+
+
+def read_json(path):
+    return parse_json(Path(path).read_bytes())
 
 
 def _digest(value, label):
@@ -222,8 +226,7 @@ def validate_reproducer_source(source):
 def load_reproducer_source(path):
     path = Path(path).resolve(strict=True)
     raw = path.read_bytes()
-    report = json.loads(raw, object_pairs_hook=_unique_object)
-    _require(isinstance(report, dict) and _finite(report), "Source must be finite JSON")
+    report = parse_json(raw)
     validate_failure_trace(report)
     meta = report["metadata"]
     replay = meta.get("action_replay", {})
