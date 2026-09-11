@@ -2,7 +2,7 @@
 # Focused Go2 RMA workflow. Run from the repository root in the Isaac Lab env.
 set -euo pipefail
 
-PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|diagnose|probe-startup|probe-centered|probe-friction|startup|check-repair|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
+PARKOUR_MODE="${1:?Usage: bash scripts/rsl_rl/go2_rma.sh train|recover|resume|repair|diagnose|probe-startup|probe-centered|probe-friction|probe-solver|startup|check-repair|check-step|check-control|check|teleop CHECKPOINT [extra arguments]}"
 PARKOUR_CHECKPOINT="${2:?Pass an explicit checkpoint path}"
 shift 2
 if [[ ! -f "$PARKOUR_CHECKPOINT" ]]; then
@@ -64,6 +64,59 @@ case "$PARKOUR_REWARD_PROFILE" in
 esac
 
 case "$PARKOUR_MODE" in
+  probe-solver)
+    if (( $# != 3 )) || [[ ! -f "$1" ]] || [[ ! -f "$2" ]] || \
+       [[ ! -f "$3/level_0/startup_diagnostics.json" ]] || \
+       [[ ! -f "$3/level_6/startup_diagnostics.json" ]]; then
+      echo "Usage: go2_rma.sh probe-solver CHECKPOINT SOURCE_STARTUP_JSON FRICTION_NATIVE_JSON ORIGINAL_ACTION_PROBE_DIR (no extra overrides)" >&2
+      exit 2
+    fi
+    PARKOUR_PROBE_SOURCE="$1"
+    PARKOUR_PROBE_BASELINE="$2"
+    PARKOUR_ORIGINAL_PROBE="$3"
+    PARKOUR_CHECKPOINT_DIR="$(dirname -- "$PARKOUR_CHECKPOINT")"
+    PARKOUR_PROBE_DIR="$(mktemp -d "$PARKOUR_CHECKPOINT_DIR/solver_probe_XXXXXX")"
+    echo "Conditional solver experiment: $PARKOUR_PROBE_DIR"
+    PARKOUR_SOLVER_REPORT=(scripts/rsl_rl/startup_solver_report.py "$PARKOUR_PROBE_DIR"
+      --reference="$PARKOUR_PROBE_SOURCE" --baseline="$PARKOUR_PROBE_BASELINE"
+      --original-probe="$PARKOUR_ORIGINAL_PROBE")
+    for PARKOUR_CASE in native_L6 pgs_L0 pgs_L6; do
+      PARKOUR_SOLVER=pgs
+      PARKOUR_LEVEL=6
+      if [[ "$PARKOUR_CASE" == native_L6 ]]; then PARKOUR_SOLVER=tgs; fi
+      if [[ "$PARKOUR_CASE" == pgs_L0 ]]; then PARKOUR_LEVEL=0; fi
+      python scripts/rsl_rl/play.py "${PARKOUR_COMMON[@]}" \
+        --headless --livestream=0 --checkpoint="$PARKOUR_CHECKPOINT" \
+        --startup_diagnostics --startup_steps=10 \
+        --startup_action_replay="$PARKOUR_PROBE_SOURCE" \
+        --startup_solver_probe="$PARKOUR_SOLVER" \
+        --startup_output_dir="$PARKOUR_PROBE_DIR/$PARKOUR_CASE" \
+        --num_envs=1 --eval_episodes=1 --no-screen --reset_profile=jitter \
+        --policy_mode=history_mean --terrain_family=high_step \
+        --difficulty_level="$PARKOUR_LEVEL" --geometry_variant=0 \
+        --desired_speed=0.55 --desired_yaw_rate=0 --command_profile=translation_only
+      if [[ "$PARKOUR_CASE" == native_L6 ]]; then
+        if ! python "${PARKOUR_SOLVER_REPORT[@]}" --preflight > "$PARKOUR_PROBE_DIR/preflight_report.json"; then
+          echo "Solver preflight stopped; no PGS runs launched. See $PARKOUR_PROBE_DIR/preflight_report.json" >&2
+          exit 2
+        fi
+      fi
+    done
+    if ! python "${PARKOUR_SOLVER_REPORT[@]}" > "$PARKOUR_PROBE_DIR/solver_report.json"; then
+      echo "Solver replay gate stopped; no policy runs launched. Inspect $PARKOUR_PROBE_DIR/solver_report.json (partial improvement is not an invalid experiment)." >&2
+      exit 2
+    fi
+    # The same explicit PGS selection/readback also applies to normal feedback.
+    # No replay, centering, gains, limit or training changes in these episodes.
+    python scripts/rsl_rl/play.py "${PARKOUR_COMMON[@]}" \
+      --headless --livestream=0 --checkpoint="$PARKOUR_CHECKPOINT" \
+      --evaluation_solver_probe=pgs --screen --num_envs=1 --eval_episodes=3 \
+      --reset_profile=jitter --policy_mode=history_mean \
+      --terrain_family=high_step --difficulty_level=6 --geometry_variant=0 \
+      --desired_speed=0.55 --desired_yaw_rate=0 --command_profile=translation_only \
+      --video_output_dir="$PARKOUR_PROBE_DIR/policy_L6"
+    echo "PGS high-step screen completed; this is not full control/operator acceptance. Artifacts: $PARKOUR_PROBE_DIR"
+    ;;
   probe-friction)
     if (( $# != 2 )) || [[ ! -f "$1" ]] || [[ ! -f "$2" ]]; then
       echo "Usage: go2_rma.sh probe-friction CHECKPOINT SOURCE_STARTUP_JSON PREVIOUS_UNCENTERED_L6_JSON (no extra overrides)" >&2
@@ -373,7 +426,7 @@ case "$PARKOUR_MODE" in
       --terrain_family=tilted_ramps --difficulty_level=0 "$@"
     ;;
   *)
-    echo "Unknown mode: $PARKOUR_MODE (use train, recover, resume, repair, diagnose, probe-startup, probe-centered, probe-friction, startup, check-repair, check-step, check-control, check or teleop)." >&2
+    echo "Unknown mode: $PARKOUR_MODE (use train, recover, resume, repair, diagnose, probe-startup, probe-centered, probe-friction, probe-solver, startup, check-repair, check-step, check-control, check or teleop)." >&2
     exit 2
     ;;
 esac

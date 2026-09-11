@@ -27,6 +27,52 @@ def validate_startup_arguments(args) -> None:
     replay = getattr(args, "startup_action_replay", None)
     centered = getattr(args, "startup_center_scene", False)
     legacy_friction = getattr(args, "startup_legacy_friction", None)
+    solver = getattr(args, "startup_solver_probe", None)
+    evaluation_solver = getattr(args, "evaluation_solver_probe", None)
+    if evaluation_solver is not None and (
+        evaluation_solver != "pgs"
+        or args.startup_diagnostics
+        or replay
+        or centered
+        or solver is not None
+        or legacy_friction is not None
+        or args.terrain_family != "high_step"
+        or args.difficulty_level != 6
+        or args.geometry_variant != 0
+        or args.command_profile != "translation_only"
+        or args.num_envs != 1
+        or args.eval_episodes != 3
+        or args.seed != 42
+        or args.reset_profile != "jitter"
+        or args.policy_mode != "history_mean"
+        or args.desired_speed != 0.55
+        or args.desired_yaw_rate != 0.0
+        or args.video
+        or args.teleop
+        or args.telemetry
+        or args.all_courses
+        or args._course_manifest is not None
+        or args.real_time
+        or args.action_noise_std is not None
+        or args.action_noise_seed is not None
+    ):
+        raise ValueError(
+            "--evaluation_solver_probe is only for the fixed three-episode PGS high_step L6 feedback screen"
+        )
+    if solver is not None and (
+        solver not in ("tgs", "pgs")
+        or not args.startup_diagnostics
+        or not replay
+        or centered
+        or legacy_friction is not None
+        or args.terrain_family != "high_step"
+        or args.difficulty_level not in (0, 6)
+        or args.geometry_variant != 0
+        or args.command_profile != "translation_only"
+    ):
+        raise ValueError(
+            "--startup_solver_probe requires uncentered high_step L0/L6 action replay without other interventions"
+        )
     if legacy_friction is not None and (
         legacy_friction not in ("observe", "zero")
         or not args.startup_diagnostics

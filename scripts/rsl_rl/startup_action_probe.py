@@ -142,7 +142,10 @@ def _action_order(value, joint_ids, raw_count, *, suffix=()):
 class StartupActionProbe:
     """Replay at most ten source actions, failing closed on contract mismatch."""
 
-    def __init__(self, source_path, max_steps=MAX_REPLAY_STEPS):
+    def __init__(self, source_path, max_steps=MAX_REPLAY_STEPS, *, solver_probe=None):
+        if solver_probe not in (None, "tgs", "pgs"):
+            raise ValueError("Solver probe must be explicitly tgs or pgs")
+        self.solver_probe = solver_probe
         if type(max_steps) is not int or not 1 <= max_steps <= MAX_REPLAY_STEPS:
             raise ValueError("Replay prefix must contain 1 to 10 actions")
         self.source_path = Path(source_path).resolve()
@@ -219,7 +222,24 @@ class StartupActionProbe:
         source = self.source["metadata"]
         if not isinstance(metadata, dict) or not _finite(metadata):
             raise ValueError("Runtime metadata must be finite JSON data")
+        if self.solver_probe is None and "solver_probe" in metadata:
+            raise ValueError("Solver intervention requires explicit replay opt-in")
+        if self.solver_probe is not None:
+            try:
+                from .startup_solver_probe import validate_solver_environment_physics
+            except ImportError:
+                from startup_solver_probe import validate_solver_environment_physics
+            solver_meta = metadata.get("solver_probe", {})
+            if solver_meta.get("requested_solver") != self.solver_probe.upper():
+                raise ValueError("Requested replay solver does not match readback")
+            validate_solver_environment_physics(
+                source.get("environment_physics"),
+                metadata.get("environment_physics"),
+                solver_meta,
+            )
         for key in RUNTIME_REQUIRED + RUNTIME_OPTIONAL:
+            if key == "environment_physics" and self.solver_probe is not None:
+                continue  # The explicit single-field exception was checked above.
             if key in source or key in RUNTIME_REQUIRED:
                 if key not in metadata or metadata[key] != source[key]:
                     raise ValueError(f"Runtime metadata.{key}: missing or mismatch")

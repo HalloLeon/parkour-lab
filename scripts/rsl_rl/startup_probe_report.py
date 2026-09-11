@@ -320,9 +320,24 @@ def _physical_state(state, origin):
     return result
 
 
-def _validate_probe(report, source, source_sha256, label):
+def _validate_probe(report, source, source_sha256, label, *, allow_solver_probe=False):
     validate_failure_trace(report)
     meta, source_meta = report["metadata"], source["metadata"]
+    solver_meta = meta.get("solver_probe")
+    if allow_solver_probe:
+        try:
+            from .startup_solver_probe import validate_solver_environment_physics
+        except ImportError:
+            from startup_solver_probe import validate_solver_environment_physics
+        validate_solver_environment_physics(
+            source_meta.get("environment_physics"),
+            meta.get("environment_physics"),
+            solver_meta,
+        )
+    else:
+        _require(
+            solver_meta is None, f"{label}: solver probe requires its dedicated reader"
+        )
     _require(
         meta.get("action_source") == "recorded_action_replay",
         f"{label}: not a recorded-action replay",
@@ -385,6 +400,8 @@ def _validate_probe(report, source, source_sha256, label):
             f"{label}.contact_body_names",
         )
     for key in PHYSICS_FIELDS:
+        if key == "physx" and allow_solver_probe:
+            continue  # Complete physics object, except solver_type, checked above.
         _match(
             _field(_field(meta, "environment_physics", label), key, label),
             _field(
@@ -633,7 +650,9 @@ def _substep_outcomes(left, right):
     return {"post_physics": results, "unavailable": unavailable}
 
 
-def compare_probe_reports(flat, obstacle, reference, *, reference_sha256):
+def compare_probe_reports(
+    flat, obstacle, reference, *, reference_sha256, allow_solver_probe=False
+):
     """Validate matching inputs, then report physical differences without a pass gate."""
     validate_failure_trace(reference)
     _require(
@@ -670,8 +689,16 @@ def compare_probe_reports(flat, obstacle, reference, *, reference_sha256):
             and value["metadata"].get("difficulty_level") == level,
             f"{label}: expected high_step level {level}",
         )
-    left_physics = _validate_probe(flat, reference, reference_sha256, "flat")
-    right_physics = _validate_probe(obstacle, reference, reference_sha256, "obstacle")
+    left_physics = _validate_probe(
+        flat, reference, reference_sha256, "flat", allow_solver_probe=allow_solver_probe
+    )
+    right_physics = _validate_probe(
+        obstacle,
+        reference,
+        reference_sha256,
+        "obstacle",
+        allow_solver_probe=allow_solver_probe,
+    )
     for key in (
         "joint_names",
         "body_names",

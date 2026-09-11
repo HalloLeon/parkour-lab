@@ -134,6 +134,18 @@ parser.add_argument(
     help="Replay-only legacy joint-friction readback or conditional zeroing; never a training preset.",
 )
 parser.add_argument(
+    "--startup_solver_probe",
+    choices=("tgs", "pgs"),
+    default=None,
+    help="Diagnostic-only solver selection for a matched startup replay; no training defaults change.",
+)
+parser.add_argument(
+    "--evaluation_solver_probe",
+    choices=("pgs",),
+    default=None,
+    help="Diagnostic-only three-episode high_step L6 PGS feedback screen after matched replay.",
+)
+parser.add_argument(
     "--teleop",
     action="store_true",
     help="Local or streamed single-Go2 keyboard control using history_mean; no evaluation sweep.",
@@ -1486,7 +1498,9 @@ def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
         from startup_action_probe import StartupActionProbe
 
         action_probe = StartupActionProbe(
-            args_cli.startup_action_replay, max_steps=args_cli.startup_steps
+            args_cli.startup_action_replay,
+            max_steps=args_cli.startup_steps,
+            solver_probe=getattr(args_cli, "startup_solver_probe", None),
         )
 
     family, level, variant, speed, yaw, profile, level_metadata = (
@@ -1503,6 +1517,11 @@ def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
     if env_cfg.scene.num_envs != 1:
         raise ValueError("Startup diagnostics require exactly one environment.")
     centered_scene = None
+    solver_probe = None
+    if getattr(args_cli, "startup_solver_probe", None) is not None:
+        from startup_solver_probe import configure_solver_probe
+
+        solver_probe = configure_solver_probe(env_cfg, args_cli.startup_solver_probe)
     if getattr(args_cli, "startup_center_scene", False):
         from startup_centered_scene import configure_centered_startup_scene
 
@@ -1588,6 +1607,12 @@ def _run_startup_diagnostic_course(env_cfg, agent_cfg, checkpoint) -> None:
             },
         }
         if action_probe is not None:
+            if solver_probe is not None:
+                from startup_solver_probe import validate_solver_probe_readback
+
+                report["metadata"]["solver_probe"] = validate_solver_probe_readback(
+                    env.unwrapped, solver_probe
+                )
             if centered_scene is not None:
                 if not centered_scene.get("applied"):
                     raise RuntimeError("Centered replay terrain was not generated.")
@@ -1746,6 +1771,11 @@ def _evaluate_course(
         desired_yaw_rate=desired_yaw_rate,
         command_profile=command_profile,
     )
+    solver_probe = None
+    if getattr(args_cli, "evaluation_solver_probe", None) is not None:
+        from startup_solver_probe import configure_solver_probe
+
+        solver_probe = configure_solver_probe(env_cfg, args_cli.evaluation_solver_probe)
     env = _create_evaluation_environment(env_cfg, agent_cfg, artifacts)
     num_envs = env.num_envs
     step_dt = env.unwrapped.step_dt
@@ -1753,6 +1783,10 @@ def _evaluate_course(
     telemetry_report = None
 
     try:
+        if solver_probe is not None:
+            from startup_solver_probe import validate_solver_probe_readback
+
+            validate_solver_probe_readback(env.unwrapped, solver_probe)
         evaluation_reward_config = _evaluation_reward_config(
             env.unwrapped.reward_manager
         )
@@ -1805,6 +1839,11 @@ def _evaluate_course(
         telemetry=telemetry_report,
         evaluation_reward_config=evaluation_reward_config,
     )
+    if solver_probe is not None:
+        report["solver_probe"] = solver_probe
+        physics = env_cfg.sim.to_dict()
+        physics.pop("log_dir", None)
+        report["environment_physics"] = _to_jsonable(physics)
     report_path = _write_evaluation_report(artifacts.directory, report)
     return report, report_path
 
