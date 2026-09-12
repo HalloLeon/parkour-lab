@@ -1,4 +1,4 @@
-"""Evidence-bound, one-block v3 continuation of the completed zero-retention run."""
+"""Evidence-bound v3 training from the completed zero-retention learning state."""
 
 import json
 from pathlib import Path
@@ -113,7 +113,8 @@ def sequence_resume_preflight(args, agent, saved, baseline):
     """Restore current learning state; change only command-sequence exposure."""
     if (
         args.curriculum != VERSION
-        or args.iterations != 200
+        or not 50 <= args.iterations <= 3000
+        or args.iterations % 50
         or not args.moving_retention
         or args.resume_retention_reference is None
         or args.zero_command_reference_report is None
@@ -121,7 +122,7 @@ def sequence_resume_preflight(args, agent, saved, baseline):
         or args.refinement_profile != "source"
     ):
         raise ValueError(
-            "v3 requires 200 updates, both preserved retention terms, original reference and checks"
+            "v3 requires a predeclared 50-aligned budget up to 3000, both preserved retention terms, original reference and checks"
         )
     capture = probe.load_baseline(
         args.checkpoint, args.resume_retention_reference, args.baseline_report.parent
@@ -197,8 +198,9 @@ def sequence_resume_preflight(args, agent, saved, baseline):
         "reference_sha256": reference["sha256"]["checkpoint"],
         "reference_iteration": reference["iteration"],
         "adam_steps": 8000,
-        "additional_updates": 200,
-        "cumulative_retention_updates": 600,
+        "additional_updates": args.iterations,
+        "cumulative_retention_updates": previous_resume["cumulative_retention_updates"]
+        + args.iterations,
         "optimizer": "exact saved moments, counters, parameter order and options",
         "not_restored": [
             "simulator state",
@@ -216,5 +218,5 @@ def sequence_resume_preflight(args, agent, saved, baseline):
                 "source_provenance.json",
             )
         },
-        "scope": "one 200-update sequence-exposure intervention, both soft losses preserved; simulation/RNG restart, not uninterrupted trajectory equivalence",
+        "scope": f"one predeclared {args.iterations}-update sequence-exposure experiment, both soft losses preserved; simulation/RNG restart, not uninterrupted trajectory equivalence or convergence proof",
     }

@@ -101,6 +101,34 @@ def training_curriculum_manifest(version):
     )
 
 
+def retention_check_offsets(args):
+    """Predeclare saved checkpoints; evaluation does not truncate learning."""
+    offsets = getattr(args, "check_offsets", None)
+    if not args.moving_retention:
+        if offsets is not None:
+            raise ValueError("--check-offsets requires --moving-retention")
+        return []
+    if args.curriculum == SEQUENCE_VERSION:
+        if not 50 <= args.iterations <= 3000 or args.iterations % 50:
+            raise ValueError("v3 requires 50-aligned iterations between 50 and 3000")
+    elif args.iterations != 200:
+        raise ValueError("The legacy v2 retention protocol requires 200 updates")
+    if offsets is None:
+        offsets = [100, 200] if args.iterations == 200 else [args.iterations]
+    if (
+        not 1 <= len(offsets) <= 3
+        or offsets != sorted(set(offsets))
+        or any(offset <= 0 or offset % 50 for offset in offsets)
+        or offsets[-1] != args.iterations
+    ):
+        raise ValueError(
+            "Predeclare one to three increasing, unique, positive 50-aligned check offsets, ending at --iterations"
+        )
+    if args.curriculum != SEQUENCE_VERSION and offsets != [100, 200]:
+        raise ValueError("The legacy v2 retention checks remain +100/+200")
+    return offsets
+
+
 def training_configs(saved, agent, args):
     from isaaclab_tasks.manager_based.locomotion.velocity.config.go2.agents.rsl_rl_ppo_cfg import (
         UnitreeGo2FlatPPORunnerCfg,
@@ -339,9 +367,11 @@ def run_training(args, output, agent, saved):
             handoff["moving_retention"]["reference_iteration"] = (
                 source["iter"] if reference is None else reference["iter"]
             )
-            handoff["moving_retention"]["check_offsets"] = [100, 200]
+            handoff["moving_retention"]["check_offsets"] = getattr(
+                args, "check_offsets", [100, 200]
+            )
             handoff["moving_retention"]["check_timing"] = (
-                "after the uninterrupted 200-update worker exits"
+                f"after the uninterrupted {args.iterations}-update worker exits"
             )
         if zero_reference is not None:
             handoff["zero_command_reference"] = zero_reference
@@ -491,9 +521,9 @@ def retention_preflight(args, agent, saved):
         from .operator_checkpoint_screen import replay_report
     except ImportError:
         from operator_checkpoint_screen import replay_report
+    retention_check_offsets(args)
     if (
-        args.iterations != 200
-        or args.curriculum not in ("operator_transitions_v2", SEQUENCE_VERSION)
+        args.curriculum not in ("operator_transitions_v2", SEQUENCE_VERSION)
         or args.refinement_profile != "source"
         or source_profile(saved, agent).name != "stationary_twist_v1"
         or args.skip_check
@@ -501,7 +531,7 @@ def retention_preflight(args, agent, saved):
         or importlib.metadata.version("rsl-rl-lib") != "3.1.2"
     ):
         raise ValueError(
-            "Moving retention requires source stationary_twist_v1, v2/v3 commands, RSL 3.1.2, 200 updates, a baseline report and checks enabled"
+            "Moving retention requires source stationary_twist_v1, v2/v3 commands, RSL 3.1.2, a baseline report and checks enabled"
         )
     baseline = replay_report(args.baseline_report.resolve(strict=True), args.checkpoint)
     phases = baseline["phase_summary"]["phases"]
@@ -690,7 +720,7 @@ def retention_decision(measured, baseline):
 
 
 def run_retention_checks(checkpoints, output, device, baseline):
-    """At most two screens, only after the training worker has released the GPU."""
+    """Screen predeclared checkpoints after the worker has released the GPU."""
     try:
         from .operator_checkpoint_screen import replay_report
     except ImportError:
@@ -700,7 +730,7 @@ def run_retention_checks(checkpoints, output, device, baseline):
         "promoted": False,
         "baseline": baseline,
         "candidates": [],
-        "scope": "200 training updates already completed; only evaluation stops early. Selection seed43, not held-out confirmation, RMA or hardware acceptance.",
+        "scope": "The entire predeclared training budget already completed; only evaluation stops early. Selection seed43, not held-out confirmation, convergence proof, RMA or hardware acceptance.",
     }
     try:
         output.mkdir(parents=True, exist_ok=True)
@@ -771,7 +801,13 @@ def main(argv=None):
     parser.add_argument(
         "--moving-retention",
         action="store_true",
-        help="Opt-in bounded source-mean retention repair; requires --baseline-report, v2, 200 updates",
+        help="Source-mean retention; v2 keeps its 200-update protocol, evidence-bound v3 permits up to 3000",
+    )
+    parser.add_argument(
+        "--check-offsets",
+        nargs="+",
+        type=int,
+        help="One to three saved-checkpoint offsets after the source; positive, increasing and 50-aligned, including the final update. Defaults to +100/+200 for 200 updates, otherwise final only. All checks run after training exits",
     )
     parser.add_argument(
         "--baseline-report",
@@ -842,6 +878,10 @@ def main(argv=None):
             "Seeds 43–45 are reserved for evaluation; choose a different training seed"
         )
     try:
+        args.check_offsets = retention_check_offsets(args)
+    except ValueError as error:
+        parser.error(str(error))
+    try:
         args.checkpoint = args.checkpoint.resolve(strict=True)
         agent_path, env_path = (
             args.checkpoint.parent / "params" / name
@@ -884,7 +924,7 @@ def main(argv=None):
             parser.error(str(error))
     if args.validate_only:
         print(
-            "Validated v3 source, Adam8000, original reference, both losses and two negative recovery arms. Training remains UNRUN."
+            f"Validated v3 source, Adam8000, original reference, both losses and two negative recovery arms; {args.iterations} updates, check offsets {args.check_offsets}, final Adam step {8000 + 20 * args.iterations}. Training remains UNRUN."
         )
         return 0
     if args.worker_output is not None:
@@ -921,8 +961,8 @@ def main(argv=None):
                     zero_command=args.zero_command_reference is not None
                 ),
                 "zero_command_reference": args.zero_command_reference,
-                "training_updates": 200,
-                "check_offsets": [100, 200],
+                "training_updates": args.iterations,
+                "check_offsets": args.check_offsets,
                 "seed": args.seed,
                 "evaluation_seed": 43,
                 "optimizer": "exact restored Adam; fixed original reference"
@@ -935,7 +975,7 @@ def main(argv=None):
                     "complete unchanged physical PASS",
                     "execution/integrity error",
                 ],
-                "regressed_candidate": "reject individually, but still screen the already-trained +200 candidate; learning can be non-monotonic",
+                "regressed_candidate": "reject individually, but still screen the remaining predeclared, already-trained candidates; learning can be non-monotonic",
                 "not_promoted": True,
             },
         )
@@ -1039,6 +1079,11 @@ def main(argv=None):
                 if args.reversal_stop_probe is not None
                 else []
             ),
+            *(
+                ["--check-offsets", *(str(offset) for offset in args.check_offsets)]
+                if args.moving_retention
+                else []
+            ),
         ],
         output,
         timeout_s=args.timeout,
@@ -1069,7 +1114,15 @@ def main(argv=None):
             )
             or (
                 args.curriculum == SEQUENCE_VERSION
-                and report.get("handoff", {}).get("curriculum") != sequence_manifest()
+                and (
+                    report.get("handoff", {}).get("curriculum") != sequence_manifest()
+                    or report.get("handoff", {}).get("additional_updates")
+                    != args.iterations
+                    or report.get("handoff", {})
+                    .get("moving_retention", {})
+                    .get("check_offsets")
+                    != args.check_offsets
+                )
             )
             or (
                 args.zero_command_reference is not None
@@ -1089,10 +1142,11 @@ def main(argv=None):
             write_json(output / "report.json", report)
             return 2
         checkpoints = [
-            output / f"model_{source['iter'] + offset}.pt" for offset in (100, 200)
+            output / f"model_{source['iter'] + offset}.pt"
+            for offset in args.check_offsets
         ]
         print(
-            "Training worker finished. Screening only the predeclared +100/+200 checkpoints.",
+            f"Training worker finished all {args.iterations} updates. Screening only predeclared offsets {args.check_offsets}.",
             flush=True,
         )
         report["operator_check"], code = run_retention_checks(
