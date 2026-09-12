@@ -226,7 +226,16 @@ def write_json(path, data):
     path.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
 
 
-def run_benchmark(args, output, agent, saved):
+def run_benchmark(args, output, agent, saved, *, stop_probe=None):
+    # The separate diagnostic CLI owns mixed-controller experiments. The normal
+    # benchmark never constructs a probe and retains its original action path.
+    if stop_probe is not None and (
+        getattr(args, "audit_student_interface", False)
+        or getattr(args, "diagnostic_reference", None) is None
+    ):
+        raise ValueError(
+            "Stop probes require control capture, not an oracle parity audit"
+        )
     from isaaclab.app import AppLauncher
 
     # Streaming cannot be enabled accidentally by the LIVESTREAM environment var.
@@ -304,6 +313,12 @@ def run_benchmark(args, output, agent, saved):
         if reference_actor is not None:
             reference_actor.to(env.device)
             diagnostics = OperatorControlTrace(env, reference_actor)
+            if stop_probe is not None:
+                stop_probe.reference = reference_actor
+                diagnostics.metadata["action"] = (
+                    "executed raw mean: learner except declared reference stop windows"
+                )
+                diagnostics.metadata["scope"] = stop_probe.scope
             capture.control_trace = diagnostics
             write_json(
                 output / "control_interface.json",
@@ -333,11 +348,15 @@ def run_benchmark(args, output, agent, saved):
                 action = actor(observation)
                 if not torch.isfinite(action).all():
                     raise RuntimeError(f"Nonfinite policy action at step {step}")
+                if stop_probe is not None:
+                    action = stop_probe.select(step, observation, action)
                 if audit is not None:
                     audit.observe(observation, action, reset_mask)
                 if diagnostics is not None:
                     diagnostics.before_step(observation, action)
                 stepped = env.step(action)
+                if stop_probe is not None:
+                    stop_probe.observe_done(stepped[2] | stepped[3])
                 if audit is not None:
                     # ManagerBasedRLEnv returns termination/timeout masks for the
                     # transition just executed, with new-episode observations.
@@ -387,6 +406,8 @@ def run_benchmark(args, output, agent, saved):
                 "timeout moved one step beyond 20-s benchmark",
             ],
         }
+        if stop_probe is not None:
+            result = stop_probe.publish(output, result, trace, control)
         # Kit's app.close() can terminate Python with os._exit(0). Publish before
         # cleanup; a supervising process maps the measured status to an exit code.
         write_json(output / "measurement_report.json", result)
