@@ -30,7 +30,13 @@ try:
         read_yaml_data,
         score_trace,
     )
-    from .operator_profiles import PROFILES, apply_reward_profile, environment_profile
+    from .operator_profiles import (
+        PROFILES,
+        STOCK_FUNCTIONS,
+        STATIONARY_FUNCTIONS,
+        apply_reward_profile,
+        environment_profile,
+    )
 except ImportError:
     from operator_benchmark_core import (
         DT,
@@ -43,7 +49,13 @@ except ImportError:
         read_yaml_data,
         score_trace,
     )
-    from operator_profiles import PROFILES, apply_reward_profile, environment_profile
+    from operator_profiles import (
+        PROFILES,
+        STOCK_FUNCTIONS,
+        STATIONARY_FUNCTIONS,
+        apply_reward_profile,
+        environment_profile,
+    )
 
 
 def make_recorder_cfg():
@@ -137,6 +149,7 @@ def reference_config(saved):
     )
 
     cfg = UnitreeGo2FlatEnvCfg()
+    profile = environment_profile(saved)
     if (
         cfg.rewards.track_ang_vel_z_exp.params.get("std")
         != PROFILES["stock"].yaw_tracking_std
@@ -144,14 +157,37 @@ def reference_config(saved):
         raise ValueError(
             "Installed stock yaw-tracking kernel differs from the known reference"
         )
-    # Reconstruct only a known reward-parameter variant. Keep the FULL comparison
+    if profile.stationary_precision:
+        for name, expected in STOCK_FUNCTIONS.items():
+            term = getattr(cfg.rewards, name)
+            function = term.func
+            identity = (
+                f"{function.__module__}:{function.__name__}"
+                if callable(function)
+                else function
+            )
+            if identity != expected or term.params.get("std") != 0.5:
+                raise ValueError(
+                    "Installed stock tracking contract differs before stationary override"
+                )
+    # Reconstruct only a known reward variant. Keep the FULL comparison
     # below: do not ignore rewards or trust arbitrary saved function names.
-    apply_reward_profile(cfg, environment_profile(saved))
+    apply_reward_profile(cfg, profile)
     # No function from the archived YAML is executed. Its complete relevant
     # contract is compared to this installed, known stock environment instead.
     current = yaml.load(
         yaml.dump(cfg.to_dict(), sort_keys=False), Loader=yaml.BaseLoader
     )
+    if profile.stationary_precision:
+        # The CLI and `python -m` import the same two repository functions under
+        # different package prefixes. Only these explicit identities are aliases.
+        for name, function in STATIONARY_FUNCTIONS.items():
+            aliases = (
+                f"operator_rewards:{function}",
+                f"scripts.rsl_rl.operator_rewards:{function}",
+            )
+            if current["rewards"][name]["func"] in aliases:
+                current["rewards"][name]["func"] = saved["rewards"][name]["func"]
     differences = config_differences(saved, current)
     if differences:
         raise ValueError(
@@ -412,6 +448,9 @@ def main(argv=None):
             ),
             "reward_profiles": file_sha256(
                 Path(__file__).with_name("operator_profiles.py")
+            ),
+            "operator_rewards": file_sha256(
+                Path(__file__).with_name("operator_rewards.py")
             ),
         },
     }

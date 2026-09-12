@@ -230,6 +230,8 @@ def run_training(args, output, agent, saved):
         )
         if not refinement["reward_parameters_changed"]:
             handoff["unchanged"].append("rewards")
+        elif refinement["reward_functions_changed"]:
+            handoff["unchanged"].append("rewards_except_versioned_velocity_tracking")
         else:
             handoff["unchanged"].append("reward_parameters_except_yaw_tracking_std")
         write_json(params / "operator_training.json", handoff)
@@ -256,7 +258,8 @@ def run_training(args, output, agent, saved):
             f"Refinement profile: {refinement['source']['name']} → "
             f"{refinement['selected']['name']}; "
             f"yaw reward std={refinement['selected']['yaw_tracking_std']}, "
-            f"entropy coefficient={refinement['selected']['entropy_coef']}. "
+            f"entropy coefficient={refinement['selected']['entropy_coef']}, "
+            f"stationary precision={refinement['selected']['stationary_precision']}. "
             "Acceptance thresholds unchanged.",
             flush=True,
         )
@@ -359,7 +362,7 @@ def main(argv=None):
         "--refinement-profile",
         choices=("source", *PROFILES),
         default="source",
-        help="Preserve the source profile, or explicitly select stock, yaw precision or low entropy",
+        help="Preserve the source profile, or explicitly select a versioned reward/entropy objective",
     )
     parser.add_argument(
         "--curriculum",
@@ -453,6 +456,7 @@ def main(argv=None):
         "operator_curriculum.py",
         "operator_command.py",
         "operator_profiles.py",
+        "operator_rewards.py",
         "operator_benchmark.py",
         "operator_benchmark_core.py",
     ):
