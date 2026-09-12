@@ -27,10 +27,11 @@
 # ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 # POSSIBILITY OF SUCH DAMAGE.
 
-"""Opt-in source-mean retention on learner-visited moving-command states.
+"""Opt-in source-mean retention on learner-visited command-conditioned states.
 
 This is a soft training loss, not action blending or a behavioral guarantee.
 The supported PPO update is deliberately restricted to the pinned stock path.
+An explicitly enabled zero-twist term supplements, never dilutes, the moving loss.
 """
 
 from __future__ import annotations
@@ -45,10 +46,12 @@ from torch import nn
 VERSION = "moving_anchor_v1"
 COEFFICIENT = 0.1
 ACTION_SCALE = 0.1  # Raw policy actions; 0.025 rad after the stock action scale.
+ZERO_COMMAND_VERSION = "zero_command_anchor_v1"
+ZERO_COMMAND_COEFFICIENT = 0.1
 
 
-def retention_manifest():
-    return {
+def retention_manifest(*, zero_command=False):
+    result = {
         "version": VERSION,
         "reference": "exact frozen source actor from this repair's initial checkpoint",
         "observations": "current pre-action 48-D learner rollout observations",
@@ -64,6 +67,24 @@ def retention_manifest():
         "reward_changed": False,
         "rsl_rl_version": "3.1.2",
     }
+    if zero_command:
+        result["zero_command_retention"] = {
+            "version": ZERO_COMMAND_VERSION,
+            "mask": "all three delivered velocity commands are exactly zero",
+            "loss": "coefficient * zero-row mean over 12 joints of squared mean-action difference / (2 * action_scale**2)",
+            "coefficient": ZERO_COMMAND_COEFFICIENT,
+            "action_scale_raw": ACTION_SCALE,
+            "reference": "same original frozen actor as the moving term",
+            "normalization": "separate conditional mean; moving contribution unchanged",
+            "pure_pivots_regularized": False,
+            "measured_velocity_gate": False,
+            "reference_selects_actions": False,
+            "reference_gradient": False,
+            "action_noise_regularized": False,
+            "hard_constraint": False,
+            "scope": "new learning intervention; reference stop success on its own trajectories is not a learner-state recovery guarantee",
+        }
+    return result
 
 
 def moving_anchor_loss(mean, reference_mean, observation):
@@ -72,6 +93,15 @@ def moving_anchor_loss(mean, reference_mean, observation):
     Commands are indices 9:12 of the validated stock observation; the gate
     uses commanded, not measured, velocity. A stalled moving robot still counts.
     """
+    return _command_anchor_loss(mean, reference_mean, observation, zero_command=False)
+
+
+def zero_command_anchor_loss(mean, reference_mean, observation):
+    """Retain exact zero-twist rows, even while braking; exclude both pure pivots."""
+    return _command_anchor_loss(mean, reference_mean, observation, zero_command=True)
+
+
+def _command_anchor_loss(mean, reference_mean, observation, *, zero_command):
     if (
         mean.ndim != 2
         or len(mean) == 0
@@ -87,18 +117,22 @@ def moving_anchor_loss(mean, reference_mean, observation):
         raise ValueError(
             "Require matching finite 48-D observations and 12-D action means"
         )
-    moving = (observation.detach()[:, 9:11] != 0).any(dim=1)
+    selected = (
+        (observation.detach()[:, 9:12] == 0).all(dim=1)
+        if zero_command
+        else (observation.detach()[:, 9:11] != 0).any(dim=1)
+    )
     squared = (mean - reference_mean.detach()).square().mean(dim=1)
-    mean_squared = (squared * moving).sum() / moving.sum().clamp_min(1)
+    mean_squared = (squared * selected).sum() / selected.sum().clamp_min(1)
     return (
         mean_squared / (2 * ACTION_SCALE**2),
         mean_squared.detach(),
-        moving.float().mean(),
+        selected.float().mean(),
     )
 
 
 class MovingRetentionUpdate:
-    """Pinned single-GPU, fixed-rate, feed-forward PPO plus one explicit loss.
+    """Pinned single-GPU, fixed-rate, feed-forward PPO plus explicit retention losses.
 
     Installed after exact source restoration; only ``alg.update`` is replaced.
     The normal rollout, value bootstrap, optimizer, policy state and exporter
@@ -109,7 +143,7 @@ class MovingRetentionUpdate:
     SPDX-License-Identifier: BSD-3-Clause
     """
 
-    def __init__(self, algorithm, *, reference_state=None):
+    def __init__(self, algorithm, *, reference_state=None, zero_command=False):
         from rsl_rl.algorithms import PPO
         from rsl_rl.modules import ActorCritic
 
@@ -136,6 +170,10 @@ class MovingRetentionUpdate:
             raise ValueError(
                 "Moving retention requires the fresh stock fixed-rate PPO path"
             )
+        if zero_command and reference_state is None:
+            raise ValueError(
+                "Zero-command retention requires an explicit original reference"
+            )
         self.algorithm = algorithm
         self.reference = copy.deepcopy(policy.actor).eval().requires_grad_(False)
         if reference_state is not None:
@@ -152,6 +190,8 @@ class MovingRetentionUpdate:
             ):
                 raise ValueError("Frozen reference was not restored exactly")
         self.coefficient = COEFFICIENT
+        self.zero_command = zero_command
+        self.zero_command_coefficient = ZERO_COMMAND_COEFFICIENT
         self.updates = 0
 
     def __call__(self):
@@ -164,6 +204,14 @@ class MovingRetentionUpdate:
             moving_action_mse=0.0,
             moving_fraction=0.0,
         )
+        if self.zero_command:
+            totals.update(
+                moving_anchor_weighted=0.0,
+                zero_command_anchor=0.0,
+                zero_command_action_mse=0.0,
+                zero_command_fraction=0.0,
+                zero_command_anchor_weighted=0.0,
+            )
         generator = alg.storage.mini_batch_generator(
             alg.num_mini_batches, alg.num_learning_epochs
         )
@@ -219,6 +267,11 @@ class MovingRetentionUpdate:
                 - alg.entropy_coef * entropy.mean()
             )
             loss = loss + self.coefficient * anchor
+            if self.zero_command:
+                zero_anchor, zero_mse, zero_fraction = zero_command_anchor_loss(
+                    mean, reference_mean, observation
+                )
+                loss = loss + self.zero_command_coefficient * zero_anchor
             if not torch.isfinite(loss):
                 raise RuntimeError("Nonfinite retention PPO loss")
             alg.optimizer.zero_grad()
@@ -229,11 +282,18 @@ class MovingRetentionUpdate:
             if not torch.isfinite(norm):
                 raise RuntimeError("Nonfinite retention PPO gradient")
             alg.optimizer.step()
-            for name, value in zip(
-                totals,
-                (value_loss, surrogate_loss, entropy.mean(), anchor, mse, fraction),
-                strict=True,
-            ):
+            values = [value_loss, surrogate_loss, entropy.mean(), anchor, mse, fraction]
+            if self.zero_command:
+                values.extend(
+                    [
+                        self.coefficient * anchor,
+                        zero_anchor,
+                        zero_mse,
+                        zero_fraction,
+                        self.zero_command_coefficient * zero_anchor,
+                    ]
+                )
+            for name, value in zip(totals, values, strict=True):
                 totals[name] += float(value.detach())
             count += 1
         if count != alg.num_mini_batches * alg.num_learning_epochs:
@@ -243,8 +303,10 @@ class MovingRetentionUpdate:
         return {name: value / count for name, value in totals.items()}
 
 
-def install_moving_retention(algorithm, *, reference_state=None):
-    update = MovingRetentionUpdate(algorithm, reference_state=reference_state)
+def install_moving_retention(algorithm, *, reference_state=None, zero_command=False):
+    update = MovingRetentionUpdate(
+        algorithm, reference_state=reference_state, zero_command=zero_command
+    )
     algorithm.update = update
     return update
 

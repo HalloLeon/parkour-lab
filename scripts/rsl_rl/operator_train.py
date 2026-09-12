@@ -173,6 +173,7 @@ def restore_reference(runner, data):
 
 def run_training(args, output, agent, saved):
     resume = getattr(args, "retention_resume", None)
+    zero_reference = getattr(args, "zero_command_reference", None)
     reference = None
     if resume is not None:
         reference_path = args.resume_retention_reference
@@ -236,6 +237,7 @@ def run_training(args, output, agent, saved):
                 reference_state=None
                 if reference is None
                 else reference["model_state_dict"],
+                zero_command=zero_reference is not None,
             )
             if resume is not None:
                 restore_adam_state(runner.alg, source, resume["adam_steps"])
@@ -247,6 +249,17 @@ def run_training(args, output, agent, saved):
         refinement = profile_manifest(
             saved, agent, getattr(args, "refinement_profile", "source")
         )
+        if resume is not None:
+            refinement["interpretation"] = (
+                "Source reward/entropy profile preserved; Adam moments/counters/options "
+                "restored exactly. Simulator and RNG restart. "
+                + (
+                    "A separate zero-command retention loss is the new learning intervention. "
+                    if zero_reference is not None
+                    else "Retention objective preserved. "
+                )
+                + "Judge unchanged physical gates, not reward or action similarity alone."
+            )
         handoff.update(
             source_checkpoint=str(args.checkpoint),
             source_sha256=file_sha256(args.checkpoint),
@@ -279,7 +292,9 @@ def run_training(args, output, agent, saved):
         else:
             handoff["unchanged"].append("reward_parameters_except_yaw_tracking_std")
         if retention is not None:
-            handoff["moving_retention"] = retention_manifest()
+            handoff["moving_retention"] = retention_manifest(
+                zero_command=zero_reference is not None
+            )
             handoff["moving_retention"]["reference_sha256"] = (
                 handoff["source_sha256"]
                 if resume is None
@@ -292,6 +307,8 @@ def run_training(args, output, agent, saved):
             handoff["moving_retention"]["check_timing"] = (
                 "after the uninterrupted 200-update worker exits"
             )
+        if zero_reference is not None:
+            handoff["zero_command_reference"] = zero_reference
         write_json(params / "operator_training.json", handoff)
         # The pre-update checkpoint includes the fresh OR exactly resumed Adam.
         # Never overwrite or renumber the source run's model files.
@@ -321,6 +338,13 @@ def run_training(args, output, agent, saved):
             "Acceptance thresholds unchanged.",
             flush=True,
         )
+        if zero_reference is not None:
+            print(
+                "New zero-command retention intervention: original frozen reference, "
+                "separate moving/zero loss means; pure pivots excluded. "
+                "Not an unchanged-objective continuation or a safety guarantee.",
+                flush=True,
+            )
         runner.learn(
             num_learning_iterations=args.iterations, init_at_random_ep_len=False
         )
@@ -494,6 +518,8 @@ def retention_resume_preflight(args, agent, saved, baseline):
         or handoff.get("first_update") != reference["iter"] + 1
         or handoff.get("source_sha256") != reference_hash
         or handoff.get("retention_resume") is not None
+        or handoff.get("zero_command_reference") is not None
+        or "zero_command_retention" in loss
         or handoff.get("curriculum") != curriculum
         or any(loss.get(k) != v for k, v in retention_manifest().items())
         or loss.get("reference_sha256") != reference_hash
@@ -561,6 +587,48 @@ def retention_resume_preflight(args, agent, saved, baseline):
                 "source_provenance.json",
             )
         },
+    }
+
+
+def zero_command_retention_preflight(args, baseline, resume):
+    """Bind the extra zero-twist term to verified holds of the original actor.
+
+    The existing resume preflight still requires the initial 200-update endpoint,
+    so this is a paired alternative from that learning state, not another block
+    from a regressed continuation. No reference action controls the simulator.
+    """
+    try:
+        from .operator_checkpoint_screen import replay_report
+    except ImportError:
+        from operator_checkpoint_screen import replay_report
+    if resume is None:
+        raise ValueError(
+            "Zero-command retention requires the original-reference retention resume"
+        )
+    measured = replay_report(
+        args.zero_command_reference_report.resolve(strict=True),
+        args.resume_retention_reference.resolve(strict=True),
+    )
+    phases = measured["phase_summary"]["phases"]
+    if (
+        measured["sha256"]["checkpoint"] != resume["reference_sha256"]
+        or measured["iteration"] != resume["reference_iteration"]
+        or measured["packages"] != baseline["packages"]
+        or any(p["sequence_failed"] for p in phases.values())
+        or any(
+            phases[name]["expected"] != expected
+            or phases[name]["complete"] != expected
+            or phases[name]["kinematic_passed"] != expected
+            for name, expected in (("stand", 10), ("initial_stand", 90), ("stop", 90))
+        )
+    ):
+        raise ValueError(
+            "Zero-command reference must be the exact original actor with complete stand/stop passes, no sequence violation and matching runtime"
+        )
+    return {
+        "reference_screen": measured,
+        "intervention": retention_manifest(zero_command=True)["zero_command_retention"],
+        "scope": "paired alternative from the initial retention endpoint; same learning state, seed and budget, only the zero-command loss is added; simulation restarts and seed43 development selection are not independent confirmation",
     }
 
 
@@ -676,6 +744,11 @@ def main(argv=None):
         help="Resume completed retention checkpoint AND Adam, keeping this original frozen reference (requires --moving-retention)",
     )
     parser.add_argument(
+        "--zero-command-reference-report",
+        type=Path,
+        help="Opt in to separately normalized zero-twist retention using this original-reference stand/stop-pass screen; requires --resume-retention-reference",
+    )
+    parser.add_argument(
         "--output-parent",
         type=Path,
         default=Path("logs/rsl_rl/go2_operator_refinement"),
@@ -721,14 +794,25 @@ def main(argv=None):
         parser.error(
             "--baseline-report/--resume-retention-reference require --moving-retention"
         )
+    if args.zero_command_reference_report is not None and (
+        not args.moving_retention or args.resume_retention_reference is None
+    ):
+        parser.error(
+            "--zero-command-reference-report requires --moving-retention and --resume-retention-reference"
+        )
     baseline = None
     args.retention_resume = None
+    args.zero_command_reference = None
     if args.moving_retention:
         try:
             baseline = retention_preflight(args, agent, saved)
             if args.resume_retention_reference is not None:
                 args.retention_resume = retention_resume_preflight(
                     args, agent, saved, baseline
+                )
+            if args.zero_command_reference_report is not None:
+                args.zero_command_reference = zero_command_retention_preflight(
+                    args, baseline, args.retention_resume
                 )
         except Exception as error:
             parser.error(str(error))
@@ -762,7 +846,10 @@ def main(argv=None):
             output / "retention_protocol.json",
             {
                 "baseline": baseline,
-                "loss": retention_manifest(),
+                "loss": retention_manifest(
+                    zero_command=args.zero_command_reference is not None
+                ),
+                "zero_command_reference": args.zero_command_reference,
                 "training_updates": 200,
                 "check_offsets": [100, 200],
                 "seed": args.seed,
@@ -857,6 +944,14 @@ def main(argv=None):
                 if args.retention_resume is not None
                 else []
             ),
+            *(
+                [
+                    "--zero-command-reference-report",
+                    str(args.zero_command_reference_report.resolve()),
+                ]
+                if args.zero_command_reference is not None
+                else []
+            ),
         ],
         output,
         timeout_s=args.timeout,
@@ -877,12 +972,25 @@ def main(argv=None):
         print(report.get("traceback", report.get("error")), flush=True)
         return 2
     if baseline is not None:
-        if report.get("handoff", {}).get("source_sha256") != baseline["sha256"][
-            "checkpoint"
-        ] or (
-            args.retention_resume is not None
-            and report.get("handoff", {}).get("retention_resume")
-            != args.retention_resume
+        if (
+            report.get("handoff", {}).get("source_sha256")
+            != baseline["sha256"]["checkpoint"]
+            or (
+                args.retention_resume is not None
+                and report.get("handoff", {}).get("retention_resume")
+                != args.retention_resume
+            )
+            or (
+                args.zero_command_reference is not None
+                and (
+                    report.get("handoff", {}).get("zero_command_reference")
+                    != args.zero_command_reference
+                    or report.get("handoff", {})
+                    .get("moving_retention", {})
+                    .get("zero_command_retention")
+                    != args.zero_command_reference["intervention"]
+                )
+            )
         ):
             report.update(
                 status="ERROR", error="Training source differs from retention baseline"
