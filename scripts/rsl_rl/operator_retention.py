@@ -109,7 +109,7 @@ class MovingRetentionUpdate:
     SPDX-License-Identifier: BSD-3-Clause
     """
 
-    def __init__(self, algorithm):
+    def __init__(self, algorithm, *, reference_state=None):
         from rsl_rl.algorithms import PPO
         from rsl_rl.modules import ActorCritic
 
@@ -138,6 +138,19 @@ class MovingRetentionUpdate:
             )
         self.algorithm = algorithm
         self.reference = copy.deepcopy(policy.actor).eval().requires_grad_(False)
+        if reference_state is not None:
+            # Resume uses the ORIGINAL frozen actor, not the restored learner.
+            actor_state = {
+                k.removeprefix("actor."): v
+                for k, v in reference_state.items()
+                if k.startswith("actor.")
+            }
+            self.reference.load_state_dict(actor_state, strict=True)
+            if any(
+                not torch.equal(v.detach().cpu(), actor_state[k].detach().cpu())
+                for k, v in self.reference.state_dict().items()
+            ):
+                raise ValueError("Frozen reference was not restored exactly")
         self.coefficient = COEFFICIENT
         self.updates = 0
 
@@ -230,7 +243,73 @@ class MovingRetentionUpdate:
         return {name: value / count for name, value in totals.items()}
 
 
-def install_moving_retention(algorithm):
-    update = MovingRetentionUpdate(algorithm)
+def install_moving_retention(algorithm, *, reference_state=None):
+    update = MovingRetentionUpdate(algorithm, reference_state=reference_state)
     algorithm.update = update
     return update
+
+
+def validate_adam_state(state, policy_state, expected_steps):
+    """Validate the complete pinned Adam state before any simulator is launched."""
+    # Stock ActorCritic registers std first, then actor and critic layers. Explicit
+    # names avoid trusting state-dict insertion order for optimizer identities.
+    names = ["std"] + [
+        f"{prefix}.{layer}.{kind}"
+        for prefix in ("actor", "critic")
+        for layer in (0, 2, 4, 6)
+        for kind in ("weight", "bias")
+    ]
+    template = torch.optim.Adam(
+        [nn.Parameter(policy_state[name].detach().clone()) for name in names], lr=1e-4
+    ).state_dict()
+    if (
+        type(expected_steps) is not int
+        or expected_steps <= 0
+        or set(state) != {"state", "param_groups"}
+        or state["param_groups"] != template["param_groups"]
+        or set(state["state"]) != set(range(len(names)))
+    ):
+        raise ValueError(
+            "Require complete stock fixed-rate Adam state and parameter order"
+        )
+    for index, name in enumerate(names):
+        values = state["state"][index]
+        if set(values) != {"step", "exp_avg", "exp_avg_sq"}:
+            raise ValueError(f"Incomplete Adam state for {name}")
+        step = values["step"]
+        if (
+            not isinstance(step, torch.Tensor)
+            or step.shape != ()
+            or step.dtype != torch.float32
+            or not torch.isfinite(step)
+            or step.item() != expected_steps
+        ):
+            raise ValueError(f"Incorrect Adam step for {name}")
+        for key in ("exp_avg", "exp_avg_sq"):
+            value = values[key]
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.shape != policy_state[name].shape
+                or value.dtype != policy_state[name].dtype
+                or not torch.isfinite(value).all()
+                or (key == "exp_avg_sq" and (value < 0).any())
+            ):
+                raise ValueError(f"Invalid Adam {key} for {name}")
+
+
+def restore_adam_state(algorithm, data, expected_steps):
+    """Load moments/counters exactly; never replace them with fresh Adam silently."""
+    if type(algorithm.optimizer) is not torch.optim.Adam or algorithm.optimizer.state:
+        raise ValueError("Restore retention Adam once into a fresh stock optimizer")
+    state = data["optimizer_state_dict"]
+    validate_adam_state(state, data["model_state_dict"], expected_steps)
+    if state["param_groups"] != algorithm.optimizer.state_dict()["param_groups"]:
+        raise ValueError("Runtime Adam options differ from the saved optimizer")
+    algorithm.optimizer.load_state_dict(copy.deepcopy(state))
+    restored = algorithm.optimizer.state_dict()
+    if restored["param_groups"] != state["param_groups"] or any(
+        not torch.equal(value.detach().cpu(), restored["state"][i][key].detach().cpu())
+        for i, values in state["state"].items()
+        for key, value in values.items()
+    ):
+        raise RuntimeError("Adam state was not restored exactly")

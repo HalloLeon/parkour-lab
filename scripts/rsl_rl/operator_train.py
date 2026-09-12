@@ -2,7 +2,8 @@
 
 No external Isaac Lab training script is needed. Actor, critic and action noise
 are restored exactly. Command sampling and versioned reward/entropy profiles
-are explicit; Adam starts fresh. This is NOT an RMA or obstacle policy.
+are explicit; Adam starts fresh unless an evidence-bound retention resume is
+requested. This is NOT an RMA or obstacle policy.
 """
 
 from __future__ import annotations
@@ -43,7 +44,12 @@ try:
         source_profile,
     )
     from .run_provenance import write_run_provenance
-    from .operator_retention import install_moving_retention, retention_manifest
+    from .operator_retention import (
+        install_moving_retention,
+        retention_manifest,
+        restore_adam_state,
+        validate_adam_state,
+    )
 except ImportError:
     from operator_benchmark import reference_config, supervise, write_json
     from operator_benchmark_core import (
@@ -67,7 +73,12 @@ except ImportError:
         source_profile,
     )
     from run_provenance import write_run_provenance
-    from operator_retention import install_moving_retention, retention_manifest
+    from operator_retention import (
+        install_moving_retention,
+        retention_manifest,
+        restore_adam_state,
+        validate_adam_state,
+    )
 
 
 def training_configs(saved, agent, args):
@@ -161,6 +172,15 @@ def restore_reference(runner, data):
 
 
 def run_training(args, output, agent, saved):
+    resume = getattr(args, "retention_resume", None)
+    reference = None
+    if resume is not None:
+        reference_path = args.resume_retention_reference
+        reference = load_reference_checkpoint(
+            reference_path, read_yaml_data(reference_path.parent / "params/agent.yaml")
+        )
+        if file_sha256(reference_path) != resume["reference_sha256"]:
+            raise ValueError("Retention reference changed after preflight")
     from isaaclab.app import AppLauncher
 
     launcher = AppLauncher(headless=True, livestream=0, device=args.device)
@@ -191,6 +211,11 @@ def run_training(args, output, agent, saved):
         (params / "env.yaml").write_text(yaml.dump(cfg.to_dict(), sort_keys=False))
         (params / "agent.yaml").write_text(yaml.dump(runner_cfg, sort_keys=False))
         source = load_reference_checkpoint(args.checkpoint, agent)
+        if (
+            resume is not None
+            and file_sha256(args.checkpoint) != resume["checkpoint_sha256"]
+        ):
+            raise ValueError("Resume checkpoint changed after preflight")
 
         class RefinementRunner(OnPolicyRunner):
             def save(self, path, infos=None):
@@ -206,7 +231,19 @@ def run_training(args, output, agent, saved):
         if getattr(args, "moving_retention", False):
             # Freeze the exactly restored source once. Never re-anchor at an
             # intermediate checkpoint; keep a single uninterrupted Adam run.
-            retention = install_moving_retention(runner.alg)
+            retention = install_moving_retention(
+                runner.alg,
+                reference_state=None
+                if reference is None
+                else reference["model_state_dict"],
+            )
+            if resume is not None:
+                restore_adam_state(runner.alg, source, resume["adam_steps"])
+                handoff["optimizer"] = (
+                    "restored Adam moments, counters and options exactly"
+                )
+                handoff["restored"].append("optimizer_state")
+                handoff["retention_resume"] = resume
         refinement = profile_manifest(
             saved, agent, getattr(args, "refinement_profile", "source")
         )
@@ -243,15 +280,21 @@ def run_training(args, output, agent, saved):
             handoff["unchanged"].append("reward_parameters_except_yaw_tracking_std")
         if retention is not None:
             handoff["moving_retention"] = retention_manifest()
-            handoff["moving_retention"]["reference_sha256"] = handoff["source_sha256"]
-            handoff["moving_retention"]["reference_iteration"] = source["iter"]
+            handoff["moving_retention"]["reference_sha256"] = (
+                handoff["source_sha256"]
+                if resume is None
+                else resume["reference_sha256"]
+            )
+            handoff["moving_retention"]["reference_iteration"] = (
+                source["iter"] if reference is None else reference["iter"]
+            )
             handoff["moving_retention"]["check_offsets"] = [100, 200]
             handoff["moving_retention"]["check_timing"] = (
                 "after the uninterrupted 200-update worker exits"
             )
         write_json(params / "operator_training.json", handoff)
-        # A pre-update checkpoint is explicit and inspectable, with a fresh Adam
-        # state. Never overwrite or renumber the source run's model files.
+        # The pre-update checkpoint includes the fresh OR exactly resumed Adam.
+        # Never overwrite or renumber the source run's model files.
         torch.save(
             {
                 "model_state_dict": runner.alg.policy.state_dict(),
@@ -264,7 +307,7 @@ def run_training(args, output, agent, saved):
         print(
             f"Restored actor/critic/std exactly from iteration {source['iter']}; "
             f"training updates {handoff['first_update']}–{handoff['final_iteration']}, "
-            "fresh Adam at fixed 1e-4, streaming OFF.",
+            f"{handoff['optimizer']}; fixed 1e-4, streaming OFF.",
             flush=True,
         )
         # Normal reset ages preserve long standing windows from the first rollout.
@@ -287,6 +330,15 @@ def run_training(args, output, agent, saved):
         )
         if checked["iter"] != handoff["final_iteration"]:
             raise RuntimeError("Training did not reach the requested final checkpoint")
+        if resume is not None:
+            validate_adam_state(
+                checked["optimizer_state_dict"],
+                checked["model_state_dict"],
+                resume["adam_steps"]
+                + args.iterations
+                * runner.alg.num_learning_epochs
+                * runner.alg.num_mini_batches,
+            )
         if (
             env.exposure.report()["environment_transitions"]
             != handoff["environment_transitions"]
@@ -408,6 +460,110 @@ def retention_preflight(args, agent, saved):
     return baseline
 
 
+def retention_resume_preflight(args, agent, saved, baseline):
+    """Permit one 200-update continuation of a completed initial retention run.
+
+    Physics/rollout state is not checkpointed. This restores the learning state,
+    not the exact random stream or trajectory of an uninterrupted 400-update run.
+    """
+    source = load_reference_checkpoint(args.checkpoint, agent)
+    reference_path = args.resume_retention_reference.resolve(strict=True)
+    reference = load_reference_checkpoint(
+        reference_path, read_yaml_data(reference_path.parent / "params/agent.yaml")
+    )
+    reference_hash = file_sha256(reference_path)
+    run = args.checkpoint.parent
+    training_status = json.loads((run / "training_status.json").read_text())
+    handoff = json.loads((run / "params/operator_training.json").read_text())
+    provenance = json.loads((run / "source_provenance.json").read_text())
+    loss = handoff.get("moving_retention", {})
+    # Torch preserves tuples; JSON sidecars encode those same tuples as lists.
+    checkpoint_handoff = json.loads(
+        json.dumps(source.get("infos", {}).get("handoff"), allow_nan=False)
+    )
+    curriculum = json.loads(json.dumps(curriculum_manifest("operator_transitions_v2")))
+    if (
+        training_status.get("status") != "COMPLETED"
+        or training_status.get("final_sha256") != baseline["sha256"]["checkpoint"]
+        or training_status.get("handoff") != handoff
+        or checkpoint_handoff != handoff
+        or source["iter"] != handoff.get("final_iteration")
+        or source["iter"] != reference["iter"] + 200
+        or handoff.get("additional_updates") != 200
+        or handoff.get("source_iteration") != reference["iter"]
+        or handoff.get("first_update") != reference["iter"] + 1
+        or handoff.get("source_sha256") != reference_hash
+        or handoff.get("retention_resume") is not None
+        or handoff.get("curriculum") != curriculum
+        or any(loss.get(k) != v for k, v in retention_manifest().items())
+        or loss.get("reference_sha256") != reference_hash
+        or loss.get("reference_iteration") != reference["iter"]
+        or loss.get("check_offsets") != [100, 200]
+        or provenance.get("sha256", {}).get("checkpoint") != reference_hash
+        or baseline["packages"].get("rsl-rl-lib") != "3.1.2"
+    ):
+        raise ValueError(
+            "Resume requires the completed initial 200-update moving_anchor_v1 run and its exact original reference"
+        )
+    if (
+        args.seed != int(agent["seed"])
+        or args.seed != int(saved["seed"])
+        or args.num_envs != int(saved["scene"]["num_envs"])
+        or int(agent["num_steps_per_env"]) != 24
+        or int(agent["save_interval"]) != 50
+        or agent["algorithm"]["schedule"] != "fixed"
+        or float(agent["algorithm"]["learning_rate"]) != 1e-4
+    ):
+        raise ValueError(
+            "Retention resume must preserve training seed, environment count and optimizer/rollout settings"
+        )
+    for name in (
+        "operator_curriculum.py",
+        "operator_command.py",
+        "operator_profiles.py",
+        "operator_rewards.py",
+    ):
+        if provenance["sha256"].get(name) != file_sha256(
+            Path(__file__).with_name(name)
+        ):
+            raise ValueError(
+                f"Learning implementation changed since retention training: {name}"
+            )
+    steps = (
+        200
+        * int(agent["algorithm"]["num_learning_epochs"])
+        * int(agent["algorithm"]["num_mini_batches"])
+    )
+    validate_adam_state(
+        source["optimizer_state_dict"], source["model_state_dict"], steps
+    )
+    return {
+        "checkpoint_sha256": baseline["sha256"]["checkpoint"],
+        "reference_checkpoint": str(reference_path),
+        "reference_sha256": reference_hash,
+        "reference_iteration": reference["iter"],
+        "adam_steps": steps,
+        "additional_updates": 200,
+        "cumulative_retention_updates": 400,
+        "optimizer": "exact saved moments, counters, parameter order and options",
+        "not_restored": [
+            "simulator state",
+            "command ages",
+            "random generator state",
+            "rollout buffers",
+        ],
+        "scope": "One bounded learning-state continuation; environment restarts, not bitwise uninterrupted-run equivalence",
+        "evidence_sha256": {
+            name: file_sha256(run / name)
+            for name in (
+                "training_status.json",
+                "params/operator_training.json",
+                "source_provenance.json",
+            )
+        },
+    }
+
+
 def retention_decision(measured, baseline):
     """Do not rescue a physical failure with an audit or a pooled score."""
     if measured["status"] == "PASS":
@@ -515,6 +671,11 @@ def main(argv=None):
         help="Checkpoint-bound development report for --moving-retention",
     )
     parser.add_argument(
+        "--resume-retention-reference",
+        type=Path,
+        help="Resume completed retention checkpoint AND Adam, keeping this original frozen reference (requires --moving-retention)",
+    )
+    parser.add_argument(
         "--output-parent",
         type=Path,
         default=Path("logs/rsl_rl/go2_operator_refinement"),
@@ -554,12 +715,21 @@ def main(argv=None):
         agent, saved = read_yaml_data(agent_path), read_yaml_data(env_path)
     except Exception as error:
         parser.error(f"Invalid source files ({type(error).__name__}): {error}")
-    if args.baseline_report is not None and not args.moving_retention:
-        parser.error("--baseline-report requires --moving-retention")
+    if (
+        args.baseline_report is not None or args.resume_retention_reference is not None
+    ) and not args.moving_retention:
+        parser.error(
+            "--baseline-report/--resume-retention-reference require --moving-retention"
+        )
     baseline = None
+    args.retention_resume = None
     if args.moving_retention:
         try:
             baseline = retention_preflight(args, agent, saved)
+            if args.resume_retention_reference is not None:
+                args.retention_resume = retention_resume_preflight(
+                    args, agent, saved, baseline
+                )
         except Exception as error:
             parser.error(str(error))
     if args.worker_output is not None:
@@ -597,7 +767,10 @@ def main(argv=None):
                 "check_offsets": [100, 200],
                 "seed": args.seed,
                 "evaluation_seed": 43,
-                "optimizer": "one fresh Adam at the initial source; uninterrupted through all 200 updates",
+                "optimizer": "exact restored Adam; fixed original reference"
+                if args.retention_resume
+                else "one fresh Adam at the initial source; uninterrupted through all 200 updates",
+                "retention_resume": args.retention_resume,
                 "evaluation_timing": "after training worker exit; never concurrent Kit workers",
                 "stop_screening": [
                     "complete unchanged physical PASS",
@@ -633,6 +806,20 @@ def main(argv=None):
         except importlib.metadata.PackageNotFoundError:
             provenance["packages"][package] = "unknown"
     write_json(output / "source_provenance.json", provenance)
+    if args.retention_resume is not None and provenance["packages"] != {
+        name: baseline["packages"].get(name) for name in provenance["packages"]
+    }:
+        write_json(
+            output / "report.json",
+            {
+                "status": "ERROR",
+                "error": "Runtime packages changed since the retention baseline",
+            },
+        )
+        print(
+            f"ERROR: runtime packages changed; see {output / 'report.json'}", flush=True
+        )
+        return 2
     report = supervise(
         [
             sys.executable,
@@ -662,6 +849,14 @@ def main(argv=None):
                 if args.moving_retention
                 else []
             ),
+            *(
+                [
+                    "--resume-retention-reference",
+                    str(args.resume_retention_reference.resolve()),
+                ]
+                if args.retention_resume is not None
+                else []
+            ),
         ],
         output,
         timeout_s=args.timeout,
@@ -682,9 +877,12 @@ def main(argv=None):
         print(report.get("traceback", report.get("error")), flush=True)
         return 2
     if baseline is not None:
-        if (
-            report.get("handoff", {}).get("source_sha256")
-            != baseline["sha256"]["checkpoint"]
+        if report.get("handoff", {}).get("source_sha256") != baseline["sha256"][
+            "checkpoint"
+        ] or (
+            args.retention_resume is not None
+            and report.get("handoff", {}).get("retention_resume")
+            != args.retention_resume
         ):
             report.update(
                 status="ERROR", error="Training source differs from retention baseline"
