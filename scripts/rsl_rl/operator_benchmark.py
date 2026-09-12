@@ -73,6 +73,7 @@ def make_recorder_cfg():
             super().__init__(cfg, env)
             self.enabled = False
             self.samples = []
+            self.control_trace = None
             env.operator_capture = self
 
         def record_pre_step(self):
@@ -102,6 +103,8 @@ def make_recorder_cfg():
                         for k, v in sample.items()
                     }
                 )
+                if self.control_trace is not None:
+                    self.control_trace.after_step()
             # EXPORT_NONE + no return data avoids a parallel HDF5 recording.
             return None, None
 
@@ -237,6 +240,24 @@ def run_benchmark(args, output, agent, saved):
         from isaaclab.envs import ManagerBasedRLEnv
 
         actor, iteration = load_reference_actor(args.checkpoint, agent)
+        diagnostic_reference = getattr(args, "diagnostic_reference", None)
+        reference_actor = None
+        if diagnostic_reference is not None:
+            try:
+                from .operator_control_trace import (
+                    OperatorControlTrace,
+                    load_diagnostic_reference,
+                    summarize_control_trace,
+                )
+            except ImportError:
+                from operator_control_trace import (
+                    OperatorControlTrace,
+                    load_diagnostic_reference,
+                    summarize_control_trace,
+                )
+            reference_actor, reference_identity = load_diagnostic_reference(
+                args.checkpoint, diagnostic_reference
+            )
         labels, schedule_np = command_schedule(args.repetitions)
         cfg = prepare_config(
             saved, seed=args.seed, num_envs=len(labels), device=args.device
@@ -279,6 +300,19 @@ def run_benchmark(args, output, agent, saved):
             )
             reset_mask = torch.ones(len(labels), dtype=torch.bool, device=env.device)
         capture = env.operator_capture
+        diagnostics = None
+        if reference_actor is not None:
+            reference_actor.to(env.device)
+            diagnostics = OperatorControlTrace(env, reference_actor)
+            capture.control_trace = diagnostics
+            write_json(
+                output / "control_interface.json",
+                {
+                    **diagnostics.metadata,
+                    "reference": reference_identity,
+                    "learner_sha256": file_sha256(args.checkpoint),
+                },
+            )
         initial = {
             "initial_position": env.scene["robot"]
             .data.root_pos_w.detach()
@@ -301,6 +335,8 @@ def run_benchmark(args, output, agent, saved):
                     raise RuntimeError(f"Nonfinite policy action at step {step}")
                 if audit is not None:
                     audit.observe(observation, action, reset_mask)
+                if diagnostics is not None:
+                    diagnostics.before_step(observation, action)
                 stepped = env.step(action)
                 if audit is not None:
                     # ManagerBasedRLEnv returns termination/timeout masks for the
@@ -314,6 +350,27 @@ def run_benchmark(args, output, agent, saved):
         result["checkpoint_iteration"] = iteration
         result["seed"] = args.seed
         result["simulation_steps"] = STEPS
+        if diagnostics is not None:
+            control = diagnostics.finish()
+            np.savez_compressed(output / "control_trace.npz", **control)
+            control_report = summarize_control_trace(
+                control, trace, labels, diagnostics.metadata
+            )
+            control_report["reference"] = reference_identity
+            control_report["sha256"] = {
+                "learner_checkpoint": file_sha256(args.checkpoint),
+                "physical_trace": file_sha256(output / "trace.npz"),
+                "control_trace": file_sha256(output / "control_trace.npz"),
+                "interface": file_sha256(output / "control_interface.json"),
+            }
+            write_json(output / "control_report.json", control_report)
+            result["control_diagnostics"] = {
+                "status": control_report["status"],
+                "report": "control_report.json",
+                "sha256": file_sha256(output / "control_report.json"),
+                "reference": reference_identity,
+                "scope": diagnostics.metadata["scope"],
+            }
         if audit is not None:
             result["student_interface_audit"] = audit.report()
         result["runtime"] = {
@@ -431,6 +488,11 @@ def main(argv=None):
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
+        "--diagnostic-reference",
+        type=Path,
+        help="Shadow this frozen checkpoint on the actual observations and capture actions/joints/contacts; no action override or training",
+    )
+    parser.add_argument(
         "--audit-student-interface",
         action="store_true",
         help="Shadow oracle/history audit on delivered observations; original actor still controls; no student rollout",
@@ -443,11 +505,32 @@ def main(argv=None):
         help="CPU-only checkpoint/config-shape check; no simulation",
     )
     args = parser.parse_args(argv)
-    args.checkpoint = args.checkpoint.resolve(strict=True)
-    command_schedule(args.repetitions)
-    agent_path = args.checkpoint.parent / "params/agent.yaml"
-    env_path = args.checkpoint.parent / "params/env.yaml"
-    agent, saved = read_yaml_data(agent_path), read_yaml_data(env_path)
+    reference_identity = None
+    try:
+        import torch
+
+        args.checkpoint = args.checkpoint.resolve(strict=True)
+        command_schedule(args.repetitions)
+        agent_path = args.checkpoint.parent / "params/agent.yaml"
+        env_path = args.checkpoint.parent / "params/env.yaml"
+        agent, saved = read_yaml_data(agent_path), read_yaml_data(env_path)
+        # Reject corrupt/incompatible learner tensors before creating an output
+        # run or launching Kit. Construction must not consume simulation RNG.
+        with torch.random.fork_rng(devices=[]):
+            _, iteration = load_reference_actor(args.checkpoint, agent)
+        if args.diagnostic_reference is not None:
+            try:
+                from .operator_control_trace import load_diagnostic_reference
+            except ImportError:
+                from operator_control_trace import load_diagnostic_reference
+            args.diagnostic_reference = args.diagnostic_reference.resolve(strict=True)
+            _, reference_identity = load_diagnostic_reference(
+                args.checkpoint, args.diagnostic_reference
+            )
+    except Exception as error:
+        # Exit 1 is reserved for a measured behavioral FAIL. This covers path,
+        # YAML, tensor-contract and restricted-unpickling errors, not interrupts.
+        parser.error(f"Preflight failed: {type(error).__name__}: {error}")
     if args.worker_output is not None:
         try:
             run_benchmark(args, args.worker_output, agent, saved)
@@ -463,10 +546,11 @@ def main(argv=None):
             )
         return 0  # Only the supervisor owns behavioral exit semantics.
     if args.validate_only:
-        _, iteration = load_reference_actor(args.checkpoint, agent)
         print(
             f"Checkpoint iteration {iteration}: stock 48→12 mean actor loaded. Simulator contract/behavior NOT checked."
         )
+        if reference_identity is not None:
+            print("Diagnostic reference validated; no capture or behavior checked.")
         return 0
     parent = args.output_parent or args.checkpoint.parent
     parent.mkdir(parents=True, exist_ok=True)
@@ -493,6 +577,11 @@ def main(argv=None):
         },
     }
     provenance["packages"] = {}
+    if reference_identity is not None:
+        provenance["diagnostic_reference"] = reference_identity
+        provenance["sha256"]["operator_control_trace"] = file_sha256(
+            Path(__file__).with_name("operator_control_trace.py")
+        )
     for package in ("isaaclab", "isaaclab_tasks", "isaacsim", "rsl-rl-lib", "torch"):
         try:
             provenance["packages"][package] = importlib.metadata.version(package)
@@ -515,9 +604,30 @@ def main(argv=None):
             "--device",
             args.device,
             *(["--audit-student-interface"] if args.audit_student_interface else []),
+            *(
+                ["--diagnostic-reference", str(args.diagnostic_reference)]
+                if reference_identity is not None
+                else []
+            ),
         ],
         output,
     )
+    if reference_identity is not None and report.get("status") != "ERROR":
+        try:
+            try:
+                from .operator_control_trace import validate_control_artifacts
+            except ImportError:
+                from operator_control_trace import validate_control_artifacts
+            validate_control_artifacts(
+                output, report, reference_identity, provenance["sha256"]["checkpoint"]
+            )
+        except (OSError, ValueError, TypeError) as error:
+            report = {
+                "status": "ERROR",
+                "error": f"Control diagnostics invalid: {error}",
+                "measurement_result": report,
+                "worker": report.get("worker"),
+            }
     report["provenance"] = provenance
     (output / "report.json").write_text(
         json.dumps(report, indent=2, allow_nan=False) + "\n"
