@@ -43,6 +43,7 @@ try:
         source_profile,
     )
     from .run_provenance import write_run_provenance
+    from .operator_retention import install_moving_retention, retention_manifest
 except ImportError:
     from operator_benchmark import reference_config, supervise, write_json
     from operator_benchmark_core import (
@@ -66,6 +67,7 @@ except ImportError:
         source_profile,
     )
     from run_provenance import write_run_provenance
+    from operator_retention import install_moving_retention, retention_manifest
 
 
 def training_configs(saved, agent, args):
@@ -200,6 +202,11 @@ def run_training(args, output, agent, saved):
             env, copy.deepcopy(runner_cfg), str(output), args.device
         )
         handoff = restore_reference(runner, source)
+        retention = None
+        if getattr(args, "moving_retention", False):
+            # Freeze the exactly restored source once. Never re-anchor at an
+            # intermediate checkpoint; keep a single uninterrupted Adam run.
+            retention = install_moving_retention(runner.alg)
         refinement = profile_manifest(
             saved, agent, getattr(args, "refinement_profile", "source")
         )
@@ -234,6 +241,14 @@ def run_training(args, output, agent, saved):
             handoff["unchanged"].append("rewards_except_versioned_velocity_tracking")
         else:
             handoff["unchanged"].append("reward_parameters_except_yaw_tracking_std")
+        if retention is not None:
+            handoff["moving_retention"] = retention_manifest()
+            handoff["moving_retention"]["reference_sha256"] = handoff["source_sha256"]
+            handoff["moving_retention"]["reference_iteration"] = source["iter"]
+            handoff["moving_retention"]["check_offsets"] = [100, 200]
+            handoff["moving_retention"]["check_timing"] = (
+                "after the uninterrupted 200-update worker exits"
+            )
         write_json(params / "operator_training.json", handoff)
         # A pre-update checkpoint is explicit and inspectable, with a fresh Adam
         # state. Never overwrite or renumber the source run's model files.
@@ -277,6 +292,8 @@ def run_training(args, output, agent, saved):
             != handoff["environment_transitions"]
         ):
             raise RuntimeError("Executed training budget differs from requested budget")
+        if retention is not None and retention.updates != args.iterations:
+            raise RuntimeError("Moving retention was not applied to every PPO update")
         if runner.writer is not None:
             runner.writer.flush()
             runner.writer.close()
@@ -356,6 +373,113 @@ def run_final_check(checkpoint, output, device, *, audit_student_interface=False
         return result, 2
 
 
+def retention_preflight(args, agent, saved):
+    """Bind a bounded repair to replayed development evidence, before Kit starts."""
+    try:
+        from .operator_checkpoint_screen import replay_report
+    except ImportError:
+        from operator_checkpoint_screen import replay_report
+    if (
+        args.iterations != 200
+        or args.curriculum != "operator_transitions_v2"
+        or args.refinement_profile != "source"
+        or source_profile(saved, agent).name != "stationary_twist_v1"
+        or args.skip_check
+        or args.baseline_report is None
+        or importlib.metadata.version("rsl-rl-lib") != "3.1.2"
+    ):
+        raise ValueError(
+            "Moving retention requires source stationary_twist_v1, v2 commands, RSL 3.1.2, 200 updates, a baseline report and checks enabled"
+        )
+    baseline = replay_report(args.baseline_report.resolve(strict=True), args.checkpoint)
+    phases = baseline["phase_summary"]["phases"]
+    if (
+        baseline["passed"] < 90
+        or any(p["sequence_failed"] for p in phases.values())
+        or any(
+            phases[name]["kinematic_passed"] != phases[name]["expected"]
+            for name in ("forward", "restart")
+        )
+        or baseline["iteration"] % 50
+    ):
+        raise ValueError(
+            "Repair source must have >=90/100 passes, complete forward/restart retention, no sequence violation, and a 50-aligned checkpoint"
+        )
+    return baseline
+
+
+def retention_decision(measured, baseline):
+    """Do not rescue a physical failure with an audit or a pooled score."""
+    if measured["status"] == "PASS":
+        return "DEVELOPMENT_PASS"
+    phases = measured["phase_summary"]["phases"]
+    if (
+        measured["passed"] < baseline["passed"]
+        or any(p["sequence_failed"] for p in phases.values())
+        or any(
+            phases[name]["kinematic_passed"] != phases[name]["expected"]
+            for name in ("forward", "restart")
+        )
+    ):
+        return "REGRESSED_CANDIDATE"
+    return "NO_DEVELOPMENT_PASS"
+
+
+def run_retention_checks(checkpoints, output, device, baseline):
+    """At most two screens, only after the training worker has released the GPU."""
+    try:
+        from .operator_checkpoint_screen import replay_report
+    except ImportError:
+        from operator_checkpoint_screen import replay_report
+    result = {
+        "status": "ERROR",
+        "promoted": False,
+        "baseline": baseline,
+        "candidates": [],
+        "scope": "200 training updates already completed; only evaluation stops early. Selection seed43, not held-out confirmation, RMA or hardware acceptance.",
+    }
+    try:
+        output.mkdir(parents=True, exist_ok=True)
+        for checkpoint in checkpoints:
+            check, code = run_final_check(
+                checkpoint,
+                output / checkpoint.stem,
+                device,
+                audit_student_interface=True,
+            )
+            if code not in (0, 1):
+                raise RuntimeError(f"Retention screen execution failed: {check}")
+            measured = replay_report(Path(check["report"]), checkpoint)
+            audit = measured["student_interface_audit"]
+            if not isinstance(audit, dict) or any(
+                audit.get(k) != v
+                for k, v in {
+                    "status": "ORACLE_PARITY_PASS",
+                    "control_steps": 1000,
+                    "action_comparisons": 100000,
+                    "exact_action_equality": True,
+                    "student_status": "UNTRAINED_NOT_RUN",
+                }.items()
+            ):
+                raise ValueError("Missing or incomplete shadow oracle audit")
+            if measured["packages"] != baseline["packages"]:
+                raise ValueError("Runtime packages changed from the repair baseline")
+            measured["repair_classification"] = retention_decision(measured, baseline)
+            result["candidates"].append(measured)
+            result["status"] = (
+                "DEVELOPMENT_PASS"
+                if measured["status"] == "PASS"
+                else "NO_DEVELOPMENT_PASS"
+            )
+            write_json(output / "report.json", result)
+            if result["status"] == "DEVELOPMENT_PASS":
+                break
+        return result, 0 if result["status"] == "DEVELOPMENT_PASS" else 1
+    except Exception as error:
+        result.update(status="ERROR", error=str(error), error_type=type(error).__name__)
+        return result, 2
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
@@ -380,6 +504,16 @@ def main(argv=None):
     parser.add_argument("--num-envs", type=int, default=4096)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--moving-retention",
+        action="store_true",
+        help="Opt-in bounded source-mean retention repair; requires --baseline-report, v2, 200 updates",
+    )
+    parser.add_argument(
+        "--baseline-report",
+        type=Path,
+        help="Checkpoint-bound development report for --moving-retention",
+    )
     parser.add_argument(
         "--output-parent",
         type=Path,
@@ -411,11 +545,23 @@ def main(argv=None):
         parser.error(
             "Seeds 43–45 are reserved for evaluation; choose a different training seed"
         )
-    args.checkpoint = args.checkpoint.resolve(strict=True)
-    agent_path, env_path = (
-        args.checkpoint.parent / "params" / name for name in ("agent.yaml", "env.yaml")
-    )
-    agent, saved = read_yaml_data(agent_path), read_yaml_data(env_path)
+    try:
+        args.checkpoint = args.checkpoint.resolve(strict=True)
+        agent_path, env_path = (
+            args.checkpoint.parent / "params" / name
+            for name in ("agent.yaml", "env.yaml")
+        )
+        agent, saved = read_yaml_data(agent_path), read_yaml_data(env_path)
+    except Exception as error:
+        parser.error(f"Invalid source files ({type(error).__name__}): {error}")
+    if args.baseline_report is not None and not args.moving_retention:
+        parser.error("--baseline-report requires --moving-retention")
+    baseline = None
+    if args.moving_retention:
+        try:
+            baseline = retention_preflight(args, agent, saved)
+        except Exception as error:
+            parser.error(str(error))
     if args.worker_output is not None:
         try:
             run_training(args, args.worker_output, agent, saved)
@@ -432,17 +578,35 @@ def main(argv=None):
 
     try:
         select_profile(saved, agent, args.refinement_profile)
-    except ValueError as error:
+        source = load_reference_checkpoint(args.checkpoint, agent)
+    except Exception as error:
         parser.error(str(error))  # Reject before Kit/worker/output creation.
-    source = load_reference_checkpoint(
-        args.checkpoint, agent
-    )  # Reject before starting Kit.
     args.output_parent.mkdir(parents=True, exist_ok=True)
     output = Path(
         tempfile.mkdtemp(prefix="operator_refine_", dir=args.output_parent)
     ).resolve()
     print(f"Operator refinement (headless, streaming off): {output}", flush=True)
     write_run_provenance(output, Path(__file__))
+    if baseline is not None:
+        write_json(
+            output / "retention_protocol.json",
+            {
+                "baseline": baseline,
+                "loss": retention_manifest(),
+                "training_updates": 200,
+                "check_offsets": [100, 200],
+                "seed": args.seed,
+                "evaluation_seed": 43,
+                "optimizer": "one fresh Adam at the initial source; uninterrupted through all 200 updates",
+                "evaluation_timing": "after training worker exit; never concurrent Kit workers",
+                "stop_screening": [
+                    "complete unchanged physical PASS",
+                    "execution/integrity error",
+                ],
+                "regressed_candidate": "reject individually, but still screen the already-trained +200 candidate; learning can be non-monotonic",
+                "not_promoted": True,
+            },
+        )
     provenance = {
         "source_checkpoint": str(args.checkpoint),
         "sha256": {
@@ -458,6 +622,7 @@ def main(argv=None):
         "operator_command.py",
         "operator_profiles.py",
         "operator_rewards.py",
+        "operator_retention.py",
         "operator_benchmark.py",
         "operator_benchmark_core.py",
     ):
@@ -488,6 +653,15 @@ def main(argv=None):
             args.curriculum,
             "--refinement-profile",
             args.refinement_profile,
+            *(
+                [
+                    "--moving-retention",
+                    "--baseline-report",
+                    str(args.baseline_report.resolve()),
+                ]
+                if args.moving_retention
+                else []
+            ),
         ],
         output,
         timeout_s=args.timeout,
@@ -507,6 +681,49 @@ def main(argv=None):
     if report["status"] == "ERROR":
         print(report.get("traceback", report.get("error")), flush=True)
         return 2
+    if baseline is not None:
+        if (
+            report.get("handoff", {}).get("source_sha256")
+            != baseline["sha256"]["checkpoint"]
+        ):
+            report.update(
+                status="ERROR", error="Training source differs from retention baseline"
+            )
+            write_json(output / "report.json", report)
+            return 2
+        checkpoints = [
+            output / f"model_{source['iter'] + offset}.pt" for offset in (100, 200)
+        ]
+        print(
+            "Training worker finished. Screening only the predeclared +100/+200 checkpoints.",
+            flush=True,
+        )
+        report["operator_check"], code = run_retention_checks(
+            checkpoints, output / "operator_check", args.device, baseline
+        )
+        try:
+            (output / "operator_check").mkdir(parents=True, exist_ok=True)
+            write_json(output / "operator_check/report.json", report["operator_check"])
+            write_json(output / "report.json", report)
+        except OSError as error:
+            # A launch may fail before it creates a screen directory. Preserve
+            # ERROR/exit2 even when nested evidence itself cannot be published.
+            code = 2
+            report["operator_check"].update(
+                status="ERROR", publication_error=str(error)
+            )
+            try:
+                write_json(output / "report.json", report)
+            except OSError as parent_error:
+                print(
+                    f"Could not publish retention report: {parent_error}",
+                    file=sys.stderr,
+                )
+        print(
+            f"{report['operator_check']['status']}: {output / 'report.json'}",
+            flush=True,
+        )
+        return code
     print(f"Training completed: {final}", flush=True)
     if args.skip_check:
         print("NOT behaviorally checked (--skip-check).", flush=True)
