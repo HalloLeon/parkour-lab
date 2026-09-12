@@ -66,7 +66,7 @@ esac
 case "$PARKOUR_MODE" in
   refine-operator)
     if [[ "$PARKOUR_REWARD_PROFILE" != baseline ]]; then
-      echo "refine-operator preserves stock rewards; parkour reward profiles do not apply." >&2
+      echo "Legacy parkour reward profiles do not apply to refine-operator; use --refinement-profile." >&2
       exit 2
     fi
     # Installed stock task, no legacy collision/streaming overrides or external scripts.

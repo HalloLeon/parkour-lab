@@ -30,6 +30,7 @@ try:
         read_yaml_data,
         score_trace,
     )
+    from .operator_profiles import PROFILES, apply_reward_profile, environment_profile
 except ImportError:
     from operator_benchmark_core import (
         DT,
@@ -42,6 +43,7 @@ except ImportError:
         read_yaml_data,
         score_trace,
     )
+    from operator_profiles import PROFILES, apply_reward_profile, environment_profile
 
 
 def make_recorder_cfg():
@@ -135,6 +137,16 @@ def reference_config(saved):
     )
 
     cfg = UnitreeGo2FlatEnvCfg()
+    if (
+        cfg.rewards.track_ang_vel_z_exp.params.get("std")
+        != PROFILES["stock"].yaw_tracking_std
+    ):
+        raise ValueError(
+            "Installed stock yaw-tracking kernel differs from the known reference"
+        )
+    # Reconstruct only a known reward-parameter variant. Keep the FULL comparison
+    # below: do not ignore rewards or trust arbitrary saved function names.
+    apply_reward_profile(cfg, environment_profile(saved))
     # No function from the archived YAML is executed. Its complete relevant
     # contract is compared to this installed, known stock environment instead.
     current = yaml.load(
@@ -397,6 +409,9 @@ def main(argv=None):
             "benchmark": file_sha256(Path(__file__)),
             "scoring": file_sha256(
                 Path(__file__).with_name("operator_benchmark_core.py")
+            ),
+            "reward_profiles": file_sha256(
+                Path(__file__).with_name("operator_profiles.py")
             ),
         },
     }

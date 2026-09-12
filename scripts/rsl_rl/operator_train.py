@@ -1,8 +1,8 @@
 """Bounded command-curriculum refinement of a stock Go2 reference checkpoint.
 
 No external Isaac Lab training script is needed. Actor, critic and action noise
-are restored exactly; only commands and the explicitly fresh PPO optimizer
-change. This is a simulator-velocity teacher, NOT an RMA or obstacle policy.
+are restored exactly. Command sampling and the optional, versioned yaw-precision
+objective are explicit; Adam starts fresh. This is NOT an RMA or obstacle policy.
 """
 
 from __future__ import annotations
@@ -35,6 +35,13 @@ try:
         VERSION,
         curriculum_manifest,
     )
+    from .operator_profiles import (
+        PROFILES,
+        apply_reward_profile,
+        profile_manifest,
+        select_profile,
+        source_profile,
+    )
     from .run_provenance import write_run_provenance
 except ImportError:
     from operator_benchmark import reference_config, supervise, write_json
@@ -51,6 +58,13 @@ except ImportError:
         VERSION,
         curriculum_manifest,
     )
+    from operator_profiles import (
+        PROFILES,
+        apply_reward_profile,
+        profile_manifest,
+        select_profile,
+        source_profile,
+    )
     from run_provenance import write_run_provenance
 
 
@@ -64,18 +78,24 @@ def training_configs(saved, agent, args):
     except ImportError:
         from operator_command import OperatorTransitionCommand, OperatorVelocityCommand
 
+    source = source_profile(saved, agent)
+    selected = select_profile(
+        saved, agent, getattr(args, "refinement_profile", "source")
+    )
     cfg = reference_config(saved)
     runner_cfg = UnitreeGo2FlatPPORunnerCfg().to_dict()
     known_algorithm = yaml.load(
         yaml.dump(runner_cfg["algorithm"]), Loader=yaml.BaseLoader
     )
+    known_algorithm["entropy_coef"] = str(source.entropy_coef)
     # Never execute class/function names from an archived YAML through RSL eval.
-    # Changing the optimizer is intentional; all other PPO settings stay stock.
+    # Only the named profile's entropy and the explicit optimizer protocol differ.
     for key in known_algorithm.keys() | agent["algorithm"].keys():
         if key not in ("learning_rate", "schedule") and agent["algorithm"].get(
             key
         ) != known_algorithm.get(key):
             raise ValueError(f"Unsupported source algorithm.{key}")
+    apply_reward_profile(cfg, selected)
     command = cfg.commands.base_velocity
     version = getattr(args, "curriculum", VERSION)
     curriculum_manifest(version)
@@ -107,7 +127,9 @@ def training_configs(saved, agent, args):
         resume=False,
         obs_groups={"policy": ["policy"], "critic": ["policy"]},
     )
-    runner_cfg["algorithm"].update(learning_rate=1.0e-4, schedule="fixed")
+    runner_cfg["algorithm"].update(
+        learning_rate=1.0e-4, schedule="fixed", entropy_coef=selected.entropy_coef
+    )
     return cfg, runner_cfg
 
 
@@ -178,6 +200,9 @@ def run_training(args, output, agent, saved):
             env, copy.deepcopy(runner_cfg), str(output), args.device
         )
         handoff = restore_reference(runner, source)
+        refinement = profile_manifest(
+            saved, agent, getattr(args, "refinement_profile", "source")
+        )
         handoff.update(
             source_checkpoint=str(args.checkpoint),
             source_sha256=file_sha256(args.checkpoint),
@@ -187,6 +212,7 @@ def run_training(args, output, agent, saved):
             * runner.num_steps_per_env
             * args.iterations,
             curriculum=curriculum_manifest(getattr(args, "curriculum", VERSION)),
+            refinement_profile=refinement,
             command_metric_warning=(
                 "Stock error_vel_xy/error_vel_yaw accumulators divide by max command duration: "
                 "12 s here versus 4 s in the original reference. Identical physical errors "
@@ -197,11 +223,15 @@ def run_training(args, output, agent, saved):
                 "observations",
                 "actions",
                 "physics",
-                "rewards",
                 "resets",
                 "terminations",
+                "reward_weights",
             ],
         )
+        if not refinement["changed"]:
+            handoff["unchanged"].append("rewards")
+        else:
+            handoff["unchanged"].append("reward_parameters_except_yaw_tracking_std")
         write_json(params / "operator_training.json", handoff)
         # A pre-update checkpoint is explicit and inspectable, with a fresh Adam
         # state. Never overwrite or renumber the source run's model files.
@@ -222,6 +252,14 @@ def run_training(args, output, agent, saved):
         )
         # Normal reset ages preserve long standing windows from the first rollout.
         print(handoff["command_metric_warning"], flush=True)
+        print(
+            f"Refinement profile: {refinement['source']['name']} → "
+            f"{refinement['selected']['name']}; "
+            f"yaw reward std={refinement['selected']['yaw_tracking_std']}, "
+            f"entropy coefficient={refinement['selected']['entropy_coef']}. "
+            "Acceptance thresholds unchanged.",
+            flush=True,
+        )
         runner.learn(
             num_learning_iterations=args.iterations, init_at_random_ep_len=False
         )
@@ -318,6 +356,12 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument(
+        "--refinement-profile",
+        choices=("source", *PROFILES),
+        default="source",
+        help="Preserve the source objective, or explicitly select yaw/entropy precision refinement",
+    )
+    parser.add_argument(
         "--curriculum",
         choices=VERSIONS,
         default=VERSION,
@@ -382,6 +426,10 @@ def main(argv=None):
             )
         return 0
 
+    try:
+        select_profile(saved, agent, args.refinement_profile)
+    except ValueError as error:
+        parser.error(str(error))  # Reject before Kit/worker/output creation.
     source = load_reference_checkpoint(
         args.checkpoint, agent
     )  # Reject before starting Kit.
@@ -404,6 +452,7 @@ def main(argv=None):
         "operator_train.py",
         "operator_curriculum.py",
         "operator_command.py",
+        "operator_profiles.py",
         "operator_benchmark.py",
         "operator_benchmark_core.py",
     ):
@@ -432,6 +481,8 @@ def main(argv=None):
             args.device,
             "--curriculum",
             args.curriculum,
+            "--refinement-profile",
+            args.refinement_profile,
         ],
         output,
         timeout_s=args.timeout,
