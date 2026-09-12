@@ -1,8 +1,8 @@
 """Bounded command-curriculum refinement of a stock Go2 reference checkpoint.
 
 No external Isaac Lab training script is needed. Actor, critic and action noise
-are restored exactly. Command sampling and the optional, versioned yaw-precision
-objective are explicit; Adam starts fresh. This is NOT an RMA or obstacle policy.
+are restored exactly. Command sampling and versioned reward/entropy profiles
+are explicit; Adam starts fresh. This is NOT an RMA or obstacle policy.
 """
 
 from __future__ import annotations
@@ -228,7 +228,7 @@ def run_training(args, output, agent, saved):
                 "reward_weights",
             ],
         )
-        if not refinement["changed"]:
+        if not refinement["reward_parameters_changed"]:
             handoff["unchanged"].append("rewards")
         else:
             handoff["unchanged"].append("reward_parameters_except_yaw_tracking_std")
@@ -359,7 +359,7 @@ def main(argv=None):
         "--refinement-profile",
         choices=("source", *PROFILES),
         default="source",
-        help="Preserve the source objective, or explicitly select yaw/entropy precision refinement",
+        help="Preserve the source profile, or explicitly select stock, yaw precision or low entropy",
     )
     parser.add_argument(
         "--curriculum",
