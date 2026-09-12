@@ -325,6 +325,7 @@ def score_trace(
     settling = round(th.settling_s / DT)
     for env_id, label in enumerate(labels):
         failures, phase_reports = [], []
+        sequence_failures = []
         terminal = np.flatnonzero(
             trace["terminated"][:, env_id] | trace["time_out"][:, env_id]
         )
@@ -362,6 +363,7 @@ def score_trace(
             )
             if max(np.abs(roll).max(), np.abs(pitch).max()) > th.flat_attitude_rad:
                 failures.append("flat attitude exceeds 15 degrees")
+            sequence_failures = failures.copy()
             start = 0
             for phase in profiles()[label]:
                 end = start + round(phase.duration_s / DT)
@@ -369,6 +371,7 @@ def score_trace(
                     phase_reports.append({"name": phase.name, "complete": False})
                     start = end
                     continue
+                failure_start = len(failures)
                 cmd = np.asarray(phase.command)
                 velocity = trace["linear_velocity_b"][start:end, env_id, :2]
                 yaw = trace["angular_velocity_w"][start:end, env_id, 2]
@@ -398,11 +401,15 @@ def score_trace(
                             "yaw_error_rad_s": float(yaw_error[tail].mean()),
                         }
                     )
-                if any(
-                    b["planar_error_m_s"] > planar_limit
-                    or b["yaw_error_rad_s"] > yaw_limit
-                    for b in blocks
-                ):
+                failed_blocks = [
+                    index
+                    for index, b in enumerate(blocks)
+                    if (
+                        b["planar_error_m_s"] > planar_limit
+                        or b["yaw_error_rad_s"] > yaw_limit
+                    )
+                ]
+                if failed_blocks:
                     failures.append(f"{phase.name}: tracking not sustained after 1 s")
                 details = {
                     "name": phase.name,
@@ -410,6 +417,9 @@ def score_trace(
                     "start_s": start * DT,
                     "command": list(phase.command),
                     "blocks": blocks,
+                    "failed_tracking_blocks": failed_blocks,
+                    "acquisition_failed": 0 in failed_blocks,
+                    "later_tracking_failed": any(i > 0 for i in failed_blocks),
                     "mean_body_yaw_rate_rad_s": float(body_yaw[settling:].mean()),
                     "mean_world_up_yaw_rate_rad_s": float(yaw[settling:].mean()),
                 }
@@ -458,8 +468,14 @@ def score_trace(
                             failures.append(
                                 f"{phase.name}: excessive zero-twist heading drift"
                             )
+                details["failures"] = failures[failure_start:]
+                # Phase-local kinematics never override a whole-sequence fall,
+                # invalid state or attitude violation. This is NOT acceptance.
+                details["kinematic_passed"] = not details["failures"]
                 phase_reports.append(details)
                 start = end
+        if not phase_reports:
+            sequence_failures = failures.copy()
         results.append(
             {
                 "env_id": env_id,
@@ -467,6 +483,7 @@ def score_trace(
                 "passed": not failures,
                 "observed_duration_s": length * DT,
                 "failures": failures,
+                "sequence_failures": sequence_failures,
                 "phases": phase_reports,
             }
         )
@@ -478,10 +495,63 @@ def score_trace(
         for name in profiles()
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "PASS" if all(r["passed"] for r in results) else "FAIL",
         "scope": "stock privileged-velocity flat-ground deterministic operator screen; not RMA or obstacle acceptance",
         "thresholds": asdict(th),
         "profiles": counts,
+        "phase_summary": summarize_phases(results),
         "trials": results,
+    }
+
+
+def summarize_phases(trials: list[dict]) -> dict:
+    """Diagnostic aggregation only; expected phases include unobserved suffixes.
+
+    A failed forward acquisition can fail a reverse *trajectory* while its
+    reverse segment tracks correctly. Never count truncated/unobserved phases
+    as passing, or conflate local kinematics with whole-trajectory safety.
+    """
+    rows = {}
+    for trial in trials:
+        observed = {phase["name"]: phase for phase in trial["phases"]}
+        for expected in profiles()[trial["profile"]]:
+            row = rows.setdefault(
+                expected.name,
+                dict(
+                    expected=0,
+                    complete=0,
+                    kinematic_passed=0,
+                    acquisition_failed=0,
+                    later_tracking_failed=0,
+                    excursion_failed=0,
+                    heading_failed=0,
+                    wrong_sign_failed=0,
+                    sequence_failed=0,
+                ),
+            )
+            row["expected"] += 1
+            row["sequence_failed"] += bool(trial["sequence_failures"])
+            phase = observed.get(expected.name, {})
+            if not phase.get("complete", False):
+                continue
+            row["complete"] += 1
+            for key in (
+                "kinematic_passed",
+                "acquisition_failed",
+                "later_tracking_failed",
+            ):
+                row[key] += phase[key]
+            for key, reason in (
+                ("excursion_failed", "excessive stationary drift/braking distance"),
+                ("heading_failed", "excessive zero-twist heading drift"),
+                ("wrong_sign_failed", "excessive wrong-sign yaw"),
+            ):
+                row[key] += f"{expected.name}: {reason}" in phase["failures"]
+    return {
+        "scope": "diagnostic phase-local kinematics; NOT trajectory acceptance",
+        "acquisition": "first block ending at the unchanged settling deadline",
+        "later_tracking": "any subsequent block; can overlap acquisition failure",
+        "sequence_failures": "termination, timeout, interruption, nonfinite/invalid state or attitude",
+        "phases": rows,
     }

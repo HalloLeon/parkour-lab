@@ -316,7 +316,7 @@ def run_training(args, output, agent, saved):
                     )
 
 
-def run_final_check(checkpoint, output, device):
+def run_final_check(checkpoint, output, device, *, audit_student_interface=False):
     """Require both the benchmark exit code and its checkpoint-bound artifact."""
     result = {"status": "ERROR", "output_parent": str(output), "seed": 43}
     try:
@@ -330,6 +330,7 @@ def run_final_check(checkpoint, output, device):
                 str(output),
                 "--device",
                 device,
+                *(["--audit-student-interface"] if audit_student_interface else []),
             ],
             check=False,
             timeout=600,

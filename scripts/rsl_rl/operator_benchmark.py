@@ -256,6 +256,28 @@ def run_benchmark(args, output, agent, saved):
         actor.to(env.device)
         schedule = torch.as_tensor(schedule_np, device=env.device)
         env.reset(seed=args.seed)
+        audit = None
+        if getattr(args, "audit_student_interface", False):
+            try:
+                from .operator_student_bridge import (
+                    OperatorOracleAudit,
+                    interface_manifest,
+                )
+            except ImportError:
+                from operator_student_bridge import (
+                    OperatorOracleAudit,
+                    interface_manifest,
+                )
+            audit = OperatorOracleAudit(actor)
+            write_json(
+                output / "student_interface.json",
+                interface_manifest(
+                    teacher_sha256=file_sha256(args.checkpoint),
+                    env_sha256=file_sha256(args.checkpoint.parent / "params/env.yaml"),
+                    joint_names=list(env.scene["robot"].joint_names),
+                ),
+            )
+            reset_mask = torch.ones(len(labels), dtype=torch.bool, device=env.device)
         capture = env.operator_capture
         initial = {
             "initial_position": env.scene["robot"]
@@ -277,7 +299,13 @@ def run_benchmark(args, output, agent, saved):
                 action = actor(observation)
                 if not torch.isfinite(action).all():
                     raise RuntimeError(f"Nonfinite policy action at step {step}")
-                env.step(action)
+                if audit is not None:
+                    audit.observe(observation, action, reset_mask)
+                stepped = env.step(action)
+                if audit is not None:
+                    # ManagerBasedRLEnv returns termination/timeout masks for the
+                    # transition just executed, with new-episode observations.
+                    reset_mask = (stepped[2] | stepped[3]).detach().clone()
         capture.enabled = False
         trace = capture.finish()
         trace.update(initial)
@@ -286,6 +314,8 @@ def run_benchmark(args, output, agent, saved):
         result["checkpoint_iteration"] = iteration
         result["seed"] = args.seed
         result["simulation_steps"] = STEPS
+        if audit is not None:
+            result["student_interface_audit"] = audit.report()
         result["runtime"] = {
             "joint_names": list(env.scene["robot"].joint_names),
             "observation_terms": list(OBSERVATION_TERMS),
@@ -400,6 +430,11 @@ def main(argv=None):
         help="Development/regression seed 43; reserve 44/45 for confirmation",
     )
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--audit-student-interface",
+        action="store_true",
+        help="Shadow oracle/history audit on delivered observations; original actor still controls; no student rollout",
+    )
     parser.add_argument("--output-parent", type=Path)
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     parser.add_argument(
@@ -452,6 +487,9 @@ def main(argv=None):
             "operator_rewards": file_sha256(
                 Path(__file__).with_name("operator_rewards.py")
             ),
+            "operator_student_bridge": file_sha256(
+                Path(__file__).with_name("operator_student_bridge.py")
+            ),
         },
     }
     provenance["packages"] = {}
@@ -476,6 +514,7 @@ def main(argv=None):
             str(args.repetitions),
             "--device",
             args.device,
+            *(["--audit-student-interface"] if args.audit_student_interface else []),
         ],
         output,
     )
@@ -485,6 +524,19 @@ def main(argv=None):
     )
     for name, row in report.get("profiles", {}).items():
         print(f"  {name}: {row['passed']}/{row['total']} passed")
+    phase_rows = report.get("phase_summary", {}).get("phases", {})
+    if phase_rows:
+        print("Phase-local diagnostics (not whole-trajectory acceptance):")
+        for name, row in phase_rows.items():
+            if row["kinematic_passed"] != row["expected"] or row["sequence_failed"]:
+                print(
+                    f"  {name}: {row['kinematic_passed']}/{row['expected']} kinematic pass; "
+                    f"acquisition={row['acquisition_failed']}, later tracking={row['later_tracking_failed']}, "
+                    f"excursion={row['excursion_failed']}, heading={row['heading_failed']}, "
+                    f"wrong sign={row['wrong_sign_failed']}, "
+                    f"incomplete={row['expected'] - row['complete']}, "
+                    f"sequence violations={row['sequence_failed']}"
+                )
     if report["status"] == "ERROR":
         print(report.get("traceback", report.get("error")))
     print(f"{report['status']}: {output / 'report.json'}", flush=True)
