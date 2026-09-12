@@ -50,6 +50,12 @@ try:
         restore_adam_state,
         validate_adam_state,
     )
+    from .operator_sequences import (
+        VERSION as SEQUENCE_VERSION,
+        sequence_manifest,
+        SequenceExposureWrapper,
+    )
+    from .operator_sequence_resume import sequence_resume_preflight
 except ImportError:
     from operator_benchmark import reference_config, supervise, write_json
     from operator_benchmark_core import (
@@ -78,6 +84,20 @@ except ImportError:
         retention_manifest,
         restore_adam_state,
         validate_adam_state,
+    )
+    from operator_sequences import (
+        VERSION as SEQUENCE_VERSION,
+        sequence_manifest,
+        SequenceExposureWrapper,
+    )
+    from operator_sequence_resume import sequence_resume_preflight
+
+
+def training_curriculum_manifest(version):
+    return (
+        sequence_manifest()
+        if version == SEQUENCE_VERSION
+        else curriculum_manifest(version)
     )
 
 
@@ -111,10 +131,16 @@ def training_configs(saved, agent, args):
     apply_reward_profile(cfg, selected)
     command = cfg.commands.base_velocity
     version = getattr(args, "curriculum", VERSION)
-    curriculum_manifest(version)
+    training_curriculum_manifest(version)
     command.class_type = (
         OperatorVelocityCommand if version == VERSION else OperatorTransitionCommand
     )
+    if version == SEQUENCE_VERSION:
+        try:
+            from .operator_sequence_command import OperatorReversalSequenceCommand
+        except ImportError:
+            from operator_sequence_command import OperatorReversalSequenceCommand
+        command.class_type = OperatorReversalSequenceCommand
     command.heading_command = False
     command.rel_heading_envs = 0.0
     command.rel_standing_envs = 0.0
@@ -174,6 +200,7 @@ def restore_reference(runner, data):
 def run_training(args, output, agent, saved):
     resume = getattr(args, "retention_resume", None)
     zero_reference = getattr(args, "zero_command_reference", None)
+    version = getattr(args, "curriculum", VERSION)
     reference = None
     if resume is not None:
         reference_path = args.resume_retention_reference
@@ -206,7 +233,12 @@ def run_training(args, output, agent, saved):
             raise ValueError("Runtime observation order differs from the reference")
         if raw_env.action_manager.total_action_dim != 12:
             raise ValueError("Runtime action dimension differs from the reference")
-        env = OperatorExposureWrapper(RslRlVecEnvWrapper(raw_env, clip_actions=None))
+        exposure_wrapper = (
+            SequenceExposureWrapper
+            if version == SEQUENCE_VERSION
+            else OperatorExposureWrapper
+        )
+        env = exposure_wrapper(RslRlVecEnvWrapper(raw_env, clip_actions=None))
         params = output / "params"
         params.mkdir(exist_ok=True)
         (params / "env.yaml").write_text(yaml.dump(cfg.to_dict(), sort_keys=False))
@@ -254,7 +286,9 @@ def run_training(args, output, agent, saved):
                 "Source reward/entropy profile preserved; Adam moments/counters/options "
                 "restored exactly. Simulator and RNG restart. "
                 + (
-                    "A separate zero-command retention loss is the new learning intervention. "
+                    "Both retention terms preserved; randomized reversal/hold/restart exposure is the sole intervention. "
+                    if version == SEQUENCE_VERSION
+                    else "A separate zero-command retention loss is the new learning intervention. "
                     if zero_reference is not None
                     else "Retention objective preserved. "
                 )
@@ -268,7 +302,9 @@ def run_training(args, output, agent, saved):
             environment_transitions=args.num_envs
             * runner.num_steps_per_env
             * args.iterations,
-            curriculum=curriculum_manifest(getattr(args, "curriculum", VERSION)),
+            curriculum=training_curriculum_manifest(
+                getattr(args, "curriculum", VERSION)
+            ),
             refinement_profile=refinement,
             command_metric_warning=(
                 "Stock error_vel_xy/error_vel_yaw accumulators divide by max command duration: "
@@ -338,7 +374,7 @@ def run_training(args, output, agent, saved):
             "Acceptance thresholds unchanged.",
             flush=True,
         )
-        if zero_reference is not None:
+        if zero_reference is not None and version != SEQUENCE_VERSION:
             print(
                 "New zero-command retention intervention: original frozen reference, "
                 "separate moving/zero loss means; pure pivots excluded. "
@@ -457,7 +493,7 @@ def retention_preflight(args, agent, saved):
         from operator_checkpoint_screen import replay_report
     if (
         args.iterations != 200
-        or args.curriculum != "operator_transitions_v2"
+        or args.curriculum not in ("operator_transitions_v2", SEQUENCE_VERSION)
         or args.refinement_profile != "source"
         or source_profile(saved, agent).name != "stationary_twist_v1"
         or args.skip_check
@@ -465,7 +501,7 @@ def retention_preflight(args, agent, saved):
         or importlib.metadata.version("rsl-rl-lib") != "3.1.2"
     ):
         raise ValueError(
-            "Moving retention requires source stationary_twist_v1, v2 commands, RSL 3.1.2, 200 updates, a baseline report and checks enabled"
+            "Moving retention requires source stationary_twist_v1, v2/v3 commands, RSL 3.1.2, 200 updates, a baseline report and checks enabled"
         )
     baseline = replay_report(args.baseline_report.resolve(strict=True), args.checkpoint)
     phases = baseline["phase_summary"]["phases"]
@@ -591,11 +627,11 @@ def retention_resume_preflight(args, agent, saved, baseline):
 
 
 def zero_command_retention_preflight(args, baseline, resume):
-    """Bind the extra zero-twist term to verified holds of the original actor.
+    """Bind the zero-twist term to verified holds of the original actor.
 
-    The existing resume preflight still requires the initial 200-update endpoint,
-    so this is a paired alternative from that learning state, not another block
-    from a regressed continuation. No reference action controls the simulator.
+    The v2 alternative adds this term at the initial 200-update endpoint; the
+    evidence-bound v3 continuation preserves it. Neither branch lets reference
+    actions control the simulator.
     """
     try:
         from .operator_checkpoint_screen import replay_report
@@ -628,7 +664,11 @@ def zero_command_retention_preflight(args, baseline, resume):
     return {
         "reference_screen": measured,
         "intervention": retention_manifest(zero_command=True)["zero_command_retention"],
-        "scope": "paired alternative from the initial retention endpoint; same learning state, seed and budget, only the zero-command loss is added; simulation restarts and seed43 development selection are not independent confirmation",
+        "scope": (
+            "existing zero-command loss retained from the completed zero-retention endpoint; only command-sequence exposure changes; simulation restarts and seed43 development selection are not independent confirmation"
+            if getattr(args, "curriculum", VERSION) == SEQUENCE_VERSION
+            else "paired alternative from the initial retention endpoint; same learning state, seed and budget, only the zero-command loss is added; simulation restarts and seed43 development selection are not independent confirmation"
+        ),
     }
 
 
@@ -715,9 +755,9 @@ def main(argv=None):
     )
     parser.add_argument(
         "--curriculum",
-        choices=VERSIONS,
+        choices=(*VERSIONS, SEQUENCE_VERSION),
         default=VERSION,
-        help="Versioned command distribution; v2 focuses on live stops and reverse",
+        help="Versioned commands; v3 requires evidence-bound reversal-stop continuation",
     )
     parser.add_argument(
         "--iterations",
@@ -749,6 +789,16 @@ def main(argv=None):
         help="Opt in to separately normalized zero-twist retention using this original-reference stand/stop-pass screen; requires --resume-retention-reference",
     )
     parser.add_argument(
+        "--reversal-stop-probe",
+        type=Path,
+        help="Complete two-arm negative recovery evidence for the single v3 sequence-exposure intervention",
+    )
+    parser.add_argument(
+        "--validate-only",
+        action="store_true",
+        help="v3 CPU evidence/learning-state preflight only; no output or simulator launch",
+    )
+    parser.add_argument(
         "--output-parent",
         type=Path,
         default=Path("logs/rsl_rl/go2_operator_refinement"),
@@ -766,6 +816,18 @@ def main(argv=None):
     )
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if (args.curriculum == SEQUENCE_VERSION) != (args.reversal_stop_probe is not None):
+        parser.error("v3 and --reversal-stop-probe must be selected together")
+    if args.reversal_stop_probe is not None and (
+        not args.moving_retention
+        or args.resume_retention_reference is None
+        or args.zero_command_reference_report is None
+    ):
+        parser.error("v3 must preserve both retention terms and the original reference")
+    if args.validate_only and (
+        args.reversal_stop_probe is None or args.worker_output is not None
+    ):
+        parser.error("--validate-only is reserved for v3 parent preflight")
     if (
         args.iterations < 1
         or args.num_envs < 4
@@ -806,7 +868,11 @@ def main(argv=None):
     if args.moving_retention:
         try:
             baseline = retention_preflight(args, agent, saved)
-            if args.resume_retention_reference is not None:
+            if args.reversal_stop_probe is not None:
+                args.retention_resume = sequence_resume_preflight(
+                    args, agent, saved, baseline
+                )
+            elif args.resume_retention_reference is not None:
                 args.retention_resume = retention_resume_preflight(
                     args, agent, saved, baseline
                 )
@@ -816,6 +882,11 @@ def main(argv=None):
                 )
         except Exception as error:
             parser.error(str(error))
+    if args.validate_only:
+        print(
+            "Validated v3 source, Adam8000, original reference, both losses and two negative recovery arms. Training remains UNRUN."
+        )
+        return 0
     if args.worker_output is not None:
         try:
             run_training(args, args.worker_output, agent, saved)
@@ -858,6 +929,7 @@ def main(argv=None):
                 if args.retention_resume
                 else "one fresh Adam at the initial source; uninterrupted through all 200 updates",
                 "retention_resume": args.retention_resume,
+                "curriculum": training_curriculum_manifest(args.curriculum),
                 "evaluation_timing": "after training worker exit; never concurrent Kit workers",
                 "stop_screening": [
                     "complete unchanged physical PASS",
@@ -885,6 +957,16 @@ def main(argv=None):
         "operator_retention.py",
         "operator_benchmark.py",
         "operator_benchmark_core.py",
+        *(
+            (
+                "operator_sequences.py",
+                "operator_sequence_command.py",
+                "operator_sequence_resume.py",
+                "operator_stop_probe.py",
+            )
+            if args.curriculum == SEQUENCE_VERSION
+            else ()
+        ),
     ):
         provenance["sha256"][name] = file_sha256(Path(__file__).with_name(name))
     for package in ("isaaclab", "isaacsim", "rsl-rl-lib", "torch"):
@@ -952,6 +1034,11 @@ def main(argv=None):
                 if args.zero_command_reference is not None
                 else []
             ),
+            *(
+                ["--reversal-stop-probe", str(args.reversal_stop_probe.resolve())]
+                if args.reversal_stop_probe is not None
+                else []
+            ),
         ],
         output,
         timeout_s=args.timeout,
@@ -979,6 +1066,10 @@ def main(argv=None):
                 args.retention_resume is not None
                 and report.get("handoff", {}).get("retention_resume")
                 != args.retention_resume
+            )
+            or (
+                args.curriculum == SEQUENCE_VERSION
+                and report.get("handoff", {}).get("curriculum") != sequence_manifest()
             )
             or (
                 args.zero_command_reference is not None

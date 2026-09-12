@@ -370,6 +370,25 @@ class StopRecoveryProbe:
         }
 
 
+def recorded_reference(report, expected):
+    """Bind downloaded evidence by content, not the original host's file path.
+
+    The recorded path remains untouched and must agree across the hash-bound
+    artifacts. It is descriptive provenance, never a local path to execute/load.
+    Every other identity field, including all three hashes and iteration, stays
+    exact; relocation cannot silently substitute another reference checkpoint.
+    """
+    reference = report.get("control_diagnostics", {}).get("reference")
+    if (
+        not isinstance(reference, dict)
+        or not isinstance(reference.get("checkpoint"), str)
+        or not reference["checkpoint"].strip()
+        or reference != {**expected, "checkpoint": reference["checkpoint"]}
+    ):
+        raise ValueError("Recorded reference content identity differs from baseline")
+    return reference
+
+
 def validate_probe_output(output, report, baseline, arm):
     if (
         report.get("status") != "PROBE_COMPLETE"
@@ -381,7 +400,7 @@ def validate_probe_output(output, report, baseline, arm):
     validate_control_artifacts(
         output,
         report,
-        baseline["reference_identity"],
+        recorded_reference(report, baseline["reference_identity"]),
         baseline["identity"]["learner"]["checkpoint"],
     )
     interface = read_json(output / "control_interface.json")
