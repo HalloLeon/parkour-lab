@@ -3,7 +3,8 @@
 No external Isaac Lab training script is needed. Actor, critic and action noise
 are restored exactly. Command sampling and versioned reward/entropy profiles
 are explicit; Adam starts fresh unless an evidence-bound retention resume is
-requested. This is NOT an RMA or obstacle policy.
+requested. Opt-in --terrain-readiness checks a terrain-conditioned warm start
+and one PPO update; it does not train or qualify an obstacle/RMA policy.
 """
 
 from __future__ import annotations
@@ -223,6 +224,569 @@ def restore_reference(runner, data):
         "learning_rate": runner.alg.learning_rate,
         "schedule": runner.alg.schedule,
     }
+
+
+TERRAIN_VERSION = "go2_operator_terrain_teacher_v1"
+TERRAIN_READINESS_STEPS = 1000
+TERRAIN_ARTIFACTS = (
+    "trace.npz",
+    "terrain_readiness.pt",
+    "params/interface.json",
+    "params/env.yaml",
+    "params/agent.yaml",
+)
+
+
+def build_terrain_policy(observations, source_state):
+    """Explicit stock-to-terrain warm start; never load legacy RMA or Adam."""
+    import torch
+    from rsl_rl.modules import ActorCritic
+    from parkour_lab.learning.distillation.teacher.model import StockTerrainInput
+
+    if (
+        observations["policy"].ndim != 2
+        or observations["policy"].shape[-1] != 48
+        or observations["terrain"].shape != (observations["policy"].shape[0], 264)
+    ):
+        raise ValueError(
+            "Terrain teacher requires separate 48-D policy and 264-D scan groups"
+        )
+    if any(
+        v.dtype != torch.float32 or not torch.isfinite(v).all()
+        for v in source_state.values()
+    ):
+        raise ValueError("Warm start requires finite float32 reference tensors")
+    reference = ActorCritic(
+        observations,
+        {"policy": ["policy"], "critic": ["policy"]},
+        12,
+        actor_hidden_dims=[128] * 3,
+        critic_hidden_dims=[128] * 3,
+        activation="elu",
+        actor_obs_normalization=False,
+        critic_obs_normalization=False,
+    )
+    reference.load_state_dict(source_state, strict=True)
+    if (reference.std <= 0).any():
+        raise ValueError("Warm-start action noise must be positive")
+    policy = copy.deepcopy(reference)
+    policy.obs_groups = {
+        "policy": ["policy", "terrain"],
+        "critic": ["policy", "terrain"],
+    }
+    policy.actor[0] = StockTerrainInput(policy.actor[0])
+    policy.critic[0] = StockTerrainInput(policy.critic[0])
+    device = observations["policy"].device
+    return policy.to(device), reference.to(device).eval().requires_grad_(False)
+
+
+def terrain_readiness_configs(saved, agent, args):
+    """Reuse the stock motor and production geometry in one bounded fixture."""
+    try:
+        from .operator_benchmark import configure_terrain, make_recorder_cfg
+        from .operator_command import (
+            TerrainReadinessCommand,
+            initialize_readiness_levels,
+            readiness_course_success,
+            readiness_course_off_route,
+        )
+    except ImportError:
+        from operator_benchmark import configure_terrain, make_recorder_cfg
+        from operator_command import (
+            TerrainReadinessCommand,
+            initialize_readiness_levels,
+            readiness_course_success,
+            readiness_course_off_route,
+        )
+    from parkour_lab.tasks.manager_based.parkour_lab.parkour_lab_env_cfg import (
+        ParkourLabEnvCfg,
+    )
+
+    cfg, runner_cfg = training_configs(saved, agent, args)
+    # This checked overlay supplies contacts and ordered stable-finish gates;
+    # replace its single-family layout with the production training matrix.
+    configure_terrain(cfg, "gap", 1)
+    courses = ParkourLabEnvCfg()
+    cfg.scene.terrain.terrain_generator = courses.scene.ground.terrain_generator
+    cfg.scene.terrain.terrain_generator.seed = args.seed
+    cfg.scene.terrain.max_init_terrain_level = 1
+    cfg.scene.height_scanner = courses.scene.height_scanner
+    cfg.scene.height_scanner.mesh_prim_paths = [cfg.scene.terrain.prim_path]
+    cfg.scene.height_scanner.update_period = DT
+    cfg.observations.terrain = courses.observations.terrain
+    cfg.events.initialize_terrain_levels = courses.events.initialize_terrain_levels
+    cfg.events.initialize_terrain_levels.func = initialize_readiness_levels
+    cfg.events.initialize_terrain_levels.params.pop("initial_level_override")
+    cfg.events.reset_routes = courses.events.reset_routes
+    cfg.commands.base_velocity.class_type = TerrainReadinessCommand
+    # Free body-twist operator episodes must not terminate for disregarding
+    # route guidance. Physical base/head/below-course failures remain active.
+    cfg.terminations.course_success.func = readiness_course_success
+    cfg.terminations.course_off_route.func = readiness_course_off_route
+    cfg.recorders = make_recorder_cfg()
+    runner_cfg["obs_groups"] = {
+        "policy": ["policy", "terrain"],
+        "critic": ["policy", "terrain"],
+    }
+    runner_cfg["num_steps_per_env"] = TERRAIN_READINESS_STEPS
+    runner_cfg["terrain_warm_start_builder"] = "operator_train.build_terrain_policy"
+    runner_cfg["interface_version"] = TERRAIN_VERSION
+    # Source rewards are a PPO plumbing fixture, not the final obstacle
+    # objective. No retention loss, promotion schedule or convergence claim.
+    return cfg, runner_cfg
+
+
+def terrain_source_identity(args):
+    """Bind parent and worker to exactly the same source, inputs and runtime."""
+    root = Path(__file__).resolve().parents[2]
+    producers = sorted(
+        [
+            *root.joinpath("scripts/rsl_rl").glob("*.py"),
+            *root.joinpath("source/parkour_lab/parkour_lab").rglob("*.py"),
+        ]
+    )
+    return {
+        "checkpoint": file_sha256(args.checkpoint),
+        "agent": file_sha256(args.checkpoint.parent / "params/agent.yaml"),
+        "environment": file_sha256(args.checkpoint.parent / "params/env.yaml"),
+        "mesh_flat_report": file_sha256(args.mesh_flat_report),
+        "producers": {str(p.relative_to(root)): file_sha256(p) for p in producers},
+        "packages": {
+            name: importlib.metadata.version(name) for name in ("torch", "rsl-rl-lib")
+        },
+    }
+
+
+def terrain_update_evidence(policy, algorithm, losses):
+    """Require actual finite learning in both new terrain branches."""
+    import torch
+
+    if not losses or any(not math.isfinite(float(value)) for value in losses.values()):
+        raise ValueError("Nonfinite or missing terrain-readiness PPO losses")
+    if (
+        any(not torch.isfinite(p).all() for p in policy.parameters())
+        or (policy.std <= 0).any()
+    ):
+        raise ValueError("Nonfinite policy or invalid action noise after PPO")
+    expected_steps = algorithm.num_learning_epochs * algorithm.num_mini_batches
+    if set(algorithm.optimizer.state) != set(policy.parameters()) or any(
+        int(s["step"].item()) != expected_steps
+        or not torch.isfinite(s["exp_avg"]).all()
+        or not torch.isfinite(s["exp_avg_sq"]).all()
+        for s in algorithm.optimizer.state.values()
+    ):
+        raise ValueError(
+            "Readiness requires one fresh, fully finite Adam update sequence"
+        )
+    branches = {}
+    for name in ("actor", "critic"):
+        branch = getattr(policy, name)[0]
+        encoder_gradients = [p.grad for p in branch.encoder.parameters()]
+        gradient = branch.projection.weight.grad
+        if (
+            gradient is None
+            or not torch.isfinite(gradient).all()
+            or not torch.count_nonzero(gradient)
+            or not torch.count_nonzero(branch.projection.weight)
+            or any(g is None or not torch.isfinite(g).all() for g in encoder_gradients)
+            or not any(torch.count_nonzero(g) for g in encoder_gradients)
+        ):
+            raise ValueError(
+                f"No finite learning path through the {name} terrain encoder"
+            )
+        branches[name] = {
+            "projection_max_abs": float(branch.projection.weight.detach().abs().max()),
+            "encoder_gradient_norm": float(
+                sum(g.square().sum() for g in encoder_gradients).sqrt()
+            ),
+        }
+    return {
+        "ppo_updates": 1,
+        "adam_steps": expected_steps,
+        "losses": losses,
+        "terrain_branches": branches,
+    }
+
+
+def run_terrain_readiness(args, output, agent, saved, protocol):
+    """Collect one rollout, verify the warm start, and exercise one PPO update."""
+    if terrain_source_identity(args) != protocol["source_identity"]:
+        raise ValueError(
+            "Terrain-readiness source changed between preflight and worker"
+        )
+    for package in ("isaaclab", "isaacsim", "rsl-rl-lib", "torch"):
+        if importlib.metadata.version(package) != protocol["mesh_flat"]["packages"].get(
+            package
+        ):
+            raise ValueError(
+                f"Runtime {package} differs from the mesh-flat prerequisite"
+            )
+    from isaaclab.app import AppLauncher
+
+    app = AppLauncher(headless=True, livestream=0, device=args.device).app
+    env = None
+    try:
+        import numpy as np
+        import torch
+        from isaaclab.envs import ManagerBasedRLEnv
+        from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+        from rsl_rl.algorithms import PPO
+
+        try:
+            from .operator_benchmark import mesh_identity, validate_motor_trace
+        except ImportError:
+            from operator_benchmark import mesh_identity, validate_motor_trace
+
+        cfg, runner_cfg = terrain_readiness_configs(saved, agent, args)
+        raw = ManagerBasedRLEnv(cfg=cfg)
+        env = raw
+        env = RslRlVecEnvWrapper(raw, clip_actions=None)
+        if (
+            abs(raw.step_dt - DT) > 1e-9
+            or tuple(raw.observation_manager.active_terms["policy"])
+            != OBSERVATION_TERMS
+        ):
+            raise ValueError(
+                "Terrain readiness changed the stock timing/observation order"
+            )
+        if (
+            raw.action_manager.total_action_dim != 12
+            or list(raw.scene["robot"].joint_names)
+            != protocol["mesh_flat"]["joint_names"]
+        ):
+            raise ValueError("Terrain readiness changed the stock joint/action order")
+        levels = raw.scene.terrain.terrain_levels
+        columns = raw.scene.terrain.terrain_types
+        if not torch.equal(levels, torch.arange(80, device=raw.device) % 2) or set(
+            columns.tolist()
+        ) != set(range(40)):
+            raise ValueError(
+                "Expected all 40 production columns with paired L0/L1 environments"
+            )
+        geometry = mesh_identity(raw)
+        obs = env.get_observations()
+        source = load_reference_checkpoint(args.checkpoint, agent)
+        policy, reference = build_terrain_policy(obs, source["model_state_dict"])
+        algorithm_cfg = dict(runner_cfg["algorithm"])
+        if algorithm_cfg.pop("class_name") != "PPO":
+            raise ValueError("Terrain readiness supports stock PPO only")
+        algorithm = PPO(policy, device=raw.device, **algorithm_cfg)
+        algorithm.init_storage("rl", 80, TERRAIN_READINESS_STEPS, obs, [12])
+        if algorithm.optimizer.state:
+            raise ValueError("Terrain warm start must use fresh Adam")
+        params = output / "params"
+        params.mkdir()
+        (params / "env.yaml").write_text(yaml.dump(cfg.to_dict(), sort_keys=False))
+        (params / "agent.yaml").write_text(yaml.dump(runner_cfg, sort_keys=False))
+        layout = cfg.events.reset_routes.params["terrain_layout"]
+        interface = {
+            "version": TERRAIN_VERSION,
+            "source_sha256": protocol["source_identity"]["checkpoint"],
+            "stock_observation_terms": list(OBSERVATION_TERMS),
+            "terrain": {
+                "width": 264,
+                "order": "132 clipped heights, then 132 validity bits",
+                "encoder": [264, 128, 64, 32],
+            },
+            "motor": {
+                "hidden_dims": [128, 128, 128],
+                "terrain_fusion": "zero-initialized additive first-hidden preactivation",
+            },
+            "joint_names": list(raw.scene["robot"].joint_names),
+            "actions": "default_joint_position + 0.25 * raw_action; no clipping",
+            "body_twist": "[vx, vy, wz]; script owns commands, no live handoff",
+            "command_roles": {
+                "L0": "operator profiles from command_schedule(4), reset-local clocks",
+                "L1": "production waypoint guidance, 0.55 m/s, 2-s initial stand",
+                "L0_profiles": list(
+                    raw.command_manager.get_term("base_velocity").labels
+                ),
+            },
+            "terrain_layout": {
+                "family_by_column": list(layout.family_index_by_column),
+                "variant_by_column": list(layout.geometry_variant_index_by_column),
+                "columns": columns.tolist(),
+                "levels": levels.tolist(),
+            },
+            "student_status": "UNTRAINED_NOT_RUN",
+            "scope": "Privileged teacher readiness only: simulator velocity and terrain; not deployable policy or obstacle acceptance",
+        }
+        write_json(params / "interface.json", interface)
+        initial = {
+            "initial_position": raw.scene["robot"]
+            .data.root_pos_w.detach()
+            .cpu()
+            .numpy()
+            .copy(),
+            "env_origins": raw.scene.env_origins.detach().cpu().numpy().copy(),
+            "terrain_levels": levels.cpu().numpy().copy(),
+            "terrain_columns": columns.cpu().numpy().copy(),
+        }
+        capture = raw.operator_capture
+        capture.motor_parity = True
+        capture.course = {"readiness": True}
+        capture.enabled = True
+        terrain_frames = []
+        with torch.inference_mode():
+            for step in range(TERRAIN_READINESS_STEPS):
+                if step % 250 == 0:
+                    print(
+                        f"Terrain readiness rollout: {step}/{TERRAIN_READINESS_STEPS} steps; no PPO update yet",
+                        flush=True,
+                    )
+                if any(
+                    not torch.isfinite(obs[key]).all() for key in ("policy", "terrain")
+                ):
+                    raise ValueError(f"Nonfinite delivered observation at step {step}")
+                heights, valid = obs["terrain"].split(132, dim=-1)
+                if (heights.abs() > 0.5).any() or not (
+                    (valid == 0) | (valid == 1)
+                ).all():
+                    raise ValueError(
+                        "Delivered terrain scan violates its height/validity contract"
+                    )
+                if not torch.equal(
+                    policy.act_inference(obs), reference.act_inference(obs)
+                ) or not torch.equal(policy.evaluate(obs), reference.evaluate(obs)):
+                    raise ValueError(
+                        f"Terrain warm-start action/value parity failed at step {step}"
+                    )
+                capture.observation = obs["policy"].detach().clone()
+                terrain_frames.append(obs["terrain"].detach().cpu().numpy().copy())
+                actions = algorithm.act(obs)
+                if not torch.isfinite(actions).all():
+                    raise ValueError("Nonfinite sampled PPO action")
+                obs, rewards, dones, extras = env.step(actions)
+                if not torch.isfinite(rewards).all():
+                    raise ValueError("Nonfinite readiness rewards")
+                algorithm.process_env_step(obs, rewards, dones, extras)
+            algorithm.compute_returns(obs)
+        capture.enabled = False
+        trace = capture.finish()
+        trace.update(initial, terrain_observation=np.stack(terrain_frames))
+        if trace["terrain_observation"].shape != (
+            TERRAIN_READINESS_STEPS,
+            80,
+            264,
+        ) or trace["action"].shape != (TERRAIN_READINESS_STEPS, 80, 12):
+            raise ValueError(
+                "Readiness requires a complete 1000-step/80-environment trace"
+            )
+        np.savez_compressed(output / "trace.npz", **trace)
+        motor = validate_motor_trace(trace)
+        update = terrain_update_evidence(policy, algorithm, algorithm.update())
+        torch.save(
+            {
+                "interface": interface,
+                "model_state_dict": policy.state_dict(),
+                "optimizer_state_dict": algorithm.optimizer.state_dict(),
+                "learning_updates": 1,
+                "readiness_only": True,
+                "behavior_validated": False,
+            },
+            output / "terrain_readiness.pt",
+        )
+        if terrain_source_identity(args) != protocol["source_identity"]:
+            raise ValueError("Readiness sources changed during execution")
+        write_json(
+            output / "training_status.json",
+            {
+                "status": "READINESS_PASS",
+                "interface_version": TERRAIN_VERSION,
+                "source_identity": protocol["source_identity"],
+                "update": update,
+                "simulation_steps": TERRAIN_READINESS_STEPS,
+                "environment_transitions": int(np.prod(trace["action"].shape[:2])),
+                "exact_action_and_value_parity_comparisons": TERRAIN_READINESS_STEPS
+                * 80,
+                "motor_interface": motor,
+                "mesh": geometry,
+                "sha256": {
+                    name: file_sha256(output / name) for name in TERRAIN_ARTIFACTS
+                },
+                "behavior_validated": False,
+                "promoted": False,
+                "scope": "One PPO plumbing update with source rewards, fixed mixed L0/L1 fixture. NOT convergence, progressive training, operator retention, student behavior or exit acceptance.",
+            },
+        )
+    except Exception as error:
+        # Publish before Kit closes: some shutdown paths terminate Python with
+        # exit(0), so the parent must own result/exit semantics.
+        write_json(
+            output / "training_status.json",
+            {
+                "status": "ERROR",
+                "error": str(error),
+                "traceback": traceback.format_exc(),
+            },
+        )
+    finally:
+        for name, resource in (("environment", env), ("application", app)):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception as error:
+                    write_json(
+                        output / f"{name}_cleanup_error.json", {"error": str(error)}
+                    )
+
+
+def terrain_readiness_main(args, parser):
+    """Keep readiness fail-closed and separate from historical flat protocols."""
+    if (
+        args.iterations != 1
+        or args.num_envs != 80
+        or args.seed != 42
+        or args.curriculum != VERSION
+        or args.refinement_profile != "source"
+        or args.mesh_flat_report is None
+        or args.skip_check
+        or args.moving_retention
+        or any(
+            getattr(args, name) is not None
+            for name in (
+                "check_offsets",
+                "baseline_report",
+                "resume_retention_reference",
+                "zero_command_reference_report",
+                "reversal_stop_probe",
+            )
+        )
+        or not math.isfinite(args.timeout)
+        or args.timeout <= 0
+        or (args.validate_only and args.worker_output is not None)
+    ):
+        parser.error(
+            "Terrain readiness requires --iterations 1 --num-envs 80 --seed 42 --mesh-flat-report; no flat refinement/resume/check flags"
+        )
+    try:
+        try:
+            from .operator_benchmark import validate_mesh_flat_report
+        except ImportError:
+            from operator_benchmark import validate_mesh_flat_report
+        args.checkpoint = args.checkpoint.resolve(strict=True)
+        args.mesh_flat_report = args.mesh_flat_report.resolve(strict=True)
+        agent = read_yaml_data(args.checkpoint.parent / "params/agent.yaml")
+        saved = read_yaml_data(args.checkpoint.parent / "params/env.yaml")
+        source = load_reference_checkpoint(args.checkpoint, agent)
+        select_profile(saved, agent, "source")
+        if importlib.metadata.version("rsl-rl-lib") != "3.1.2":
+            raise ValueError("Terrain readiness requires RSL-RL 3.1.2")
+        mesh_flat = validate_mesh_flat_report(args.mesh_flat_report, args.checkpoint)
+        identity = terrain_source_identity(args)
+        # CPU-only construction catches dtype, shape and source migration errors
+        # before a simulator or output directory is created. Preserve CPU RNG.
+        import torch
+
+        with torch.random.fork_rng(devices=[]):
+            observations = {"policy": torch.zeros(4, 48), "terrain": torch.ones(4, 264)}
+            policy, reference = build_terrain_policy(
+                observations, source["model_state_dict"]
+            )
+            with torch.no_grad():
+                if not torch.equal(
+                    policy.act_inference(observations),
+                    reference.act_inference(observations),
+                ) or not torch.equal(
+                    policy.evaluate(observations), reference.evaluate(observations)
+                ):
+                    raise ValueError("CPU terrain warm-start parity failed")
+    except Exception as error:
+        parser.error(f"Terrain readiness preflight failed: {error}")
+    if args.validate_only:
+        print(
+            "Validated terrain warm start and mesh prerequisite. GPU rollout/PPO update remain UNRUN."
+        )
+        return 0
+    if args.worker_output is not None:
+        try:
+            protocol = json.loads(
+                (args.worker_output / "readiness_protocol.json").read_text()
+            )
+            run_terrain_readiness(args, args.worker_output, agent, saved, protocol)
+        except Exception as error:
+            write_json(
+                args.worker_output / "training_status.json",
+                {
+                    "status": "ERROR",
+                    "error": str(error),
+                    "traceback": traceback.format_exc(),
+                },
+            )
+        return 0
+    args.output_parent.mkdir(parents=True, exist_ok=True)
+    output = Path(
+        tempfile.mkdtemp(prefix="operator_terrain_readiness_", dir=args.output_parent)
+    ).resolve()
+    write_run_provenance(output, Path(__file__))
+    write_json(
+        output / "readiness_protocol.json",
+        {
+            "version": TERRAIN_VERSION,
+            "source_identity": identity,
+            "mesh_flat": mesh_flat,
+            "seed": 42,
+            "num_envs": 80,
+            "rollout_steps": 1000,
+            "ppo_updates": 1,
+            "scope": "Engineering readiness only. Source rewards; no convergence or behavior claim; no retention or curriculum promotion.",
+        },
+    )
+    print(
+        f"Terrain warm-start/PPO readiness (not behavior acceptance): {output}",
+        flush=True,
+    )
+    report = supervise(
+        [
+            sys.executable,
+            "-u",
+            str(Path(__file__).resolve()),
+            str(args.checkpoint),
+            "--terrain-readiness",
+            "--mesh-flat-report",
+            str(args.mesh_flat_report),
+            "--iterations",
+            "1",
+            "--num-envs",
+            "80",
+            "--seed",
+            "42",
+            "--device",
+            args.device,
+            "--worker-output",
+            str(output),
+        ],
+        output,
+        timeout_s=args.timeout,
+        report_filename="training_status.json",
+        valid_statuses=("READINESS_PASS", "ERROR"),
+    )
+    if report["status"] == "READINESS_PASS":
+        try:
+            if (
+                report.get("source_identity") != identity
+                or terrain_source_identity(args) != identity
+                or report.get("interface_version") != TERRAIN_VERSION
+                or report.get("update", {}).get("ppo_updates") != 1
+                or report.get("simulation_steps") != 1000
+                or report.get("environment_transitions") != 80000
+                or report.get("exact_action_and_value_parity_comparisons") != 80000
+                or report.get("behavior_validated") is not False
+                or report.get("promoted") is not False
+                or list(output.glob("*_cleanup_error.json"))
+            ):
+                raise ValueError("Worker identity/update count mismatch")
+            for name in TERRAIN_ARTIFACTS:
+                if report.get("sha256", {}).get(name) != file_sha256(output / name):
+                    raise ValueError(f"Missing or changed readiness artifact: {name}")
+        except Exception as error:
+            report = {"status": "ERROR", "error": str(error), "worker_result": report}
+    write_json(output / "report.json", report)
+    print(
+        f"{report['status']}: {output / 'report.json'}; obstacle/critic acceptance remains false",
+        flush=True,
+    )
+    return 0 if report["status"] == "READINESS_PASS" else 2
 
 
 def run_training(args, output, agent, saved):
@@ -778,6 +1342,16 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument(
+        "--terrain-readiness",
+        action="store_true",
+        help="Validate a terrain-conditioned warm start and one PPO update on mixed L0/L1; not behavior acceptance",
+    )
+    parser.add_argument(
+        "--mesh-flat-report",
+        type=Path,
+        help="Raw checkpoint-bound mesh-flat prerequisite for --terrain-readiness",
+    )
+    parser.add_argument(
         "--refinement-profile",
         choices=("source", *PROFILES),
         default="source",
@@ -832,7 +1406,7 @@ def main(argv=None):
     parser.add_argument(
         "--validate-only",
         action="store_true",
-        help="v3 CPU evidence/learning-state preflight only; no output or simulator launch",
+        help="v3 or terrain-readiness CPU preflight only; no output or simulator launch",
     )
     parser.add_argument(
         "--output-parent",
@@ -852,6 +1426,10 @@ def main(argv=None):
     )
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.terrain_readiness:
+        return terrain_readiness_main(args, parser)
+    if args.mesh_flat_report is not None:
+        parser.error("--mesh-flat-report requires --terrain-readiness")
     if (args.curriculum == SEQUENCE_VERSION) != (args.reversal_stop_probe is not None):
         parser.error("v3 and --reversal-stop-probe must be selected together")
     if args.reversal_stop_probe is not None and (

@@ -32,6 +32,7 @@ __all__ = [
     "PrivilegedScanEncoder",
     "PrivilegedTeacherActor",
     "PrivilegedTeacherModelCfg",
+    "StockTerrainInput",
 ]
 
 
@@ -55,6 +56,41 @@ class PrivilegedScanEncoder(nn.Module):
     def forward(self, terrain_scan: torch.Tensor) -> torch.Tensor:
         """Return one fixed-width terrain latent per environment."""
         return self.network(terrain_scan)
+
+
+class StockTerrainInput(nn.Module):
+    """Terrain conditioning without changing the stock first-layer arithmetic.
+
+    Inputs are the original 48 motor values followed by 132 heights and their
+    132 validity bits. A zero-initialized projection adds the scan encoding to
+    the first hidden preactivation. Initially the motor is exactly unchanged,
+    even for nonzero terrain inputs; after learning this is one conditioned
+    motor, not an action blend or a policy switch. This is a teacher input:
+    the original simulator-velocity values are still privileged.
+    """
+
+    def __init__(self, reference: nn.Linear) -> None:
+        super().__init__()
+        if not isinstance(reference, nn.Linear) or (
+            reference.in_features,
+            reference.out_features,
+        ) != (48, 128):
+            raise ValueError("Terrain warm start requires the stock 48-to-128 layer.")
+        self.reference = reference
+        self.encoder = PrivilegedScanEncoder(264)
+        self.projection = nn.Linear(DEFAULT_TERRAIN_LATENT_DIM, 128, bias=False)
+        nn.init.zeros_(self.projection.weight)
+        self.encoder.to(reference.weight)
+        self.projection.to(reference.weight)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        if observations.shape[-1] != 312:
+            raise ValueError("Expected 48 stock values followed by 264 terrain values.")
+        # Preserve the original contiguous 48-column GEMM, not a wider GEMM
+        # whose reduction order can differ despite zero additional weights.
+        state = observations[..., :48].contiguous()
+        terrain = observations[..., 48:]
+        return self.reference(state) + self.projection(self.encoder(terrain))
 
 
 @dataclass(frozen=True)
