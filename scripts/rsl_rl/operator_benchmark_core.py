@@ -284,6 +284,211 @@ def load_reference_actor(checkpoint: Path, agent: dict):
     return actor.eval().requires_grad_(False), int(data["iter"])
 
 
+def score_course_trace(trace: dict[str, np.ndarray], course: dict) -> dict:
+    """First-attempt transfer accounting; production route gates own completion.
+
+    Preserve the pre-reset outcome, even if a later auto-reset episode succeeds.
+    This is privileged, waypoint-guided motor transfer, never joint acceptance.
+    """
+    n = len(trace["initial_position"])
+    if n < 3:
+        raise ValueError("Course transfer requires at least three initial trials")
+    masks = (
+        "terminated",
+        "time_out",
+        "base_contact",
+        "course_chassis",
+        "course_fall",
+        "course_off_route",
+        "course_success",
+    )
+    shapes = {k: (STEPS, n) for k in masks}
+    shapes.update(
+        {
+            k: (STEPS, n, 3)
+            for k in (
+                "position",
+                "command",
+                "linear_velocity_b",
+                "linear_velocity_w",
+                "angular_velocity_b",
+                "angular_velocity_w",
+            )
+        }
+    )
+    shapes.update(
+        quaternion=(STEPS, n, 4),
+        waypoint_index=(STEPS, n),
+        terminal_predicates=(STEPS, n, 10),
+        terminal_dwell_s=(STEPS, n),
+        feet_position=(STEPS, n, 4, 3),
+        feet_force=(STEPS, n, 4, 3),
+        base_height_ray=(STEPS, n, 3),
+        contact_force_history=(STEPS, n, 3, len(course["contact_body_names"]), 3),
+        initial_position=(n, 3),
+        initial_quaternion=(n, 4),
+    )
+    for key, shape in shapes.items():
+        if key not in trace or trace[key].shape != shape:
+            raise ValueError(f"Incomplete course trace: {key} must have shape {shape}")
+    if any(trace[k].dtype != np.bool_ for k in (*masks, "terminal_predicates")):
+        raise ValueError("Course event/predicate masks must be boolean")
+    if not np.issubdtype(trace["waypoint_index"].dtype, np.integer):
+        raise ValueError("Waypoint cursors must be integers")
+    final_index = len(course["course"]["waypoints"]) - 1
+    origins = np.asarray(course["env_origins"])
+    if origins.shape != (n, 3) or not np.isfinite(origins).all():
+        raise ValueError("Missing finite physical course origins")
+    body_names = course["contact_body_names"]
+    chassis_ids = [
+        i
+        for i, name in enumerate(body_names)
+        if name == "base" or name.startswith("Head_")
+    ]
+    if (
+        "base" not in body_names
+        or not chassis_ids
+        or len(body_names) != len(set(body_names))
+    ):
+        raise ValueError("Invalid chassis contact identity")
+    supports = {
+        s["name"]: np.asarray(s["vertices"], dtype=float)
+        for s in course["course"]["support_regions"]
+    }
+    final_waypoint = course["course"]["waypoints"][-1]
+
+    def loaded_feet(env_id, rows):
+        # Independent reconciliation against the recorded named support polygon;
+        # online progression still uses the authoritative production route code.
+        vertices = supports[final_waypoint["support_region_name"]]
+        edges = np.roll(vertices, -1, axis=0) - vertices
+        normal = np.cross(edges[0], edges[1])
+        normal /= np.linalg.norm(normal)
+        feet = trace["feet_position"][rows, env_id] - origins[env_id]
+        distance = (feet - vertices[0]) @ normal
+        projected = feet - distance[..., None] * normal
+        inward = np.sum(
+            np.cross(edges, projected[..., None, :] - vertices) * normal, axis=-1
+        ) / np.linalg.norm(edges, axis=-1)
+        supported = (inward >= -0.05).all(axis=-1) & (np.abs(distance) <= 0.12)
+        return supported & ((trace["feet_force"][rows, env_id] @ normal) >= 10.0)
+
+    trials = []
+    for env_id in range(n):
+        terminal = np.flatnonzero(
+            trace["terminated"][:, env_id] | trace["time_out"][:, env_id]
+        )
+        length = int(terminal[0] + 1) if len(terminal) else STEPS
+        failures = [name for name in masks[2:-1] if trace[name][:length, env_id].any()]
+        physical = (
+            "position",
+            "quaternion",
+            "linear_velocity_b",
+            "linear_velocity_w",
+            "angular_velocity_b",
+            "angular_velocity_w",
+            "command",
+            "feet_position",
+            "feet_force",
+            "contact_force_history",
+        )
+        if not all(np.isfinite(trace[k][:length, env_id]).all() for k in physical):
+            failures.append("nonfinite physical state")
+        if not np.allclose(
+            np.linalg.norm(trace["quaternion"][:length, env_id], axis=-1),
+            1.0,
+            atol=1e-3,
+            rtol=0,
+        ):
+            failures.append("invalid quaternion")
+        indices = trace["waypoint_index"][:length, env_id]
+        increments = np.diff(np.r_[0, indices])
+        if (
+            (indices < 0).any()
+            or (indices > final_index).any()
+            or not np.isin(increments, [0, 1]).all()
+        ):
+            raise ValueError("Invalid ordered waypoint progression before reset")
+        success = bool(trace["course_success"][length - 1, env_id])
+        if trace["course_success"][: length - 1, env_id].any():
+            raise ValueError("Course success reported before termination")
+        if not success:
+            failures.append("course not completed within first attempt")
+        elif (
+            not trace["terminated"][length - 1, env_id]
+            or trace["time_out"][length - 1, env_id]
+            or indices[-1] != final_index
+            or length < 10
+            or not (indices[length - 10 : length] == final_index).all()
+            or not trace["terminal_predicates"][length - 10 : length, env_id].all()
+            or not np.isfinite(trace["terminal_dwell_s"][length - 1, env_id])
+            or trace["terminal_dwell_s"][length - 1, env_id] + 1e-6 < 0.2
+        ):
+            raise ValueError("Course success lacks ordered supported stable completion")
+        if success:
+            rows = slice(length - 10, length)
+            position = trace["position"][rows, env_id]
+            ray = trace["base_height_ray"][rows, env_id]
+            velocity = trace["linear_velocity_w"][rows, env_id]
+            angular = trace["angular_velocity_w"][rows, env_id]
+            quaternion = trace["quaternion"][rows, env_id]
+            w, x, y, z = quaternion.T
+            tilt_sine = np.hypot(2 * (x * z - w * y), 2 * (y * z + w * x))
+            radius = final_waypoint["root_reach_radius"] or 0.20
+            valid_finish = (
+                np.isfinite(ray).all()
+                and (
+                    position[:, 2] - ray[:, 2] > course["course"]["min_clearance"]
+                ).all()
+                and (loaded_feet(env_id, rows).sum(axis=-1) >= 2).all()
+                and (
+                    np.linalg.norm(
+                        position[:, :2]
+                        - origins[env_id, :2]
+                        - np.asarray(final_waypoint["position"])[:2],
+                        axis=-1,
+                    )
+                    < radius
+                ).all()
+                and (np.linalg.norm(velocity[:, :2], axis=-1) < 0.2).all()
+                and (np.abs(velocity[:, 2]) < 0.2).all()
+                and (np.abs(angular[:, 2]) < 0.35).all()
+                and (np.linalg.norm(angular[:, :2], axis=-1) < 0.35).all()
+                and (tilt_sine < 0.25).all()
+            )
+            if not valid_finish:
+                raise ValueError(
+                    "Claimed stable finish contradicts recorded feet/load/clearance/motion"
+                )
+        chassis_history = trace["contact_force_history"][:length, env_id][
+            :, :, chassis_ids
+        ]
+        if (
+            np.linalg.norm(chassis_history, axis=-1) > 1.0
+        ).any() and "course_chassis" not in failures:
+            raise ValueError(
+                "Chassis contact is missing from physical failure accounting"
+            )
+        trials.append(
+            {
+                "env_id": env_id,
+                "passed": not failures,
+                "failures": failures,
+                "observed_duration_s": length * DT,
+                "final_waypoint_index": int(indices[-1]),
+            }
+        )
+    return {
+        "status": "PASS" if all(t["passed"] for t in trials) else "FAIL",
+        "policy_acceptance": False,
+        "scope": "Privileged waypoint-guided stock motor transfer only; not autonomous navigation, causal student, operator confirmation or critic exit. No flat attitude gate on banked terrain.",
+        "course": course,
+        "passed": sum(t["passed"] for t in trials),
+        "total": n,
+        "trials": trials,
+    }
+
+
 def score_trace(
     trace: dict[str, np.ndarray], labels: list[str], thresholds=None
 ) -> dict:

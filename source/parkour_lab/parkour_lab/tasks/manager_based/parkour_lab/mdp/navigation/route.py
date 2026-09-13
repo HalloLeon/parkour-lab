@@ -432,6 +432,7 @@ def advance_active_waypoints(
     terminal_max_tilt_sine: float = 0.25,
     progress_route_half_width_m: float = 0.2,
     hard_route_half_width_m: float | None = None,
+    require_stable_finish: bool = False,
 ) -> torch.Tensor:
     """Update every route once and return final-course completions.
 
@@ -523,6 +524,10 @@ def advance_active_waypoints(
         )
     )
     terminal_landing = courses.terminal_landing_masks[course_indices, active_indices]
+    # Optional evaluation overlay: use the existing load/dwell gate at every
+    # final waypoint, without changing legacy training/completion defaults.
+    if require_stable_finish:
+        terminal_landing = terminal_landing | (active_indices == waypoint_counts - 1)
     terminal_predicates = torch.stack(
         (
             root_within_radius,

@@ -1,12 +1,15 @@
-"""Finite, headless operator evaluation of the stock Go2 flat reference checkpoint.
+"""Finite, headless evaluation of the stock Go2 motor checkpoint.
 
 Uses installed Isaac Lab packages, not its separately distributed training/play
-scripts. Does not modify or train a checkpoint, or load the custom parkour task.
+scripts. The default flat screen is unchanged. Opt-in mesh/course transfer reuses
+production geometry and support gates, never the incompatible legacy RMA motor.
 """
 
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import importlib.metadata
 import json
 from pathlib import Path
@@ -29,6 +32,7 @@ try:
         load_reference_actor,
         read_yaml_data,
         score_trace,
+        score_course_trace,
     )
     from .operator_profiles import (
         PROFILES,
@@ -48,6 +52,7 @@ except ImportError:
         load_reference_actor,
         read_yaml_data,
         score_trace,
+        score_course_trace,
     )
     from operator_profiles import (
         PROFILES,
@@ -74,6 +79,8 @@ def make_recorder_cfg():
             self.enabled = False
             self.samples = []
             self.control_trace = None
+            self.motor_parity = False
+            self.course = None
             env.operator_capture = self
 
         def record_pre_step(self):
@@ -97,6 +104,42 @@ def make_recorder_cfg():
                     "terminated": self._env.reset_terminated,
                     "time_out": self._env.reset_time_outs,
                 }
+                if self.motor_parity:
+                    sample.update(
+                        observation=self.observation,
+                        action=self._env.action_manager.action,
+                        joint_target=robot.joint_pos_target,
+                        default_joint_position=robot.default_joint_pos,
+                    )
+                if self.course is not None:
+                    route_state = self._env._parkour_runtime.route
+                    params = self._env.termination_manager.get_term_cfg(
+                        "course_success"
+                    ).params
+                    feet = params["feet_asset_cfg"].body_ids
+                    contacts = self._env.scene["contact_forces"].data
+                    sample.update(
+                        linear_velocity_w=robot.root_lin_vel_w,
+                        waypoint_index=route_state.active_waypoint_indices,
+                        terminal_predicates=route_state.terminal_landing_predicates,
+                        terminal_dwell_s=route_state.terminal_landing_stable_time_s,
+                        feet_position=robot.body_pos_w[:, feet],
+                        feet_force=contacts.net_forces_w[
+                            :, params["feet_contact_cfg"].body_ids
+                        ],
+                        contact_force_history=contacts.net_forces_w_history,
+                        base_height_ray=self._env.scene[
+                            "base_height_scanner"
+                        ].data.ray_hits_w[:, 0],
+                    )
+                    for name in (
+                        "base_contact",
+                        "course_chassis",
+                        "course_fall",
+                        "course_off_route",
+                        "course_success",
+                    ):
+                        sample[name] = self._env.termination_manager.get_term(name)
                 self.samples.append(
                     {
                         k: v.detach().to("cpu", copy=True).numpy()
@@ -226,6 +269,248 @@ def write_json(path, data):
     path.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
 
 
+COURSE_FAMILIES = ("tilted_ramps", "high_step", "gap", "hurdle")
+
+
+def configure_terrain(cfg, terrain, level):
+    """Overlay only evaluation geometry/route instrumentation on validated stock."""
+    from isaaclab.managers import SceneEntityCfg, TerminationTermCfg
+
+    cfg.scene.terrain.terrain_type = (
+        "generator"  # Replaces the plane; never adds one beneath gaps.
+    )
+    if terrain == "mesh-flat":
+        from isaaclab.terrains import MeshPlaneTerrainCfg, TerrainGeneratorCfg
+
+        # Preserve grid origins already during scene construction, not after
+        # overlapping articulations or terrain-origin RNG draws were created.
+        cfg.scene.terrain.use_terrain_origins = False
+        extent = max(
+            64.0, 2 * np.ceil(np.sqrt(cfg.scene.num_envs)) * cfg.scene.env_spacing
+        )
+        cfg.scene.terrain.terrain_generator = TerrainGeneratorCfg(
+            seed=cfg.seed,
+            size=(extent, extent),
+            num_rows=1,
+            num_cols=1,
+            sub_terrains={"flat": MeshPlaneTerrainCfg(proportion=1.0)},
+            use_cache=False,
+            border_width=0.0,
+        )
+        return None
+
+    from parkour_lab.tasks.manager_based.parkour_lab.parkour_lab_env_cfg import (
+        ParkourLabEnvCfg,
+    )
+    from parkour_lab.tasks.manager_based.parkour_lab import mdp
+
+    source_file = Path(sys.modules[ParkourLabEnvCfg.__module__].__file__).resolve()
+    expected_source = (
+        Path(__file__).resolve().parents[2]
+        / "source/parkour_lab/parkour_lab/tasks/manager_based/parkour_lab/parkour_lab_env_cfg.py"
+    )
+    if source_file != expected_source:
+        raise ValueError("Course package must use this repository's reviewed source")
+    course_cfg = ParkourLabEnvCfg()
+    course_cfg.scene.num_envs = cfg.scene.num_envs
+    course_cfg.configure_evaluation(terrain, level, seed=cfg.seed, geometry_variant=0)
+    cfg.scene.terrain.terrain_generator = course_cfg.scene.ground.terrain_generator
+    cfg.scene.terrain.use_terrain_origins = True
+    cfg.scene.terrain.max_init_terrain_level = level
+    # Keep stock robot, actions, observations, gains, randomizers and BOTH
+    # materials. Copy no legacy intent command, reward or active-motion timer.
+    cfg.scene.waypoint_marker = course_cfg.scene.waypoint_marker
+    cfg.scene.base_height_scanner = course_cfg.scene.base_height_scanner
+    cfg.scene.base_height_scanner.mesh_prim_paths = [cfg.scene.terrain.prim_path]
+    cfg.events.initialize_terrain_levels = course_cfg.events.initialize_terrain_levels
+    cfg.events.reset_routes = course_cfg.events.reset_routes
+    # Explicit course-aligned root jitter; preserve the stock joint reset.
+    cfg.events.reset_base.params["pose_range"] = {
+        k: (-0.05, 0.05) for k in ("x", "y", "yaw")
+    }
+    cfg.events.reset_base.params["velocity_range"] = {
+        k: (0.0, 0.0) for k in ("x", "y", "z", "roll", "pitch", "yaw")
+    }
+    cfg.curriculum = None
+    cfg.terminations.course_off_route = course_cfg.terminations.off_route
+    cfg.terminations.course_fall = TerminationTermCfg(func=mdp.fell_below_course)
+    chassis = SceneEntityCfg("contact_forces", body_names="base|Head_.*")
+    cfg.terminations.course_chassis = TerminationTermCfg(
+        func=mdp.chassis_contact_done, params={"sensor_cfg": chassis, "threshold": 1.0}
+    )
+    cfg.terminations.course_success = course_cfg.terminations.success
+    params = cfg.terminations.course_success.params
+    params["feet_contact_cfg"].name = "contact_forces"
+    params["chassis_contact_cfg"] = copy.deepcopy(chassis)
+    params["require_stable_finish"] = True
+    return course_cfg.evaluation_course_metadata()
+
+
+def mesh_identity(env):
+    """Fail closed if the requested ground is not the sole collidable triangle mesh."""
+    from pxr import Usd, UsdPhysics
+
+    root = env.scene.stage.GetPrimAtPath(env.cfg.scene.terrain.prim_path)
+    colliders = [p for p in Usd.PrimRange(root) if p.HasAPI(UsdPhysics.CollisionAPI)]
+    if len(colliders) != 1 or colliders[0].GetTypeName() != "Mesh":
+        raise ValueError("Expected one generated ground mesh, with no underlying plane")
+    prim = colliders[0]
+    if not prim.GetAttribute("physics:collisionEnabled").Get() or prim.GetAttribute(
+        "physics:approximation"
+    ).Get() not in (None, "none"):
+        raise ValueError("Terrain must collide as triangles, not a convex hull")
+    points = np.asarray(prim.GetAttribute("points").Get(), dtype=np.float32)
+    faces = np.asarray(prim.GetAttribute("faceVertexIndices").Get(), dtype=np.int32)
+    if points.size == 0 or faces.size == 0 or not np.isfinite(points).all():
+        raise ValueError("Empty or invalid generated mesh")
+    return {
+        "prim_path": str(prim.GetPath()),
+        "collision_enabled": True,
+        "vertices": len(points),
+        "indices": len(faces),
+        "sha256": hashlib.sha256(points.tobytes() + faces.tobytes()).hexdigest(),
+    }
+
+
+def course_command(env, course, step, finished):
+    """Explicit privileged waypoint guidance; no policy/action replacement."""
+    import torch
+    from isaaclab.managers import SceneEntityCfg
+    from parkour_lab.tasks.manager_based.parkour_lab.mdp.navigation import route
+
+    target = route.active_waypoint_positions(env, SceneEntityCfg("waypoint_marker"))
+    delta = (
+        target[:, :2]
+        - (env.scene["robot"].data.root_pos_w - env.scene.env_origins)[:, :2]
+    )
+    quat = env.scene["robot"].data.root_quat_w
+    w, x, y, z = quat.unbind(-1)
+    yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    error = torch.atan2(delta[:, 1], delta[:, 0]) - yaw
+    error = torch.atan2(torch.sin(error), torch.cos(error))
+    distance = torch.linalg.vector_norm(delta, dim=-1)
+    final = route.active_waypoint_is_final(env)
+    speed = torch.full_like(distance, course["course"]["target_speed"])
+    speed = torch.where(final, torch.minimum(speed, distance), speed)
+    command = torch.stack(
+        (
+            speed * torch.cos(error).clamp_min(0),
+            torch.zeros_like(speed),
+            (1.5 * error).clamp(-0.8, 0.8),
+        ),
+        dim=-1,
+    )
+    stop = finished | (
+        final & (distance < 0.75 * route.active_waypoint_root_reach_radii(env))
+    )
+    command[stop | (step < round(2.0 / DT))] = 0.0
+    return command
+
+
+def validate_mesh_flat_report(path, checkpoint):
+    """Require an actual matched mesh-flat PASS before measuring course transfer."""
+    report = json.loads(path.read_text())
+    if report.get("terrain") != "mesh-flat" or report.get("seed") != 43:
+        raise ValueError("Expected the predeclared seed-43 mesh-flat control")
+    from dataclasses import asdict
+
+    try:
+        from .operator_benchmark_core import Thresholds
+    except ImportError:
+        from operator_benchmark_core import Thresholds
+    if report.get("thresholds") != asdict(Thresholds()):
+        raise ValueError("Mesh-flat gates changed")
+    expected = {
+        "checkpoint": checkpoint,
+        "env.yaml": checkpoint.parent / "params/env.yaml",
+        "agent.yaml": checkpoint.parent / "params/agent.yaml",
+        "benchmark": Path(__file__),
+        "scoring": Path(__file__).with_name("operator_benchmark_core.py"),
+    }
+    if any(
+        report.get("provenance", {}).get("sha256", {}).get(k) != file_sha256(p)
+        for k, p in expected.items()
+    ):
+        raise ValueError("Mesh-flat checkpoint/configuration/implementation mismatch")
+    with np.load(path.with_name("trace.npz"), allow_pickle=False) as archive:
+        raw = dict(archive)
+    replay = score_trace(raw, command_schedule(10)[0])
+    if (
+        report.get("status") != "PASS"
+        or replay["status"] != "PASS"
+        or report.get("worker") != {"returncode": 0, "timed_out": False}
+    ):
+        raise ValueError("Mesh-flat control did not pass cleanly")
+    validate_motor_trace(raw)
+    audit = report.get("student_interface_audit", {})
+    if any(
+        audit.get(k) != v
+        for k, v in {
+            "status": "ORACLE_PARITY_PASS",
+            "control_steps": STEPS,
+            "action_comparisons": STEPS * 100,
+            "cold_reset_frames": 100,
+            "later_reset_frames": 0,
+            "exact_action_equality": True,
+            "student_status": "UNTRAINED_NOT_RUN",
+        }.items()
+    ):
+        raise ValueError("Mesh-flat control lacks complete oracle parity evidence")
+    try:
+        from .operator_student_bridge import interface_manifest
+    except ImportError:
+        from operator_student_bridge import interface_manifest
+    interface = json.loads(path.with_name("student_interface.json").read_text())
+    expected_interface = interface_manifest(
+        teacher_sha256=file_sha256(checkpoint),
+        env_sha256=file_sha256(checkpoint.parent / "params/env.yaml"),
+        joint_names=report["runtime"]["joint_names"],
+    )
+    if (
+        interface != expected_interface
+        or report.get("simulation_steps") != STEPS
+        or report.get("mesh", {}).get("collision_enabled") is not True
+    ):
+        raise ValueError("Mesh-flat motor/geometry interface evidence mismatch")
+    return {
+        "report": str(path),
+        "sha256": file_sha256(path),
+        "packages": report["provenance"]["packages"],
+        "joint_names": report["runtime"]["joint_names"],
+    }
+
+
+def validate_motor_trace(trace):
+    """Check delivered stock joint targets on every pre-reset transition."""
+    action = trace["action"]
+    target = trace["joint_target"]
+    expected = trace["default_joint_position"] + 0.25 * action
+    observation = trace["observation"]
+    previous = np.zeros_like(action)
+    previous[1:] = action[:-1]
+    previous[1:][trace["terminated"][:-1] | trace["time_out"][:-1]] = 0
+    if (
+        observation.shape != (*action.shape[:2], 48)
+        or not np.isfinite(observation).all()
+        or not np.allclose(observation[..., 9:12], trace["command"], atol=1e-6, rtol=0)
+        or not np.allclose(observation[..., 36:48], previous, atol=1e-6, rtol=0)
+    ):
+        raise ValueError("Delivered observation/command/previous-action parity failed")
+    if (
+        action.shape != (*trace["terminated"].shape, 12)
+        or target.shape != action.shape
+        or trace["default_joint_position"].shape != action.shape
+        or not np.isfinite(action).all()
+        or not np.allclose(target, expected, rtol=0, atol=1e-6)
+    ):
+        raise ValueError("Stock joint-target parity failed")
+    return {
+        "status": "PASS",
+        "joint_target_comparisons": int(action.size),
+        "max_joint_target_error_rad": float(np.abs(target - expected).max()),
+    }
+
+
 def run_benchmark(args, output, agent, saved, *, stop_probe=None):
     # The separate diagnostic CLI owns mixed-controller experiments. The normal
     # benchmark never constructs a probe and retains its original action path.
@@ -268,10 +553,18 @@ def run_benchmark(args, output, agent, saved, *, stop_probe=None):
                 args.checkpoint, diagnostic_reference
             )
         labels, schedule_np = command_schedule(args.repetitions)
+        terrain = getattr(args, "terrain", "plane")
+        course_mode = terrain in COURSE_FAMILIES
+        if course_mode:
+            labels = [terrain] * args.repetitions
         cfg = prepare_config(
             saved, seed=args.seed, num_envs=len(labels), device=args.device
         )
+        course = (
+            configure_terrain(cfg, terrain, args.level) if terrain != "plane" else None
+        )
         env = ManagerBasedRLEnv(cfg=cfg)
+        mesh = mesh_identity(env) if terrain != "plane" else None
         (output / "resolved_env.yaml").write_text(
             yaml.dump(cfg.to_dict(), sort_keys=False)
         )
@@ -285,9 +578,15 @@ def run_benchmark(args, output, agent, saved, *, stop_probe=None):
             raise ValueError("Runtime action dimension differs from the stock motor")
         actor.to(env.device)
         schedule = torch.as_tensor(schedule_np, device=env.device)
+        if (
+            course_mode
+            and list(env.scene["robot"].joint_names)
+            != args.mesh_flat_evidence["joint_names"]
+        ):
+            raise ValueError("Course joint order differs from the mesh-flat motor")
         env.reset(seed=args.seed)
         audit = None
-        if getattr(args, "audit_student_interface", False):
+        if getattr(args, "audit_student_interface", False) or terrain != "plane":
             try:
                 from .operator_student_bridge import (
                     OperatorOracleAudit,
@@ -309,6 +608,31 @@ def run_benchmark(args, output, agent, saved, *, stop_probe=None):
             )
             reset_mask = torch.ones(len(labels), dtype=torch.bool, device=env.device)
         capture = env.operator_capture
+        capture.motor_parity = terrain != "plane"
+        capture.course = course
+        if course_mode:
+            from parkour_lab.tasks.manager_based.parkour_lab.mdp.navigation import route
+
+            if not torch.all(route.active_difficulty_indices(env) == args.level):
+                raise ValueError(
+                    "Generated terrain row does not match requested course"
+                )
+            course["env_origins"] = env.scene.env_origins.detach().cpu().tolist()
+            course["terrain_columns"] = (
+                env.scene.terrain.terrain_types.detach().cpu().tolist()
+            )
+            course["course_indices"] = (
+                route.active_course_indices(env).detach().cpu().tolist()
+            )
+            course["guidance"] = (
+                "Privileged waypoint bearing, yaw gain 1.5 clipped +/-0.8 rad/s; nominal course speed times nonnegative heading cosine, terminal speed capped by distance; stop within 75% final radius; initial 2s stand."
+            )
+            course["reset_override"] = (
+                "Root x/y/yaw +/-0.05 m/m/rad; zero initial root twist; stock joint reset and physical randomizers retained."
+            )
+            course["require_stable_finish"] = True
+            course["contact_body_names"] = list(env.scene["contact_forces"].body_names)
+            finished = torch.zeros(len(labels), dtype=torch.bool, device=env.device)
         diagnostics = None
         if reference_actor is not None:
             reference_actor.to(env.device)
@@ -344,7 +668,14 @@ def run_benchmark(args, output, agent, saved, *, stop_probe=None):
                 if not app.is_running():
                     raise RuntimeError(f"Simulator closed at step {step}/{STEPS}")
                 # Fresh command reaches THIS action, never one control tick later.
-                observation = command_observation(env, schedule[step])
+                desired = (
+                    course_command(env, course, step, finished)
+                    if course_mode
+                    else schedule[step]
+                )
+                observation = command_observation(env, desired)
+                if capture.motor_parity:
+                    capture.observation = observation.detach().clone()
                 action = actor(observation)
                 if not torch.isfinite(action).all():
                     raise RuntimeError(f"Nonfinite policy action at step {step}")
@@ -355,6 +686,8 @@ def run_benchmark(args, output, agent, saved, *, stop_probe=None):
                 if diagnostics is not None:
                     diagnostics.before_step(observation, action)
                 stepped = env.step(action)
+                if course_mode:
+                    finished |= stepped[2] | stepped[3]
                 if stop_probe is not None:
                     stop_probe.observe_done(stepped[2] | stepped[3])
                 if audit is not None:
@@ -365,7 +698,18 @@ def run_benchmark(args, output, agent, saved, *, stop_probe=None):
         trace = capture.finish()
         trace.update(initial)
         np.savez_compressed(output / "trace.npz", **trace)
-        result = score_trace(trace, labels)
+        result = (
+            score_course_trace(trace, course)
+            if course_mode
+            else score_trace(trace, labels)
+        )
+        if terrain != "plane":
+            result["terrain"] = terrain
+            result["motor_interface"] = validate_motor_trace(trace)
+            result["policy_acceptance"] = False
+            result["mesh"] = mesh
+        if course_mode:
+            result["mesh_flat_control"] = args.mesh_flat_evidence
         result["checkpoint_iteration"] = iteration
         result["seed"] = args.seed
         result["simulation_steps"] = STEPS
@@ -406,6 +750,18 @@ def run_benchmark(args, output, agent, saved, *, stop_probe=None):
                 "timeout moved one step beyond 20-s benchmark",
             ],
         }
+        if terrain != "plane":
+            result["runtime"]["evaluation_changes"].append(
+                "Plane replaced by verified collidable triangles; stock robot and materials retained"
+            )
+        if course_mode:
+            result["runtime"]["evaluation_changes"].extend(
+                [
+                    course["reset_override"],
+                    course["guidance"],
+                    "Production course failure/ordered support gates; stricter final two-foot load and 0.2s stability dwell for every family",
+                ]
+            )
         if stop_probe is not None:
             result = stop_probe.publish(output, result, trace, control)
         # Kit's app.close() can terminate Python with os._exit(0). Publish before
@@ -505,9 +861,26 @@ def main(argv=None):
         "--seed",
         type=int,
         default=43,
-        help="Development/regression seed 43; reserve 44/45 for confirmation",
+        help="Development/regression seed; use untouched seeds for new confirmation",
     )
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--terrain",
+        choices=("plane", "mesh-flat", *COURSE_FAMILIES),
+        default="plane",
+        help="Opt-in mesh-flat control or privileged course transfer; default operator screen unchanged",
+    )
+    parser.add_argument(
+        "--level",
+        type=int,
+        choices=range(7),
+        help="Explicit course level; only level 6 can contribute target-obstacle evidence",
+    )
+    parser.add_argument(
+        "--mesh-flat-report",
+        type=Path,
+        help="Matched seed-43 mesh-flat report.json required before course transfer",
+    )
     parser.add_argument(
         "--diagnostic-reference",
         type=Path,
@@ -532,6 +905,23 @@ def main(argv=None):
 
         args.checkpoint = args.checkpoint.resolve(strict=True)
         command_schedule(args.repetitions)
+        course_mode = args.terrain in COURSE_FAMILIES
+        if course_mode != (args.level is not None) or course_mode != (
+            args.mesh_flat_report is not None
+        ):
+            raise ValueError(
+                "Course transfer requires both --level and --mesh-flat-report; neither applies to flat screens"
+            )
+        if args.terrain != "plane" and args.diagnostic_reference is not None:
+            raise ValueError(
+                "Mesh/course transfer uses the original motor only, not control-reference diagnostics"
+            )
+        if course_mode and args.repetitions < 3:
+            raise ValueError("Course transfer requires at least three trials")
+        if args.terrain == "mesh-flat" and (args.seed != 43 or args.repetitions != 10):
+            raise ValueError(
+                "Mesh-flat control is predeclared at seed 43, ten repetitions"
+            )
         agent_path = args.checkpoint.parent / "params/agent.yaml"
         env_path = args.checkpoint.parent / "params/env.yaml"
         agent, saved = read_yaml_data(agent_path), read_yaml_data(env_path)
@@ -539,6 +929,11 @@ def main(argv=None):
         # run or launching Kit. Construction must not consume simulation RNG.
         with torch.random.fork_rng(devices=[]):
             _, iteration = load_reference_actor(args.checkpoint, agent)
+        if course_mode:
+            args.mesh_flat_report = args.mesh_flat_report.resolve(strict=True)
+            args.mesh_flat_evidence = validate_mesh_flat_report(
+                args.mesh_flat_report, args.checkpoint
+            )
         if args.diagnostic_reference is not None:
             try:
                 from .operator_control_trace import load_diagnostic_reference
@@ -573,9 +968,6 @@ def main(argv=None):
         if reference_identity is not None:
             print("Diagnostic reference validated; no capture or behavior checked.")
         return 0
-    parent = args.output_parent or args.checkpoint.parent
-    parent.mkdir(parents=True, exist_ok=True)
-    output = Path(tempfile.mkdtemp(prefix="operator_screen_", dir=parent))
     provenance = {
         "checkpoint": str(args.checkpoint),
         "sha256": {
@@ -608,6 +1000,20 @@ def main(argv=None):
             provenance["packages"][package] = importlib.metadata.version(package)
         except importlib.metadata.PackageNotFoundError:
             provenance["packages"][package] = "unknown"
+    if course_mode and provenance["packages"] != args.mesh_flat_evidence["packages"]:
+        parser.error("Course runtime packages differ from the mesh-flat control")
+    if course_mode:
+        source = (
+            Path(__file__).resolve().parents[2]
+            / "source/parkour_lab/parkour_lab/tasks/manager_based/parkour_lab"
+        )
+        provenance["course_source_sha256"] = {
+            str(p.relative_to(source)): file_sha256(p)
+            for p in sorted(source.rglob("*.py"))
+        }
+    parent = args.output_parent or args.checkpoint.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    output = Path(tempfile.mkdtemp(prefix="operator_screen_", dir=parent))
     print(f"Operator benchmark (headless, streaming off): {output}", flush=True)
     (output / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
     report = supervise(
@@ -624,6 +1030,18 @@ def main(argv=None):
             str(args.repetitions),
             "--device",
             args.device,
+            "--terrain",
+            args.terrain,
+            *(
+                [
+                    "--level",
+                    str(args.level),
+                    "--mesh-flat-report",
+                    str(args.mesh_flat_report),
+                ]
+                if course_mode
+                else []
+            ),
             *(["--audit-student-interface"] if args.audit_student_interface else []),
             *(
                 ["--diagnostic-reference", str(args.diagnostic_reference)]

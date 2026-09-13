@@ -89,6 +89,7 @@ def completed_course_done(
     terminal_max_tilt_sine: float = 0.25,
     progress_route_half_width_m: float = 0.2,
     hard_route_half_width_m: float | None = None,
+    require_stable_finish: bool = False,
 ) -> torch.Tensor:
     """Advance routes and terminate only on a supported, stable, crash-free finish.
 
@@ -118,4 +119,5 @@ def completed_course_done(
         terminal_max_tilt_sine=terminal_max_tilt_sine,
         progress_route_half_width_m=progress_route_half_width_m,
         hard_route_half_width_m=hard_route_half_width_m,
+        require_stable_finish=require_stable_finish,
     )
