@@ -237,6 +237,44 @@ TERRAIN_ARTIFACTS = (
 )
 
 
+def validate_terrain_scan(scan, *, num_envs):
+    """Check the delivered production scan, whose heights are normalized, not metres."""
+    import torch
+
+    if scan.shape != (num_envs, 264):
+        raise ValueError(f"Expected delivered terrain scan [{num_envs}, 264]")
+    if not torch.isfinite(scan).all():
+        raise ValueError("Nonfinite delivered terrain scan")
+    heights, valid = scan.split(132, dim=-1)
+    # _terrain_height_components clips in metres, then divides by that bound.
+    # A metric clip of 0.5 m therefore still produces heights in [-1, 1].
+    if (heights.abs() > 1).any():
+        raise ValueError("Delivered normalized terrain heights must be in [-1, 1]")
+    if not ((valid == 0) | (valid == 1)).all():
+        raise ValueError("Delivered terrain validity bits must be exactly 0 or 1")
+    if ((valid == 0) & (heights != 1)).any():
+        raise ValueError("Missing terrain rays must use normalized height +1")
+
+
+def report_terrain_readiness_error(output, error, progress):
+    """Expose and persist the cause before Kit shutdown can exit Python."""
+    stack = traceback.format_exc()
+    print(
+        f"Terrain readiness ERROR: {error}\nProgress: {progress}\n{stack}",
+        file=sys.stderr,
+        flush=True,
+    )
+    write_json(
+        output / "training_status.json",
+        {
+            "status": "ERROR",
+            "error": str(error),
+            "traceback": stack,
+            "progress": progress,
+        },
+    )
+
+
 def build_terrain_policy(observations, source_state):
     """Explicit stock-to-terrain warm start; never load legacy RMA or Adam."""
     import torch
@@ -410,22 +448,31 @@ def terrain_update_evidence(policy, algorithm, losses):
 
 def run_terrain_readiness(args, output, agent, saved, protocol):
     """Collect one rollout, verify the warm start, and exercise one PPO update."""
-    if terrain_source_identity(args) != protocol["source_identity"]:
-        raise ValueError(
-            "Terrain-readiness source changed between preflight and worker"
-        )
-    for package in ("isaaclab", "isaacsim", "rsl-rl-lib", "torch"):
-        if importlib.metadata.version(package) != protocol["mesh_flat"]["packages"].get(
-            package
-        ):
-            raise ValueError(
-                f"Runtime {package} differs from the mesh-flat prerequisite"
-            )
-    from isaaclab.app import AppLauncher
-
-    app = AppLauncher(headless=True, livestream=0, device=args.device).app
-    env = None
+    env = app = capture = None
+    progress = {
+        "stage": "source_validation",
+        "rollout_step": None,
+        "completed_environment_steps": 0,
+        "completed_ppo_transition_steps": 0,
+        "completed_ppo_updates": 0,
+    }
     try:
+        if terrain_source_identity(args) != protocol["source_identity"]:
+            raise ValueError(
+                "Terrain-readiness source changed between preflight and worker"
+            )
+        for package in ("isaaclab", "isaacsim", "rsl-rl-lib", "torch"):
+            if importlib.metadata.version(package) != protocol["mesh_flat"][
+                "packages"
+            ].get(package):
+                raise ValueError(
+                    f"Runtime {package} differs from the mesh-flat prerequisite"
+                )
+        progress["stage"] = "application_startup"
+        from isaaclab.app import AppLauncher
+
+        app = AppLauncher(headless=True, livestream=0, device=args.device).app
+        progress["stage"] = "configuration"
         import numpy as np
         import torch
         from isaaclab.envs import ManagerBasedRLEnv
@@ -438,6 +485,7 @@ def run_terrain_readiness(args, output, agent, saved, protocol):
             from operator_benchmark import mesh_identity, validate_motor_trace
 
         cfg, runner_cfg = terrain_readiness_configs(saved, agent, args)
+        progress["stage"] = "environment_setup"
         raw = ManagerBasedRLEnv(cfg=cfg)
         env = raw
         env = RslRlVecEnvWrapper(raw, clip_actions=None)
@@ -465,6 +513,7 @@ def run_terrain_readiness(args, output, agent, saved, protocol):
             )
         geometry = mesh_identity(raw)
         obs = env.get_observations()
+        progress["stage"] = "policy_setup"
         source = load_reference_checkpoint(args.checkpoint, agent)
         policy, reference = build_terrain_policy(obs, source["model_state_dict"])
         algorithm_cfg = dict(runner_cfg["algorithm"])
@@ -479,13 +528,20 @@ def run_terrain_readiness(args, output, agent, saved, protocol):
         (params / "env.yaml").write_text(yaml.dump(cfg.to_dict(), sort_keys=False))
         (params / "agent.yaml").write_text(yaml.dump(runner_cfg, sort_keys=False))
         layout = cfg.events.reset_routes.params["terrain_layout"]
+        scan_cfg = cfg.observations.terrain.height_scan.params["obs_cfg"]
         interface = {
             "version": TERRAIN_VERSION,
             "source_sha256": protocol["source_identity"]["checkpoint"],
             "stock_observation_terms": list(OBSERVATION_TERMS),
             "terrain": {
                 "width": 264,
-                "order": "132 clipped heights, then 132 validity bits",
+                "order": "132 normalized heights, then 132 validity bits",
+                "height_units": "dimensionless",
+                "height_range": [-1.0, 1.0],
+                "metric_clip_m": scan_cfg.clip,
+                "vertical_offset_m": scan_cfg.vertical_offset,
+                "normalization": "clamp(root_z - vertical_offset - hit_z, -clip, clip) / clip",
+                "missing_ray": {"height": 1.0, "validity": 0.0},
                 "encoder": [264, 128, 64, 32],
             },
             "motor": {
@@ -529,22 +585,17 @@ def run_terrain_readiness(args, output, agent, saved, protocol):
         terrain_frames = []
         with torch.inference_mode():
             for step in range(TERRAIN_READINESS_STEPS):
+                progress["rollout_step"] = step
+                progress["stage"] = "rollout_validation"
                 if step % 250 == 0:
                     print(
                         f"Terrain readiness rollout: {step}/{TERRAIN_READINESS_STEPS} steps; no PPO update yet",
                         flush=True,
                     )
-                if any(
-                    not torch.isfinite(obs[key]).all() for key in ("policy", "terrain")
-                ):
+                if not torch.isfinite(obs["policy"]).all():
                     raise ValueError(f"Nonfinite delivered observation at step {step}")
-                heights, valid = obs["terrain"].split(132, dim=-1)
-                if (heights.abs() > 0.5).any() or not (
-                    (valid == 0) | (valid == 1)
-                ).all():
-                    raise ValueError(
-                        "Delivered terrain scan violates its height/validity contract"
-                    )
+                validate_terrain_scan(obs["terrain"], num_envs=80)
+                progress["stage"] = "rollout_parity"
                 if not torch.equal(
                     policy.act_inference(obs), reference.act_inference(obs)
                 ) or not torch.equal(policy.evaluate(obs), reference.evaluate(obs)):
@@ -553,14 +604,22 @@ def run_terrain_readiness(args, output, agent, saved, protocol):
                     )
                 capture.observation = obs["policy"].detach().clone()
                 terrain_frames.append(obs["terrain"].detach().cpu().numpy().copy())
+                progress["stage"] = "rollout_action"
                 actions = algorithm.act(obs)
                 if not torch.isfinite(actions).all():
                     raise ValueError("Nonfinite sampled PPO action")
+                progress["stage"] = "environment_step"
                 obs, rewards, dones, extras = env.step(actions)
+                progress["completed_environment_steps"] += 1
+                progress["stage"] = "rollout_storage"
                 if not torch.isfinite(rewards).all():
                     raise ValueError("Nonfinite readiness rewards")
                 algorithm.process_env_step(obs, rewards, dones, extras)
+                progress["completed_ppo_transition_steps"] += 1
+            progress["stage"] = "returns"
+            validate_terrain_scan(obs["terrain"], num_envs=80)
             algorithm.compute_returns(obs)
+        progress["stage"] = "trace_validation"
         capture.enabled = False
         trace = capture.finish()
         trace.update(initial, terrain_observation=np.stack(terrain_frames))
@@ -574,7 +633,12 @@ def run_terrain_readiness(args, output, agent, saved, protocol):
             )
         np.savez_compressed(output / "trace.npz", **trace)
         motor = validate_motor_trace(trace)
-        update = terrain_update_evidence(policy, algorithm, algorithm.update())
+        progress["stage"] = "ppo_update"
+        losses = algorithm.update()
+        progress["completed_ppo_updates"] += 1
+        progress["stage"] = "update_validation"
+        update = terrain_update_evidence(policy, algorithm, losses)
+        progress["stage"] = "artifact_publication"
         torch.save(
             {
                 "interface": interface,
@@ -612,20 +676,19 @@ def run_terrain_readiness(args, output, agent, saved, protocol):
     except Exception as error:
         # Publish before Kit closes: some shutdown paths terminate Python with
         # exit(0), so the parent must own result/exit semantics.
-        write_json(
-            output / "training_status.json",
-            {
-                "status": "ERROR",
-                "error": str(error),
-                "traceback": traceback.format_exc(),
-            },
-        )
+        progress["recorded_steps"] = len(capture.samples) if capture is not None else 0
+        report_terrain_readiness_error(output, error, progress)
     finally:
         for name, resource in (("environment", env), ("application", app)):
             if resource is not None:
                 try:
                     resource.close()
                 except Exception as error:
+                    print(
+                        f"Terrain readiness {name} cleanup ERROR: {error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     write_json(
                         output / f"{name}_cleanup_error.json", {"error": str(error)}
                     )
@@ -705,13 +768,8 @@ def terrain_readiness_main(args, parser):
             )
             run_terrain_readiness(args, args.worker_output, agent, saved, protocol)
         except Exception as error:
-            write_json(
-                args.worker_output / "training_status.json",
-                {
-                    "status": "ERROR",
-                    "error": str(error),
-                    "traceback": traceback.format_exc(),
-                },
+            report_terrain_readiness_error(
+                args.worker_output, error, {"stage": "worker_startup"}
             )
         return 0
     args.output_parent.mkdir(parents=True, exist_ok=True)
@@ -782,6 +840,15 @@ def terrain_readiness_main(args, parser):
         except Exception as error:
             report = {"status": "ERROR", "error": str(error), "worker_result": report}
     write_json(output / "report.json", report)
+    if report["status"] == "ERROR":
+        print(
+            f"Terrain readiness ERROR: {report.get('error', 'See report for details')}",
+            file=sys.stderr,
+            flush=True,
+        )
+        failure = report.get("measurement_result", {})
+        if failure.get("error"):
+            print(f"Worker cause: {failure['error']}", file=sys.stderr, flush=True)
     print(
         f"{report['status']}: {output / 'report.json'}; obstacle/critic acceptance remains false",
         flush=True,
