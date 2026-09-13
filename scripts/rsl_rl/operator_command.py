@@ -155,6 +155,25 @@ def terrain_operator_mask(env):
     return operator_role(env).float().unsqueeze(-1)
 
 
+def terrain_critic_context(env):
+    """Value-only task state; never a command, actor input or family/level label.
+
+    Reuse the native privileged critic's distance scale and route phase. Clear
+    route fields on operator lanes, including after resets; operator control
+    has no route objective. ObservationManager supplies this alongside both
+    current and next/reset observations for native PPO value bootstrapping.
+    """
+    role = terrain_operator_mask(env)
+    course = torch.cat(
+        (
+            0.25 * parkour_mdp.active_waypoint_distance_xy(env),
+            parkour_mdp.route_phase(env),
+        ),
+        dim=-1,
+    )
+    return torch.cat((role, torch.where(role.bool(), 0.0, course)), dim=-1)
+
+
 def teacher_operator_workspace(env, margin_m: float):
     """Training-only flat-workspace censoring, not failure or behavioral credit.
 

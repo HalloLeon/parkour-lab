@@ -193,6 +193,7 @@ class MovingRetentionUpdate:
                 or zero_command
                 or not isinstance(first_input, StockTerrainInput)
                 or not isinstance(policy.critic[0], StockTerrainInput)
+                or first_input.critic_task_dim != 0
                 or "operator_mask" not in algorithm.storage.observations.keys()
             ):
                 raise ValueError(
@@ -202,6 +203,8 @@ class MovingRetentionUpdate:
                 "policy": ["policy", "terrain"],
                 "critic": ["policy", "terrain"],
             }
+            if policy.critic[0].critic_task_dim == 4:
+                expected_groups["critic"].append("critic_context")
             first_input = first_input.reference
         if (
             type(algorithm) is not PPO
@@ -252,6 +255,11 @@ class MovingRetentionUpdate:
 
     def __call__(self):
         alg = self.algorithm
+        if self.terrain_operator:
+            # Detached diagnostics only: pooled over minibatch visits (including
+            # repeated PPO epochs), not a new role-normalized value objective.
+            role_value_sums = torch.zeros(2, device=alg.device)
+            role_value_counts = torch.zeros_like(role_value_sums)
         totals = dict(
             value_function=0.0,
             surrogate=0.0,
@@ -311,6 +319,17 @@ class MovingRetentionUpdate:
                 ).mean()
             else:
                 value_loss = (returns - values).square().mean()
+            if self.terrain_operator:
+                with torch.no_grad():
+                    role = obs["operator_mask"][:, 0]
+                    squared_error = (values - returns).square().reshape(-1)
+                    role_value_sums += torch.stack(
+                        (
+                            (squared_error * role).sum(),
+                            (squared_error * (1 - role)).sum(),
+                        )
+                    )
+                    role_value_counts += torch.stack((role.sum(), (1 - role).sum()))
             observation = obs["policy"].detach()
             with torch.no_grad():
                 reference_mean = self.reference(observation)
@@ -362,6 +381,12 @@ class MovingRetentionUpdate:
         if self.terrain_operator:
             for name in ("anchor", "action_mse", "fraction"):
                 result[f"operator_{name}"] = result.pop(f"moving_{name}")
+            for name, value in zip(
+                ("operator_value_mse", "course_value_mse"),
+                role_value_sums / role_value_counts.clamp_min(1),
+                strict=True,
+            ):
+                result[name] = float(value)
         return result
 
 

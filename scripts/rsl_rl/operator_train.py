@@ -231,6 +231,19 @@ def restore_reference(runner, data):
 TERRAIN_VERSION = "go2_operator_terrain_teacher_v1"
 TERRAIN_READINESS_STEPS = 1000
 TERRAIN_TRAINING_VERSION = "go2_operator_terrain_progressive_v1"
+TERRAIN_TASK_CRITIC_VERSION = "go2_operator_terrain_progressive_task_critic_v2"
+TERRAIN_CRITIC_CONTEXT = {
+    "group": "critic_context",
+    "fields": [
+        "operator_role",
+        "active_waypoint_distance_xy * 0.25",
+        "route_cursor_phase",
+        "safe_route_progress_phase",
+    ],
+    "course_fields_zero_on_operator_rows": True,
+    "actor_access": False,
+    "initialization": "zero additive value projection; preserve existing tensors and RNG",
+}
 TERRAIN_CHECK_UPDATES = (500, 1500, 3000)
 TERRAIN_COURSE_REWARDS = (
     "waypoint_velocity_tracking",
@@ -294,7 +307,27 @@ def report_terrain_readiness_error(output, error, progress):
     )
 
 
-def build_terrain_policy(observations, source_state):
+def validate_terrain_critic_context(context, *, num_envs):
+    """Validate the explicit four-value training-only schema at construction."""
+    import torch
+
+    if (
+        context.shape != (num_envs, 4)
+        or context.dtype != torch.float32
+        or not torch.isfinite(context).all()
+        or not ((context[:, 0] == 0) | (context[:, 0] == 1)).all()
+        or (context[:, 1:] < 0).any()
+        or (context[:, 2:] > 1).any()
+        or torch.count_nonzero(context[context[:, 0] == 1, 1:])
+    ):
+        raise ValueError("Invalid four-value critic task context")
+
+
+def terrain_training_version(critic_context):
+    return TERRAIN_TASK_CRITIC_VERSION if critic_context else TERRAIN_TRAINING_VERSION
+
+
+def build_terrain_policy(observations, source_state, *, critic_context=False):
     """Explicit stock-to-terrain warm start; never load legacy RMA or Adam."""
     import torch
     from rsl_rl.modules import ActorCritic
@@ -313,6 +346,14 @@ def build_terrain_policy(observations, source_state):
         for v in source_state.values()
     ):
         raise ValueError("Warm start requires finite float32 reference tensors")
+    if critic_context:
+        if "critic_context" not in observations.keys():
+            raise ValueError(
+                "The task-context teacher requires a critic_context observation group"
+            )
+        validate_terrain_critic_context(
+            observations["critic_context"], num_envs=len(observations["policy"])
+        )
     reference = ActorCritic(
         observations,
         {"policy": ["policy"], "critic": ["policy"]},
@@ -332,7 +373,11 @@ def build_terrain_policy(observations, source_state):
         "critic": ["policy", "terrain"],
     }
     policy.actor[0] = StockTerrainInput(policy.actor[0])
-    policy.critic[0] = StockTerrainInput(policy.critic[0])
+    policy.critic[0] = StockTerrainInput(
+        policy.critic[0], critic_task_dim=4 if critic_context else 0
+    )
+    if critic_context:
+        policy.obs_groups["critic"].append("critic_context")
     device = observations["policy"].device
     return policy.to(device), reference.to(device).eval().requires_grad_(False)
 
@@ -713,7 +758,7 @@ def run_terrain_readiness(args, output, agent, saved, protocol):
                     )
 
 
-def validate_readiness_report(path, identity):
+def validate_readiness_report(path, identity, *, critic_context=False):
     """Consume completed engineering evidence, never its weights as a trained teacher."""
     import numpy as np
     import torch
@@ -760,6 +805,12 @@ def validate_readiness_report(path, identity):
         "source/parkour_lab/parkour_lab/tasks/manager_based/parkour_lab/mdp/commands.py",
         "source/parkour_lab/parkour_lab/tasks/manager_based/parkour_lab/mdp/curriculums/curriculums.py",
     }
+    if critic_context:
+        # Explicit v2-only additive critic branch; default stock/terrain math
+        # remains unchanged and is covered by exact parity/RNG regression tests.
+        changed.add(
+            "source/parkour_lab/parkour_lab/learning/distillation/teacher/model.py"
+        )
     producers = prior.get("producers", {})
     if set(producers) != set(identity["producers"]) or any(
         value != identity["producers"][name]
@@ -895,6 +946,12 @@ def terrain_teacher_configs(saved, agent, args, *, evaluation=False):
     mask = ObservationGroupCfg(concatenate_terms=True, enable_corruption=False)
     mask.role = ObservationTermCfg(func=binding.terrain_operator_mask)
     cfg.observations.operator_mask = mask
+    critic_context = getattr(args, "terrain_critic_context", False)
+    if critic_context:
+        task = ObservationGroupCfg(concatenate_terms=True, enable_corruption=False)
+        task.context = ObservationTermCfg(func=binding.terrain_critic_context)
+        cfg.observations.critic_context = task
+        runner_cfg["obs_groups"]["critic"] = ["policy", "terrain", "critic_context"]
     if evaluation:
         # Same physical scoring as stock benchmark, including no extra tilt gate.
         cfg.curriculum = None
@@ -909,7 +966,7 @@ def terrain_teacher_configs(saved, agent, args, *, evaluation=False):
         num_steps_per_env=24,
         max_iterations=args.iterations,
         experiment_name="go2_operator_terrain_teacher",
-        run_name=TERRAIN_TRAINING_VERSION,
+        run_name=terrain_training_version(critic_context),
     )
     return cfg, runner_cfg
 
@@ -925,13 +982,28 @@ def make_terrain_runner(env, runner_cfg, output, source_state, protocol):
     except ImportError:
         from operator_retention import MovingRetentionUpdate
 
+    version = protocol["version"]
+    if version not in (TERRAIN_TRAINING_VERSION, TERRAIN_TASK_CRITIC_VERSION):
+        raise ValueError("Unknown terrain-training protocol version")
+    critic_context = version == TERRAIN_TASK_CRITIC_VERSION
+
     class TerrainRunner(OnPolicyRunner):
         def _construct_algorithm(self, obs):
             if self.is_distributed or self.alg_cfg.get("class_name") != "PPO":
                 raise ValueError(
                     "Terrain training supports pinned single-device PPO only"
                 )
-            policy, reference = build_terrain_policy(obs, source_state)
+            policy, reference = build_terrain_policy(
+                obs, source_state, critic_context=critic_context
+            )
+            if runner_cfg["obs_groups"] != policy.obs_groups:
+                raise ValueError(
+                    "Terrain runner observation groups differ from the declared model"
+                )
+            if critic_context and not torch.equal(
+                obs["critic_context"][:, :1], obs["operator_mask"]
+            ):
+                raise ValueError("Critic task role and retention role differ")
             with torch.no_grad():
                 if not torch.equal(
                     policy.act_inference(obs), reference.act_inference(obs)
@@ -962,13 +1034,13 @@ def make_terrain_runner(env, runner_cfg, output, source_state, protocol):
             exposure = env.exposure.report()
             exposure.update(
                 background_sampler_version=exposure["version"],
-                version=f"{TERRAIN_TRAINING_VERSION}:operator_commands",
+                version=f"{version}:operator_commands",
                 sequence_sampler=sequence_manifest(),
                 scope="Executed operator-lane commands only; v3 chains with v2 background sampling",
                 workspace_censored_episodes=int(env.workspace_censored.item()),
             )
             metadata = {
-                "version": TERRAIN_TRAINING_VERSION,
+                "version": version,
                 "interface_version": TERRAIN_VERSION,
                 "source_identity": protocol["source_identity"],
                 "learning_updates": updates,
@@ -978,6 +1050,8 @@ def make_terrain_runner(env, runner_cfg, output, source_state, protocol):
                 "readiness_only": False,
                 "behavior_validated": False,
             }
+            if critic_context:
+                metadata["critic_context"] = copy.deepcopy(TERRAIN_CRITIC_CONTEXT)
             super().save(
                 path,
                 {
@@ -1032,15 +1106,21 @@ def validate_teacher_adam(state, optimizer, expected_steps):
         raise ValueError("Invalid finite teacher weights/Adam/update accounting")
 
 
-def load_terrain_teacher(path, observations, source_state, identity):
-    """Strict known 312-input loader; readiness/stock/legacy RMA are not teachers."""
+def load_terrain_teacher(
+    path, observations, source_state, identity, *, expected_version=None
+):
+    """Strict versioned loader; actor remains 312-D and only v2 has value context."""
     import torch
 
     data = torch.load(path, map_location="cpu", weights_only=True)
     metadata = data.get("infos", {}).get("terrain_training", {})
     updates = metadata.get("learning_updates")
+    version = metadata.get("version")
     if (
-        metadata.get("version") != TERRAIN_TRAINING_VERSION
+        version not in (TERRAIN_TRAINING_VERSION, TERRAIN_TASK_CRITIC_VERSION)
+        or (expected_version is not None and version != expected_version)
+        or metadata.get("critic_context")
+        != (TERRAIN_CRITIC_CONTEXT if version == TERRAIN_TASK_CRITIC_VERSION else None)
         or metadata.get("interface_version") != TERRAIN_VERSION
         or metadata.get("source_identity") != identity
         or metadata.get("readiness_only") is not False
@@ -1049,7 +1129,11 @@ def load_terrain_teacher(path, observations, source_state, identity):
         or data.get("iter") != updates
     ):
         raise ValueError("Not a source-bound learned terrain-teacher checkpoint")
-    policy, _ = build_terrain_policy(observations, source_state)
+    policy, _ = build_terrain_policy(
+        observations,
+        source_state,
+        critic_context=version == TERRAIN_TASK_CRITIC_VERSION,
+    )
     policy.load_state_dict(data["model_state_dict"], strict=True)
     validate_teacher_adam(
         data["model_state_dict"], data["optimizer_state_dict"], updates * 20
@@ -1190,6 +1274,8 @@ def run_terrain_teacher(args, output, saved, agent, protocol):
     try:
         if (
             terrain_source_identity(args) != protocol["source_identity"]
+            or protocol["version"]
+            != terrain_training_version(args.terrain_critic_context)
             or file_sha256(args.readiness_report)
             != protocol["readiness"]["report_sha256"]
         ):
@@ -1224,8 +1310,13 @@ def run_terrain_teacher(args, output, saved, agent, protocol):
         (params / "agent.yaml").write_text(yaml.dump(runner_cfg, sort_keys=False))
         interface = {
             "version": TERRAIN_VERSION,
-            "training_version": TERRAIN_TRAINING_VERSION,
+            "training_version": protocol["version"],
             "inputs": ["policy:48", "terrain:264"],
+            "critic_inputs": ["policy:48", "terrain:264"]
+            + (["critic_context:4"] if args.terrain_critic_context else []),
+            "critic_context": TERRAIN_CRITIC_CONTEXT
+            if args.terrain_critic_context
+            else None,
             "retention_metadata_not_policy_input": "operator_mask:1",
             "actions": "12 raw actions; default_joint_position + 0.25*action; no clipping",
             "source_identity": protocol["source_identity"],
@@ -1264,6 +1355,7 @@ def run_terrain_teacher(args, output, saved, agent, protocol):
                 obs,
                 source,
                 protocol["source_identity"],
+                expected_version=protocol["version"],
             )
             result = evaluate_terrain_teacher(raw, policy, output)
             result.update(
@@ -1359,19 +1451,26 @@ def terrain_teacher_main(args, parser):
             raise ValueError("Terrain learning requires RSL-RL 3.1.2")
         mesh = validate_mesh_flat_report(args.mesh_flat_report, args.checkpoint)
         identity = terrain_source_identity(args)
-        readiness = validate_readiness_report(args.readiness_report, identity)
+        readiness = validate_readiness_report(
+            args.readiness_report, identity, critic_context=args.terrain_critic_context
+        )
         import torch
 
         with torch.random.fork_rng(devices=[]):
+            observations = {"policy": torch.zeros(4, 48), "terrain": torch.ones(4, 264)}
+            if args.terrain_critic_context:
+                observations["critic_context"] = torch.zeros(4, 4)
+                observations["critic_context"][0, 0] = 1
             policy, _ = build_terrain_policy(
-                {"policy": torch.zeros(4, 48), "terrain": torch.ones(4, 264)},
+                observations,
                 source["model_state_dict"],
+                critic_context=args.terrain_critic_context,
             )
     except Exception as error:
         parser.error(f"Terrain learning preflight failed: {error}")
     if args.validate_only:
         print(
-            "Validated readiness/source and 312-input teacher construction. Progressive training and learned behavior remain UNRUN."
+            f"Validated readiness/source and {terrain_training_version(args.terrain_critic_context)} construction (actor 312-D). Progressive training and learned behavior remain UNRUN."
         )
         return 0
     if args.worker_output is not None:
@@ -1412,8 +1511,9 @@ def terrain_teacher_main(args, parser):
 def supervise_terrain_teacher(args, output, identity, readiness, mesh):
     """Keep measured behavioral failures; stop on invalid/missing measurements."""
     write_run_provenance(output, Path(__file__))
+    critic_context = getattr(args, "terrain_critic_context", False)
     protocol = {
-        "version": TERRAIN_TRAINING_VERSION,
+        "version": terrain_training_version(critic_context),
         "source_identity": identity,
         "readiness": readiness,
         "mesh_flat": mesh,
@@ -1424,7 +1524,8 @@ def supervise_terrain_teacher(args, output, identity, readiness, mesh):
         "environment_transitions": 230400000,
         "initial_level": 0,
         "max_level": 6,
-        "roles": "fixed IDs%4==0 operator; remaining course, including L0 replay; role never enters actor/critic",
+        "roles": "fixed IDs%4==0 operator; remaining course, including L0 replay; role never enters actor"
+        + ("; value-only role/route context" if critic_context else "/critic"),
         "operator_objective": "source rewards plus all-operator-row frozen 8500 soft mean retention (coefficient 0.1, raw action scale 0.1), including pivots and stops; randomized v3 chains",
         "course_objective": list(TERRAIN_COURSE_REWARDS),
         "physical_failure_impulse": -10.0,
@@ -1435,6 +1536,20 @@ def supervise_terrain_teacher(args, output, identity, readiness, mesh):
         "checks": "after all training; actual teacher, 40 operator trials + 10 per family/level 1, 3, 6 at canonical variant 0; all results retained",
         "scope": "Privileged teacher acquisition only; no live handoff/student/heldout/exit promotion",
     }
+    if critic_context:
+        protocol["critic_context"] = copy.deepcopy(TERRAIN_CRITIC_CONTEXT)
+        protocol["experiment"] = {
+            "intervention": "critic-only task/route state; fresh stock-8500 zero-fusion initialization, not a learned-teacher resume",
+            "unchanged": "actor 312-D, original tensor initialization/RNG, noise, rewards, PPO/retention, role sampler, curriculum, physical scoring, seeds, budget and check offsets",
+            "comparison": "Matched progressive_v1 with identical source/seed/config at 500/1500/3000; development evidence, not heldout",
+            "value_diagnostics": "Detached unclipped operator/course value MSE pooled over minibatch visits, including repeated PPO epochs; no loss/normalization change",
+            "co_primary_outcomes": [
+                "operator preservation",
+                "first complete L1 traversal in each of the four families",
+            ],
+            "decision": "Retain all declared checks. If operator control still collapses and high_step, hurdle and tilted_ramps still have zero L1 passes, close the context-only branch rather than extend it. Lower value loss, frontier advancement or gap-only gains are insufficient.",
+            "causal_claim": "Missing task state is a representational omission, not a demonstrated sole cause of the prior failures or a proven solution.",
+        }
     write_json(output / "terrain_protocol.json", protocol)
     command = [
         sys.executable,
@@ -1455,6 +1570,8 @@ def supervise_terrain_teacher(args, output, identity, readiness, mesh):
         "--device",
         args.device,
     ]
+    if critic_context:
+        command.append("--terrain-critic-context")
     print(
         f"Progressive terrain teacher: {output}; 3000 updates, then checks 500/1500/3000; no exit promotion",
         flush=True,
@@ -2282,6 +2399,11 @@ def main(argv=None):
         help="Source-bound completed terrain-readiness report",
     )
     parser.add_argument(
+        "--terrain-critic-context",
+        action="store_true",
+        help="Opt in to v2 critic-only task/route context; requires --terrain-train and preserves the 312-D actor",
+    )
+    parser.add_argument(
         "--terrain-evaluate-checkpoint", type=Path, help=argparse.SUPPRESS
     )
     parser.add_argument(
@@ -2374,6 +2496,7 @@ def main(argv=None):
     if (
         args.readiness_report is not None
         or args.terrain_evaluate_checkpoint is not None
+        or args.terrain_critic_context
     ):
         parser.error("Terrain learning/evaluation arguments require --terrain-train")
     if args.terrain_readiness:
