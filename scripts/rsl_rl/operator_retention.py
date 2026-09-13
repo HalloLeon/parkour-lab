@@ -131,6 +131,30 @@ def _command_anchor_loss(mean, reference_mean, observation, *, zero_command):
     )
 
 
+def terrain_operator_anchor_loss(mean, reference_mean, operator_mask):
+    """Soft retention on persistent operator roles, NEVER course/L0 replay roles."""
+    if (
+        mean.ndim != 2
+        or len(mean) == 0
+        or mean.shape[-1] != 12
+        or reference_mean.shape != mean.shape
+        or operator_mask.shape != (len(mean), 1)
+        or any(
+            v.device != mean.device or v.dtype != mean.dtype
+            for v in (reference_mean, operator_mask)
+        )
+        or not all(
+            torch.isfinite(v).all() for v in (mean, reference_mean, operator_mask)
+        )
+        or not ((operator_mask == 0) | (operator_mask == 1)).all()
+    ):
+        raise ValueError("Invalid terrain operator retention means/role mask")
+    selected = operator_mask[:, 0].detach()
+    squared = (mean - reference_mean.detach()).square().mean(dim=-1)
+    mse = (squared * selected).sum() / selected.sum().clamp_min(1)
+    return mse / (2 * ACTION_SCALE**2), mse.detach(), selected.mean()
+
+
 class MovingRetentionUpdate:
     """Pinned single-GPU, fixed-rate, feed-forward PPO plus explicit retention losses.
 
@@ -143,13 +167,42 @@ class MovingRetentionUpdate:
     SPDX-License-Identifier: BSD-3-Clause
     """
 
-    def __init__(self, algorithm, *, reference_state=None, zero_command=False):
+    def __init__(
+        self,
+        algorithm,
+        *,
+        reference_state=None,
+        zero_command=False,
+        terrain_operator=False,
+    ):
         from rsl_rl.algorithms import PPO
         from rsl_rl.modules import ActorCritic
 
         if importlib.metadata.version("rsl-rl-lib") != "3.1.2":
             raise ValueError("Moving retention supports only RSL-RL 3.1.2")
         policy = algorithm.policy
+        expected_groups = {"policy": ["policy"], "critic": ["policy"]}
+        first_input = policy.actor[0]
+        if terrain_operator:
+            from parkour_lab.learning.distillation.teacher.model import (
+                StockTerrainInput,
+            )
+
+            if (
+                reference_state is None
+                or zero_command
+                or not isinstance(first_input, StockTerrainInput)
+                or not isinstance(policy.critic[0], StockTerrainInput)
+                or "operator_mask" not in algorithm.storage.observations.keys()
+            ):
+                raise ValueError(
+                    "Terrain retention requires the explicit source and rollout-only operator mask"
+                )
+            expected_groups = {
+                "policy": ["policy", "terrain"],
+                "critic": ["policy", "terrain"],
+            }
+            first_input = first_input.reference
         if (
             type(algorithm) is not PPO
             or type(policy) is not ActorCritic
@@ -158,13 +211,13 @@ class MovingRetentionUpdate:
             or policy.critic_obs_normalization
             or policy.state_dependent_std
             or policy.noise_std_type != "scalar"
-            or policy.obs_groups != {"policy": ["policy"], "critic": ["policy"]}
+            or policy.obs_groups != expected_groups
             or algorithm.schedule != "fixed"
             or algorithm.is_multi_gpu
             or algorithm.rnd is not None
             or algorithm.symmetry is not None
             or algorithm.optimizer.state
-            or policy.actor[0].in_features != 48
+            or first_input.in_features != 48
             or policy.actor[-1].out_features != 12
         ):
             raise ValueError(
@@ -176,6 +229,9 @@ class MovingRetentionUpdate:
             )
         self.algorithm = algorithm
         self.reference = copy.deepcopy(policy.actor).eval().requires_grad_(False)
+        self.terrain_operator = terrain_operator
+        if terrain_operator:
+            self.reference[0] = copy.deepcopy(first_input).eval().requires_grad_(False)
         if reference_state is not None:
             # Resume uses the ORIGINAL frozen actor, not the restored learner.
             actor_state = {
@@ -258,8 +314,10 @@ class MovingRetentionUpdate:
             observation = obs["policy"].detach()
             with torch.no_grad():
                 reference_mean = self.reference(observation)
-            anchor, mse, fraction = moving_anchor_loss(
-                mean, reference_mean, observation
+            anchor, mse, fraction = (
+                terrain_operator_anchor_loss(mean, reference_mean, obs["operator_mask"])
+                if self.terrain_operator
+                else moving_anchor_loss(mean, reference_mean, observation)
             )
             loss = (
                 surrogate_loss
@@ -300,7 +358,11 @@ class MovingRetentionUpdate:
             raise RuntimeError("Incomplete retention PPO minibatch update")
         alg.storage.clear()
         self.updates += 1
-        return {name: value / count for name, value in totals.items()}
+        result = {name: value / count for name, value in totals.items()}
+        if self.terrain_operator:
+            for name in ("anchor", "action_mse", "fraction"):
+                result[f"operator_{name}"] = result.pop(f"moving_{name}")
+        return result
 
 
 def install_moving_retention(algorithm, *, reference_state=None, zero_command=False):

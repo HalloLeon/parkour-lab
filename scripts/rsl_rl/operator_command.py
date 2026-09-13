@@ -1,10 +1,14 @@
 """Isaac Lab binding for the operator curriculum. Import after AppLauncher."""
 
 from functools import wraps
+import copy
+import inspect
+import math
 
 import torch
 
 from isaaclab.envs.mdp.commands import UniformVelocityCommand
+from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 from parkour_lab.tasks.manager_based.parkour_lab import mdp as parkour_mdp
 
 try:
@@ -139,3 +143,224 @@ class TerrainReadinessCommand(UniformVelocityCommand):
 
     def __str__(self):
         return "TerrainReadinessCommand: L0 operator / L1 guidance, body [vx, vy, wz]"
+
+
+def operator_role(env):
+    """Persistent lane ownership, independent of current/replayed terrain level."""
+    return torch.arange(env.num_envs, device=env.device) % 4 == 0
+
+
+def terrain_operator_mask(env):
+    """Rollout-only retention metadata, excluded from BOTH policy input groups."""
+    return operator_role(env).float().unsqueeze(-1)
+
+
+def teacher_operator_workspace(env, margin_m: float):
+    """Training-only flat-workspace censoring, not failure or behavioral credit.
+
+    Check every rigid-body center with explicit padding, not just commanded
+    travel distance. Evaluate LAST, so a real physical failure is never turned
+    into a bootstrapped workspace timeout. Fixed development gates omit this.
+    """
+    roles = operator_role(env)
+    if (env.scene.terrain.terrain_levels[roles] != 0).any():
+        raise RuntimeError("Operator lanes left their assigned L0 row")
+    size = env.cfg.scene.terrain.terrain_generator.size
+    if tuple(size) != (8.0, 4.0) or not 0 < margin_m < min(size) / 2:
+        raise ValueError(
+            "Teacher operator workspace requires the production 8 x 4 m tile and valid padding"
+        )
+    half = torch.as_tensor(size, device=env.device) / 2 - margin_m
+    local = (
+        env.scene["robot"].data.body_pos_w[..., :2] - env.scene.env_origins[:, None, :2]
+    )
+    boundary = (local.abs() >= half).any(dim=-1).any(dim=-1)
+    return roles & boundary & ~env.termination_manager.terminated
+
+
+def initialize_teacher_levels(env, env_ids, curriculum_cfg, terrain_layout):
+    ids = torch.arange(env.num_envs, device=env.device)
+    if env_ids is not None:
+        ids = (
+            ids[env_ids]
+            if isinstance(env_ids, slice)
+            else torch.as_tensor(env_ids, device=env.device)
+        )
+    if env.cfg.terrain_teacher_evaluation:
+        # Ten independent resets of each canonical family/level. The native
+        # 40-column mesh remains unchanged; only assignment selects variant 0.
+        terrain = env.scene.terrain
+        terrain.terrain_types[ids] = (terrain.terrain_types[ids] // 10) * 10
+        for slot, level in enumerate((0, 1, 3, 6)):
+            parkour_mdp.initialize_parkour_terrain_levels(
+                env, ids[ids % 4 == slot], terrain_layout, curriculum_cfg, level
+            )
+    else:
+        parkour_mdp.initialize_parkour_terrain_levels(
+            env, ids, terrain_layout, curriculum_cfg, 0
+        )
+
+
+@wraps(parkour_mdp.completed_course_done, assigned=("__doc__",))
+def teacher_course_success(env, **params):
+    return parkour_mdp.completed_course_done(env, **params) & ~operator_role(env)
+
+
+@wraps(parkour_mdp.off_route, assigned=("__doc__",))
+def teacher_course_off_route(env, **params):
+    return parkour_mdp.off_route(env, **params) & ~operator_role(env)
+
+
+class TerrainTeacherCommand(OperatorTransitionCommand):
+    """Randomized v3 operator chains and native course guidance on disjoint lanes.
+
+    This is teacher acquisition, not live arbitration or within-episode handoff.
+    Evaluation disables sampling; the existing benchmark publishes every packet.
+    """
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        try:
+            from .operator_sequences import ReversalSequencePlan
+        except ImportError:
+            from operator_sequences import ReversalSequencePlan
+        self.sequence_plan = ReversalSequencePlan(self.num_envs, self.device)
+        self.operator_role = operator_role(env)
+        self.finished = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+    def _resample(self, env_ids):
+        ids = torch.arange(self.num_envs, device=self.device)[env_ids]
+        self.vel_command_b[ids] = 0
+        self.time_left[ids] = float("inf")
+        self.is_heading_env[ids] = False
+        self.is_standing_env[ids] = False
+        if self._env.cfg.terrain_teacher_evaluation:
+            self.command_counter[ids] += 1
+            return
+        selected = ids[self.operator_role[ids]]
+        super()._resample(selected)
+
+    def _resample_command(self, env_ids):
+        new_episode = self.command_counter[env_ids] == 0
+        super()._resample_command(env_ids)
+        selected, commands, categories, seconds = self.sequence_plan.resample(
+            env_ids, new_episode
+        )
+        self.category[selected] = categories
+        self.vel_command_b[selected] = commands
+        self.is_standing_env[selected] = categories == 0
+        self.time_left[selected] = seconds
+
+    def _update_command(self):
+        if self._env.cfg.terrain_teacher_evaluation:
+            return
+        try:
+            from .operator_benchmark import course_command
+        except ImportError:
+            from operator_benchmark import course_command
+        desired = course_command(
+            self._env,
+            {"course": {"target_speed": 0.55}},
+            self._env.episode_length_buf,
+            self.finished,
+        )
+        self.vel_command_b[~self.operator_role] = desired[~self.operator_role]
+
+    def __str__(self):
+        return "TerrainTeacherCommand: fixed operator v3-chain/v2-background lanes and course guidance"
+
+
+class RoleReward(ManagerTermBase):
+    """Mask an existing stateless reward without modifying its physical formula."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.term = copy.deepcopy(cfg.params["term"])
+        if not inspect.isfunction(self.term.func):
+            raise ValueError("Role rewards support existing stateless functions only")
+        # Native managers only resolve top-level SceneEntityCfg parameters.
+        for value in self.term.params.values():
+            if isinstance(value, SceneEntityCfg):
+                value.resolve(env.scene)
+        self.mask = operator_role(env) == cfg.params["operator"]
+
+    def __call__(self, env, term, operator):
+        value = self.term.func(env, **self.term.params)
+        return torch.where(self.mask, value, 0.0)
+
+
+class PersistentTilt(ManagerTermBase):
+    """Training-only fall cutoff; short obstacle maneuvers remain possible."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.seconds = torch.zeros(env.num_envs, device=env.device)
+
+    def reset(self, env_ids=None):
+        self.seconds[slice(None) if env_ids is None else env_ids] = 0
+
+    def __call__(self, env, angle_deg: float, duration_s: float):
+        tilted = env.scene["robot"].data.projected_gravity_b[:, 2] > -math.cos(
+            math.radians(angle_deg)
+        )
+        self.seconds.copy_(torch.where(tilted, self.seconds + env.step_dt, 0.0))
+        return self.seconds >= duration_s
+
+
+class TerrainTeacherCurriculum(parkour_mdp.ParkourTerrainCurriculum):
+    """Reuse production promotion/replay, excluding permanent operator lanes."""
+
+    outcome_names = (
+        "success",
+        "chassis",
+        "fall",
+        "off_route",
+        "timeout",
+        "other_failure",
+    )
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.outcomes = torch.zeros(40, 7, 6, dtype=torch.long, device=env.device)
+        env.terrain_teacher_curriculum = self
+
+    def __call__(self, env, env_ids, curriculum_cfg, terrain_layout):
+        from parkour_lab.tasks.manager_based.parkour_lab.mdp.curriculums.curriculums import (
+            _terminal_event_masks,
+        )
+
+        ids = torch.arange(env.num_envs, device=env.device)[env_ids]
+        ids = ids[~operator_role(env)[ids]]
+        if not len(ids):
+            return {}
+        success, _, _, chassis, fall, off_route, timeout, other = _terminal_event_masks(
+            env, ids
+        )
+        terrain = env.scene.terrain
+        # Count the ATTEMPTED column/level before native promotion or replay.
+        index = (terrain.terrain_types[ids] * 7 + terrain.terrain_levels[ids]) * 6
+        for outcome, mask in enumerate(
+            (success, chassis, fall, off_route, timeout, other)
+        ):
+            self.outcomes.view(-1).scatter_add_(0, index + outcome, mask.long())
+        super().__call__(env, ids, curriculum_cfg, terrain_layout)
+        # Native population metrics include fixed operator lanes. Do not publish
+        # their diluted mean as course progress; actual denominators are saved.
+        return {"course_completed_attempts": self.outcomes.sum().float()}
+
+    def state_dict(self):
+        return {
+            "curriculum": super().state_dict(),
+            "outcomes": self.outcomes.detach().cpu().clone(),
+        }
+
+    def load_state_dict(self, state):
+        values = state["outcomes"]
+        if (
+            values.shape != self.outcomes.shape
+            or values.dtype != torch.long
+            or (values < 0).any()
+        ):
+            raise ValueError("Invalid attempted-course outcome counters")
+        super().load_state_dict(state["curriculum"])
+        self.outcomes.copy_(values)

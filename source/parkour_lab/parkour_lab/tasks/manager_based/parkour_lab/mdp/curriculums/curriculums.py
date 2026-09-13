@@ -774,8 +774,12 @@ def _terminal_event_masks(
     )
 
     def term(name: str) -> torch.Tensor:
+        names = getattr(getattr(env, "cfg", None), "parkour_termination_names", {})
+        resolved = names.get(name, name)
+        if resolved is None:
+            return torch.zeros_like(terminal_event)
         return (
-            env.termination_manager.get_term(name)[env_ids].to(
+            env.termination_manager.get_term(resolved)[env_ids].to(
                 device=env.device,
                 dtype=torch.bool,
             )
@@ -788,11 +792,15 @@ def _terminal_event_masks(
     off_route_event = term("off_route")
     raw_success_event = term("success")
     wall_timeout_event = term("wall_time_out")
+    extra_failure = torch.zeros_like(terminal_event)
+    for name in getattr(getattr(env, "cfg", None), "parkour_extra_failure_terms", ()):
+        extra_failure |= term(name)
     success_event = (
         raw_success_event
         & (~chassis_contact_event)
         & (~fell_below_event)
         & (~off_route_event)
+        & (~extra_failure)
     )
     # The validated wall cap exceeds the active-motion budget. A wall-only
     # timeout therefore proves that command stops consumed the difference.
@@ -822,6 +830,7 @@ def _terminal_event_masks(
         & (~chassis_contact_failure)
         & (~fell_below_failure)
         & (~off_route_failure)
+        & (~extra_failure)
         & (active_timeout_event | wall_timeout_event)
     )
     other_failure = (

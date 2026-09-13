@@ -5,6 +5,8 @@ are restored exactly. Command sampling and versioned reward/entropy profiles
 are explicit; Adam starts fresh unless an evidence-bound retention resume is
 requested. Opt-in --terrain-readiness checks a terrain-conditioned warm start
 and one PPO update; it does not train or qualify an obstacle/RMA policy.
+Opt-in --terrain-train runs progressive teacher acquisition and fixed development
+checks after verified readiness; it does not qualify a causal student or handoff.
 """
 
 from __future__ import annotations
@@ -228,6 +230,23 @@ def restore_reference(runner, data):
 
 TERRAIN_VERSION = "go2_operator_terrain_teacher_v1"
 TERRAIN_READINESS_STEPS = 1000
+TERRAIN_TRAINING_VERSION = "go2_operator_terrain_progressive_v1"
+TERRAIN_CHECK_UPDATES = (500, 1500, 3000)
+TERRAIN_COURSE_REWARDS = (
+    "waypoint_velocity_tracking",
+    "waypoint_heading_alignment",
+    "stationary_velocity_tracking",
+    "route_cross_track_excess",
+    "completed_course",
+    "intermediate_milestone",
+    "base_clearance_below",
+    "action_rate_l2",
+    "ang_vel_xy_l2",
+    "flat_orientation_l2",
+    "stable_orientation_l2",
+    "joint_deviation_l2",
+    "joint_torques_l2",
+)
 TERRAIN_ARTIFACTS = (
     "trace.npz",
     "terrain_readiness.pt",
@@ -692,6 +711,850 @@ def run_terrain_readiness(args, output, agent, saved, protocol):
                     write_json(
                         output / f"{name}_cleanup_error.json", {"error": str(error)}
                     )
+
+
+def validate_readiness_report(path, identity):
+    """Consume completed engineering evidence, never its weights as a trained teacher."""
+    import numpy as np
+    import torch
+
+    try:
+        from .operator_benchmark import validate_motor_trace
+    except ImportError:
+        from operator_benchmark import validate_motor_trace
+
+    report = json.loads(path.read_text())
+    prior = report.get("source_identity", {})
+    if (
+        report.get("status") != "READINESS_PASS"
+        or report.get("interface_version") != TERRAIN_VERSION
+        or report.get("worker") != {"returncode": 0, "timed_out": False}
+        or report.get("environment_transitions") != 80000
+        or report.get("exact_action_and_value_parity_comparisons") != 80000
+        or report.get("update", {}).get("adam_steps") != 20
+        or report.get("update", {}).get("ppo_updates") != 1
+        or report.get("behavior_validated") is not False
+        or report.get("promoted") is not False
+        or any(
+            prior.get(k) != identity[k]
+            for k in ("checkpoint", "agent", "environment", "mesh_flat_report")
+        )
+        or list(path.parent.glob("*_cleanup_error.json"))
+    ):
+        raise ValueError("A complete source-bound READINESS_PASS is required")
+    protocol = json.loads((path.parent / "readiness_protocol.json").read_text())
+    if protocol.get("source_identity") != prior:
+        raise ValueError("Readiness protocol/report identity mismatch")
+    # These are the explicit training-adapter changes. Geometry, motor, scan,
+    # route, physical scoring and every other producer must remain unchanged.
+    changed = {
+        f"scripts/rsl_rl/{name}.py"
+        for name in (
+            "operator_train",
+            "operator_command",
+            "operator_curriculum",
+            "operator_rewards",
+            "operator_retention",
+        )
+    } | {
+        "source/parkour_lab/parkour_lab/tasks/manager_based/parkour_lab/mdp/commands.py",
+        "source/parkour_lab/parkour_lab/tasks/manager_based/parkour_lab/mdp/curriculums/curriculums.py",
+    }
+    producers = prior.get("producers", {})
+    if set(producers) != set(identity["producers"]) or any(
+        value != identity["producers"][name]
+        for name, value in producers.items()
+        if name not in changed
+    ):
+        raise ValueError(
+            "Readiness producer drift outside the declared training adapters"
+        )
+    if set(report.get("sha256", {})) != set(TERRAIN_ARTIFACTS) or any(
+        file_sha256(path.parent / name) != report["sha256"][name]
+        for name in TERRAIN_ARTIFACTS
+    ):
+        raise ValueError("Readiness artifacts are missing or changed")
+    with np.load(path.parent / "trace.npz", allow_pickle=False) as archive:
+        trace = {
+            k: archive[k]
+            for k in (
+                "action",
+                "joint_target",
+                "default_joint_position",
+                "observation",
+                "command",
+                "terminated",
+                "time_out",
+            )
+        }
+        if trace["action"].shape != (1000, 80, 12):
+            raise ValueError("Incomplete readiness rollout")
+        validate_motor_trace(trace)
+        scan = torch.from_numpy(archive["terrain_observation"].reshape(-1, 264))
+        validate_terrain_scan(scan, num_envs=80000)
+    data = torch.load(
+        path.parent / "terrain_readiness.pt", map_location="cpu", weights_only=True
+    )
+    state = data["model_state_dict"]
+    adam = data["optimizer_state_dict"]["state"]
+    if (
+        data.get("readiness_only") is not True
+        or data.get("learning_updates") != 1
+        or len(adam) != len(state)
+        or any(not torch.isfinite(v).all() for v in state.values())
+        or any(
+            s["step"].item() != 20
+            or not torch.isfinite(s["exp_avg"]).all()
+            or not torch.isfinite(s["exp_avg_sq"]).all()
+            for s in adam.values()
+        )
+        or any(
+            not torch.count_nonzero(state[f"{branch}.0.projection.weight"])
+            for branch in ("actor", "critic")
+        )
+    ):
+        raise ValueError("Readiness checkpoint lacks finite learning evidence")
+    return {
+        "report_sha256": file_sha256(path),
+        "artifacts": report["sha256"],
+        "source_identity": prior,
+        "use": "prerequisite only; fresh zero-fusion source warm start",
+    }
+
+
+def terrain_teacher_configs(saved, agent, args, *, evaluation=False):
+    """One opt-in objective on the verified motor/scan and native course matrix."""
+    from isaaclab.managers import (
+        ObservationGroupCfg,
+        ObservationTermCfg,
+        RewardTermCfg,
+        TerminationTermCfg,
+        RecorderManagerBaseCfg,
+    )
+    from parkour_lab.tasks.manager_based.parkour_lab.parkour_lab_env_cfg import (
+        ParkourLabEnvCfg,
+    )
+
+    try:
+        from . import operator_command as binding
+        from .operator_rewards import teacher_physical_failure
+    except ImportError:
+        import operator_command as binding
+        from operator_rewards import teacher_physical_failure
+
+    cfg, runner_cfg = terrain_readiness_configs(saved, agent, args)
+    courses = ParkourLabEnvCfg()
+    cfg.terrain_teacher_evaluation = evaluation
+    cfg.scene.num_envs = 160 if evaluation else args.num_envs
+    cfg.seed = 43 if evaluation else args.seed
+    cfg.scene.terrain.terrain_generator.seed = cfg.seed
+    cfg.scene.terrain.max_init_terrain_level = 0
+    cfg.events.initialize_terrain_levels.func = binding.initialize_teacher_levels
+    cfg.commands.base_velocity.class_type = binding.TerrainTeacherCommand
+    cfg.body_twist_command_name = "base_velocity"
+    cfg.parkour_termination_names = {
+        "chassis_contact": "course_chassis",
+        "fell_below_course": "course_fall",
+        "off_route": "course_off_route",
+        "success": "course_success",
+        "wall_time_out": None,
+    }
+    cfg.parkour_extra_failure_terms = ("base_contact", "persistent_tilt")
+    cfg.terminations.course_success.func = binding.teacher_course_success
+    cfg.terminations.course_off_route.func = binding.teacher_course_off_route
+    cfg.terminations.persistent_tilt = TerminationTermCfg(
+        func=binding.PersistentTilt, params={"angle_deg": 70.0, "duration_s": 0.5}
+    )
+    cfg.terminations.operator_workspace = TerminationTermCfg(
+        func=binding.teacher_operator_workspace, params={"margin_m": 0.5}, time_out=True
+    )
+    rewards = {}
+    for prefix, operator, terms in (
+        ("operator", True, vars(cfg.rewards).items()),
+        (
+            "course",
+            False,
+            ((name, getattr(courses.rewards, name)) for name in TERRAIN_COURSE_REWARDS),
+        ),
+    ):
+        for name, term in terms:
+            if isinstance(term, RewardTermCfg) and term.weight:
+                rewards[f"{prefix}_{name}"] = RewardTermCfg(
+                    func=binding.RoleReward,
+                    weight=term.weight,
+                    params={"term": copy.deepcopy(term), "operator": operator},
+                )
+    rewards["physical_failure"] = RewardTermCfg(
+        func=teacher_physical_failure, weight=-10.0
+    )
+    cfg.rewards = rewards
+    cfg.curriculum = {
+        "terrain_levels": copy.deepcopy(courses.curriculum.terrain_levels)
+    }
+    cfg.curriculum["terrain_levels"].func = binding.TerrainTeacherCurriculum
+    mask = ObservationGroupCfg(concatenate_terms=True, enable_corruption=False)
+    mask.role = ObservationTermCfg(func=binding.terrain_operator_mask)
+    cfg.observations.operator_mask = mask
+    if evaluation:
+        # Same physical scoring as stock benchmark, including no extra tilt gate.
+        cfg.curriculum = None
+        cfg.terminations.persistent_tilt = None
+        cfg.terminations.operator_workspace = None
+        cfg.rewards = {}
+        cfg.observations.policy.enable_corruption = False
+        cfg.episode_length_s = 20.02
+    else:
+        cfg.recorders = RecorderManagerBaseCfg()
+    runner_cfg.update(
+        num_steps_per_env=24,
+        max_iterations=args.iterations,
+        experiment_name="go2_operator_terrain_teacher",
+        run_name=TERRAIN_TRAINING_VERSION,
+    )
+    return cfg, runner_cfg
+
+
+def make_terrain_runner(env, runner_cfg, output, source_state, protocol):
+    """Native RSL rollout/logging/checkpoint loop with explicit construction only."""
+    import torch
+    from rsl_rl.algorithms import PPO
+    from rsl_rl.runners import OnPolicyRunner
+
+    try:
+        from .operator_retention import MovingRetentionUpdate
+    except ImportError:
+        from operator_retention import MovingRetentionUpdate
+
+    class TerrainRunner(OnPolicyRunner):
+        def _construct_algorithm(self, obs):
+            if self.is_distributed or self.alg_cfg.get("class_name") != "PPO":
+                raise ValueError(
+                    "Terrain training supports pinned single-device PPO only"
+                )
+            policy, reference = build_terrain_policy(obs, source_state)
+            with torch.no_grad():
+                if not torch.equal(
+                    policy.act_inference(obs), reference.act_inference(obs)
+                ) or not torch.equal(policy.evaluate(obs), reference.evaluate(obs)):
+                    raise ValueError(
+                        "Initial terrain teacher action/value parity failed"
+                    )
+            algorithm_cfg = dict(self.alg_cfg)
+            algorithm_cfg.pop("class_name")
+            alg = PPO(policy, device=self.device, **algorithm_cfg)
+            alg.init_storage("rl", env.num_envs, self.num_steps_per_env, obs, [12])
+            self.retention_update = MovingRetentionUpdate(
+                alg, reference_state=source_state, terrain_operator=True
+            )
+            alg.update = self.retention_update
+            return alg
+
+        def save(self, path, infos=None):
+            updates = self.retention_update.updates
+            if updates != self.current_learning_iteration:
+                raise ValueError("Terrain checkpoint iteration/update mismatch")
+            validate_teacher_adam(
+                self.alg.policy.state_dict(),
+                self.alg.optimizer.state_dict(),
+                updates * 20,
+            )
+            curriculum = env.unwrapped.terrain_teacher_curriculum
+            exposure = env.exposure.report()
+            exposure.update(
+                background_sampler_version=exposure["version"],
+                version=f"{TERRAIN_TRAINING_VERSION}:operator_commands",
+                sequence_sampler=sequence_manifest(),
+                scope="Executed operator-lane commands only; v3 chains with v2 background sampling",
+                workspace_censored_episodes=int(env.workspace_censored.item()),
+            )
+            metadata = {
+                "version": TERRAIN_TRAINING_VERSION,
+                "interface_version": TERRAIN_VERSION,
+                "source_identity": protocol["source_identity"],
+                "learning_updates": updates,
+                "environment_transitions": updates
+                * env.num_envs
+                * self.num_steps_per_env,
+                "readiness_only": False,
+                "behavior_validated": False,
+            }
+            super().save(
+                path,
+                {
+                    "terrain_training": metadata,
+                    "curriculum": curriculum.state_dict(),
+                    "operator_exposure": exposure,
+                },
+            )
+            write_json(output / "command_exposure.json", exposure)
+            write_json(
+                output / "course_outcomes.json",
+                {
+                    "axis_order": [
+                        "physical_column (family*10+variant)",
+                        "attempted_level",
+                        "outcome",
+                    ],
+                    "outcome_order": curriculum.outcome_names,
+                    "counts": curriculum.outcomes.cpu().tolist(),
+                    "scope": "Completed training episodes only; course lanes only; not heldout mastery",
+                },
+            )
+            write_json(output / "training_progress.json", metadata)
+
+    runner = TerrainRunner(
+        env, copy.deepcopy(runner_cfg), str(output), runner_cfg["device"]
+    )
+    # Terrain update numbering is separate from the stock source's iteration8500.
+    runner.current_learning_iteration = 1
+    return runner
+
+
+def validate_teacher_adam(state, optimizer, expected_steps):
+    """Finite complete native Adam, with every parameter updated as declared."""
+    import torch
+
+    params = [p for group in optimizer["param_groups"] for p in group["params"]]
+    states = optimizer["state"]
+    if (
+        len(params) != len(set(params))
+        or len(params) != len(state)
+        or set(states) != set(params)
+        or any(not torch.isfinite(value).all() for value in state.values())
+        or (state["std"] <= 0).any()
+        or any(
+            s["step"].item() != expected_steps
+            or not torch.isfinite(s["exp_avg"]).all()
+            or not torch.isfinite(s["exp_avg_sq"]).all()
+            for s in states.values()
+        )
+    ):
+        raise ValueError("Invalid finite teacher weights/Adam/update accounting")
+
+
+def load_terrain_teacher(path, observations, source_state, identity):
+    """Strict known 312-input loader; readiness/stock/legacy RMA are not teachers."""
+    import torch
+
+    data = torch.load(path, map_location="cpu", weights_only=True)
+    metadata = data.get("infos", {}).get("terrain_training", {})
+    updates = metadata.get("learning_updates")
+    if (
+        metadata.get("version") != TERRAIN_TRAINING_VERSION
+        or metadata.get("interface_version") != TERRAIN_VERSION
+        or metadata.get("source_identity") != identity
+        or metadata.get("readiness_only") is not False
+        or type(updates) is not int
+        or updates < 1
+        or data.get("iter") != updates
+    ):
+        raise ValueError("Not a source-bound learned terrain-teacher checkpoint")
+    policy, _ = build_terrain_policy(observations, source_state)
+    policy.load_state_dict(data["model_state_dict"], strict=True)
+    validate_teacher_adam(
+        data["model_state_dict"], data["optimizer_state_dict"], updates * 20
+    )
+    return policy.eval(), metadata
+
+
+def evaluate_terrain_teacher(raw, policy, output):
+    """Replay unchanged physical scorers on the actual terrain-conditioned policy."""
+    import numpy as np
+    import torch
+    from parkour_lab.tasks.manager_based.parkour_lab.parkour_lab_env_cfg import (
+        ParkourLabEnvCfg,
+    )
+
+    try:
+        from .operator_benchmark import (
+            course_command,
+            command_observation,
+            validate_motor_trace,
+        )
+        from .operator_benchmark_core import (
+            command_schedule,
+            score_trace,
+            score_course_trace,
+        )
+    except ImportError:
+        from operator_benchmark import (
+            course_command,
+            command_observation,
+            validate_motor_trace,
+        )
+        from operator_benchmark_core import (
+            command_schedule,
+            score_trace,
+            score_course_trace,
+        )
+
+    labels, commands = command_schedule(4)
+    schedule = torch.as_tensor(commands, device=raw.device)
+    operator_ids = torch.arange(0, 160, 4, device=raw.device)
+    initial = {
+        "initial_position": raw.scene["robot"].data.root_pos_w.cpu().numpy().copy(),
+        "initial_quaternion": raw.scene["robot"].data.root_quat_w.cpu().numpy().copy(),
+        "env_origins": raw.scene.env_origins.cpu().numpy().copy(),
+        "terrain_levels": raw.scene.terrain.terrain_levels.cpu().numpy().copy(),
+        "terrain_columns": raw.scene.terrain.terrain_types.cpu().numpy().copy(),
+    }
+    if not np.array_equal(
+        initial["terrain_levels"], np.tile([0, 1, 3, 6], 40)
+    ) or not np.array_equal(initial["terrain_columns"], np.repeat([0, 10, 20, 30], 40)):
+        raise ValueError("Unexpected teacher evaluation family/level assignment")
+    capture = raw.operator_capture
+    capture.enabled = capture.motor_parity = True
+    capture.course = {"teacher_development": True}
+    finished = torch.zeros(160, dtype=torch.bool, device=raw.device)
+    scans = []
+    with torch.inference_mode():
+        for step in range(1000):
+            desired = course_command(
+                raw, {"course": {"target_speed": 0.55}}, step, finished
+            )
+            desired[operator_ids] = schedule[step]
+            observation = command_observation(raw, desired)
+            terrain = raw.observation_manager.compute_group("terrain")
+            validate_terrain_scan(terrain, num_envs=160)
+            obs = {"policy": observation, "terrain": terrain}
+            capture.observation = observation.clone()
+            scans.append(terrain.cpu().numpy().copy())
+            action = policy.act_inference(obs)
+            if not torch.isfinite(action).all():
+                raise ValueError(f"Nonfinite learned teacher action at step {step}")
+            _, _, terminated, truncated, _ = raw.step(action)
+            finished |= terminated | truncated
+            if step % 250 == 0:
+                print(f"Teacher development evaluation: {step}/1000", flush=True)
+    capture.enabled = False
+    trace = capture.finish()
+    trace.update(initial, terrain_observation=np.stack(scans))
+    np.savez_compressed(output / "trace.npz", **trace)
+    motor = validate_motor_trace(trace)
+
+    def sliced(ids):
+        return {
+            k: value[ids] if k in initial else value[:, ids]
+            for k, value in trace.items()
+        }
+
+    operator = score_trace(sliced(np.arange(0, 160, 4)), labels)
+    native = ParkourLabEnvCfg()
+    layout = native.events.reset_routes.params["terrain_layout"]
+    cfg = native.parkour_curriculum
+    results, metadata = {}, {}
+    for family in range(4):
+        for level in (1, 3, 6):
+            ids = np.flatnonzero(
+                (initial["terrain_columns"] == family * 10)
+                & (initial["terrain_levels"] == level)
+            )
+            key = f"{cfg.families[family].name}_L{level}"
+            course = {
+                "family_index": family,
+                "difficulty_index": level,
+                "geometry_variant_index": 0,
+                "course": cfg.course(family, level, 0).metadata(),
+                "env_origins": initial["env_origins"][ids].tolist(),
+                "contact_body_names": list(raw.scene["contact_forces"].body_names),
+                "require_stable_finish": True,
+            }
+            metadata[key] = course
+            results[key] = score_course_trace(sliced(ids), course)
+    measurement = {
+        "operator": operator,
+        "courses": results,
+        "motor": motor,
+        "course_metadata": metadata,
+        "family_by_column": list(layout.family_index_by_column),
+        "scope": "Seed 43 teacher development; canonical variant 0; not held-out student/handoff/exit evidence",
+    }
+    write_json(output / "measurement_report.json", measurement)
+    return {
+        "status": "MEASURED",
+        "operator_status": operator["status"],
+        "course_statuses": {key: value["status"] for key, value in results.items()},
+        "sha256": {
+            name: file_sha256(output / name)
+            for name in ("trace.npz", "measurement_report.json")
+        },
+        "promoted": False,
+        "exit_gate_passed": False,
+    }
+
+
+def run_terrain_teacher(args, output, saved, agent, protocol):
+    """Supervised native training or fixed-checkpoint evaluation; no new PPO loop."""
+    app = env = None
+    progress = {"stage": "source_validation"}
+    try:
+        if (
+            terrain_source_identity(args) != protocol["source_identity"]
+            or file_sha256(args.readiness_report)
+            != protocol["readiness"]["report_sha256"]
+        ):
+            raise ValueError(
+                "Terrain training source/prerequisite changed after preflight"
+            )
+        for package in ("isaaclab", "isaacsim", "rsl-rl-lib", "torch"):
+            if importlib.metadata.version(package) != protocol["mesh_flat"][
+                "packages"
+            ].get(package):
+                raise ValueError(f"Runtime {package} differs from verified physics")
+        from isaaclab.app import AppLauncher
+
+        app = AppLauncher(headless=True, livestream=0, device=args.device).app
+        import torch
+        from isaaclab.envs import ManagerBasedRLEnv
+        from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+
+        try:
+            from .operator_benchmark import mesh_identity
+        except ImportError:
+            from operator_benchmark import mesh_identity
+
+        evaluation = args.terrain_evaluate_checkpoint is not None
+        cfg, runner_cfg = terrain_teacher_configs(
+            saved, agent, args, evaluation=evaluation
+        )
+        params = output / "params"
+        params.mkdir(exist_ok=True)
+        # Serialize before managers replace function classes with instances.
+        (params / "env.yaml").write_text(yaml.dump(cfg.to_dict(), sort_keys=False))
+        (params / "agent.yaml").write_text(yaml.dump(runner_cfg, sort_keys=False))
+        interface = {
+            "version": TERRAIN_VERSION,
+            "training_version": TERRAIN_TRAINING_VERSION,
+            "inputs": ["policy:48", "terrain:264"],
+            "retention_metadata_not_policy_input": "operator_mask:1",
+            "actions": "12 raw actions; default_joint_position + 0.25*action; no clipping",
+            "source_identity": protocol["source_identity"],
+            "scope": "Privileged teacher, not a causal student",
+        }
+        write_json(params / "interface.json", interface)
+        progress["stage"] = "environment_setup"
+        raw = ManagerBasedRLEnv(cfg=cfg)
+        env = raw
+        wrapped = RslRlVecEnvWrapper(raw, clip_actions=None)
+        env = wrapped
+        if (
+            abs(raw.step_dt - DT) > 1e-9
+            or tuple(raw.observation_manager.active_terms["policy"])
+            != OBSERVATION_TERMS
+            or raw.action_manager.total_action_dim != 12
+            or list(raw.scene["robot"].joint_names)
+            != protocol["mesh_flat"]["joint_names"]
+        ):
+            raise ValueError(
+                "Terrain training changed the verified motor/observation contract"
+            )
+        geometry = mesh_identity(raw)
+        obs = wrapped.get_observations()
+        validate_terrain_scan(obs["terrain"], num_envs=raw.num_envs)
+        source = load_reference_checkpoint(args.checkpoint, agent)["model_state_dict"]
+        if evaluation:
+            progress["stage"] = "teacher_evaluation"
+            if (
+                file_sha256(args.terrain_evaluate_checkpoint)
+                != protocol["evaluation_checkpoint_sha256"]
+            ):
+                raise ValueError("Evaluation checkpoint changed after selection")
+            policy, metadata = load_terrain_teacher(
+                args.terrain_evaluate_checkpoint,
+                obs,
+                source,
+                protocol["source_identity"],
+            )
+            result = evaluate_terrain_teacher(raw, policy, output)
+            result.update(
+                checkpoint_sha256=file_sha256(args.terrain_evaluate_checkpoint),
+                learning_updates=metadata["learning_updates"],
+            )
+        else:
+            progress["stage"] = "teacher_learning"
+            env = OperatorExposureWrapper(wrapped, operator_only=True)
+            if torch.count_nonzero(raw.scene.terrain.terrain_levels) or set(
+                raw.scene.terrain.terrain_types.tolist()
+            ) != set(range(40)):
+                raise ValueError(
+                    "Teacher acquisition must start all 40 production columns at L0"
+                )
+            runner = make_terrain_runner(env, runner_cfg, output, source, protocol)
+            runner.learn(
+                num_learning_iterations=args.iterations, init_at_random_ep_len=False
+            )
+            if runner.retention_update.updates != args.iterations:
+                raise ValueError("Incomplete declared terrain-learning budget")
+            result = {
+                "status": "TRAINED",
+                "learning_updates": args.iterations,
+                "environment_transitions": args.num_envs * 24 * args.iterations,
+                "checkpoints": {
+                    str(i): file_sha256(output / f"model_{i}.pt")
+                    for i in TERRAIN_CHECK_UPDATES
+                },
+                "promoted": False,
+                "exit_gate_passed": False,
+            }
+        if terrain_source_identity(args) != protocol["source_identity"]:
+            raise ValueError("Terrain training sources changed during execution")
+        result.update(source_identity=protocol["source_identity"], mesh=geometry)
+        write_json(output / "training_status.json", result)
+    except Exception as error:
+        report_terrain_readiness_error(output, error, progress)
+    finally:
+        for name, resource in (("environment", env), ("application", app)):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception as error:
+                    write_json(
+                        output / f"{name}_cleanup_error.json", {"error": str(error)}
+                    )
+
+
+def terrain_teacher_main(args, parser):
+    if (
+        args.terrain_readiness
+        or args.iterations != 3000
+        or args.num_envs != 3200
+        or args.seed != 42
+        or args.curriculum != VERSION
+        or args.refinement_profile != "source"
+        or args.mesh_flat_report is None
+        or args.readiness_report is None
+        or args.skip_check
+        or args.moving_retention
+        or any(
+            getattr(args, name) is not None
+            for name in (
+                "check_offsets",
+                "baseline_report",
+                "resume_retention_reference",
+                "zero_command_reference_report",
+                "reversal_stop_probe",
+            )
+        )
+        or not math.isfinite(args.timeout)
+        or args.timeout <= 0
+        or (args.validate_only and args.worker_output is not None)
+        or (args.terrain_evaluate_checkpoint is not None and args.worker_output is None)
+    ):
+        parser.error(
+            "Terrain learning requires --iterations 3000 --num-envs 3200 --seed 42 --readiness-report --mesh-flat-report; no legacy refinement/resume flags"
+        )
+    try:
+        try:
+            from .operator_benchmark import validate_mesh_flat_report
+        except ImportError:
+            from operator_benchmark import validate_mesh_flat_report
+        args.checkpoint = args.checkpoint.resolve(strict=True)
+        args.mesh_flat_report = args.mesh_flat_report.resolve(strict=True)
+        args.readiness_report = args.readiness_report.resolve(strict=True)
+        agent = read_yaml_data(args.checkpoint.parent / "params/agent.yaml")
+        saved = read_yaml_data(args.checkpoint.parent / "params/env.yaml")
+        source = load_reference_checkpoint(args.checkpoint, agent)
+        select_profile(saved, agent, "source")
+        if importlib.metadata.version("rsl-rl-lib") != "3.1.2":
+            raise ValueError("Terrain learning requires RSL-RL 3.1.2")
+        mesh = validate_mesh_flat_report(args.mesh_flat_report, args.checkpoint)
+        identity = terrain_source_identity(args)
+        readiness = validate_readiness_report(args.readiness_report, identity)
+        import torch
+
+        with torch.random.fork_rng(devices=[]):
+            policy, _ = build_terrain_policy(
+                {"policy": torch.zeros(4, 48), "terrain": torch.ones(4, 264)},
+                source["model_state_dict"],
+            )
+    except Exception as error:
+        parser.error(f"Terrain learning preflight failed: {error}")
+    if args.validate_only:
+        print(
+            "Validated readiness/source and 312-input teacher construction. Progressive training and learned behavior remain UNRUN."
+        )
+        return 0
+    if args.worker_output is not None:
+        try:
+            protocol = json.loads(
+                (args.worker_output / "terrain_protocol.json").read_text()
+            )
+            run_terrain_teacher(args, args.worker_output, saved, agent, protocol)
+        except Exception as error:
+            report_terrain_readiness_error(
+                args.worker_output, error, {"stage": "worker_startup"}
+            )
+        return 0
+    output = None
+    try:
+        args.output_parent.mkdir(parents=True, exist_ok=True)
+        output = Path(
+            tempfile.mkdtemp(prefix="operator_terrain_teacher_", dir=args.output_parent)
+        ).resolve()
+        return supervise_terrain_teacher(args, output, identity, readiness, mesh)
+    except Exception as error:
+        print(f"Terrain teacher supervisor ERROR: {error}", file=sys.stderr, flush=True)
+        if output is not None:
+            try:
+                write_json(
+                    output / "report.json",
+                    {"status": "ERROR", "error": str(error), "promoted": False},
+                )
+            except OSError as publication_error:
+                print(
+                    f"Could not publish error report: {publication_error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        return 2
+
+
+def supervise_terrain_teacher(args, output, identity, readiness, mesh):
+    """Keep measured behavioral failures; stop on invalid/missing measurements."""
+    write_run_provenance(output, Path(__file__))
+    protocol = {
+        "version": TERRAIN_TRAINING_VERSION,
+        "source_identity": identity,
+        "readiness": readiness,
+        "mesh_flat": mesh,
+        "num_envs": 3200,
+        "seed": 42,
+        "rollout_steps": 24,
+        "learning_updates": 3000,
+        "environment_transitions": 230400000,
+        "initial_level": 0,
+        "max_level": 6,
+        "roles": "fixed IDs%4==0 operator; remaining course, including L0 replay; role never enters actor/critic",
+        "operator_objective": "source rewards plus all-operator-row frozen 8500 soft mean retention (coefficient 0.1, raw action scale 0.1), including pivots and stops; randomized v3 chains",
+        "course_objective": list(TERRAIN_COURSE_REWARDS),
+        "physical_failure_impulse": -10.0,
+        "training_tilt_cutoff": "70 degrees sustained for 0.5 s; reset-safe; disabled for evaluation",
+        "operator_workspace": "Training-only neutral timeout when any body center enters the 0.5 m edge margin of its L0 tile; real physical failure wins; counts saved separately; disabled for evaluation",
+        "check_updates": list(TERRAIN_CHECK_UPDATES),
+        "check_seed": 43,
+        "checks": "after all training; actual teacher, 40 operator trials + 10 per family/level 1, 3, 6 at canonical variant 0; all results retained",
+        "scope": "Privileged teacher acquisition only; no live handoff/student/heldout/exit promotion",
+    }
+    write_json(output / "terrain_protocol.json", protocol)
+    command = [
+        sys.executable,
+        "-u",
+        str(Path(__file__).resolve()),
+        str(args.checkpoint),
+        "--terrain-train",
+        "--readiness-report",
+        str(args.readiness_report),
+        "--mesh-flat-report",
+        str(args.mesh_flat_report),
+        "--iterations",
+        "3000",
+        "--num-envs",
+        "3200",
+        "--seed",
+        "42",
+        "--device",
+        args.device,
+    ]
+    print(
+        f"Progressive terrain teacher: {output}; 3000 updates, then checks 500/1500/3000; no exit promotion",
+        flush=True,
+    )
+
+    def checked_worker(folder, extra, expected):
+        result = supervise(
+            command + extra + ["--worker-output", str(folder)],
+            folder,
+            timeout_s=args.timeout if expected == "TRAINED" else 1800,
+            report_filename="training_status.json",
+            valid_statuses=(expected, "ERROR"),
+        )
+        if result.get("status") == expected:
+            if (
+                result.get("source_identity") != identity
+                or terrain_source_identity(args) != identity
+                or list(folder.glob("*_cleanup_error.json"))
+            ):
+                result = {
+                    "status": "ERROR",
+                    "error": "Source or cleanup validation failed",
+                    "measurement_result": result,
+                }
+        return result
+
+    report = checked_worker(output, [], "TRAINED")
+    if report.get("status") == "TRAINED":
+        checks = {}
+        try:
+            if (
+                report.get("learning_updates") != 3000
+                or report.get("environment_transitions") != 230400000
+                or report.get("checkpoints")
+                != {
+                    str(i): file_sha256(output / f"model_{i}.pt")
+                    for i in TERRAIN_CHECK_UPDATES
+                }
+            ):
+                raise ValueError("Incomplete terrain training/checkpoint accounting")
+            for update in TERRAIN_CHECK_UPDATES:
+                checkpoint = output / f"model_{update}.pt"
+                folder = output / "teacher_check" / f"model_{update}"
+                folder.mkdir(parents=True)
+                write_json(
+                    folder / "terrain_protocol.json",
+                    {
+                        **protocol,
+                        "evaluation_checkpoint_sha256": file_sha256(checkpoint),
+                    },
+                )
+                result = checked_worker(
+                    folder,
+                    ["--terrain-evaluate-checkpoint", str(checkpoint)],
+                    "MEASURED",
+                )
+                if result.get("status") == "MEASURED" and (
+                    result.get("checkpoint_sha256") != file_sha256(checkpoint)
+                    or result.get("learning_updates") != update
+                    or result.get("sha256")
+                    != {
+                        name: file_sha256(folder / name)
+                        for name in ("trace.npz", "measurement_report.json")
+                    }
+                ):
+                    result = {
+                        "status": "ERROR",
+                        "error": "Teacher evaluation identity/artifact mismatch",
+                        "measurement_result": result,
+                    }
+                write_json(folder / "report.json", result)
+                checks[str(update)] = result
+                if result["status"] == "ERROR":
+                    # A compatibility/cleanup failure is not a measured policy
+                    # failure. Do not repeat an invalid expensive evaluation.
+                    break
+            report = {
+                "status": "COMPLETED"
+                if len(checks) == len(TERRAIN_CHECK_UPDATES)
+                and all(r["status"] == "MEASURED" for r in checks.values())
+                else "ERROR",
+                "training": report,
+                "teacher_checks": checks,
+                "checks_not_run": [
+                    i for i in TERRAIN_CHECK_UPDATES if str(i) not in checks
+                ],
+                "promoted": False,
+                "exit_gate_passed": False,
+                "scope": "COMPLETED means budget and measurements finished, not behavioral acceptance",
+            }
+        except Exception as error:
+            report = {
+                "status": "ERROR",
+                "error": str(error),
+                "training": report,
+                "teacher_checks": checks,
+            }
+    write_json(output / "report.json", report)
+    print(f"{report['status']}: {output / 'report.json'}", flush=True)
+    return 0 if report["status"] == "COMPLETED" else 2
 
 
 def terrain_readiness_main(args, parser):
@@ -1409,6 +2272,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument(
+        "--terrain-train",
+        action="store_true",
+        help="Progressive L0-to-L6 teacher acquisition after verified readiness; no exit promotion",
+    )
+    parser.add_argument(
+        "--readiness-report",
+        type=Path,
+        help="Source-bound completed terrain-readiness report",
+    )
+    parser.add_argument(
+        "--terrain-evaluate-checkpoint", type=Path, help=argparse.SUPPRESS
+    )
+    parser.add_argument(
         "--terrain-readiness",
         action="store_true",
         help="Validate a terrain-conditioned warm start and one PPO update on mixed L0/L1; not behavior acceptance",
@@ -1416,7 +2292,7 @@ def main(argv=None):
     parser.add_argument(
         "--mesh-flat-report",
         type=Path,
-        help="Raw checkpoint-bound mesh-flat prerequisite for --terrain-readiness",
+        help="Raw checkpoint-bound mesh-flat prerequisite for --terrain-readiness or --terrain-train",
     )
     parser.add_argument(
         "--refinement-profile",
@@ -1473,7 +2349,7 @@ def main(argv=None):
     parser.add_argument(
         "--validate-only",
         action="store_true",
-        help="v3 or terrain-readiness CPU preflight only; no output or simulator launch",
+        help="v3, terrain-readiness or terrain-training CPU preflight only; no output or simulator launch",
     )
     parser.add_argument(
         "--output-parent",
@@ -1493,10 +2369,19 @@ def main(argv=None):
     )
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    if args.terrain_train:
+        return terrain_teacher_main(args, parser)
+    if (
+        args.readiness_report is not None
+        or args.terrain_evaluate_checkpoint is not None
+    ):
+        parser.error("Terrain learning/evaluation arguments require --terrain-train")
     if args.terrain_readiness:
         return terrain_readiness_main(args, parser)
     if args.mesh_flat_report is not None:
-        parser.error("--mesh-flat-report requires --terrain-readiness")
+        parser.error(
+            "--mesh-flat-report requires --terrain-readiness or --terrain-train"
+        )
     if (args.curriculum == SEQUENCE_VERSION) != (args.reversal_stop_probe is not None):
         parser.error("v3 and --reversal-stop-probe must be selected together")
     if args.reversal_stop_probe is not None and (

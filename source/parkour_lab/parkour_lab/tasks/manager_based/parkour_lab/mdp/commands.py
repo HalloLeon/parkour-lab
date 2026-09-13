@@ -593,6 +593,14 @@ def get_requested_travel_direction_yaw_xy(env: ManagerBasedRLEnv) -> Tensor:
 def get_preferred_speed(env: ManagerBasedRLEnv) -> Tensor:
     """Return the unmodified speed stored in the external intent packet."""
 
+    # Explicit opt-in for the stock-motor terrain teacher. Its delivered twist
+    # already includes any route braking; never apply legacy assistance twice.
+    twist_name = getattr(getattr(env, "cfg", None), "body_twist_command_name", None)
+    if twist_name is not None:
+        command = env.command_manager.get_command(twist_name)
+        if command.ndim != 2 or command.shape[-1] != 3:
+            raise ValueError("Body-twist commands must be [vx, vy, wz]")
+        return torch.linalg.vector_norm(command[:, :2], dim=-1)
     return env.command_manager.get_command(INTENT_COMMAND_NAME)[:, 2]
 
 
@@ -605,6 +613,8 @@ def get_target_speed(env: ManagerBasedRLEnv) -> Tensor:
     """
 
     preferred_speed = get_preferred_speed(env)
+    if getattr(getattr(env, "cfg", None), "body_twist_command_name", None) is not None:
+        return preferred_speed
     # ObservationManager evaluates terms once for shape inference before the
     # first curriculum reset creates route state. At that point there is no
     # route context to condition on, so preserve the raw command semantics.
@@ -638,6 +648,12 @@ def get_target_speed(env: ManagerBasedRLEnv) -> Tensor:
 def get_target_yaw_rate(env: ManagerBasedRLEnv) -> Tensor:
     """Return the signed in-place yaw-rate command in radians per second."""
 
+    twist_name = getattr(getattr(env, "cfg", None), "body_twist_command_name", None)
+    if twist_name is not None:
+        command = env.command_manager.get_command(twist_name)
+        if command.ndim != 2 or command.shape[-1] != 3:
+            raise ValueError("Body-twist commands must be [vx, vy, wz]")
+        return command[:, 2]
     return env.command_manager.get_command(INTENT_COMMAND_NAME)[:, 3]
 
 

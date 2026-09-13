@@ -220,9 +220,11 @@ class CommandExposure:
 class OperatorExposureWrapper:
     """Instrument the existing RSL wrapper; never alter actions or observations."""
 
-    def __init__(self, env):
+    def __init__(self, env, *, operator_only=False):
         self.env = env
         self.command_term = env.unwrapped.command_manager.get_term("base_velocity")
+        self.operator_only = operator_only
+        self.workspace_censored = torch.zeros((), dtype=torch.long, device=env.device)
         self.exposure = CommandExposure(
             env.device, getattr(self.command_term, "curriculum_version", VERSION)
         )
@@ -246,7 +248,14 @@ class OperatorExposureWrapper:
         category = self.command_term.category.clone()
         generation = self.command_term.command_counter.clone()
         observation, reward, done, extras = self.env.step(actions)
-        fractions = self.exposure.observe(category, generation, self.previous_done)
+        if self.operator_only:
+            self.workspace_censored += self.env.unwrapped.termination_manager.get_term(
+                "operator_workspace"
+            ).sum()
+        rows = self.command_term.operator_role if self.operator_only else slice(None)
+        fractions = self.exposure.observe(
+            category[rows], generation[rows], self.previous_done[rows]
+        )
         self.previous_done = done.bool().clone()
         extras = dict(extras)
         # RSL prefers "episode" if present, otherwise "log". Preserve every key.
