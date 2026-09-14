@@ -12,6 +12,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -28,6 +29,13 @@ FRAME_TERMS = (
     ("joint_pos", 12),
     ("joint_vel", 12),
     ("actions", 12),
+)
+CONTROLLER_ROLLOUT_COMMANDS = (
+    (0.0, 0.0, 0.0),
+    (0.55, 0.0, 0.5),
+    (0.55, 0.0, -0.5),
+    (0.0, 0.0, 0.0),
+    (0.55, 0.0, 0.0),
 )
 
 
@@ -599,3 +607,327 @@ def controller_preflight(checkpoint):
         "learning_updates": 0,
         "exit_allowed": False,
     }
+
+
+def _runtime_motor_binding(env):
+    """Bind the resolved native stock motor, not merely an action tensor width."""
+    robot = env.scene["robot"]
+    term = env.action_manager.get_term("joint_pos")
+    cfg, descriptor = term.cfg, term.IO_descriptor
+    joints = tuple(robot.joint_names)
+    default = robot.data.default_joint_pos
+    _check_tensor(default, (env.num_envs, 12), "runtime default joint position")
+    _check_tensor(
+        robot.data.default_joint_vel, default.shape, "runtime default joint velocity"
+    )
+    if (
+        tuple(env.action_manager.active_terms) != ("joint_pos",)
+        or env.action_manager.total_action_dim != 12
+        or len(joints) != 12
+        or len(set(joints)) != 12
+        or tuple(descriptor.joint_names) != joints
+        or cfg.asset_name != "robot"
+        or cfg.joint_names != [".*"]
+        or cfg.preserve_order
+        or not cfg.use_default_offset
+        or cfg.scale != 0.25
+        or descriptor.scale != 0.25
+        or cfg.clip is not None
+        or descriptor.clip is not None
+        or cfg.class_type.__name__ != "JointPositionAction"
+        or cfg.class_type.__module__ != "isaaclab.envs.mdp.actions.joint_actions"
+        or not torch.equal(default, default[0].expand_as(default))
+        or torch.any(robot.data.default_joint_vel != 0)
+        or not torch.equal(
+            torch.as_tensor(
+                descriptor.offset, device=default.device, dtype=default.dtype
+            ),
+            default[0],
+        )
+    ):
+        raise ValueError(
+            "Native stock joint order, default pose/velocity or action transform differs"
+        )
+    actuators = {}
+    covered = []
+    for name, actuator in robot.actuators.items():
+        covered.extend(actuator.joint_names)
+        parameters = {}
+        for parameter in (
+            "stiffness",
+            "damping",
+            "effort_limit",
+            "velocity_limit",
+            "effort_limit_sim",
+            "velocity_limit_sim",
+            "armature",
+            "friction",
+        ):
+            value = getattr(actuator, parameter)
+            _check_tensor(value, (env.num_envs, len(actuator.joint_names)), parameter)
+            parameters[parameter] = value.detach().cpu().tolist()
+        actuators[name] = {
+            "joint_names": list(actuator.joint_names),
+            "configuration": actuator.cfg.to_dict(),
+            "resolved_parameters": parameters,
+        }
+    if sorted(covered) != sorted(joints):
+        raise ValueError("Native actuators must cover each motor joint exactly once")
+    binding = {
+        "joint_names": list(joints),
+        "default_position_rad": default[0].cpu().tolist(),
+        "action": cfg.to_dict(),
+        "actuators": actuators,
+        "step_dt_s": env.step_dt,
+        "physics_dt_s": env.physics_dt,
+        "decimation": env.cfg.decimation,
+    }
+    digest = hashlib.sha256(
+        json.dumps(binding, sort_keys=True, allow_nan=False).encode()
+    ).hexdigest()
+    return binding, digest
+
+
+def run_controller_rollout(env, actor, checkpoint_sha256, *, is_running, steps=200):
+    """Bounded native integration check; caller owns reset, artifacts and cleanup.
+
+    Independent robot samples reach the adapter, whose actions alone drive the
+    existing native motor. The original actor is a same-frame shadow comparator.
+    No terrain tensor, reward, termination state or environment reaches act().
+    """
+    import numpy as np
+    from parkour_lab.learning.controller import ControllerSession, Sample
+
+    try:
+        from .operator_benchmark import command_observation, validate_motor_trace
+        from .operator_benchmark_core import DT, OBSERVATION_TERMS
+    except ImportError:
+        from operator_benchmark import command_observation, validate_motor_trace
+        from operator_benchmark_core import DT, OBSERVATION_TERMS
+
+    if (
+        type(steps) is not int
+        or steps != 200
+        or not 20 <= env.num_envs <= 80
+        or env.num_envs % 20
+        or env.cfg.decimation != 4
+        or not math.isclose(env.step_dt, DT, abs_tol=1e-9)
+        or not math.isclose(env.physics_dt, 0.005, abs_tol=1e-9)
+        or env.cfg.observations.policy.enable_corruption
+        or tuple(env.observation_manager.active_terms["policy"]) != OBSERVATION_TERMS
+        or actor.training
+        or any(p.requires_grad for p in actor.parameters())
+    ):
+        raise ValueError(
+            "Runtime fixture requires 200 steps, 20–80 environments, uncorrupted stock48 and frozen motor"
+        )
+    command = env.command_manager.get_term("base_velocity")
+    if (
+        command.cfg.heading_command
+        or command.cfg.rel_heading_envs
+        or command.cfg.rel_standing_envs
+    ):
+        raise ValueError(
+            "Runtime body twist must not receive heading or standing assistance"
+        )
+    binding, motor_hash = _runtime_motor_binding(env)
+    robot = env.scene["robot"].data
+    term = env.action_manager.get_term("joint_pos")
+    adapter = StockOperatorAdapter(
+        actor,
+        joint_names=tuple(binding["joint_names"]),
+        default_position_rad=robot.default_joint_pos[0],
+        artifact_sha256=checkpoint_sha256,
+        actuator_profile="native_motor_sha256:" + motor_hash,
+    )
+    session = ControllerSession(
+        adapter,
+        joint_names=adapter.spec.joint_names,
+        actuator_profile=adapter.spec.actuator_profile,
+        allow_privileged=True,
+    )
+    capture = env.operator_capture
+    if capture.enabled or capture.samples or capture.control_trace is not None:
+        raise ValueError("Runtime fixture requires a fresh disabled native recorder")
+
+    class TargetAudit:
+        def __init__(self):
+            self.target = self.raw = None
+            self.current, self.substeps, self.targets = [], [], []
+
+        def after_substep(self):
+            # This native hook precedes scene.update. Target/actuator command
+            # buffers are current; cached body/joint measurements are not.
+            if (
+                self.target is None
+                or len(self.current) >= 4
+                or any(
+                    not torch.equal(value, self.target)
+                    for value in (robot.joint_pos_target, term.processed_actions)
+                )
+                or not torch.equal(env.action_manager.action, self.raw)
+            ):
+                raise RuntimeError(
+                    "Native actuator substep differs from controller output"
+                )
+            self.current.append(robot.joint_pos_target.detach().cpu().numpy().copy())
+
+        def after_step(self):
+            if len(self.current) != 4 or not torch.equal(
+                robot.joint_pos_target, self.target
+            ):
+                raise RuntimeError(
+                    "Missing native substeps or changed pre-reset target"
+                )
+            self.substeps.append(np.stack(self.current, axis=1))
+            self.targets.append(self.target.detach().cpu().numpy().copy())
+            self.current = []
+            self.target = self.raw = None
+
+    audit = TargetAudit()
+    capture.motor_parity = True
+    capture.control_trace = audit
+    capture.enabled = True
+    reset = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    forced = torch.zeros_like(reset)
+    forced[: env.num_envs // 2] = True
+    terrain_samples = []
+    partial_resets = 0
+    try:
+        with torch.inference_mode():
+            for step in range(steps):
+                if not is_running():
+                    raise RuntimeError(
+                        f"Simulator closed at controller step {step}/{steps}"
+                    )
+                desired = robot.joint_pos.new_tensor(
+                    CONTROLLER_ROLLOUT_COMMANDS[step // 40]
+                ).repeat(env.num_envs, 1)
+                if 40 <= step < 120:
+                    desired[: env.num_envs // 2, 0] = (
+                        0.0  # Predeclared pure pivots alongside the arc rows.
+                    )
+                observation = command_observation(env, desired)
+                previous = env.action_manager.action
+                if not torch.equal(observation[:, 36:48], previous) or torch.any(
+                    previous[reset] != 0
+                ):
+                    raise RuntimeError(
+                        "Native delivered previous action/reset mismatch"
+                    )
+                values = (
+                    robot.root_lin_vel_b,
+                    robot.root_ang_vel_b,
+                    robot.projected_gravity_b,
+                    robot.joint_pos - robot.default_joint_pos,
+                    robot.joint_vel,
+                    previous,
+                )
+                independent = torch.cat((*values[:3], desired, *values[3:]), dim=-1)
+                if not torch.equal(independent, observation):
+                    raise RuntimeError(
+                        "Independent semantic provider differs from native stock48 observation"
+                    )
+                now = step * DT
+                samples = {
+                    name: Sample(
+                        value,
+                        now,
+                        torch.ones_like(reset),
+                        spec.units,
+                        spec.frame,
+                        spec.privileged,
+                    )
+                    for (name, spec), value in zip(
+                        adapter.spec.sensors.items(), values, strict=True
+                    )
+                }
+                output = session.step(
+                    time_s=now,
+                    command=desired,
+                    command_time_s=now,
+                    sensors=samples,
+                    reset_mask=reset,
+                )
+                if not torch.equal(output.raw_action, actor(observation)):
+                    raise RuntimeError(
+                        "Controller adapter differs from same-frame shadow actor"
+                    )
+                capture.observation = observation.detach().clone()
+                audit.target, audit.raw = output.position_rad, output.raw_action
+                if step == 99:
+                    env.episode_length_buf[forced] = env.max_episode_length - 1
+                # Native action processing remains the exact stock affine map;
+                # its four delivered target buffers must equal the named output.
+                observed, _, terminated, timed_out, _ = env.step(output.raw_action)
+                if len(audit.targets) != step + 1:
+                    raise RuntimeError(
+                        "Native post-step/pre-reset controller capture missing"
+                    )
+                reset = (terminated | timed_out).detach().clone()
+                partial_resets += int(reset.any() and not reset.all())
+                if step == 99 and (
+                    not timed_out[forced].all() or not reset.any() or reset.all()
+                ):
+                    raise RuntimeError(
+                        "Injected timeouts did not exercise a partial native reset"
+                    )
+                if "terrain" not in observed:
+                    raise RuntimeError("Missing privileged terrain fixture")
+                terrain = observed["terrain"]
+                _check_tensor(
+                    terrain, (env.num_envs, 264), "privileged terrain fixture"
+                )
+                if not torch.all((terrain[:, 132:] == 0) | (terrain[:, 132:] == 1)):
+                    raise RuntimeError(
+                        "Privileged terrain fixture validity is not binary"
+                    )
+                terrain_samples.append(terrain.detach().cpu().numpy().copy())
+    finally:
+        capture.enabled = False
+        capture.control_trace = None
+    trace = capture.finish()
+    motor_interface = validate_motor_trace(trace)
+    trace.update(
+        adapter_target=np.stack(audit.targets),
+        joint_target_substeps=np.stack(audit.substeps),
+        decision_time_s=np.arange(steps, dtype=np.float64) * DT,
+        forced_timeout=np.zeros((steps, env.num_envs), dtype=np.bool_),
+        terrain_observation=np.stack(terrain_samples),
+    )
+    trace["forced_timeout"][99, : env.num_envs // 2] = True
+    if not np.array_equal(trace["adapter_target"], trace["joint_target"]):
+        raise RuntimeError("Recorded pre-reset targets differ from adapter outputs")
+    return {
+        "status": "SIM_ADAPTER_PARITY_PASS",
+        "source_sha256": checkpoint_sha256,
+        "control_steps": steps,
+        "action_comparisons": steps * env.num_envs,
+        "substep_target_comparisons": steps * env.num_envs * 4 * 12,
+        "forced_timeout_step": 99,
+        "forced_timeout_count": env.num_envs // 2,
+        "partial_reset_steps": partial_resets,
+        "physical_failure_count": int(trace["terminated"].sum()),
+        "other_timeout_count": int(
+            (trace["time_out"] & ~trace["forced_timeout"]).sum()
+        ),
+        "motor_interface": motor_interface,
+        "motor_binding": binding,
+        "controller_manifest": session.manifest,
+        "interface_sha256": session.interface_sha256,
+        "motor_binding_sha256": motor_hash,
+        "command_phases": [list(p) for p in CONTROLLER_ROLLOUT_COMMANDS],
+        "pivot_env_ids": list(range(env.num_envs // 2)),
+        "pivot_phase_steps": [40, 120],
+        "exact_action_and_target_equality": True,
+        "phase_steps": 40,
+        "policy_inputs": "stock48 with simulator velocity; explicit oracle only",
+        "terrain_fixture_steps": len(terrain_samples),
+        "terrain_sampling": "env.step returned observation, after auto-reset; never delivered to actor",
+        "terrain_actor_access": False,
+        "capture": "four native target substeps and post-physics/pre-reset state",
+        "environment_transitions": steps * env.num_envs,
+        "learning_updates": 0,
+        "exit_allowed": False,
+        "scope": "interface integration, not locomotion/terrain acceptance or hardware delivery",
+    }, trace

@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import argparse
 import copy
+from contextlib import ExitStack
 import importlib.metadata
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -388,6 +390,7 @@ PROCEDURAL_TERRAIN_VERSION = "go2_operator_procedural_terrain_v1"
 # are not admitted by this wheel-only check. Do not use a broad 2.3.* match.
 PROCEDURAL_ISAACLAB_DISTRIBUTIONS = ("2.3.2", "2.3.2.post1")
 PROCEDURAL_EASY_DIFFICULTY = (0.05, 0.15)
+PROCEDURAL_ROLLOUT_STEPS = 200
 PROCEDURAL_SCAN_INTERFACE = {
     "version": "privileged_centered_height_valid_132_v1",
     "height_count": 132,
@@ -2213,8 +2216,125 @@ def run_retention_checks(checkpoints, output, device, baseline):
         return result, 2
 
 
+def validate_procedural_rollout(result, output, num_envs):
+    """Replay the saved motor/target evidence before accepting a worker receipt."""
+    import numpy as np
+    from parkour_lab.learning.controller import VERSION as controller_version
+
+    try:
+        from .operator_benchmark import validate_motor_trace
+        from .operator_student_bridge import CONTROLLER_ROLLOUT_COMMANDS
+    except ImportError:
+        from operator_benchmark import validate_motor_trace
+        from operator_student_bridge import CONTROLLER_ROLLOUT_COMMANDS
+
+    hashes = result["sha256"]
+    if set(hashes) != {"trace.npz", "resolved_env.yaml"} or any(
+        file_sha256(output / name) != digest for name, digest in hashes.items()
+    ):
+        raise ValueError("Rollout artifact hashes differ")
+    controller = result["controller"]
+    expected = {
+        "status": "SIM_ADAPTER_PARITY_PASS",
+        "control_steps": PROCEDURAL_ROLLOUT_STEPS,
+        "action_comparisons": PROCEDURAL_ROLLOUT_STEPS * num_envs,
+        "substep_target_comparisons": PROCEDURAL_ROLLOUT_STEPS * num_envs * 4 * 12,
+        "forced_timeout_step": PROCEDURAL_ROLLOUT_STEPS // 2 - 1,
+        "forced_timeout_count": num_envs // 2,
+        "terrain_fixture_steps": PROCEDURAL_ROLLOUT_STEPS,
+        "terrain_actor_access": False,
+        "exit_allowed": False,
+        "learning_updates": 0,
+        "phase_steps": 40,
+        "command_phases": [list(phase) for phase in CONTROLLER_ROLLOUT_COMMANDS],
+        "pivot_env_ids": list(range(num_envs // 2)),
+        "pivot_phase_steps": [40, 120],
+        "exact_action_and_target_equality": True,
+        "source_sha256": result["source_sha256"],
+        "environment_transitions": PROCEDURAL_ROLLOUT_STEPS * num_envs,
+    }
+    if any(controller.get(key) != value for key, value in expected.items()):
+        raise ValueError("Incomplete native controller evidence")
+    for name, key in (
+        ("controller_manifest", "interface_sha256"),
+        ("motor_binding", "motor_binding_sha256"),
+    ):
+        digest = hashlib.sha256(
+            json.dumps(controller[name], sort_keys=True, allow_nan=False).encode()
+        ).hexdigest()
+        if digest != controller[key]:
+            raise ValueError("Native controller/motor identity differs")
+    manifest = controller["controller_manifest"]
+    if (
+        manifest.get("version") != controller_version
+        or manifest.get("name") != "stock_operator_oracle"
+        or manifest.get("preprocessing_version") != "stock_48_unscaled_v1"
+        or manifest.get("period_s") != DT
+        or manifest.get("sensors", {}).get("oracle_base_lin_vel", {}).get("privileged")
+        is not True
+        or controller.get("policy_inputs")
+        != "stock48 with simulator velocity; explicit oracle only"
+        or manifest["artifact_sha256"] != result["source_sha256"]
+        or manifest["joint_names"] != controller["motor_binding"]["joint_names"]
+        or manifest["actuator_profile"]
+        != "native_motor_sha256:" + controller["motor_binding_sha256"]
+    ):
+        raise ValueError("Controller identity is not bound to this checkpoint/motor")
+    with np.load(output / "trace.npz", allow_pickle=False) as archive:
+        trace = dict(archive)
+    shape = (PROCEDURAL_ROLLOUT_STEPS, num_envs)
+    if (
+        trace["terminated"].shape != shape
+        or trace["time_out"].shape != shape
+        or trace["terminated"].dtype != np.bool_
+        or trace["time_out"].dtype != np.bool_
+        or trace["forced_timeout"].dtype != np.bool_
+        or trace["adapter_target"].shape != (*shape, 12)
+        or trace["joint_target_substeps"].shape != (*shape, 4, 12)
+        or trace["terrain_observation"].shape != (*shape, 264)
+        or any(not np.isfinite(value).all() for value in trace.values())
+        or not np.isin(trace["terrain_observation"][:, :, 132:], (0, 1)).all()
+        or not np.array_equal(trace["adapter_target"], trace["joint_target"])
+        or not np.array_equal(
+            trace["joint_target_substeps"],
+            np.repeat(trace["adapter_target"][:, :, None], 4, axis=2),
+        )
+        or validate_motor_trace(trace) != controller["motor_interface"]
+    ):
+        raise ValueError("Native motor/adapter trace replay failed")
+    forced = expected["forced_timeout_step"]
+    injected = np.zeros(shape, dtype=np.bool_)
+    injected[forced, : num_envs // 2] = True
+    schedule = np.repeat(
+        np.asarray(CONTROLLER_ROLLOUT_COMMANDS, dtype=np.float32), 40, axis=0
+    )
+    schedule = np.broadcast_to(schedule[:, None], (*shape, 3)).copy()
+    schedule[40:120, : num_envs // 2, 0] = 0
+    reset = trace["terminated"] | trace["time_out"]
+    if (
+        not trace["time_out"][forced, : num_envs // 2].all()
+        or (trace["terminated"][forced] | trace["time_out"][forced]).all()
+        or not np.array_equal(trace["forced_timeout"], injected)
+        or not np.array_equal(trace["command"], schedule)
+        or not np.array_equal(
+            trace["decision_time_s"], np.arange(PROCEDURAL_ROLLOUT_STEPS) * DT
+        )
+        or controller["physical_failure_count"] != int(trace["terminated"].sum())
+        or controller["other_timeout_count"]
+        != int((trace["time_out"] & ~injected).sum())
+        or controller["partial_reset_steps"]
+        != int((reset.any(axis=1) & ~reset.all(axis=1)).sum())
+    ):
+        raise ValueError("Recorded commands, outcomes or partial auto-reset differ")
+
+
 def procedural_config_main(args, parser):
-    """Resolve configuration using the existing fail-closed worker supervisor."""
+    """Configuration or bounded adapter integration, never a learning launch."""
+    rollout = args.procedural_rollout_check
+    success_status = (
+        "SIM_ADAPTER_PARITY_PASS" if rollout else "CONFIG_VALIDATED_NOT_SIMULATED"
+    )
+    report_filename = "measurement_report.json" if rollout else "config_report.json"
     if (
         args.terrain_train
         or args.terrain_readiness
@@ -2227,6 +2347,7 @@ def procedural_config_main(args, parser):
         or args.seed != 42
         or args.num_envs < 20
         or args.num_envs % 20
+        or (rollout and (args.num_envs > 80 or args.validate_only))
         or not math.isfinite(args.timeout)
         or args.timeout <= 0
         or (args.validate_only and args.worker_output is not None)
@@ -2245,8 +2366,9 @@ def procedural_config_main(args, parser):
         )
     ):
         parser.error(
-            "Procedural config check requires --num-envs a positive multiple of 20 "
-            "and --seed 42; no learning, legacy terrain, refinement or resume flags"
+            "Procedural checks require --num-envs a positive multiple of 20 "
+            "and --seed 42; rollout allows 20-80 environments and no --validate-only. "
+            "No learning, legacy terrain, refinement or resume flags"
         )
     try:
         checkpoint = args.checkpoint.resolve(strict=True)
@@ -2277,17 +2399,31 @@ def procedural_config_main(args, parser):
         return 0
     if args.worker_output is None:
         source_hash = file_sha256(checkpoint)
-        # Reuse the existing supervisor, not another persistent probe/run tree.
-        # A receipt written before Kit closes preserves failures even if native
-        # shutdown exits(0). Temporary receipts are removed after reporting.
-        with tempfile.TemporaryDirectory(prefix="operator_config_check_") as folder:
+        # Config-only receipts stay temporary. Physics evidence must survive for
+        # independent inspection, including a failed or interrupted rollout.
+        with ExitStack() as cleanup:
+            if rollout:
+                args.output_parent.mkdir(parents=True, exist_ok=True)
+                folder = tempfile.mkdtemp(
+                    prefix="operator_procedural_rollout_", dir=args.output_parent
+                )
+                args.procedural_output = Path(folder)
+                print(f"Adapter integration (no learning): {folder}", flush=True)
+            else:
+                folder = cleanup.enter_context(
+                    tempfile.TemporaryDirectory(prefix="operator_config_check_")
+                )
             result = supervise(
                 [
                     sys.executable,
                     "-u",
                     str(Path(__file__).resolve()),
                     str(checkpoint),
-                    "--procedural-config-check",
+                    (
+                        "--procedural-rollout-check"
+                        if rollout
+                        else "--procedural-config-check"
+                    ),
                     "--num-envs",
                     str(args.num_envs),
                     "--device",
@@ -2297,10 +2433,10 @@ def procedural_config_main(args, parser):
                 ],
                 Path(folder),
                 timeout_s=args.timeout,
-                report_filename="config_report.json",
-                valid_statuses=("CONFIG_VALIDATED_NOT_SIMULATED", "ERROR"),
+                report_filename=report_filename,
+                valid_statuses=(success_status, "ERROR"),
             )
-        if result.get("status") == "CONFIG_VALIDATED_NOT_SIMULATED" and (
+        if result.get("status") == success_status and (
             not isinstance(result.get("packages"), dict)
             or result["packages"].get("isaaclab")
             not in PROCEDURAL_ISAACLAB_DISTRIBUTIONS
@@ -2310,20 +2446,66 @@ def procedural_config_main(args, parser):
                     "version": PROCEDURAL_TERRAIN_VERSION,
                     "source_sha256": source_hash,
                     "num_envs": args.num_envs,
-                    "environment_transitions": 0,
+                    "environment_transitions": (
+                        PROCEDURAL_ROLLOUT_STEPS * args.num_envs if rollout else 0
+                    ),
                     "learning_updates": 0,
                     "exit_allowed": False,
                 }.items()
             )
         ):
-            result = {"status": "ERROR", "error": "Invalid configuration receipt"}
+            result = {
+                "status": "ERROR",
+                "error": "Invalid procedural receipt",
+                "measurement_result": result,
+            }
+        if rollout and result.get("status") == success_status:
+            try:
+                validate_procedural_rollout(result, Path(folder), args.num_envs)
+            except Exception as error:
+                result = {
+                    "status": "ERROR",
+                    "error": str(error),
+                    "measurement_result": result,
+                }
         if file_sha256(checkpoint) != source_hash:
             result = {"status": "ERROR", "error": "Source checkpoint changed"}
-        print(json.dumps(result, indent=2, allow_nan=False), flush=True)
-        return 0 if result["status"] == "CONFIG_VALIDATED_NOT_SIMULATED" else 2
+        if rollout:
+            result["exit_allowed"] = False
+            write_json(Path(folder) / "report.json", result)
+            print(f"Report: {Path(folder) / 'report.json'}", flush=True)
+            summary = {
+                key: result[key]
+                for key in (
+                    "status",
+                    "error",
+                    "environment_transitions",
+                    "learning_updates",
+                    "exit_allowed",
+                )
+                if key in result
+            }
+            summary["controller"] = {
+                key: result.get("controller", {}).get(key)
+                for key in (
+                    "action_comparisons",
+                    "substep_target_comparisons",
+                    "physical_failure_count",
+                    "forced_timeout_count",
+                    "other_timeout_count",
+                )
+            }
+            print(json.dumps(summary, indent=2, allow_nan=False), flush=True)
+        else:
+            print(json.dumps(result, indent=2, allow_nan=False), flush=True)
+        return 0 if result["status"] == success_status else 2
     app = None
+    env = None
     packages = {}
     try:
+        source_hash = file_sha256(checkpoint)
+        if rollout:
+            write_run_provenance(args.worker_output, __file__)
         packages["isaaclab"] = importlib.metadata.version("isaaclab")
         if packages["isaaclab"] not in PROCEDURAL_ISAACLAB_DISTRIBUTIONS:
             raise ValueError(
@@ -2339,37 +2521,108 @@ def procedural_config_main(args, parser):
         )
 
         cfg, runner_cfg = procedural_terrain_configs(saved, agent, args)
+        if rollout:
+            from isaaclab.envs import ManagerBasedRLEnv
+
+            try:
+                from .operator_benchmark import make_recorder_cfg
+                from .operator_benchmark_core import load_reference_actor
+                from .operator_student_bridge import run_controller_rollout
+            except ImportError:
+                from operator_benchmark import make_recorder_cfg
+                from operator_benchmark_core import load_reference_actor
+                from operator_student_bridge import run_controller_rollout
+            # Independent semantic samples can be compared to native observation
+            # terms without drawing a second noise realization. Evaluation only.
+            cfg.observations.policy.enable_corruption = False
+            cfg.recorders = make_recorder_cfg()
         cfg.validate()
+        result = {
+            "status": success_status,
+            "version": PROCEDURAL_TERRAIN_VERSION,
+            "packages": packages,
+            "source_sha256": source_hash,
+            "num_envs": cfg.scene.num_envs,
+            "acquisition_difficulty": list(PROCEDURAL_EASY_DIFFICULTY),
+            "geometry": terrain_envelope(),
+            "scan": PROCEDURAL_SCAN_INTERFACE,
+            "policy_groups": runner_cfg["obs_groups"],
+            "environment_transitions": 0,
+            "learning_updates": 0,
+            "exit_allowed": False,
+        }
+        if rollout:
+            import numpy as np
+
+            (args.worker_output / "resolved_env.yaml").write_text(
+                yaml.dump(cfg.to_dict(), sort_keys=False)
+            )
+            actor, _ = load_reference_actor(checkpoint, agent)
+            env = ManagerBasedRLEnv(cfg=cfg)
+            env.reset(seed=args.seed)
+            controller, trace = run_controller_rollout(
+                env,
+                actor.to(env.device),
+                source_hash,
+                is_running=app.is_running,
+                steps=PROCEDURAL_ROLLOUT_STEPS,
+            )
+            np.savez_compressed(args.worker_output / "trace.npz", **trace)
+            result.update(
+                controller=controller,
+                environment_transitions=PROCEDURAL_ROLLOUT_STEPS * args.num_envs,
+                evaluation_changes=[
+                    "observation corruption disabled",
+                    "fixed body-twist schedule",
+                    "one injected partial timeout",
+                ],
+                sha256={
+                    name: file_sha256(args.worker_output / name)
+                    for name in ("trace.npz", "resolved_env.yaml")
+                },
+            )
+            if file_sha256(checkpoint) != source_hash:
+                raise ValueError("Checkpoint changed during native rollout")
         write_json(
-            args.worker_output / "config_report.json",
-            {
-                "status": "CONFIG_VALIDATED_NOT_SIMULATED",
-                "version": PROCEDURAL_TERRAIN_VERSION,
-                "packages": packages,
-                "source_sha256": file_sha256(checkpoint),
-                "num_envs": cfg.scene.num_envs,
-                "acquisition_difficulty": list(PROCEDURAL_EASY_DIFFICULTY),
-                "geometry": terrain_envelope(),
-                "scan": PROCEDURAL_SCAN_INTERFACE,
-                "policy_groups": runner_cfg["obs_groups"],
-                "environment_transitions": 0,
-                "learning_updates": 0,
-                "exit_allowed": False,
-            },
+            args.worker_output / report_filename,
+            result,
         )
         return 0
     except Exception as error:
+        failure = {
+            "status": "ERROR",
+            "error": str(error),
+            "error_type": type(error).__name__,
+            "traceback": traceback.format_exc(),
+            "packages": packages,
+            "exit_allowed": False,
+        }
+        capture = getattr(env, "operator_capture", None)
+        if capture is not None and capture.samples:
+            try:
+                import numpy as np
+
+                np.savez_compressed(
+                    args.worker_output / "trace.npz", **capture.finish()
+                )
+                failure["partial_control_steps"] = len(capture.samples)
+                failure["trace_sha256"] = file_sha256(args.worker_output / "trace.npz")
+            except Exception as capture_error:
+                failure["partial_trace_error"] = str(capture_error)
         write_json(
-            args.worker_output / "config_report.json",
-            {
-                "status": "ERROR",
-                "error": str(error),
-                "packages": packages,
-                "exit_allowed": False,
-            },
+            args.worker_output / report_filename,
+            failure,
         )
         return 2
     finally:
+        if env is not None:
+            try:
+                env.close()
+            except Exception as error:
+                write_json(
+                    args.worker_output / "environment_cleanup_error.json",
+                    {"error": str(error)},
+                )
         if app is not None:
             try:
                 app.close()
@@ -2383,10 +2636,16 @@ def procedural_config_main(args, parser):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
-    parser.add_argument(
+    procedural = parser.add_mutually_exclusive_group()
+    procedural.add_argument(
         "--procedural-config-check",
         action="store_true",
         help="Check the easy operator-only native configuration; no environment, rollout or learning. Add --validate-only for checkpoint/source and controller-adapter CPU validation",
+    )
+    procedural.add_argument(
+        "--procedural-rollout-check",
+        action="store_true",
+        help="Run 200 control steps with native physics through the stock oracle adapter; 20-80 environments, no learning or terrain acceptance",
     )
     parser.add_argument(
         "--terrain-train",
@@ -2491,8 +2750,20 @@ def main(argv=None):
     )
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    if args.procedural_config_check:
-        return procedural_config_main(args, parser)
+    if args.procedural_config_check or args.procedural_rollout_check:
+        try:
+            return procedural_config_main(args, parser)
+        except Exception as error:
+            result = {"status": "ERROR", "error": str(error), "exit_allowed": False}
+            output = getattr(args, "procedural_output", None)
+            if output is not None:
+                result["output"] = str(output)
+                try:
+                    write_json(output / "report.json", result)
+                except Exception as publication_error:
+                    result["report_write_error"] = str(publication_error)
+            print(json.dumps(result, indent=2, allow_nan=False), flush=True)
+            return 2
     if (
         args.terrain_train
         or args.terrain_readiness
