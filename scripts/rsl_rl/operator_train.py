@@ -533,6 +533,45 @@ def procedural_terrain_configs(saved, agent, args):
     return cfg, runner_cfg
 
 
+def proprioceptive_procedural_configs(saved, agent, args):
+    """Causal GRU candidate on the existing acquisition fixture, not a launch.
+
+    The source configuration binds the physical motor only. This policy starts
+    from fresh weights; neither stock8500 nor the terrain teacher can be resumed.
+    A progressive learner and numerical behavior protocol remain separate work.
+    """
+    try:
+        from .operator_student_bridge import (
+            RECURRENT_OPERATOR_VERSION,
+            recurrent_policy_config,
+        )
+    except ImportError:
+        from operator_student_bridge import (
+            RECURRENT_OPERATOR_VERSION,
+            recurrent_policy_config,
+        )
+
+    cfg, runner_cfg = procedural_terrain_configs(saved, agent, args)
+    # Copy the noisy sensor group BEFORE making the privileged critic noiseless.
+    # Removing this term at the manager boundary avoids passing oracle velocity
+    # into actor normalization, recurrent state or inference preprocessing.
+    cfg.observations.proprio = copy.deepcopy(cfg.observations.policy)
+    cfg.observations.proprio.base_lin_vel = None
+    cfg.observations.policy.enable_corruption = False
+    runner_cfg.pop("terrain_warm_start_builder", None)
+    runner_cfg.update(
+        run_name=RECURRENT_OPERATOR_VERSION,
+        interface_version=RECURRENT_OPERATOR_VERSION,
+        policy=recurrent_policy_config(),
+        obs_groups={"policy": ["proprio"], "critic": ["policy", "terrain"]},
+        resume=False,
+    )
+    # Native recurrent PPO does not support its symmetry augmentation path.
+    # This candidate uses standard PPO, without an auxiliary estimator or RND.
+    runner_cfg["algorithm"].update(symmetry_cfg=None, rnd_cfg=None)
+    return cfg, runner_cfg
+
+
 def terrain_readiness_configs(saved, agent, args):
     """Reuse the stock motor and production geometry in one bounded fixture."""
     try:
