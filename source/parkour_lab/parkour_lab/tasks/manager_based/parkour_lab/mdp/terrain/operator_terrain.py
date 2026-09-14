@@ -3,7 +3,9 @@
 """Seeded, command-agnostic surfaces for provisional operator-terrain acquisition.
 
 The pure NumPy builder is shared by CPU geometry checks and the lazy Isaac Lab
-adapter. Heights are metres, grades are rise/run, and holes contain no floor.
+adapter. Heights are metres and grades are rise/run. The default mixture has
+continuous support at every difficulty; explicit legacy gap fixtures remain
+available for historical geometry checks, never selected by the default factory.
 This is a development envelope, not a calibrated robot capability or acceptance
 gate. Native curriculum layout fixes column identity; it does not promote robots.
 """
@@ -27,8 +29,7 @@ PROFILE_BY_COLUMN = (
     *("rough_flat",) * 4,
     *("hills",) * 4,
     *("step_hills",) * 4,
-    *("tilted_ramps",) * 3,
-    "gaps",
+    *("tilted_ramps",) * 4,
 )
 # Full-difficulty surface-height magnitude and maximum triangulated surface grade.
 ENVELOPES = {
@@ -44,7 +45,7 @@ ENVELOPES = {
 def terrain_envelope():
     """Explicit geometry bounds; none are learned-policy success thresholds."""
     return {
-        "version": "operator_procedural_surface_v1",
+        "version": "operator_procedural_surface_v2",
         "status": "provisional_development_geometry_not_robot_acceptance",
         "tile_size_m": list(TILE_SIZE),
         "resolution_m": RESOLUTION,
@@ -57,17 +58,13 @@ def terrain_envelope():
         "height_and_grade_bounds_at_full_difficulty": {
             name: {"absolute_height_m": height, "maximum_surface_grade": grade}
             for name, (height, grade) in ENVELOPES.items()
+            if name in PROFILE_BY_COLUMN
         },
         "roughness_wavelengths_m": [3.2, 1.6, 0.8, 0.4],
         "roughness": "four seeded directional octaves, H=0.7; band-limited, not infinite fractal",
         "gaps": {
-            "start_difficulty": GAP_START_DIFFICULTY,
-            "maximum_count_per_gap_tile": 2,
-            "maximum_narrow_width_m": 0.2,
-            "maximum_length_m": 1.2,
-            "maximum_tile_area_fraction": 0.01,
-            "side_wall_bottom_m": GAP_WALL_BOTTOM,
-            "floor": False,
+            "enabled": False,
+            "scope": "outside the blind default operating envelope at every difficulty",
         },
         "stepped_hills": (
             "rough terraced height field with slanted 0.1 m mesh risers; "
