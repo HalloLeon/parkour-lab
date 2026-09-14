@@ -383,6 +383,10 @@ def build_terrain_policy(observations, source_state, *, critic_context=False):
 
 
 PROCEDURAL_TERRAIN_VERSION = "go2_operator_procedural_terrain_v1"
+# Official release wheels; post1 is also the version in our recorded GPU runs.
+# Source-checkout extension versions (e.g. 0.54.2) are a separate identity and
+# are not admitted by this wheel-only check. Do not use a broad 2.3.* match.
+PROCEDURAL_ISAACLAB_DISTRIBUTIONS = ("2.3.2", "2.3.2.post1")
 PROCEDURAL_EASY_DIFFICULTY = (0.05, 0.15)
 PROCEDURAL_SCAN_INTERFACE = {
     "version": "privileged_centered_height_valid_132_v1",
@@ -2286,16 +2290,21 @@ def procedural_config_main(args, parser):
                 report_filename="config_report.json",
                 valid_statuses=("CONFIG_VALIDATED_NOT_SIMULATED", "ERROR"),
             )
-        if result.get("status") == "CONFIG_VALIDATED_NOT_SIMULATED" and any(
-            result.get(key) != value
-            for key, value in {
-                "version": PROCEDURAL_TERRAIN_VERSION,
-                "source_sha256": source_hash,
-                "num_envs": args.num_envs,
-                "environment_transitions": 0,
-                "learning_updates": 0,
-                "exit_allowed": False,
-            }.items()
+        if result.get("status") == "CONFIG_VALIDATED_NOT_SIMULATED" and (
+            not isinstance(result.get("packages"), dict)
+            or result["packages"].get("isaaclab")
+            not in PROCEDURAL_ISAACLAB_DISTRIBUTIONS
+            or any(
+                result.get(key) != value
+                for key, value in {
+                    "version": PROCEDURAL_TERRAIN_VERSION,
+                    "source_sha256": source_hash,
+                    "num_envs": args.num_envs,
+                    "environment_transitions": 0,
+                    "learning_updates": 0,
+                    "exit_allowed": False,
+                }.items()
+            )
         ):
             result = {"status": "ERROR", "error": "Invalid configuration receipt"}
         if file_sha256(checkpoint) != source_hash:
@@ -2303,9 +2312,15 @@ def procedural_config_main(args, parser):
         print(json.dumps(result, indent=2, allow_nan=False), flush=True)
         return 0 if result["status"] == "CONFIG_VALIDATED_NOT_SIMULATED" else 2
     app = None
+    packages = {}
     try:
-        if importlib.metadata.version("isaaclab") != "2.3.2":
-            raise ValueError("Native configuration check requires Isaac Lab 2.3.2")
+        packages["isaaclab"] = importlib.metadata.version("isaaclab")
+        if packages["isaaclab"] not in PROCEDURAL_ISAACLAB_DISTRIBUTIONS:
+            raise ValueError(
+                "Native configuration check requires an Isaac Lab release wheel "
+                f"with distribution version in {PROCEDURAL_ISAACLAB_DISTRIBUTIONS}; "
+                f"detected isaaclab=={packages['isaaclab']} using {sys.executable}"
+            )
         from isaaclab.app import AppLauncher
 
         app = AppLauncher(headless=True, livestream=0, device=args.device).app
@@ -2320,6 +2335,7 @@ def procedural_config_main(args, parser):
             {
                 "status": "CONFIG_VALIDATED_NOT_SIMULATED",
                 "version": PROCEDURAL_TERRAIN_VERSION,
+                "packages": packages,
                 "source_sha256": file_sha256(checkpoint),
                 "num_envs": cfg.scene.num_envs,
                 "acquisition_difficulty": list(PROCEDURAL_EASY_DIFFICULTY),
@@ -2335,7 +2351,12 @@ def procedural_config_main(args, parser):
     except Exception as error:
         write_json(
             args.worker_output / "config_report.json",
-            {"status": "ERROR", "error": str(error), "exit_allowed": False},
+            {
+                "status": "ERROR",
+                "error": str(error),
+                "packages": packages,
+                "exit_allowed": False,
+            },
         )
         return 2
     finally:
