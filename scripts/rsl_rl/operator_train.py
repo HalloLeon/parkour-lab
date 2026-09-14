@@ -2259,8 +2259,18 @@ def procedural_config_main(args, parser):
     except Exception as error:
         parser.error(f"Procedural source preflight failed: {error}")
     if args.validate_only:
+        try:
+            try:
+                from .operator_student_bridge import controller_preflight
+            except ImportError:
+                from operator_student_bridge import controller_preflight
+            print(
+                json.dumps(controller_preflight(checkpoint), indent=2, allow_nan=False)
+            )
+        except Exception as error:
+            parser.error(f"Controller boundary preflight failed: {error}")
         print(
-            "Checkpoint architecture and reward profile validated. Native physical/"
+            "Checkpoint architecture, controller adapter and reward profile validated. Native physical/"
             "algorithm configuration, physics, learning and behavior remain UNRUN; "
             "no files written."
         )
@@ -2376,7 +2386,7 @@ def main(argv=None):
     parser.add_argument(
         "--procedural-config-check",
         action="store_true",
-        help="Check the easy operator-only native configuration; no environment, rollout or learning. Add --validate-only for source-only CPU validation",
+        help="Check the easy operator-only native configuration; no environment, rollout or learning. Add --validate-only for checkpoint/source and controller-adapter CPU validation",
     )
     parser.add_argument(
         "--terrain-train",

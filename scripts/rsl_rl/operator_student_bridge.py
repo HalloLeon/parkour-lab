@@ -404,3 +404,198 @@ class OperatorOracleAudit:
             "student_status": "UNTRAINED_NOT_RUN",
             "scope": "same delivered pre-action observations, previous raw actions, commands and observed resets only; NOT student behavior",
         }
+
+
+class StockOperatorAdapter:
+    """Semantic adapter for the existing stock actor, explicitly oracle-only.
+
+    Previous raw action is supplied from actual action-manager delivery, not from
+    an unacknowledged prediction. The host supplies measured joint order/default
+    pose and a verified actuator-profile identity; this adapter cannot set gains.
+    """
+
+    def __init__(
+        self,
+        actor,
+        *,
+        joint_names,
+        default_position_rad,
+        artifact_sha256,
+        actuator_profile,
+    ):
+        from parkour_lab.learning.controller import ControllerSpec, SensorSpec
+
+        if len(joint_names) != 12:
+            raise ValueError("Stock adapter requires twelve named joints")
+        _check_tensor(default_position_rad, (12,), "default joint position")
+        self.actor = copy.deepcopy(actor).eval().requires_grad_(False)
+        self.default_position_rad = default_position_rad.detach().clone()
+        self.reset_mask = None
+        self.spec = ControllerSpec(
+            name="stock_operator_oracle",
+            artifact_sha256=artifact_sha256,
+            preprocessing_version="stock_48_unscaled_v1",
+            joint_names=tuple(joint_names),
+            period_s=0.02,
+            actuator_profile=actuator_profile,
+            sensors={
+                "oracle_base_lin_vel": SensorSpec(
+                    (3,), "m/s", "body", 0.02, privileged=True
+                ),
+                "base_ang_vel": SensorSpec((3,), "rad/s", "body", 0.02),
+                "projected_gravity": SensorSpec((3,), "unitless", "body", 0.02),
+                "joint_position_relative_default": SensorSpec(
+                    (12,), "rad", "joint", 0.02
+                ),
+                "joint_velocity": SensorSpec((12,), "rad/s", "joint", 0.02),
+                "stock_previous_raw_action": SensorSpec(
+                    (12,), "unitless", "joint", 0.02
+                ),
+            },
+            raw_action_meaning="stock unscaled action; q_target = default_q + 0.25 * raw_action; no clip",
+            configuration={
+                "default_position_rad": default_position_rad.tolist(),
+                "action_scale": 0.25,
+                "action_clip": None,
+            },
+        )
+
+    def reset(self, mask):
+        # Feed-forward actor has no latent memory. The previous-action input must
+        # still be zero on a reset; host action-manager state owns that value.
+        self.reset_mask = mask
+
+    def act(self, inputs):
+        from parkour_lab.learning.controller import JointTargets
+
+        sensors = inputs.sensors
+        previous = sensors["stock_previous_raw_action"].value
+        if self.reset_mask is None or torch.any(previous[self.reset_mask] != 0):
+            raise ValueError("Stock previous action must be zero after reset")
+        observation = torch.cat(
+            (
+                sensors["oracle_base_lin_vel"].value,
+                sensors["base_ang_vel"].value,
+                sensors["projected_gravity"].value,
+                inputs.command,
+                sensors["joint_position_relative_default"].value,
+                sensors["joint_velocity"].value,
+                previous,
+            ),
+            dim=-1,
+        )
+        action = self.actor(observation)
+        return JointTargets(
+            self.spec.joint_names, self.default_position_rad + 0.25 * action, action
+        )
+
+
+def controller_preflight(checkpoint):
+    """Actual checkpoint, synthetic sensor fixture: exact CPU action/target parity.
+
+    No claim about runtime joint mapping, physics, estimator or deployability.
+    Keeps this boundary exercised without touching the archived benchmark path.
+    """
+    from parkour_lab.learning.controller import ControllerSession, Sample
+
+    try:
+        from .operator_benchmark_core import (
+            load_reference_actor,
+            read_yaml_data,
+            file_sha256,
+        )
+        from .operator_control_trace import controller_record
+    except ImportError:
+        from operator_benchmark_core import (
+            load_reference_actor,
+            read_yaml_data,
+            file_sha256,
+        )
+        from operator_control_trace import controller_record
+
+    source_hash = file_sha256(checkpoint)
+    with torch.random.fork_rng(devices=[]):
+        actor, _ = load_reference_actor(
+            checkpoint, read_yaml_data(checkpoint.parent / "params/agent.yaml")
+        )
+    generator = torch.Generator().manual_seed(123)
+    default = torch.linspace(-0.3, 0.3, 12)
+    adapter = StockOperatorAdapter(
+        actor,
+        joint_names=tuple(f"fixture_joint_{i}" for i in range(12)),
+        default_position_rad=default,
+        artifact_sha256=source_hash,
+        actuator_profile="CPU_SYNTHETIC_NOT_A_RUNTIME_MOTOR_CONFIGURATION",
+    )
+    session = ControllerSession(
+        adapter,
+        joint_names=adapter.spec.joint_names,
+        actuator_profile=adapter.spec.actuator_profile,
+        allow_privileged=True,
+        capture=True,
+    )
+    previous = torch.zeros(4, 12)
+    slices = ((0, 3), (3, 6), (6, 9), (12, 24), (24, 36), (36, 48))
+    for step in range(6):
+        observation = torch.randn(4, 48, generator=generator)
+        reset = torch.tensor([step in (0, 3), step == 0, step == 0, step in (0, 4)])
+        previous[reset] = 0
+        observation[:, 36:48] = previous
+        now = step * 0.02
+        samples = {
+            name: Sample(
+                observation[:, start:end],
+                now,
+                torch.ones(4, dtype=torch.bool),
+                spec.units,
+                spec.frame,
+                spec.privileged,
+            )
+            for (name, spec), (start, end) in zip(
+                adapter.spec.sensors.items(), slices, strict=True
+            )
+        }
+        command = observation[:, 9:12]
+        result = session.step(
+            time_s=now,
+            command=command,
+            command_time_s=now,
+            sensors=samples,
+            reset_mask=reset,
+        )
+        with torch.inference_mode():
+            expected = actor(observation)
+        if not torch.equal(result.raw_action, expected) or not torch.equal(
+            result.position_rad, default + 0.25 * expected
+        ):
+            raise RuntimeError("Stock controller adapter changed actions or targets")
+        record = controller_record(
+            session,
+            requested_command=command,
+            requested_at_s=now,
+            delivered_position_rad=None,
+            delivery_time_s=None,
+            command_source="synthetic_cpu_fixture",
+            safety_events=(),
+        )
+        json.dumps(record, allow_nan=False)
+        if record["delivered_position_rad"] is not None:
+            raise RuntimeError("CPU fixture falsely records actuator delivery")
+        previous = result.raw_action.clone()
+    if file_sha256(checkpoint) != source_hash:
+        raise ValueError("Checkpoint changed during controller preflight")
+    return {
+        "status": "CPU_ADAPTER_PARITY_PASS",
+        "source_sha256": adapter.spec.artifact_sha256,
+        "interface_sha256": session.interface_sha256,
+        "control_steps": 6,
+        "action_comparisons": 24,
+        "joint_target_comparisons": 288,
+        "exact_action_and_target_equality": True,
+        "fixture": "synthetic sensors and joint names, partial resets, changed body twist",
+        "privileged": True,
+        "actuator_delivery": "NOT_RUN",
+        "environment_transitions": 0,
+        "learning_updates": 0,
+        "exit_allowed": False,
+    }

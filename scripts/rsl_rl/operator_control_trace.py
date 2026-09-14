@@ -8,6 +8,8 @@ they are never executed and do not demonstrate counterfactual recovery.
 from __future__ import annotations
 
 import json
+import copy
+import math
 from pathlib import Path
 
 import numpy as np
@@ -30,6 +32,78 @@ except ImportError:
 
 
 VERSION = "operator_control_trace_v1"
+
+
+def controller_record(
+    session,
+    *,
+    requested_command,
+    requested_at_s,
+    delivered_position_rad,
+    delivery_time_s,
+    command_source,
+    safety_events,
+):
+    """JSON-ready snapshot for the new controller boundary, not legacy NPZ v1.
+
+    Enable session capture explicitly (CPU copies are not a real-time logger).
+    Persist the session manifest once alongside these records. Delivered targets
+    are host-reported command delivery, NOT measured motion/torque. None means
+    not delivered/unknown, never inferred from a successful policy computation.
+    Replay requested BODY COMMANDS with live sensing for future closed-loop
+    comparison; this function neither replays motor actions nor controls hardware.
+    """
+    from parkour_lab.learning.controller import finite_tensor
+
+    if session.record is None:
+        raise ValueError(
+            "No captured validated controller input; capture must be enabled"
+        )
+    record = copy.deepcopy(session.record)
+    batch = len(record["applied_command"])
+    finite_tensor(requested_command, (batch, 3))
+    if (
+        not math.isfinite(requested_at_s)
+        or not 0 <= requested_at_s <= record["applied_at_s"]
+        or not isinstance(command_source, str)
+        or not command_source
+        or not isinstance(safety_events, (tuple, list))
+        or any(not isinstance(event, str) or not event for event in safety_events)
+    ):
+        raise ValueError("Invalid command source, timestamp or safety events")
+    requested = requested_command.detach().cpu().tolist()
+    if requested != record["applied_command"] and not safety_events:
+        raise ValueError("Changed applied command requires an explicit event/reason")
+    if (delivered_position_rad is None) != (delivery_time_s is None):
+        raise ValueError("Delivery target and time must both be known or both absent")
+    delivered = None
+    if delivered_position_rad is not None:
+        if record["status"] == "FAULT":
+            raise ValueError("Faulted inference cannot claim target delivery")
+        finite_tensor(delivered_position_rad, (batch, len(record["joint_names"])))
+        if not math.isfinite(delivery_time_s) or delivery_time_s < record["time_s"]:
+            raise ValueError("Invalid delivery time")
+        delivered = delivered_position_rad.detach().cpu().tolist()
+        if delivered != record["requested_position_rad"] and not safety_events:
+            raise ValueError(
+                "Changed delivered target requires an explicit event/reason"
+            )
+    record.update(
+        version="operator_controller_record_v1",
+        controller_artifact_sha256=session.manifest["artifact_sha256"],
+        requested_command=requested,
+        requested_at_s=requested_at_s,
+        command_source=command_source,
+        safety_events=list(safety_events),
+        delivered_position_rad=delivered,
+        delivery_time_s=delivery_time_s,
+        delivery_evidence=(
+            "NOT_REPORTED"
+            if delivered is None
+            else "HOST_REPORTED_TARGET_NOT_MEASURED_MOTION"
+        ),
+    )
+    return record
 
 
 def load_diagnostic_reference(checkpoint: Path, reference: Path):
