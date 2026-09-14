@@ -6,7 +6,9 @@ are explicit; Adam starts fresh unless an evidence-bound retention resume is
 requested. --procedural-config-check validates the replacement operator-only
 configuration without constructing an environment, collecting transitions or
 learning. Its simulator scan is a privileged fixture, not a deployed sensor.
-The old four-family acquisition recipe is retired; archived readers remain.
+--procedural-train learns a fresh proprioceptive GRU on supported easy terrain;
+the positional checkpoint supplies only validated physical configuration, never
+policy weights. The old four-family recipe is retired; archived readers remain.
 """
 
 from __future__ import annotations
@@ -384,7 +386,7 @@ def build_terrain_policy(observations, source_state, *, critic_context=False):
     return policy.to(device), reference.to(device).eval().requires_grad_(False)
 
 
-PROCEDURAL_TERRAIN_VERSION = "go2_operator_procedural_terrain_v1"
+PROCEDURAL_TERRAIN_VERSION = "go2_operator_procedural_terrain_v2"
 # Official release wheels; post1 is also the version in our recorded GPU runs.
 # Source-checkout extension versions (e.g. 0.54.2) are a separate identity and
 # are not admitted by this wheel-only check. Do not use a broad 2.3.* match.
@@ -407,8 +409,8 @@ PROCEDURAL_SCAN_INTERFACE = {
 }
 
 
-def procedural_terrain_configs(saved, agent, args):
-    """Build the new operator-only acquisition fixture, without a route overlay.
+def _procedural_environment_configs(saved, agent, args):
+    """Build shared operator terrain and stock physics without choosing a policy.
 
     This is a configuration/preflight contract, not a training or acceptance
     claim. A fixed easy row deliberately has no adaptive progression until
@@ -524,6 +526,12 @@ def procedural_terrain_configs(saved, agent, args):
         params={"margin_m": BORDER_WIDTH + 0.25},
         time_out=True,
     )
+    return cfg, runner_cfg
+
+
+def procedural_terrain_configs(saved, agent, args):
+    """Privileged stock-to-terrain fixture for configuration and motor diagnostics."""
+    cfg, runner_cfg = _procedural_environment_configs(saved, agent, args)
     runner_cfg.update(
         run_name=PROCEDURAL_TERRAIN_VERSION,
         obs_groups={"policy": ["policy", "terrain"], "critic": ["policy", "terrain"]},
@@ -534,11 +542,11 @@ def procedural_terrain_configs(saved, agent, args):
 
 
 def proprioceptive_procedural_configs(saved, agent, args):
-    """Causal GRU candidate on the existing acquisition fixture, not a launch.
+    """Fresh causal GRU recipe on the fixed easy supported acquisition stage.
 
     The source configuration binds the physical motor only. This policy starts
     from fresh weights; neither stock8500 nor the terrain teacher can be resumed.
-    A progressive learner and numerical behavior protocol remain separate work.
+    Terrain promotion and held-out behavior qualification remain separate work.
     """
     try:
         from .operator_student_bridge import (
@@ -551,14 +559,16 @@ def proprioceptive_procedural_configs(saved, agent, args):
             recurrent_policy_config,
         )
 
-    cfg, runner_cfg = procedural_terrain_configs(saved, agent, args)
+    cfg, runner_cfg = _procedural_environment_configs(saved, agent, args)
+    # Do not inherit the source8500 fine stationary kernels into a fresh actor.
+    # Keep the rough orientation/air-time adjustments and physical motor.
+    apply_reward_profile(cfg, PROFILES["stock"])
     # Copy the noisy sensor group BEFORE making the privileged critic noiseless.
     # Removing this term at the manager boundary avoids passing oracle velocity
     # into actor normalization, recurrent state or inference preprocessing.
     cfg.observations.proprio = copy.deepcopy(cfg.observations.policy)
     cfg.observations.proprio.base_lin_vel = None
     cfg.observations.policy.enable_corruption = False
-    runner_cfg.pop("terrain_warm_start_builder", None)
     runner_cfg.update(
         run_name=RECURRENT_OPERATOR_VERSION,
         interface_version=RECURRENT_OPERATOR_VERSION,
@@ -566,9 +576,16 @@ def proprioceptive_procedural_configs(saved, agent, args):
         obs_groups={"policy": ["proprio"], "critic": ["policy", "terrain"]},
         resume=False,
     )
-    # Native recurrent PPO does not support its symmetry augmentation path.
-    # This candidate uses standard PPO, without an auxiliary estimator or RND.
-    runner_cfg["algorithm"].update(symmetry_cfg=None, rnd_cfg=None)
+    # Fresh acquisition uses the pinned Isaac Lab Go2 PPO recipe, not the
+    # reference actor's 1e-4 fixed-rate refinement protocol. No auxiliary loss.
+    runner_cfg["num_steps_per_env"] = 24
+    runner_cfg["algorithm"].update(
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        entropy_coef=0.01,
+        symmetry_cfg=None,
+        rnd_cfg=None,
+    )
     return cfg, runner_cfg
 
 
@@ -746,254 +763,6 @@ def terrain_update_evidence(policy, algorithm, losses):
         "losses": losses,
         "terrain_branches": branches,
     }
-
-
-def run_terrain_readiness(args, output, agent, saved, protocol):
-    """Collect one rollout, verify the warm start, and exercise one PPO update."""
-    env = app = capture = None
-    progress = {
-        "stage": "source_validation",
-        "rollout_step": None,
-        "completed_environment_steps": 0,
-        "completed_ppo_transition_steps": 0,
-        "completed_ppo_updates": 0,
-    }
-    try:
-        if terrain_source_identity(args) != protocol["source_identity"]:
-            raise ValueError(
-                "Terrain-readiness source changed between preflight and worker"
-            )
-        for package in ("isaaclab", "isaacsim", "rsl-rl-lib", "torch"):
-            if importlib.metadata.version(package) != protocol["mesh_flat"][
-                "packages"
-            ].get(package):
-                raise ValueError(
-                    f"Runtime {package} differs from the mesh-flat prerequisite"
-                )
-        progress["stage"] = "application_startup"
-        from isaaclab.app import AppLauncher
-
-        app = AppLauncher(headless=True, livestream=0, device=args.device).app
-        progress["stage"] = "configuration"
-        import numpy as np
-        import torch
-        from isaaclab.envs import ManagerBasedRLEnv
-        from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
-        from rsl_rl.algorithms import PPO
-
-        try:
-            from .operator_benchmark import mesh_identity, validate_motor_trace
-        except ImportError:
-            from operator_benchmark import mesh_identity, validate_motor_trace
-
-        cfg, runner_cfg = terrain_readiness_configs(saved, agent, args)
-        progress["stage"] = "environment_setup"
-        raw = ManagerBasedRLEnv(cfg=cfg)
-        env = raw
-        env = RslRlVecEnvWrapper(raw, clip_actions=None)
-        if (
-            abs(raw.step_dt - DT) > 1e-9
-            or tuple(raw.observation_manager.active_terms["policy"])
-            != OBSERVATION_TERMS
-        ):
-            raise ValueError(
-                "Terrain readiness changed the stock timing/observation order"
-            )
-        if (
-            raw.action_manager.total_action_dim != 12
-            or list(raw.scene["robot"].joint_names)
-            != protocol["mesh_flat"]["joint_names"]
-        ):
-            raise ValueError("Terrain readiness changed the stock joint/action order")
-        levels = raw.scene.terrain.terrain_levels
-        columns = raw.scene.terrain.terrain_types
-        if not torch.equal(levels, torch.arange(80, device=raw.device) % 2) or set(
-            columns.tolist()
-        ) != set(range(40)):
-            raise ValueError(
-                "Expected all 40 production columns with paired L0/L1 environments"
-            )
-        geometry = mesh_identity(raw)
-        obs = env.get_observations()
-        progress["stage"] = "policy_setup"
-        source = load_reference_checkpoint(args.checkpoint, agent)
-        policy, reference = build_terrain_policy(obs, source["model_state_dict"])
-        algorithm_cfg = dict(runner_cfg["algorithm"])
-        if algorithm_cfg.pop("class_name") != "PPO":
-            raise ValueError("Terrain readiness supports stock PPO only")
-        algorithm = PPO(policy, device=raw.device, **algorithm_cfg)
-        algorithm.init_storage("rl", 80, TERRAIN_READINESS_STEPS, obs, [12])
-        if algorithm.optimizer.state:
-            raise ValueError("Terrain warm start must use fresh Adam")
-        params = output / "params"
-        params.mkdir()
-        (params / "env.yaml").write_text(yaml.dump(cfg.to_dict(), sort_keys=False))
-        (params / "agent.yaml").write_text(yaml.dump(runner_cfg, sort_keys=False))
-        layout = cfg.events.reset_routes.params["terrain_layout"]
-        scan_cfg = cfg.observations.terrain.height_scan.params["obs_cfg"]
-        interface = {
-            "version": TERRAIN_VERSION,
-            "source_sha256": protocol["source_identity"]["checkpoint"],
-            "stock_observation_terms": list(OBSERVATION_TERMS),
-            "terrain": {
-                "width": 264,
-                "order": "132 normalized heights, then 132 validity bits",
-                "height_units": "dimensionless",
-                "height_range": [-1.0, 1.0],
-                "metric_clip_m": scan_cfg.clip,
-                "vertical_offset_m": scan_cfg.vertical_offset,
-                "normalization": "clamp(root_z - vertical_offset - hit_z, -clip, clip) / clip",
-                "missing_ray": {"height": 1.0, "validity": 0.0},
-                "encoder": [264, 128, 64, 32],
-            },
-            "motor": {
-                "hidden_dims": [128, 128, 128],
-                "terrain_fusion": "zero-initialized additive first-hidden preactivation",
-            },
-            "joint_names": list(raw.scene["robot"].joint_names),
-            "actions": "default_joint_position + 0.25 * raw_action; no clipping",
-            "body_twist": "[vx, vy, wz]; script owns commands, no live handoff",
-            "command_roles": {
-                "L0": "operator profiles from command_schedule(4), reset-local clocks",
-                "L1": "production waypoint guidance, 0.55 m/s, 2-s initial stand",
-                "L0_profiles": list(
-                    raw.command_manager.get_term("base_velocity").labels
-                ),
-            },
-            "terrain_layout": {
-                "family_by_column": list(layout.family_index_by_column),
-                "variant_by_column": list(layout.geometry_variant_index_by_column),
-                "columns": columns.tolist(),
-                "levels": levels.tolist(),
-            },
-            "student_status": "UNTRAINED_NOT_RUN",
-            "scope": "Privileged teacher readiness only: simulator velocity and terrain; not deployable policy or obstacle acceptance",
-        }
-        write_json(params / "interface.json", interface)
-        initial = {
-            "initial_position": raw.scene["robot"]
-            .data.root_pos_w.detach()
-            .cpu()
-            .numpy()
-            .copy(),
-            "env_origins": raw.scene.env_origins.detach().cpu().numpy().copy(),
-            "terrain_levels": levels.cpu().numpy().copy(),
-            "terrain_columns": columns.cpu().numpy().copy(),
-        }
-        capture = raw.operator_capture
-        capture.motor_parity = True
-        capture.course = {"readiness": True}
-        capture.enabled = True
-        terrain_frames = []
-        with torch.inference_mode():
-            for step in range(TERRAIN_READINESS_STEPS):
-                progress["rollout_step"] = step
-                progress["stage"] = "rollout_validation"
-                if step % 250 == 0:
-                    print(
-                        f"Terrain readiness rollout: {step}/{TERRAIN_READINESS_STEPS} steps; no PPO update yet",
-                        flush=True,
-                    )
-                if not torch.isfinite(obs["policy"]).all():
-                    raise ValueError(f"Nonfinite delivered observation at step {step}")
-                validate_terrain_scan(obs["terrain"], num_envs=80)
-                progress["stage"] = "rollout_parity"
-                if not torch.equal(
-                    policy.act_inference(obs), reference.act_inference(obs)
-                ) or not torch.equal(policy.evaluate(obs), reference.evaluate(obs)):
-                    raise ValueError(
-                        f"Terrain warm-start action/value parity failed at step {step}"
-                    )
-                capture.observation = obs["policy"].detach().clone()
-                terrain_frames.append(obs["terrain"].detach().cpu().numpy().copy())
-                progress["stage"] = "rollout_action"
-                actions = algorithm.act(obs)
-                if not torch.isfinite(actions).all():
-                    raise ValueError("Nonfinite sampled PPO action")
-                progress["stage"] = "environment_step"
-                obs, rewards, dones, extras = env.step(actions)
-                progress["completed_environment_steps"] += 1
-                progress["stage"] = "rollout_storage"
-                if not torch.isfinite(rewards).all():
-                    raise ValueError("Nonfinite readiness rewards")
-                algorithm.process_env_step(obs, rewards, dones, extras)
-                progress["completed_ppo_transition_steps"] += 1
-            progress["stage"] = "returns"
-            validate_terrain_scan(obs["terrain"], num_envs=80)
-            algorithm.compute_returns(obs)
-        progress["stage"] = "trace_validation"
-        capture.enabled = False
-        trace = capture.finish()
-        trace.update(initial, terrain_observation=np.stack(terrain_frames))
-        if trace["terrain_observation"].shape != (
-            TERRAIN_READINESS_STEPS,
-            80,
-            264,
-        ) or trace["action"].shape != (TERRAIN_READINESS_STEPS, 80, 12):
-            raise ValueError(
-                "Readiness requires a complete 1000-step/80-environment trace"
-            )
-        np.savez_compressed(output / "trace.npz", **trace)
-        motor = validate_motor_trace(trace)
-        progress["stage"] = "ppo_update"
-        losses = algorithm.update()
-        progress["completed_ppo_updates"] += 1
-        progress["stage"] = "update_validation"
-        update = terrain_update_evidence(policy, algorithm, losses)
-        progress["stage"] = "artifact_publication"
-        torch.save(
-            {
-                "interface": interface,
-                "model_state_dict": policy.state_dict(),
-                "optimizer_state_dict": algorithm.optimizer.state_dict(),
-                "learning_updates": 1,
-                "readiness_only": True,
-                "behavior_validated": False,
-            },
-            output / "terrain_readiness.pt",
-        )
-        if terrain_source_identity(args) != protocol["source_identity"]:
-            raise ValueError("Readiness sources changed during execution")
-        write_json(
-            output / "training_status.json",
-            {
-                "status": "READINESS_PASS",
-                "interface_version": TERRAIN_VERSION,
-                "source_identity": protocol["source_identity"],
-                "update": update,
-                "simulation_steps": TERRAIN_READINESS_STEPS,
-                "environment_transitions": int(np.prod(trace["action"].shape[:2])),
-                "exact_action_and_value_parity_comparisons": TERRAIN_READINESS_STEPS
-                * 80,
-                "motor_interface": motor,
-                "mesh": geometry,
-                "sha256": {
-                    name: file_sha256(output / name) for name in TERRAIN_ARTIFACTS
-                },
-                "behavior_validated": False,
-                "promoted": False,
-                "scope": "One PPO plumbing update with source rewards, fixed mixed L0/L1 fixture. NOT convergence, progressive training, operator retention, student behavior or exit acceptance.",
-            },
-        )
-    except Exception as error:
-        # Publish before Kit closes: some shutdown paths terminate Python with
-        # exit(0), so the parent must own result/exit semantics.
-        progress["recorded_steps"] = len(capture.samples) if capture is not None else 0
-        report_terrain_readiness_error(output, error, progress)
-    finally:
-        for name, resource in (("environment", env), ("application", app)):
-            if resource is not None:
-                try:
-                    resource.close()
-                except Exception as error:
-                    print(
-                        f"Terrain readiness {name} cleanup ERROR: {error}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    write_json(
-                        output / f"{name}_cleanup_error.json", {"error": str(error)}
-                    )
 
 
 def validate_readiness_report(path, identity, *, critic_context=False):
@@ -2672,10 +2441,296 @@ def procedural_config_main(args, parser):
                 )
 
 
+def recurrent_training_identity(checkpoint):
+    """Bind executable inputs only; docs and tests need not exist on the server."""
+    root = Path(__file__).resolve().parents[2]
+    sources = sorted((root / "scripts/rsl_rl").glob("*.py")) + sorted(
+        (root / "source/parkour_lab/parkour_lab").rglob("*.py")
+    )
+    return {
+        "physical_reference": {
+            "checkpoint": file_sha256(checkpoint),
+            **{
+                name: file_sha256(checkpoint.parent / "params" / name)
+                for name in ("agent.yaml", "env.yaml")
+            },
+        },
+        "runtime": {str(p.relative_to(root)): file_sha256(p) for p in sources},
+    }
+
+
+def recurrent_training_main(args, parser):
+    """One native acquisition run; no test/docs dependency or implicit promotion."""
+    if (
+        not 1 <= args.iterations <= 3000
+        or not 80 <= args.num_envs <= 5120
+        or args.num_envs % 20
+        or args.seed < 0
+        or args.seed in (43, 44, 45)
+        or not math.isfinite(args.timeout)
+        or args.timeout <= 0
+        or args.curriculum != VERSION
+        or args.refinement_profile != "source"
+        or args.skip_check
+        or args.moving_retention
+        or args.terrain_train
+        or args.terrain_readiness
+        or args.terrain_critic_context
+        or any(
+            getattr(args, name) is not None
+            for name in (
+                "terrain_evaluate_checkpoint",
+                "mesh_flat_report",
+                "readiness_report",
+                "check_offsets",
+                "baseline_report",
+                "resume_retention_reference",
+                "zero_command_reference_report",
+                "reversal_stop_probe",
+            )
+        )
+        or (args.validate_only and args.worker_output is not None)
+    ):
+        parser.error(
+            "Procedural acquisition requires 1–3000 updates, 80–5120 environments "
+            "in multiples of 20, positive timeout and a training seed outside 43–45. "
+            "No legacy training, refinement, retention, skip-check or resume flags."
+        )
+    try:
+        from .operator_student_bridge import RECURRENT_OPERATOR_VERSION
+    except ImportError:
+        from operator_student_bridge import RECURRENT_OPERATOR_VERSION
+    try:
+        checkpoint = args.checkpoint.resolve(strict=True)
+        agent = read_yaml_data(checkpoint.parent / "params/agent.yaml")
+        saved = read_yaml_data(checkpoint.parent / "params/env.yaml")
+        load_reference_checkpoint(checkpoint, agent)
+        select_profile(saved, agent, "source")
+        if importlib.metadata.version("rsl-rl-lib") != "3.1.2":
+            raise ValueError("Recurrent acquisition requires RSL-RL 3.1.2")
+        identity = recurrent_training_identity(checkpoint)
+    except Exception as error:
+        parser.error(f"Invalid physical reference or runtime: {error}")
+    protocol = {
+        "version": "operator_proprio_acquisition_v1",
+        "policy_version": RECURRENT_OPERATOR_VERSION,
+        "source_identity": identity,
+        "initialization": "fresh actor, critic and Adam; physical reference weights NOT loaded",
+        "seed": args.seed,
+        "num_envs": args.num_envs,
+        "learning_updates": args.iterations,
+        "rollout_steps_per_update": 24,
+        "simulated_seconds_per_environment": args.iterations * 24 * DT,
+        "terrain": "operator_procedural_surface_v2",
+        "difficulty_range": list(PROCEDURAL_EASY_DIFFICULTY),
+        "adaptive_terrain_promotion": False,
+        "gaps": False,
+        "stage": "fixed_easy_acquisition",
+        "ppo": {"learning_rate": 1e-3, "schedule": "adaptive", "entropy_coef": 0.01},
+        "reward_profile": "stock broad tracking kernels; flat_orientation_l2=0, feet_air_time=0.01; no stationary precision or action-retention loss",
+        "initial_action_std": 0.5,
+        "metrics": "per-profile command tracking, measured moving/nonflat exposure, physical failures and timeouts; training data, not held-out success rates",
+        "checkpoint_selection": "save every 50 completed updates and final; no automatic selection or promotion",
+        "scope": "Acquire a causal gait before progression; short budgets are integration only. No terrain exit acceptance or deployment claim.",
+        "exit_allowed": False,
+    }
+    if args.validate_only:
+        print(
+            json.dumps(
+                {"status": "SOURCE_VALIDATED_NOT_SIMULATED", "protocol": protocol},
+                indent=2,
+            )
+        )
+        return 0
+    if args.worker_output is None:
+        args.output_parent.mkdir(parents=True, exist_ok=True)
+        output = Path(
+            tempfile.mkdtemp(prefix="operator_proprio_", dir=args.output_parent)
+        ).resolve()
+        args.procedural_output = output
+        write_run_provenance(output, __file__)
+        write_json(output / "training_protocol.json", protocol)
+        print(f"Fresh recurrent acquisition: {output}", flush=True)
+        result = supervise(
+            [
+                sys.executable,
+                "-u",
+                str(Path(__file__).resolve()),
+                str(checkpoint),
+                "--procedural-train",
+                "--iterations",
+                str(args.iterations),
+                "--num-envs",
+                str(args.num_envs),
+                "--seed",
+                str(args.seed),
+                "--device",
+                args.device,
+                "--worker-output",
+                str(output),
+            ],
+            output,
+            timeout_s=args.timeout,
+            report_filename="training_status.json",
+            valid_statuses=("ACQUISITION_COMPLETE_NOT_ACCEPTED", "ERROR"),
+        )
+        try:
+            if identity != recurrent_training_identity(checkpoint):
+                raise ValueError(
+                    "Physical reference or runtime changed during training"
+                )
+            if result.get("status") == "ACQUISITION_COMPLETE_NOT_ACCEPTED":
+                expected = {
+                    "policy_version": RECURRENT_OPERATOR_VERSION,
+                    "learning_updates": args.iterations,
+                    "environment_transitions": args.iterations * 24 * args.num_envs,
+                    "protocol_sha256": file_sha256(output / "training_protocol.json"),
+                    "exit_allowed": False,
+                }
+                if any(result.get(k) != v for k, v in expected.items()):
+                    raise ValueError("Incomplete recurrent training receipt")
+                artifacts = result["sha256"]
+                required = {
+                    f"model_{args.iterations}.pt",
+                    "params/env.yaml",
+                    "params/agent.yaml",
+                }
+                if set(artifacts) != required or any(
+                    file_sha256(output / name) != digest
+                    for name, digest in artifacts.items()
+                ):
+                    raise ValueError("Recurrent checkpoint/configuration hashes differ")
+                # A matching file hash alone does not make a usable checkpoint.
+                import torch
+
+                learned = torch.load(
+                    output / f"model_{args.iterations}.pt",
+                    map_location="cpu",
+                    weights_only=True,
+                )
+                info = learned["infos"]
+                metadata = info["recurrent_training"]
+                weights = learned["model_state_dict"]
+                adam = learned["optimizer_state_dict"]["state"]
+                if (
+                    learned["iter"] != args.iterations - 1
+                    or info["learning_updates"] != args.iterations
+                    or any(
+                        metadata.get(k) != expected[k]
+                        for k in (
+                            "policy_version",
+                            "learning_updates",
+                            "environment_transitions",
+                        )
+                    )
+                    or not weights
+                    or any(not torch.isfinite(v).all() for v in weights.values())
+                    or not adam
+                    or any(
+                        state["step"].item() != 20 * args.iterations
+                        or not torch.isfinite(state["exp_avg"]).all()
+                        or not torch.isfinite(state["exp_avg_sq"]).all()
+                        for state in adam.values()
+                    )
+                ):
+                    raise ValueError(
+                        "Invalid saved recurrent weights, Adam state or update counts"
+                    )
+        except Exception as error:
+            result = {
+                "status": "ERROR",
+                "error": str(error),
+                "measurement_result": result,
+            }
+        result["exit_allowed"] = False
+        write_json(output / "report.json", result)
+        print(f"{result['status']}: {output / 'report.json'}", flush=True)
+        if result["status"] == "ERROR":
+            print(json.dumps(result, indent=2), flush=True)
+        return 0 if result["status"] == "ACQUISITION_COMPLETE_NOT_ACCEPTED" else 2
+
+    output, app, env = args.worker_output, None, None
+    try:
+        if json.loads((output / "training_protocol.json").read_text()) != protocol:
+            raise ValueError("Training inputs differ from the predeclared protocol")
+        detected = importlib.metadata.version("isaaclab")
+        if detected not in PROCEDURAL_ISAACLAB_DISTRIBUTIONS:
+            raise ValueError(
+                f"Require Isaac Lab {PROCEDURAL_ISAACLAB_DISTRIBUTIONS}; found {detected}"
+            )
+        from isaaclab.app import AppLauncher
+
+        app = AppLauncher(headless=True, livestream=0, device=args.device).app
+        from isaaclab.envs import ManagerBasedRLEnv
+
+        try:
+            from .operator_student_bridge import run_recurrent_training
+        except ImportError:
+            from operator_student_bridge import run_recurrent_training
+        cfg, runner_cfg = proprioceptive_procedural_configs(saved, agent, args)
+        cfg.validate()
+        params = output / "params"
+        params.mkdir()
+        (params / "env.yaml").write_text(yaml.dump(cfg.to_dict(), sort_keys=False))
+        (params / "agent.yaml").write_text(yaml.dump(runner_cfg, sort_keys=False))
+        env = ManagerBasedRLEnv(cfg=cfg)
+        result = run_recurrent_training(
+            env,
+            runner_cfg,
+            output,
+            is_running=app.is_running,
+            iterations=args.iterations,
+        )
+        if identity != recurrent_training_identity(checkpoint):
+            raise ValueError("Physical reference or runtime changed during training")
+        result.update(
+            status="ACQUISITION_COMPLETE_NOT_ACCEPTED",
+            policy_version=RECURRENT_OPERATOR_VERSION,
+            protocol_sha256=file_sha256(output / "training_protocol.json"),
+            packages={"isaaclab": detected, "rsl-rl-lib": "3.1.2"},
+            sha256={
+                name: file_sha256(output / name)
+                for name in (
+                    f"model_{args.iterations}.pt",
+                    "params/env.yaml",
+                    "params/agent.yaml",
+                )
+            },
+            exit_allowed=False,
+        )
+        write_json(output / "training_status.json", result)
+        return 0
+    except Exception as error:
+        write_json(
+            output / "training_status.json",
+            {
+                "status": "ERROR",
+                "error": str(error),
+                "traceback": traceback.format_exc(),
+                "exit_allowed": False,
+            },
+        )
+        return 2
+    finally:
+        for name, resource in (("environment", env), ("application", app)):
+            if resource is not None:
+                try:
+                    resource.close()
+                except Exception as error:
+                    write_json(
+                        output / f"{name}_cleanup_error.json", {"error": str(error)}
+                    )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     procedural = parser.add_mutually_exclusive_group()
+    procedural.add_argument(
+        "--procedural-train",
+        action="store_true",
+        help="Train a fresh proprioceptive GRU on fixed easy supported terrain; reference checkpoint binds physics only; no resume or exit acceptance",
+    )
     procedural.add_argument(
         "--procedural-config-check",
         action="store_true",
@@ -2729,10 +2784,10 @@ def main(argv=None):
     parser.add_argument(
         "--iterations",
         type=int,
-        default=300,
-        help="Additional PPO updates (default: 300)",
+        default=None,
+        help="PPO updates (default: procedural acquisition 1000; refinement 300)",
     )
-    parser.add_argument("--num-envs", type=int, default=4096)
+    parser.add_argument("--num-envs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
@@ -2769,7 +2824,7 @@ def main(argv=None):
     parser.add_argument(
         "--validate-only",
         action="store_true",
-        help="v3 or procedural-config source-only CPU preflight; no output or simulator launch",
+        help="v3, procedural-config or procedural-train source-only CPU preflight; no output or simulator launch",
     )
     parser.add_argument(
         "--output-parent",
@@ -2789,9 +2844,21 @@ def main(argv=None):
     )
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    if args.procedural_config_check or args.procedural_rollout_check:
+    if args.iterations is None:
+        args.iterations = 1000 if args.procedural_train else 300
+    if args.num_envs is None:
+        args.num_envs = 1280 if args.procedural_train else 4096
+    if (
+        args.procedural_train
+        or args.procedural_config_check
+        or args.procedural_rollout_check
+    ):
         try:
-            return procedural_config_main(args, parser)
+            return (
+                recurrent_training_main(args, parser)
+                if args.procedural_train
+                else procedural_config_main(args, parser)
+            )
         except Exception as error:
             result = {"status": "ERROR", "error": str(error), "exit_allowed": False}
             output = getattr(args, "procedural_output", None)
