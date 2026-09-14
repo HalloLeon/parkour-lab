@@ -3,10 +3,10 @@
 No external Isaac Lab training script is needed. Actor, critic and action noise
 are restored exactly. Command sampling and versioned reward/entropy profiles
 are explicit; Adam starts fresh unless an evidence-bound retention resume is
-requested. Opt-in --terrain-readiness checks a terrain-conditioned warm start
-and one PPO update; it does not train or qualify an obstacle/RMA policy.
-Opt-in --terrain-train runs progressive teacher acquisition and fixed development
-checks after verified readiness; it does not qualify a causal student or handoff.
+requested. --procedural-config-check validates the replacement operator-only
+configuration without constructing an environment, collecting transitions or
+learning. Its simulator scan is a privileged fixture, not a deployed sensor.
+The old four-family acquisition recipe is retired; archived readers remain.
 """
 
 from __future__ import annotations
@@ -380,6 +380,150 @@ def build_terrain_policy(observations, source_state, *, critic_context=False):
         policy.obs_groups["critic"].append("critic_context")
     device = observations["policy"].device
     return policy.to(device), reference.to(device).eval().requires_grad_(False)
+
+
+PROCEDURAL_TERRAIN_VERSION = "go2_operator_procedural_terrain_v1"
+PROCEDURAL_EASY_DIFFICULTY = (0.05, 0.15)
+PROCEDURAL_SCAN_INTERFACE = {
+    "version": "privileged_centered_height_valid_132_v1",
+    "height_count": 132,
+    "validity_count": 132,
+    "grid_size_m": [1.65, 1.50],
+    "grid_resolution_m": 0.15,
+    "grid_offset_m": [0.0, 0.0, 20.0],
+    "ordering": "xy",
+    "ray_alignment": "yaw",
+    "vertical_offset_m": 0.30,
+    "clip_m": 0.50,
+    "deployment_claim": "privileged teacher only; causal student sensing unresolved",
+    "checkpoint_compatibility": "stock 48-D warm start only; no legacy terrain resume",
+}
+
+
+def procedural_terrain_configs(saved, agent, args):
+    """Build the new operator-only acquisition fixture, without a route overlay.
+
+    This is a configuration/preflight contract, not a training or acceptance
+    claim. A fixed easy row deliberately has no adaptive progression until
+    command-integrated traversal criteria and deployed sensing are validated.
+    """
+    from isaaclab.managers import (
+        ObservationGroupCfg,
+        ObservationTermCfg,
+        SceneEntityCfg,
+        TerminationTermCfg,
+    )
+    from isaaclab.sensors import RayCasterCfg, patterns
+    from parkour_lab.tasks.manager_based.parkour_lab import mdp
+    from parkour_lab.tasks.manager_based.parkour_lab.mdp.terrain.operator_terrain import (
+        BORDER_WIDTH,
+        ENVELOPES,
+        make_operator_terrain_generator,
+    )
+
+    try:
+        from .operator_command import (
+            ProceduralTerrainCommand,
+            procedural_physical_failure,
+            procedural_workspace,
+        )
+    except ImportError:
+        from operator_command import (
+            ProceduralTerrainCommand,
+            procedural_physical_failure,
+            procedural_workspace,
+        )
+
+    # Reconstruct/validate the stock physical checkpoint contract first.
+    # This task explicitly chooses v3 for its level-terrain training draws.
+    procedural_args = copy.copy(args)
+    procedural_args.curriculum = SEQUENCE_VERSION
+    cfg, runner_cfg = training_configs(saved, agent, procedural_args)
+    cfg.scene.terrain.terrain_type = "generator"
+    cfg.scene.terrain.terrain_generator = make_operator_terrain_generator(
+        seed=args.seed,
+        num_rows=1,
+        difficulty_range=PROCEDURAL_EASY_DIFFICULTY,
+        # Native generator flag means deterministic profile columns here;
+        # one row plus no manager curriculum means NO level promotion.
+        curriculum=True,
+    )
+    cfg.scene.terrain.max_init_terrain_level = 0
+    cfg.curriculum.terrain_levels = None
+    cfg.commands.base_velocity.class_type = ProceduralTerrainCommand
+    # The reset support pad extends one metre in both axes. The smaller root
+    # jitter leaves room for the complete Go2 support footprint at any yaw.
+    cfg.events.reset_base.params["pose_range"] = {
+        "x": (-0.2, 0.2),
+        "y": (-0.2, 0.2),
+        "yaw": (-math.pi, math.pi),
+    }
+    # Match the pinned Isaac Lab Go2 rough baseline for the two explicitly
+    # flat-specific rewards. All motors, actions, other rewards, noise and
+    # startup physical randomization still come from the validated reference.
+    cfg.rewards.flat_orientation_l2.weight = 0.0
+    cfg.rewards.feet_air_time.weight = 0.01
+
+    scan = PROCEDURAL_SCAN_INTERFACE
+    cfg.scene.height_scanner = RayCasterCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/base",
+        offset=RayCasterCfg.OffsetCfg(pos=tuple(scan["grid_offset_m"])),
+        ray_alignment=scan["ray_alignment"],
+        pattern_cfg=patterns.GridPatternCfg(
+            resolution=scan["grid_resolution_m"],
+            size=tuple(scan["grid_size_m"]),
+            direction=(0.0, 0.0, -1.0),
+            ordering=scan["ordering"],
+        ),
+        mesh_prim_paths=[cfg.scene.terrain.prim_path],
+        max_distance=25.0,
+        update_period=DT,
+        debug_vis=False,
+    )
+    cfg.scene.base_height_scanner = cfg.scene.height_scanner.replace(
+        pattern_cfg=patterns.GridPatternCfg(
+            resolution=1.0, size=(0.0, 0.0), direction=(0.0, 0.0, -1.0)
+        )
+    )
+    terrain_observations = ObservationGroupCfg(
+        enable_corruption=False, concatenate_terms=True
+    )
+    terrain_observations.height_scan = ObservationTermCfg(
+        func=mdp.terrain_height_scan,
+        params={
+            "asset_cfg": SceneEntityCfg("robot"),
+            "sensor_cfg": SceneEntityCfg("height_scanner"),
+            "obs_cfg": mdp.config.HeightScanObservationCfg(
+                num_rays=scan["height_count"],
+                vertical_offset=scan["vertical_offset_m"],
+                clip=scan["clip_m"],
+            ),
+        },
+    )
+    cfg.observations.terrain = terrain_observations
+    cfg.terminations.procedural_physical_failure = TerminationTermCfg(
+        func=procedural_physical_failure,
+        params={
+            "minimum_m": 0.12,
+            "minimum_surface_z_m": -max(height for height, _ in ENVELOPES.values())
+            * PROCEDURAL_EASY_DIFFICULTY[1],
+            "fall_margin_m": 0.5,
+        },
+    )
+    # Install last so existing base contact / terrain-relative physical
+    # failure cannot become a bootstrapped workspace timeout.
+    cfg.terminations.procedural_workspace = TerminationTermCfg(
+        func=procedural_workspace,
+        params={"margin_m": BORDER_WIDTH + 0.25},
+        time_out=True,
+    )
+    runner_cfg.update(
+        run_name=PROCEDURAL_TERRAIN_VERSION,
+        obs_groups={"policy": ["policy", "terrain"], "critic": ["policy", "terrain"]},
+        terrain_warm_start_builder="operator_train.build_terrain_policy",
+        interface_version=PROCEDURAL_TERRAIN_VERSION,
+    )
+    return cfg, runner_cfg
 
 
 def terrain_readiness_configs(saved, agent, args):
@@ -1514,439 +1658,6 @@ def run_terrain_teacher(args, output, saved, agent, protocol):
                     )
 
 
-def terrain_teacher_main(args, parser):
-    if (
-        args.terrain_readiness
-        or args.iterations != 3000
-        or args.num_envs != 3200
-        or args.seed != 42
-        or args.curriculum != VERSION
-        or args.refinement_profile != "source"
-        or args.mesh_flat_report is None
-        or args.readiness_report is None
-        or args.skip_check
-        or args.moving_retention
-        or any(
-            getattr(args, name) is not None
-            for name in (
-                "check_offsets",
-                "baseline_report",
-                "resume_retention_reference",
-                "zero_command_reference_report",
-                "reversal_stop_probe",
-            )
-        )
-        or not math.isfinite(args.timeout)
-        or args.timeout <= 0
-        or (args.validate_only and args.worker_output is not None)
-        or (args.terrain_evaluate_checkpoint is not None and args.worker_output is None)
-    ):
-        parser.error(
-            "Terrain learning requires --iterations 3000 --num-envs 3200 --seed 42 --readiness-report --mesh-flat-report; no legacy refinement/resume flags"
-        )
-    try:
-        try:
-            from .operator_benchmark import validate_mesh_flat_report
-        except ImportError:
-            from operator_benchmark import validate_mesh_flat_report
-        args.checkpoint = args.checkpoint.resolve(strict=True)
-        args.mesh_flat_report = args.mesh_flat_report.resolve(strict=True)
-        args.readiness_report = args.readiness_report.resolve(strict=True)
-        agent = read_yaml_data(args.checkpoint.parent / "params/agent.yaml")
-        saved = read_yaml_data(args.checkpoint.parent / "params/env.yaml")
-        source = load_reference_checkpoint(args.checkpoint, agent)
-        select_profile(saved, agent, "source")
-        if importlib.metadata.version("rsl-rl-lib") != "3.1.2":
-            raise ValueError("Terrain learning requires RSL-RL 3.1.2")
-        mesh = validate_mesh_flat_report(args.mesh_flat_report, args.checkpoint)
-        identity = terrain_source_identity(args)
-        readiness = validate_readiness_report(
-            args.readiness_report, identity, critic_context=args.terrain_critic_context
-        )
-        import torch
-
-        with torch.random.fork_rng(devices=[]):
-            observations = {"policy": torch.zeros(4, 48), "terrain": torch.ones(4, 264)}
-            if args.terrain_critic_context:
-                observations["critic_context"] = torch.zeros(4, 4)
-                observations["critic_context"][0, 0] = 1
-            policy, _ = build_terrain_policy(
-                observations,
-                source["model_state_dict"],
-                critic_context=args.terrain_critic_context,
-            )
-    except Exception as error:
-        parser.error(f"Terrain learning preflight failed: {error}")
-    if args.validate_only:
-        print(
-            f"Validated readiness/source and {terrain_training_version(args.terrain_critic_context)} construction (actor 312-D). Progressive training and learned behavior remain UNRUN."
-        )
-        return 0
-    if args.worker_output is not None:
-        try:
-            protocol = json.loads(
-                (args.worker_output / "terrain_protocol.json").read_text()
-            )
-            run_terrain_teacher(args, args.worker_output, saved, agent, protocol)
-        except Exception as error:
-            report_terrain_readiness_error(
-                args.worker_output, error, {"stage": "worker_startup"}
-            )
-        return 0
-    output = None
-    try:
-        args.output_parent.mkdir(parents=True, exist_ok=True)
-        output = Path(
-            tempfile.mkdtemp(prefix="operator_terrain_teacher_", dir=args.output_parent)
-        ).resolve()
-        return supervise_terrain_teacher(args, output, identity, readiness, mesh)
-    except Exception as error:
-        print(f"Terrain teacher supervisor ERROR: {error}", file=sys.stderr, flush=True)
-        if output is not None:
-            try:
-                write_json(
-                    output / "report.json",
-                    {"status": "ERROR", "error": str(error), "promoted": False},
-                )
-            except OSError as publication_error:
-                print(
-                    f"Could not publish error report: {publication_error}",
-                    file=sys.stderr,
-                    flush=True,
-                )
-        return 2
-
-
-def supervise_terrain_teacher(args, output, identity, readiness, mesh):
-    """Keep measured behavioral failures; stop on invalid/missing measurements."""
-    write_run_provenance(output, Path(__file__))
-    critic_context = getattr(args, "terrain_critic_context", False)
-    protocol = {
-        "version": terrain_training_version(critic_context),
-        "source_identity": identity,
-        "readiness": readiness,
-        "mesh_flat": mesh,
-        "num_envs": 3200,
-        "seed": 42,
-        "rollout_steps": 24,
-        "learning_updates": 3000,
-        "environment_transitions": 230400000,
-        "initial_level": 0,
-        "max_level": 6,
-        "roles": "fixed IDs%4==0 operator; remaining course, including L0 replay; role never enters actor"
-        + ("; value-only role/route context" if critic_context else "/critic"),
-        "operator_objective": "source rewards plus all-operator-row frozen 8500 soft mean retention (coefficient 0.1, raw action scale 0.1), including pivots and stops; randomized v3 chains",
-        "course_objective": list(TERRAIN_COURSE_REWARDS),
-        "physical_failure_impulse": -10.0,
-        "training_tilt_cutoff": "70 degrees sustained for 0.5 s; reset-safe; disabled for evaluation",
-        "operator_workspace": "Training-only neutral timeout when any body center enters the 0.5 m edge margin of its L0 tile; real physical failure wins; counts saved separately; disabled for evaluation",
-        "check_updates": list(TERRAIN_CHECK_UPDATES),
-        "check_seed": 43,
-        "checks": "after all training; actual teacher, 40 operator trials + 10 per family/level 1, 3, 6 at canonical variant 0; all results retained",
-        "scope": "Privileged teacher acquisition only; no live handoff/student/heldout/exit promotion",
-    }
-    if critic_context:
-        protocol["critic_context"] = copy.deepcopy(TERRAIN_CRITIC_CONTEXT)
-        protocol["experiment"] = {
-            "intervention": "critic-only task/route state; fresh stock-8500 zero-fusion initialization, not a learned-teacher resume",
-            "unchanged": "actor 312-D, original tensor initialization/RNG, noise, rewards, PPO/retention, role sampler, curriculum, physical scoring, seeds, budget and check offsets",
-            "comparison": "Matched progressive_v1 with identical source/seed/config at 500/1500/3000; development evidence, not heldout",
-            "value_diagnostics": "Detached unclipped operator/course value MSE pooled over minibatch visits, including repeated PPO epochs; no loss/normalization change",
-            "co_primary_outcomes": [
-                "operator preservation",
-                "first complete L1 traversal in each of the four families",
-            ],
-            "decision": "Retain all declared checks. If operator control still collapses and high_step, hurdle and tilted_ramps still have zero L1 passes, close the context-only branch rather than extend it. Lower value loss, frontier advancement or gap-only gains are insufficient.",
-            "causal_claim": "Missing task state is a representational omission, not a demonstrated sole cause of the prior failures or a proven solution.",
-        }
-    write_json(output / "terrain_protocol.json", protocol)
-    command = [
-        sys.executable,
-        "-u",
-        str(Path(__file__).resolve()),
-        str(args.checkpoint),
-        "--terrain-train",
-        "--readiness-report",
-        str(args.readiness_report),
-        "--mesh-flat-report",
-        str(args.mesh_flat_report),
-        "--iterations",
-        "3000",
-        "--num-envs",
-        "3200",
-        "--seed",
-        "42",
-        "--device",
-        args.device,
-    ]
-    if critic_context:
-        command.append("--terrain-critic-context")
-    print(
-        f"Progressive terrain teacher: {output}; 3000 updates, then checks 500/1500/3000; no exit promotion",
-        flush=True,
-    )
-
-    def checked_worker(folder, extra, expected):
-        result = supervise(
-            command + extra + ["--worker-output", str(folder)],
-            folder,
-            timeout_s=args.timeout if expected == "TRAINED" else 1800,
-            report_filename="training_status.json",
-            valid_statuses=(expected, "ERROR"),
-        )
-        if result.get("status") == expected:
-            if (
-                result.get("source_identity") != identity
-                or terrain_source_identity(args) != identity
-                or list(folder.glob("*_cleanup_error.json"))
-            ):
-                result = {
-                    "status": "ERROR",
-                    "error": "Source or cleanup validation failed",
-                    "measurement_result": result,
-                }
-        return result
-
-    report = checked_worker(output, [], "TRAINED")
-    if report.get("status") == "TRAINED":
-        checks = {}
-        try:
-            if (
-                report.get("learning_updates") != 3000
-                or report.get("environment_transitions") != 230400000
-                or report.get("checkpoints")
-                != {
-                    str(i): file_sha256(output / f"model_{i}.pt")
-                    for i in TERRAIN_CHECK_UPDATES
-                }
-            ):
-                raise ValueError("Incomplete terrain training/checkpoint accounting")
-            for update in TERRAIN_CHECK_UPDATES:
-                checkpoint = output / f"model_{update}.pt"
-                folder = output / "teacher_check" / f"model_{update}"
-                folder.mkdir(parents=True)
-                write_json(
-                    folder / "terrain_protocol.json",
-                    {
-                        **protocol,
-                        "evaluation_checkpoint_sha256": file_sha256(checkpoint),
-                    },
-                )
-                result = checked_worker(
-                    folder,
-                    ["--terrain-evaluate-checkpoint", str(checkpoint)],
-                    "MEASURED",
-                )
-                if result.get("status") == "MEASURED" and (
-                    result.get("checkpoint_sha256") != file_sha256(checkpoint)
-                    or result.get("learning_updates") != update
-                    or result.get("sha256")
-                    != {
-                        name: file_sha256(folder / name)
-                        for name in ("trace.npz", "measurement_report.json")
-                    }
-                ):
-                    result = {
-                        "status": "ERROR",
-                        "error": "Teacher evaluation identity/artifact mismatch",
-                        "measurement_result": result,
-                    }
-                write_json(folder / "report.json", result)
-                checks[str(update)] = result
-                if result["status"] == "ERROR":
-                    # A compatibility/cleanup failure is not a measured policy
-                    # failure. Do not repeat an invalid expensive evaluation.
-                    break
-            report = {
-                "status": (
-                    "COMPLETED"
-                    if len(checks) == len(TERRAIN_CHECK_UPDATES)
-                    and all(r["status"] == "MEASURED" for r in checks.values())
-                    else "ERROR"
-                ),
-                "training": report,
-                "teacher_checks": checks,
-                "checks_not_run": [
-                    i for i in TERRAIN_CHECK_UPDATES if str(i) not in checks
-                ],
-                "promoted": False,
-                "exit_gate_passed": False,
-                "scope": "COMPLETED means budget and measurements finished, not behavioral acceptance",
-            }
-        except Exception as error:
-            report = {
-                "status": "ERROR",
-                "error": str(error),
-                "training": report,
-                "teacher_checks": checks,
-            }
-    write_json(output / "report.json", report)
-    print(f"{report['status']}: {output / 'report.json'}", flush=True)
-    return 0 if report["status"] == "COMPLETED" else 2
-
-
-def terrain_readiness_main(args, parser):
-    """Keep readiness fail-closed and separate from historical flat protocols."""
-    if (
-        args.iterations != 1
-        or args.num_envs != 80
-        or args.seed != 42
-        or args.curriculum != VERSION
-        or args.refinement_profile != "source"
-        or args.mesh_flat_report is None
-        or args.skip_check
-        or args.moving_retention
-        or any(
-            getattr(args, name) is not None
-            for name in (
-                "check_offsets",
-                "baseline_report",
-                "resume_retention_reference",
-                "zero_command_reference_report",
-                "reversal_stop_probe",
-            )
-        )
-        or not math.isfinite(args.timeout)
-        or args.timeout <= 0
-        or (args.validate_only and args.worker_output is not None)
-    ):
-        parser.error(
-            "Terrain readiness requires --iterations 1 --num-envs 80 --seed 42 --mesh-flat-report; no flat refinement/resume/check flags"
-        )
-    try:
-        try:
-            from .operator_benchmark import validate_mesh_flat_report
-        except ImportError:
-            from operator_benchmark import validate_mesh_flat_report
-        args.checkpoint = args.checkpoint.resolve(strict=True)
-        args.mesh_flat_report = args.mesh_flat_report.resolve(strict=True)
-        agent = read_yaml_data(args.checkpoint.parent / "params/agent.yaml")
-        saved = read_yaml_data(args.checkpoint.parent / "params/env.yaml")
-        source = load_reference_checkpoint(args.checkpoint, agent)
-        select_profile(saved, agent, "source")
-        if importlib.metadata.version("rsl-rl-lib") != "3.1.2":
-            raise ValueError("Terrain readiness requires RSL-RL 3.1.2")
-        mesh_flat = validate_mesh_flat_report(args.mesh_flat_report, args.checkpoint)
-        identity = terrain_source_identity(args)
-        # CPU-only construction catches dtype, shape and source migration errors
-        # before a simulator or output directory is created. Preserve CPU RNG.
-        import torch
-
-        with torch.random.fork_rng(devices=[]):
-            observations = {"policy": torch.zeros(4, 48), "terrain": torch.ones(4, 264)}
-            policy, reference = build_terrain_policy(
-                observations, source["model_state_dict"]
-            )
-            with torch.no_grad():
-                if not torch.equal(
-                    policy.act_inference(observations),
-                    reference.act_inference(observations),
-                ) or not torch.equal(
-                    policy.evaluate(observations), reference.evaluate(observations)
-                ):
-                    raise ValueError("CPU terrain warm-start parity failed")
-    except Exception as error:
-        parser.error(f"Terrain readiness preflight failed: {error}")
-    if args.validate_only:
-        print(
-            "Validated terrain warm start and mesh prerequisite. GPU rollout/PPO update remain UNRUN."
-        )
-        return 0
-    if args.worker_output is not None:
-        try:
-            protocol = json.loads(
-                (args.worker_output / "readiness_protocol.json").read_text()
-            )
-            run_terrain_readiness(args, args.worker_output, agent, saved, protocol)
-        except Exception as error:
-            report_terrain_readiness_error(
-                args.worker_output, error, {"stage": "worker_startup"}
-            )
-        return 0
-    args.output_parent.mkdir(parents=True, exist_ok=True)
-    output = Path(
-        tempfile.mkdtemp(prefix="operator_terrain_readiness_", dir=args.output_parent)
-    ).resolve()
-    write_run_provenance(output, Path(__file__))
-    write_json(
-        output / "readiness_protocol.json",
-        {
-            "version": TERRAIN_VERSION,
-            "source_identity": identity,
-            "mesh_flat": mesh_flat,
-            "seed": 42,
-            "num_envs": 80,
-            "rollout_steps": 1000,
-            "ppo_updates": 1,
-            "scope": "Engineering readiness only. Source rewards; no convergence or behavior claim; no retention or curriculum promotion.",
-        },
-    )
-    print(
-        f"Terrain warm-start/PPO readiness (not behavior acceptance): {output}",
-        flush=True,
-    )
-    report = supervise(
-        [
-            sys.executable,
-            "-u",
-            str(Path(__file__).resolve()),
-            str(args.checkpoint),
-            "--terrain-readiness",
-            "--mesh-flat-report",
-            str(args.mesh_flat_report),
-            "--iterations",
-            "1",
-            "--num-envs",
-            "80",
-            "--seed",
-            "42",
-            "--device",
-            args.device,
-            "--worker-output",
-            str(output),
-        ],
-        output,
-        timeout_s=args.timeout,
-        report_filename="training_status.json",
-        valid_statuses=("READINESS_PASS", "ERROR"),
-    )
-    if report["status"] == "READINESS_PASS":
-        try:
-            if (
-                report.get("source_identity") != identity
-                or terrain_source_identity(args) != identity
-                or report.get("interface_version") != TERRAIN_VERSION
-                or report.get("update", {}).get("ppo_updates") != 1
-                or report.get("simulation_steps") != 1000
-                or report.get("environment_transitions") != 80000
-                or report.get("exact_action_and_value_parity_comparisons") != 80000
-                or report.get("behavior_validated") is not False
-                or report.get("promoted") is not False
-                or list(output.glob("*_cleanup_error.json"))
-            ):
-                raise ValueError("Worker identity/update count mismatch")
-            for name in TERRAIN_ARTIFACTS:
-                if report.get("sha256", {}).get(name) != file_sha256(output / name):
-                    raise ValueError(f"Missing or changed readiness artifact: {name}")
-        except Exception as error:
-            report = {"status": "ERROR", "error": str(error), "worker_result": report}
-    write_json(output / "report.json", report)
-    if report["status"] == "ERROR":
-        print(
-            f"Terrain readiness ERROR: {report.get('error', 'See report for details')}",
-            file=sys.stderr,
-            flush=True,
-        )
-        failure = report.get("measurement_result", {})
-        if failure.get("error"):
-            print(f"Worker cause: {failure['error']}", file=sys.stderr, flush=True)
-    print(
-        f"{report['status']}: {output / 'report.json'}; obstacle/critic acceptance remains false",
-        flush=True,
-    )
-    return 0 if report["status"] == "READINESS_PASS" else 2
-
-
 def run_training(args, output, agent, saved):
     resume = getattr(args, "retention_resume", None)
     zero_reference = getattr(args, "zero_command_reference", None)
@@ -2498,23 +2209,168 @@ def run_retention_checks(checkpoints, output, device, baseline):
         return result, 2
 
 
+def procedural_config_main(args, parser):
+    """Resolve configuration using the existing fail-closed worker supervisor."""
+    if (
+        args.terrain_train
+        or args.terrain_readiness
+        or args.terrain_critic_context
+        or args.moving_retention
+        or args.skip_check
+        or args.curriculum != VERSION
+        or args.refinement_profile != "source"
+        or args.iterations != 300  # Reject an attempted learning budget in this mode.
+        or args.seed != 42
+        or args.num_envs < 20
+        or args.num_envs % 20
+        or not math.isfinite(args.timeout)
+        or args.timeout <= 0
+        or (args.validate_only and args.worker_output is not None)
+        or any(
+            getattr(args, name) is not None
+            for name in (
+                "terrain_evaluate_checkpoint",
+                "mesh_flat_report",
+                "readiness_report",
+                "check_offsets",
+                "baseline_report",
+                "resume_retention_reference",
+                "zero_command_reference_report",
+                "reversal_stop_probe",
+            )
+        )
+    ):
+        parser.error(
+            "Procedural config check requires --num-envs a positive multiple of 20 "
+            "and --seed 42; no learning, legacy terrain, refinement or resume flags"
+        )
+    try:
+        checkpoint = args.checkpoint.resolve(strict=True)
+        saved = read_yaml_data(checkpoint.parent / "params/env.yaml")
+        agent = read_yaml_data(checkpoint.parent / "params/agent.yaml")
+        load_reference_checkpoint(checkpoint, agent)
+        select_profile(saved, agent, "source")
+        if importlib.metadata.version("rsl-rl-lib") != "3.1.2":
+            raise ValueError("This integration targets the pinned RSL-RL 3.1.2")
+    except Exception as error:
+        parser.error(f"Procedural source preflight failed: {error}")
+    if args.validate_only:
+        print(
+            "Checkpoint architecture and reward profile validated. Native physical/"
+            "algorithm configuration, physics, learning and behavior remain UNRUN; "
+            "no files written."
+        )
+        return 0
+    if args.worker_output is None:
+        source_hash = file_sha256(checkpoint)
+        # Reuse the existing supervisor, not another persistent probe/run tree.
+        # A receipt written before Kit closes preserves failures even if native
+        # shutdown exits(0). Temporary receipts are removed after reporting.
+        with tempfile.TemporaryDirectory(prefix="operator_config_check_") as folder:
+            result = supervise(
+                [
+                    sys.executable,
+                    "-u",
+                    str(Path(__file__).resolve()),
+                    str(checkpoint),
+                    "--procedural-config-check",
+                    "--num-envs",
+                    str(args.num_envs),
+                    "--device",
+                    args.device,
+                    "--worker-output",
+                    folder,
+                ],
+                Path(folder),
+                timeout_s=args.timeout,
+                report_filename="config_report.json",
+                valid_statuses=("CONFIG_VALIDATED_NOT_SIMULATED", "ERROR"),
+            )
+        if result.get("status") == "CONFIG_VALIDATED_NOT_SIMULATED" and any(
+            result.get(key) != value
+            for key, value in {
+                "version": PROCEDURAL_TERRAIN_VERSION,
+                "source_sha256": source_hash,
+                "num_envs": args.num_envs,
+                "environment_transitions": 0,
+                "learning_updates": 0,
+                "exit_allowed": False,
+            }.items()
+        ):
+            result = {"status": "ERROR", "error": "Invalid configuration receipt"}
+        if file_sha256(checkpoint) != source_hash:
+            result = {"status": "ERROR", "error": "Source checkpoint changed"}
+        print(json.dumps(result, indent=2, allow_nan=False), flush=True)
+        return 0 if result["status"] == "CONFIG_VALIDATED_NOT_SIMULATED" else 2
+    app = None
+    try:
+        if importlib.metadata.version("isaaclab") != "2.3.2":
+            raise ValueError("Native configuration check requires Isaac Lab 2.3.2")
+        from isaaclab.app import AppLauncher
+
+        app = AppLauncher(headless=True, livestream=0, device=args.device).app
+        from parkour_lab.tasks.manager_based.parkour_lab.mdp.terrain.operator_terrain import (
+            terrain_envelope,
+        )
+
+        cfg, runner_cfg = procedural_terrain_configs(saved, agent, args)
+        cfg.validate()
+        write_json(
+            args.worker_output / "config_report.json",
+            {
+                "status": "CONFIG_VALIDATED_NOT_SIMULATED",
+                "version": PROCEDURAL_TERRAIN_VERSION,
+                "source_sha256": file_sha256(checkpoint),
+                "num_envs": cfg.scene.num_envs,
+                "acquisition_difficulty": list(PROCEDURAL_EASY_DIFFICULTY),
+                "geometry": terrain_envelope(),
+                "scan": PROCEDURAL_SCAN_INTERFACE,
+                "policy_groups": runner_cfg["obs_groups"],
+                "environment_transitions": 0,
+                "learning_updates": 0,
+                "exit_allowed": False,
+            },
+        )
+        return 0
+    except Exception as error:
+        write_json(
+            args.worker_output / "config_report.json",
+            {"status": "ERROR", "error": str(error), "exit_allowed": False},
+        )
+        return 2
+    finally:
+        if app is not None:
+            try:
+                app.close()
+            except Exception as error:
+                write_json(
+                    args.worker_output / "application_cleanup_error.json",
+                    {"error": str(error)},
+                )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     parser.add_argument(
+        "--procedural-config-check",
+        action="store_true",
+        help="Check the easy operator-only native configuration; no environment, rollout or learning. Add --validate-only for source-only CPU validation",
+    )
+    parser.add_argument(
         "--terrain-train",
         action="store_true",
-        help="Progressive L0-to-L6 teacher acquisition after verified readiness; no exit promotion",
+        help="Retired four-family acquisition mode (rejected); use --procedural-config-check",
     )
     parser.add_argument(
         "--readiness-report",
         type=Path,
-        help="Source-bound completed terrain-readiness report",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--terrain-critic-context",
         action="store_true",
-        help="Opt in to v2 critic-only task/route context; requires --terrain-train and preserves the 312-D actor",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--terrain-evaluate-checkpoint", type=Path, help=argparse.SUPPRESS
@@ -2522,12 +2378,12 @@ def main(argv=None):
     parser.add_argument(
         "--terrain-readiness",
         action="store_true",
-        help="Validate a terrain-conditioned warm start and one PPO update on mixed L0/L1; not behavior acceptance",
+        help="Retired four-family readiness mode (rejected); use --procedural-config-check",
     )
     parser.add_argument(
         "--mesh-flat-report",
         type=Path,
-        help="Raw checkpoint-bound mesh-flat prerequisite for --terrain-readiness or --terrain-train",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--refinement-profile",
@@ -2584,7 +2440,7 @@ def main(argv=None):
     parser.add_argument(
         "--validate-only",
         action="store_true",
-        help="v3, terrain-readiness or terrain-training CPU preflight only; no output or simulator launch",
+        help="v3 or procedural-config source-only CPU preflight; no output or simulator launch",
     )
     parser.add_argument(
         "--output-parent",
@@ -2604,19 +2460,20 @@ def main(argv=None):
     )
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    if args.terrain_train:
-        return terrain_teacher_main(args, parser)
+    if args.procedural_config_check:
+        return procedural_config_main(args, parser)
     if (
-        args.readiness_report is not None
-        or args.terrain_evaluate_checkpoint is not None
+        args.terrain_train
+        or args.terrain_readiness
         or args.terrain_critic_context
+        or args.readiness_report is not None
+        or args.terrain_evaluate_checkpoint is not None
+        or args.mesh_flat_report is not None
     ):
-        parser.error("Terrain learning/evaluation arguments require --terrain-train")
-    if args.terrain_readiness:
-        return terrain_readiness_main(args, parser)
-    if args.mesh_flat_report is not None:
         parser.error(
-            "--mesh-flat-report requires --terrain-readiness or --terrain-train"
+            "Four-family terrain training/readiness is retired. Use "
+            "--procedural-config-check --num-envs 80 for the replacement configuration; "
+            "historical artifact replay remains in scripts.analysis.operator_terrain_audit."
         )
     if (args.curriculum == SEQUENCE_VERSION) != (args.reversal_stop_probe is not None):
         parser.error("v3 and --reversal-stop-probe must be selected together")

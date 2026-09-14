@@ -64,6 +64,147 @@ class OperatorTransitionCommand(OperatorVelocityCommand):
     curriculum_version = TRANSITION_VERSION
 
 
+class ProceduralTerrainCommand(OperatorTransitionCommand):
+    """Training packet draws, never terrain-dependent steering or arbitration.
+
+    Level/rough-flat tiles retain the v3 operator distribution. Other tiles
+    exercise forward motion, both yaw signs, pivots and exact stops, matching
+    the declared forward-only rough-terrain acquisition envelope. This class
+    is not a live-operator adapter: externally supplied packets must bypass
+    sampling entirely, not be clamped or redirected by terrain profile.
+    """
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        from parkour_lab.tasks.manager_based.parkour_lab.mdp.terrain.operator_terrain import (
+            PROFILE_BY_COLUMN,
+        )
+
+        try:
+            from .operator_sequences import ReversalSequencePlan
+        except ImportError:
+            from operator_sequences import ReversalSequencePlan
+
+        generator = env.cfg.scene.terrain.terrain_generator
+        if (
+            not generator.curriculum
+            or generator.num_cols != len(PROFILE_BY_COLUMN)
+            or generator.num_rows != 1
+            or getattr(env.cfg.curriculum, "terrain_levels", None) is not None
+            or tuple(
+                getattr(sub, "profile", None) for sub in generator.sub_terrains.values()
+            )
+            != PROFILE_BY_COLUMN
+            or any(
+                not math.isclose(sub.proportion, 1 / len(PROFILE_BY_COLUMN))
+                for sub in generator.sub_terrains.values()
+            )
+        ):
+            raise ValueError(
+                "Procedural command sampling requires its fixed one-row profile layout"
+            )
+        flat_columns = torch.tensor(
+            [profile in ("plane", "rough_flat") for profile in PROFILE_BY_COLUMN],
+            dtype=torch.bool,
+            device=self.device,
+        )
+        self.flat_command_rows = flat_columns[env.scene.terrain.terrain_types]
+        self.sequence_plan = ReversalSequencePlan(self.num_envs, self.device)
+        self.rough_sampler = OperatorCommandSampler(self.device, TRANSITION_VERSION)
+        # Same mode identities, magnitudes and live-stop replacement as v2;
+        # only its training draw probabilities differ. No reverse/lateral
+        # packet is drawn on non-flat terrain, including the coverage branch.
+        probabilities = self.rough_sampler.probability.new_tensor(
+            (0.15, 0.075, 0.075, 0.40, 0.15, 0.15, 0.0, 0.0, 0.0)
+        )
+        self.rough_sampler.probability.copy_(probabilities)
+        self.rough_sampler.target_probability.copy_(probabilities)
+
+    def _resample_command(self, env_ids):
+        ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        if not len(ids):
+            return
+        flat_ids = ids[self.flat_command_rows[ids]]
+        if len(flat_ids):
+            new_episode = self.command_counter[flat_ids] == 0
+            super()._resample_command(flat_ids)
+            selected, commands, categories, seconds = self.sequence_plan.resample(
+                flat_ids, new_episode
+            )
+            self.category[selected] = categories
+            self.vel_command_b[selected] = commands
+            self.is_standing_env[selected] = categories == 0
+            self.time_left[selected] = seconds
+        rough_ids = ids[~self.flat_command_rows[ids]]
+        if len(rough_ids):
+            categories, commands, seconds = self.rough_sampler.sample(
+                len(rough_ids),
+                previous_category=self.category[rough_ids],
+                new_episode=self.command_counter[rough_ids] == 0,
+            )
+            self.category[rough_ids] = categories
+            self.vel_command_b[rough_ids] = commands
+            self.is_heading_env[rough_ids] = False
+            self.is_standing_env[rough_ids] = categories == 0
+            self.time_left[rough_ids] = seconds
+
+    def __str__(self):
+        return "ProceduralTerrainCommand: operator body twist on every row; no route guidance"
+
+
+def procedural_physical_failure(
+    env,
+    minimum_m: float,
+    minimum_surface_z_m: float,
+    fall_margin_m: float,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("base_height_scanner"),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """Terrain-relative physical failure; downhill elevation is not a fall.
+
+    A center-ray miss over a real gap is not fabricated into a support height.
+    A plunge below the lowest possible generated surface minus a declared
+    margin is nevertheless a failure, even for a floorless hole. This bound
+    must come from the geometry envelope, not a fixed offset below spawn.
+    """
+    if (
+        not math.isfinite(minimum_m)
+        or minimum_m <= 0
+        or not math.isfinite(minimum_surface_z_m)
+        or minimum_surface_z_m > 0
+        or not math.isfinite(fall_margin_m)
+        or fall_margin_m <= 0
+    ):
+        raise ValueError("Procedural clearance and geometry fall bounds are invalid")
+    hits = env.scene[sensor_cfg.name].data.ray_hits_w
+    if hits.shape != (env.num_envs, 1, 3):
+        raise ValueError("Procedural base clearance requires exactly one center ray")
+    root_position = env.scene[asset_cfg.name].data.root_pos_w
+    if not torch.isfinite(root_position).all() or torch.isnan(hits).any():
+        raise RuntimeError("Nonfinite robot state or corrupt procedural clearance rays")
+    valid = torch.isfinite(hits[:, 0]).all(dim=-1)
+    clearance = root_position[:, 2] - hits[:, 0, 2]
+    below_geometry = (
+        root_position[:, 2] - env.scene.env_origins[:, 2]
+        < minimum_surface_z_m - fall_margin_m
+    )
+    return (valid & (clearance < minimum_m)) | below_geometry
+
+
+def procedural_workspace(env, margin_m: float):
+    """Censor tile departures without steering, mastery credit or fall masking."""
+    size = env.cfg.scene.terrain.terrain_generator.size
+    if not math.isfinite(margin_m) or not 0 < margin_m < min(size) / 2:
+        raise ValueError("Procedural workspace requires a finite positive tile margin")
+    half = torch.as_tensor(size, device=env.device) / 2 - margin_m
+    local = (
+        env.scene["robot"].data.body_pos_w[..., :2] - env.scene.env_origins[:, None, :2]
+    )
+    boundary = (local.abs() >= half).any(dim=-1).any(dim=-1)
+    # The config installs this term last, after every physical failure.
+    return boundary & ~env.termination_manager.terminated
+
+
 def initialize_readiness_levels(env, env_ids, curriculum_cfg, terrain_layout):
     """Pin alternating environments to L0/L1 in the production family layout."""
     from parkour_lab.tasks.manager_based.parkour_lab import mdp

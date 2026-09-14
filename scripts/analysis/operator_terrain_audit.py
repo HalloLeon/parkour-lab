@@ -57,6 +57,30 @@ DIAGNOSTIC_ADAPTER_BASE = {
     "scripts/rsl_rl/operator_rewards.py": "6aeb923a97901bf0fc69759d930911fe2b552e4e7a0f6814a5cf9e600c5bcc5c",
 }
 
+# CPU replay executes these two consumers, not the retired simulator/trainer.
+# Pin BOTH the recorded source and reviewed consumer. This permits unrelated
+# task replacement without allowing arbitrary scorer changes or new GPU capture.
+OFFLINE_REPLAY_SOURCES = {
+    "scripts/rsl_rl/operator_benchmark.py": (
+        "443e8043a30e5a30feb71a53d6a1baa0646352d9ab0523883c20e43fab2a8fcb",
+        "29e07a539556c367dc53a77f3ce349272e614cc7662ecabae81fc7a02f48bb54",
+    ),
+    "scripts/rsl_rl/operator_benchmark_core.py": (
+        "faee1501fc323fc7775d395ac37164afadb25c99d258217439b448048ad11ae9",
+        "faee1501fc323fc7775d395ac37164afadb25c99d258217439b448048ad11ae9",
+    ),
+}
+
+
+def validate_offline_replay_sources(original, current):
+    """Validate the narrow, versioned CPU consumer boundary; never authorize capture."""
+    evidence = {}
+    for name, (recorded, reviewed) in OFFLINE_REPLAY_SOURCES.items():
+        if original.get(name) != recorded or current.get(name) != reviewed:
+            raise ValueError(f"Unreviewed offline replay source: {name}")
+        evidence[name] = {"recorded_sha256": recorded, "consumer_sha256": reviewed}
+    return evidence
+
 
 def diagnostic_producer_delta(original, current):
     if original.keys() != current.keys():
@@ -245,14 +269,10 @@ def audit_run(run):
         )
     repo = Path(__file__).resolve().parents[2]
     producers = protocol["source_identity"]["producers"]
-    current_producers = {
-        str(p.relative_to(repo)): file_sha256(p)
-        for p in (
-            *repo.joinpath("scripts/rsl_rl").glob("*.py"),
-            *repo.joinpath("source/parkour_lab/parkour_lab").rglob("*.py"),
-        )
-    }
-    delta = diagnostic_producer_delta(producers, current_producers)
+    consumers = validate_offline_replay_sources(
+        producers,
+        {name: file_sha256(repo / name) for name in OFFLINE_REPLAY_SOURCES},
+    )
     weights = selected_weights(read_yaml_data(run / "params/env.yaml"))
     if weights["observed_physical_failure"] != protocol["physical_failure_impulse"]:
         raise ValueError("Saved failure weight differs from declared protocol")
@@ -330,14 +350,14 @@ def audit_run(run):
             }
         )
     return {
-        "schema_version": "operator_terrain_offline_audit_v1",
+        "schema_version": "operator_terrain_offline_audit_v2",
         "status": "AUDITED",
         "run": str(run),
         "audit_sha256": file_sha256(Path(__file__)),
         "report_sha256": file_sha256(run / "report.json"),
         "training_env_sha256": file_sha256(run / "params/env.yaml"),
-        "producer_hashes_verified": len(producers) - len(delta),
-        "diagnostic_consumer_delta": delta,
+        "replay_sources_verified": consumers,
+        "historical_simulator_producers_revalidated": False,
         "weights": weights,
         "checks": checks,
         "promoted": False,
@@ -355,14 +375,10 @@ def audit_run(run):
 
 def format_summary(result):
     lines = [
-        f"{result['status']}: {result['producer_hashes_verified']} producer hashes; physical scores and motor targets replayed.",
+        f"{result['status']}: {len(result['replay_sources_verified'])} pinned CPU replay sources; physical scores and motor targets replayed.",
         "First attempts only. Costs below are selected counterfactual terms, NOT complete training returns.",
+        "Historical simulator/trainer reproduction is not asserted; GPU capture retains its stricter full-source check.",
     ]
-    if result.get("diagnostic_consumer_delta"):
-        lines.insert(
-            1,
-            f"Reviewed diagnostic adapter differences: {len(result['diagnostic_consumer_delta'])}; recorded training identity is unchanged (details in --json).",
-        )
     for check in result["checks"]:
         lines.append(
             f"Update {check['update']}: operator {check['operator_passed']}/{check['operator_total']}"
