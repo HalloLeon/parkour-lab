@@ -630,6 +630,7 @@ def proprioceptive_procedural_configs(
     runner_cfg.update(
         run_name=RECURRENT_OPERATOR_VERSION,
         interface_version=RECURRENT_OPERATOR_VERSION,
+        save_interval=getattr(args, "save_interval", 50),
         policy=recurrent_policy_config(),
         obs_groups={"policy": ["proprio"], "critic": ["policy", "terrain"]},
         resume=False,
@@ -2558,9 +2559,14 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
     policy, metadata, digest = load_recurrent_checkpoint(checkpoint, device="cpu")
     protocol = json.loads((checkpoint.parent / "training_protocol.json").read_text())
     recipe = metadata["recipe"]
+    save_interval = protocol.get("save_interval", 50)
     archived_agent = read_yaml_data(checkpoint.parent / "params/agent.yaml")
     if (
         digest != files["checkpoint"]
+        or type(save_interval) is not int
+        or save_interval < 1
+        or type(recipe.get("save_interval")) is not int
+        or save_interval != recipe["save_interval"]
         or protocol["version"] not in PROPRIO_ACQUISITION_VERSIONS
         or protocol.get("reward_change")
         != (
@@ -2611,6 +2617,7 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
     original.num_envs = training_protocol["num_envs"]
     original.seed = training_protocol["seed"]
     original.iterations = training_protocol["learning_updates"]
+    original.save_interval = metadata["recipe"]["save_interval"]
     original.device = metadata["recipe"]["device"]
     cfg, runner = proprioceptive_procedural_configs(
         saved, agent, original, acquisition_version=training_protocol["version"]
@@ -2739,7 +2746,8 @@ def recurrent_training_main(args, parser):
         "posture_change": copy.deepcopy(PROPRIO_POSTURE_CHANGE),
         "initial_action_std": 0.5,
         "metrics": "per-profile command tracking, measured moving/nonflat exposure, physical failures and timeouts; training data, not held-out success rates",
-        "checkpoint_selection": "save every 50 completed updates and final; no automatic selection or promotion",
+        "save_interval": args.save_interval,
+        "checkpoint_selection": f"save every {args.save_interval} completed updates and final; no automatic selection or promotion",
         "scope": "Acquire a causal gait before progression; short budgets are integration only. No terrain exit acceptance or deployment claim.",
         "exit_allowed": False,
     }
@@ -2818,7 +2826,11 @@ def recurrent_training_main(args, parser):
                         str(args.procedural_evaluate_checkpoint),
                     ]
                     if evaluation
-                    else ["--procedural-train"]
+                    else [
+                        "--procedural-train",
+                        "--save-interval",
+                        str(args.save_interval),
+                    ]
                 ),
                 "--iterations",
                 str(args.iterations),
@@ -3122,6 +3134,11 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
+        "--save-interval",
+        type=int,
+        help="Procedural-training checkpoint interval in completed PPO updates (default: 50); the final checkpoint is always saved",
+    )
+    parser.add_argument(
         "--moving-retention",
         action="store_true",
         help="Source-mean retention; v2 keeps its 200-update protocol, evidence-bound v3 permits up to 3000",
@@ -3176,6 +3193,14 @@ def main(argv=None):
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     evaluation = args.procedural_evaluate_checkpoint is not None
+    if args.save_interval is not None and (
+        not args.procedural_train or args.save_interval < 1
+    ):
+        parser.error(
+            "--save-interval requires --procedural-train and a positive integer"
+        )
+    if args.procedural_train and args.save_interval is None:
+        args.save_interval = 50
     if args.timeout is None and not args.procedural_train:
         args.timeout = 3600
     if args.iterations is None:

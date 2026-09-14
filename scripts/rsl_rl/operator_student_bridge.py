@@ -757,6 +757,8 @@ def run_recurrent_training(env, runner_cfg, output, *, is_running, iterations):
     if (
         type(iterations) is not int
         or iterations < 1
+        or type(runner_cfg.get("save_interval")) is not int
+        or runner_cfg["save_interval"] < 1
         or runner_cfg["policy"] != recurrent_policy_config()
         or runner_cfg["obs_groups"] != expected_groups
         or runner_cfg.get("resume")
@@ -965,15 +967,17 @@ def run_recurrent_training(env, runner_cfg, output, *, is_running, iterations):
 
     class TrainingRunner(OnPolicyRunner):
         saved_updates = 0
+        published_updates = 0
         checkpoint = None
 
         def save(self, path, infos=None):
             completed = stats["learning_updates"]
-            if completed == self.saved_updates or (
-                completed != iterations and completed % self.save_interval
+            if completed == self.published_updates or (
+                completed != iterations
+                and completed % self.save_interval
+                and completed % 50
             ):
                 return
-            self.checkpoint = f"model_{completed}.pt"
             metadata = {
                 "policy_version": RECURRENT_OPERATOR_VERSION,
                 **stats,
@@ -986,17 +990,26 @@ def run_recurrent_training(env, runner_cfg, output, *, is_running, iterations):
                 "exit_allowed": False,
                 "resume_supported": False,
             }
-            super().save(
-                str(output / self.checkpoint),
-                infos={
-                    "learning_updates": completed,
-                    "recurrent_training": metadata,
-                },
-            )
+            if completed == iterations or completed % self.save_interval == 0:
+                self.checkpoint = f"model_{completed}.pt"
+                super().save(
+                    str(output / self.checkpoint),
+                    infos={
+                        "learning_updates": completed,
+                        "recurrent_training": metadata,
+                    },
+                )
+                self.saved_updates = completed
+            # Keep inexpensive progress visible even with sparse checkpoints.
+            progress = {
+                **metadata,
+                "last_checkpoint": self.checkpoint,
+                "last_checkpoint_learning_updates": self.saved_updates,
+            }
             temporary = output / "training_progress.json.tmp"
-            temporary.write_text(json.dumps(metadata, indent=2, allow_nan=False) + "\n")
+            temporary.write_text(json.dumps(progress, indent=2, allow_nan=False) + "\n")
             temporary.replace(output / "training_progress.json")
-            self.saved_updates = completed
+            self.published_updates = completed
 
         def log(self, locs, *args, **kwargs):
             super().log(locs, *args, **kwargs)
