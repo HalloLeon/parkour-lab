@@ -459,6 +459,54 @@ def terrain_source_identity(args):
     }
 
 
+def terrain_execution_identity(args):
+    """Keep diagnostic consumers separate from immutable checkpoint producers."""
+    identity = terrain_source_identity(args)
+    if getattr(args, "terrain_diagnostics", None) is None:
+        return identity
+    return {
+        "runtime": identity,
+        "audit": file_sha256(
+            Path(__file__).resolve().parents[1] / "analysis/operator_terrain_audit.py"
+        ),
+    }
+
+
+def validate_terrain_capture_config(output, baseline, training_run):
+    """Only native reward observation may differ from the archived evaluation."""
+
+    def read(path):
+        # Script and -m entry points name the same in-repo callables differently.
+        def normalize(value):
+            if isinstance(value, dict):
+                return {k: normalize(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [normalize(v) for v in value]
+            if isinstance(value, str) and value.startswith("scripts.rsl_rl."):
+                return value.removeprefix("scripts.rsl_rl.")
+            return value
+
+        return normalize(read_yaml_data(path / "params/env.yaml"))
+
+    current, archived, training = read(output), read(baseline), read(training_run)
+    rewards = current.pop("rewards")
+    if archived.pop("rewards") != {} or current != archived:
+        raise ValueError("Diagnostic evaluation config differs beyond reward capture")
+    expected = training["rewards"]
+    expected["physical_failure"]["params"] = {
+        "termination_names": [
+            "base_contact",
+            "course_chassis",
+            "course_fall",
+            "course_off_route",
+        ]
+    }
+    if rewards != expected:
+        raise ValueError(
+            "Diagnostic rewards differ from the archived training objective"
+        )
+
+
 def terrain_update_evidence(policy, algorithm, losses):
     """Require actual finite learning in both new terrain branches."""
     import torch
@@ -957,7 +1005,19 @@ def terrain_teacher_configs(saved, agent, args, *, evaluation=False):
         cfg.curriculum = None
         cfg.terminations.persistent_tilt = None
         cfg.terminations.operator_workspace = None
-        cfg.rewards = {}
+        if getattr(args, "terrain_diagnostics", None) is not None:
+            # Observe the native objective without restoring a training-only
+            # reset. The unavailable tilt impulse is explicitly not measured.
+            cfg.rewards["physical_failure"].params = {
+                "termination_names": (
+                    "base_contact",
+                    "course_chassis",
+                    "course_fall",
+                    "course_off_route",
+                )
+            }
+        else:
+            cfg.rewards = {}
         cfg.observations.policy.enable_corruption = False
         cfg.episode_length_s = 20.02
     else:
@@ -1141,7 +1201,7 @@ def load_terrain_teacher(
     return policy.eval(), metadata
 
 
-def evaluate_terrain_teacher(raw, policy, output):
+def evaluate_terrain_teacher(raw, policy, output, *, diagnostic_baseline=None):
     """Replay unchanged physical scorers on the actual terrain-conditioned policy."""
     import numpy as np
     import torch
@@ -1189,6 +1249,14 @@ def evaluate_terrain_teacher(raw, policy, output):
     capture = raw.operator_capture
     capture.enabled = capture.motor_parity = True
     capture.course = {"teacher_development": True}
+    diagnostic = None
+    if diagnostic_baseline is not None:
+        try:
+            from .operator_control_trace import OperatorControlTrace
+        except ImportError:
+            from operator_control_trace import OperatorControlTrace
+        diagnostic = OperatorControlTrace(raw, native_rewards=True)
+        capture.control_trace = diagnostic
     finished = torch.zeros(160, dtype=torch.bool, device=raw.device)
     scans = []
     with torch.inference_mode():
@@ -1206,6 +1274,8 @@ def evaluate_terrain_teacher(raw, policy, output):
             action = policy.act_inference(obs)
             if not torch.isfinite(action).all():
                 raise ValueError(f"Nonfinite learned teacher action at step {step}")
+            if diagnostic is not None:
+                diagnostic.before_step(observation, action)
             _, _, terminated, truncated, _ = raw.step(action)
             finished |= terminated | truncated
             if step % 250 == 0:
@@ -1213,6 +1283,16 @@ def evaluate_terrain_teacher(raw, policy, output):
     capture.enabled = False
     trace = capture.finish()
     trace.update(initial, terrain_observation=np.stack(scans))
+    if diagnostic is not None:
+        control = diagnostic.finish()
+        # Reuse the same artifact; don't duplicate delivered frames/actions.
+        if not np.array_equal(
+            control.pop("action"), trace["action"]
+        ) or not np.array_equal(control.pop("observation_pre"), trace["observation"]):
+            raise ValueError(
+                "Native control capture is not paired with the delivered action"
+            )
+        trace.update(control)
     np.savez_compressed(output / "trace.npz", **trace)
     motor = validate_motor_trace(trace)
 
@@ -1228,7 +1308,7 @@ def evaluate_terrain_teacher(raw, policy, output):
     cfg = native.parkour_curriculum
     results, metadata = {}, {}
     for family in range(4):
-        for level in (1, 3, 6):
+        for level in ((1,) if diagnostic is not None else (1, 3, 6)):
             ids = np.flatnonzero(
                 (initial["terrain_columns"] == family * 10)
                 & (initial["terrain_levels"] == level)
@@ -1253,9 +1333,19 @@ def evaluate_terrain_teacher(raw, policy, output):
         "family_by_column": list(layout.family_index_by_column),
         "scope": "Seed 43 teacher development; canonical variant 0; not held-out student/handoff/exit evidence",
     }
+    status = "MEASURED"
+    if diagnostic is not None:
+        # This additional consumer is hashed in terrain_execution_identity.
+        from scripts.analysis.operator_terrain_audit import summarize_native_capture
+
+        measurement["native_control"] = summarize_native_capture(
+            trace, diagnostic.metadata, diagnostic_baseline, measurement
+        )
+        if not measurement["native_control"]["reproduction"]["matched"]:
+            status = "REPRODUCTION_DIVERGED"
     write_json(output / "measurement_report.json", measurement)
     return {
-        "status": "MEASURED",
+        "status": status,
         "operator_status": operator["status"],
         "course_statuses": {key: value["status"] for key, value in results.items()},
         "sha256": {
@@ -1272,12 +1362,19 @@ def run_terrain_teacher(args, output, saved, agent, protocol):
     app = env = None
     progress = {"stage": "source_validation"}
     try:
+        diagnostic_run = getattr(args, "terrain_diagnostics", None)
+        expected_identity = protocol.get(
+            "diagnostic_consumer_identity", protocol["source_identity"]
+        )
         if (
-            terrain_source_identity(args) != protocol["source_identity"]
+            terrain_execution_identity(args) != expected_identity
             or protocol["version"]
             != terrain_training_version(args.terrain_critic_context)
-            or file_sha256(args.readiness_report)
-            != protocol["readiness"]["report_sha256"]
+            or (
+                diagnostic_run is None
+                and file_sha256(args.readiness_report)
+                != protocol["readiness"]["report_sha256"]
+            )
         ):
             raise ValueError(
                 "Terrain training source/prerequisite changed after preflight"
@@ -1308,15 +1405,23 @@ def run_terrain_teacher(args, output, saved, agent, protocol):
         # Serialize before managers replace function classes with instances.
         (params / "env.yaml").write_text(yaml.dump(cfg.to_dict(), sort_keys=False))
         (params / "agent.yaml").write_text(yaml.dump(runner_cfg, sort_keys=False))
+        baseline = None
+        if diagnostic_run is not None:
+            if not evaluation:
+                raise ValueError("Native diagnostics cannot train")
+            baseline = (
+                diagnostic_run / "teacher_check" / args.terrain_evaluate_checkpoint.stem
+            )
+            validate_terrain_capture_config(output, baseline, diagnostic_run)
         interface = {
             "version": TERRAIN_VERSION,
             "training_version": protocol["version"],
             "inputs": ["policy:48", "terrain:264"],
             "critic_inputs": ["policy:48", "terrain:264"]
             + (["critic_context:4"] if args.terrain_critic_context else []),
-            "critic_context": TERRAIN_CRITIC_CONTEXT
-            if args.terrain_critic_context
-            else None,
+            "critic_context": (
+                TERRAIN_CRITIC_CONTEXT if args.terrain_critic_context else None
+            ),
             "retention_metadata_not_policy_input": "operator_mask:1",
             "actions": "12 raw actions; default_joint_position + 0.25*action; no clipping",
             "source_identity": protocol["source_identity"],
@@ -1357,7 +1462,9 @@ def run_terrain_teacher(args, output, saved, agent, protocol):
                 protocol["source_identity"],
                 expected_version=protocol["version"],
             )
-            result = evaluate_terrain_teacher(raw, policy, output)
+            result = evaluate_terrain_teacher(
+                raw, policy, output, diagnostic_baseline=baseline
+            )
             result.update(
                 checkpoint_sha256=file_sha256(args.terrain_evaluate_checkpoint),
                 learning_updates=metadata["learning_updates"],
@@ -1388,9 +1495,11 @@ def run_terrain_teacher(args, output, saved, agent, protocol):
                 "promoted": False,
                 "exit_gate_passed": False,
             }
-        if terrain_source_identity(args) != protocol["source_identity"]:
+        if terrain_execution_identity(args) != expected_identity:
             raise ValueError("Terrain training sources changed during execution")
         result.update(source_identity=protocol["source_identity"], mesh=geometry)
+        if diagnostic_run is not None:
+            result["diagnostic_consumer_identity"] = expected_identity
         write_json(output / "training_status.json", result)
     except Exception as error:
         report_terrain_readiness_error(output, error, progress)
@@ -1649,10 +1758,12 @@ def supervise_terrain_teacher(args, output, identity, readiness, mesh):
                     # failure. Do not repeat an invalid expensive evaluation.
                     break
             report = {
-                "status": "COMPLETED"
-                if len(checks) == len(TERRAIN_CHECK_UPDATES)
-                and all(r["status"] == "MEASURED" for r in checks.values())
-                else "ERROR",
+                "status": (
+                    "COMPLETED"
+                    if len(checks) == len(TERRAIN_CHECK_UPDATES)
+                    and all(r["status"] == "MEASURED" for r in checks.values())
+                    else "ERROR"
+                ),
                 "training": report,
                 "teacher_checks": checks,
                 "checks_not_run": [
@@ -1905,9 +2016,9 @@ def run_training(args, output, agent, saved):
             # intermediate checkpoint; keep a single uninterrupted Adam run.
             retention = install_moving_retention(
                 runner.alg,
-                reference_state=None
-                if reference is None
-                else reference["model_state_dict"],
+                reference_state=(
+                    None if reference is None else reference["model_state_dict"]
+                ),
                 zero_command=zero_reference is not None,
             )
             if resume is not None:
@@ -1927,9 +2038,11 @@ def run_training(args, output, agent, saved):
                 + (
                     "Both retention terms preserved; randomized reversal/hold/restart exposure is the sole intervention. "
                     if version == SEQUENCE_VERSION
-                    else "A separate zero-command retention loss is the new learning intervention. "
-                    if zero_reference is not None
-                    else "Retention objective preserved. "
+                    else (
+                        "A separate zero-command retention loss is the new learning intervention. "
+                        if zero_reference is not None
+                        else "Retention objective preserved. "
+                    )
                 )
                 + "Judge unchanged physical gates, not reward or action similarity alone."
             )
@@ -1981,9 +2094,9 @@ def run_training(args, output, agent, saved):
             handoff["moving_retention"]["check_offsets"] = getattr(
                 args, "check_offsets", [100, 200]
             )
-            handoff["moving_retention"]["check_timing"] = (
-                f"after the uninterrupted {args.iterations}-update worker exits"
-            )
+            handoff["moving_retention"][
+                "check_timing"
+            ] = f"after the uninterrupted {args.iterations}-update worker exits"
         if zero_reference is not None:
             handoff["zero_command_reference"] = zero_reference
         write_json(params / "operator_training.json", handoff)
@@ -2618,9 +2731,11 @@ def main(argv=None):
                 "check_offsets": args.check_offsets,
                 "seed": args.seed,
                 "evaluation_seed": 43,
-                "optimizer": "exact restored Adam; fixed original reference"
-                if args.retention_resume
-                else "one fresh Adam at the initial source; uninterrupted through all 200 updates",
+                "optimizer": (
+                    "exact restored Adam; fixed original reference"
+                    if args.retention_resume
+                    else "one fresh Adam at the initial source; uninterrupted through all 200 updates"
+                ),
                 "retention_resume": args.retention_resume,
                 "curriculum": training_curriculum_manifest(args.curriculum),
                 "evaluation_timing": "after training worker exit; never concurrent Kit workers",

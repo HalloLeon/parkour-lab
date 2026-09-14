@@ -11,16 +11,19 @@ import math
 import torch
 
 
-def teacher_physical_failure(env):
-    """One training impulse per physical failure, even if several gates fire."""
-    failure = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    for name in (
+def teacher_physical_failure(
+    env,
+    termination_names=(
         "base_contact",
         "course_chassis",
         "course_fall",
         "course_off_route",
         "persistent_tilt",
-    ):
+    ),
+):
+    """One training impulse per physical failure, even if several gates fire."""
+    failure = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    for name in termination_names:
         failure |= env.termination_manager.get_term(name)
     return failure.float() / env.step_dt
 

@@ -67,12 +67,17 @@ def _snapshot(values):
 class OperatorControlTrace:
     """Pair the actual pre-action frame with the post-physics/pre-reset state."""
 
-    def __init__(self, env, reference):
-        if reference.training or any(p.requires_grad for p in reference.parameters()):
+    def __init__(self, env, reference=None, *, native_rewards=False, env_ids=None):
+        if reference is not None and (
+            reference.training or any(p.requires_grad for p in reference.parameters())
+        ):
             raise ValueError("Diagnostic reference must be frozen and in eval mode")
         self.env, self.reference = env, reference
         self.pending = None
         self.samples = []
+        self.native_rewards = native_rewards
+        self.env_ids = slice(None) if env_ids is None else env_ids
+        self.substeps = []
         robot, sensor = env.scene["robot"], env.scene["contact_forces"]
         joints, bodies, contacts = (
             list(robot.joint_names),
@@ -109,32 +114,84 @@ class OperatorControlTrace:
             "sampling": "50 Hz; torque/contact fields are last-substep snapshots, not peaks over all physics substeps",
             "scope": "diagnostic only; no action blending, reference rollout, training, or acceptance relaxation",
         }
+        if reference is None:
+            self.metadata.pop("reference_action")
+        if native_rewards:
+            if env.cfg.decimation != 4 or abs(env.step_dt - DT) > 1e-9:
+                raise ValueError("Native capture requires the stock four-substep motor")
+            manager = env.reward_manager
+            names = list(manager.active_terms)
+            weights = [float(manager.get_term_cfg(n).weight) for n in names]
+            if (
+                not names
+                or len(set(names)) != len(names)
+                or not np.isfinite(weights).all()
+            ):
+                raise ValueError("Invalid native reward terms")
+            self.metadata.update(
+                schema_version="operator_native_control_trace_v1",
+                env_ids=(
+                    list(range(env.num_envs)) if env_ids is None else env_ids.tolist()
+                ),
+                body_names=bodies,
+                reward_names=names,
+                reward_weights=weights,
+                reward_contribution="Native weighted rate times step_dt, computed once by RewardManager; sum checked against reward_buf",
+                omitted_training_objective="persistent_tilt impulse (gate disabled in evaluation), PPO entropy/value/retention losses; these are evaluation returns, not training returns",
+                sampling="50 Hz post-step/pre-reset joint/contact/body state; four chronological 200 Hz computed/applied actuator torque commands (N m), not measured hardware torques",
+                height_scan_post="Unclipped world hit z (m); nonfinite rays retained, not flat-support evidence",
+                body_position_post="Body origins in world meters; NOT contact-point locations",
+            )
+
+    def snapshot(self, values):
+        return _snapshot({name: value[self.env_ids] for name, value in values.items()})
 
     def before_step(self, observation, action):
         if self.pending is not None:
             raise RuntimeError("Previous diagnostic action lacks a pre-reset capture")
-        with torch.inference_mode():
-            reference_action = self.reference(observation)
         if (
             observation.ndim != 2
             or observation.shape[1] != 48
             or action.shape != (len(observation), 12)
-            or reference_action.shape != action.shape
-            or not all(
-                torch.isfinite(x).all() for x in (observation, action, reference_action)
-            )
+            or not all(torch.isfinite(x).all() for x in (observation, action))
         ):
             raise ValueError("Invalid diagnostic observation or action")
         robot = self.env.scene["robot"].data
-        self.pending = _snapshot(
+        self.pending = self.snapshot(
             {
                 "observation_pre": observation,
                 "action": action,
-                "reference_action": reference_action,
                 "joint_position_pre": robot.joint_pos,
                 "joint_velocity_pre": robot.joint_vel,
             }
         )
+        if self.reference is not None:
+            with torch.inference_mode():
+                reference_action = self.reference(observation)
+            if (
+                reference_action.shape != action.shape
+                or not torch.isfinite(reference_action).all()
+            ):
+                self.pending = None
+                raise ValueError("Invalid diagnostic reference action")
+            self.pending.update(self.snapshot({"reference_action": reference_action}))
+        self.substeps = []
+
+    def after_substep(self):
+        if self.native_rewards:
+            if self.pending is None or len(self.substeps) >= 4:
+                raise RuntimeError("Unpaired or extra actuator substep")
+            # Native hook precedes scene.update: only explicit actuator commands
+            # are current here, NOT cached post-physics body/joint/contact state.
+            robot = self.env.scene["robot"].data
+            self.substeps.append(
+                self.snapshot(
+                    {
+                        "computed_torque_substeps": robot.computed_torque,
+                        "applied_torque_substeps": robot.applied_torque,
+                    }
+                )
+            )
 
     def after_step(self):
         if self.pending is None:
@@ -142,7 +199,7 @@ class OperatorControlTrace:
         robot = self.env.scene["robot"].data
         sample = {
             **self.pending,
-            **_snapshot(
+            **self.snapshot(
                 {
                     "joint_position_post": robot.joint_pos,
                     "joint_velocity_post": robot.joint_vel,
@@ -156,6 +213,46 @@ class OperatorControlTrace:
                 }
             ),
         }
+        if self.native_rewards:
+            if len(self.substeps) != 4:
+                raise RuntimeError("Missing actuator substeps")
+            manager = self.env.reward_manager
+            names = self.metadata["reward_names"]
+            if list(manager.active_terms) != names:
+                raise RuntimeError("Reward order changed during capture")
+            # Pinned IsaacLab 2.3.2 stores WEIGHTED RATES in this buffer.
+            contribution = manager._step_reward * self.env.step_dt
+            if (
+                contribution.shape != (self.env.num_envs, len(names))
+                or not torch.isfinite(contribution).all()
+            ):
+                raise ValueError("Invalid native reward matrix")
+            if not torch.allclose(
+                contribution.sum(-1), self.env.reward_buf, atol=2e-6, rtol=1e-5
+            ):
+                raise ValueError(
+                    "Native reward decomposition does not sum to reward_buf"
+                )
+            sample.update(
+                self.snapshot(
+                    {
+                        "reward_contribution": contribution,
+                        "reward_total": self.env.reward_buf,
+                        "body_position_post": robot.body_pos_w,
+                        "height_scan_post": self.env.scene[
+                            "height_scanner"
+                        ].data.ray_hits_w[..., 2],
+                    }
+                )
+            )
+            for name in self.substeps[0]:
+                sample[name] = np.stack([s[name] for s in self.substeps], axis=1)
+            if any(
+                not np.isfinite(v).all()
+                for k, v in sample.items()
+                if k != "height_scan_post"
+            ):
+                raise ValueError("Nonfinite native control data")
         self.samples.append(sample)
         self.pending = None
 

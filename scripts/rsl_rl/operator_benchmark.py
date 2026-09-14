@@ -90,6 +90,11 @@ def make_recorder_cfg():
                 ).clone()
             return None, None
 
+        def record_post_physics_decimation_step(self):
+            if self.enabled and self.control_trace is not None:
+                self.control_trace.after_substep()
+            return None, None
+
         def record_post_step(self):
             if self.enabled:
                 robot = self._env.scene["robot"].data
