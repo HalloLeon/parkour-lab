@@ -870,6 +870,371 @@ def _runtime_motor_binding(env):
     return binding, digest
 
 
+def run_recurrent_training(env, runner_cfg, output, *, is_running, iterations):
+    """Fresh native PPO with bounded-memory runtime audits; no acceptance claim.
+
+    The caller owns the environment, protocol and artifact publication. Native
+    PPO/rollout storage are unchanged. Only observation delivery, update checks,
+    metrics and completed-update checkpoint names are adapted here.
+    """
+    from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+    from rsl_rl.runners import OnPolicyRunner
+    from parkour_lab.learning.controller import ControllerSession, Sample
+    from parkour_lab.tasks.manager_based.parkour_lab.mdp.terrain.operator_terrain import (
+        BORDER_WIDTH,
+        FLAT_BAND_HALF_WIDTH,
+        PROFILE_BY_COLUMN,
+        SPAWN_HALF_WIDTH,
+    )
+
+    expected_groups = {"policy": ["proprio"], "critic": ["policy", "terrain"]}
+    command = env.command_manager.get_term("base_velocity")
+    if (
+        type(iterations) is not int
+        or iterations < 1
+        or runner_cfg["policy"] != recurrent_policy_config()
+        or runner_cfg["obs_groups"] != expected_groups
+        or runner_cfg.get("resume")
+        or runner_cfg["algorithm"]["class_name"] != "PPO"
+        or runner_cfg["algorithm"].get("rnd_cfg") is not None
+        or runner_cfg["algorithm"].get("symmetry_cfg") is not None
+        or tuple(env.observation_manager.active_terms["proprio"])
+        != tuple(n for n, _ in FRAME_TERMS)
+        or tuple(env.observation_manager.active_terms["policy"])
+        != ("base_lin_vel", *(n for n, _ in FRAME_TERMS))
+        or env.cfg.decimation != 4
+        or abs(env.step_dt - 0.02) > 1e-9
+        or abs(env.physics_dt - 0.005) > 1e-9
+        or command.cfg.heading_command
+        or command.cfg.rel_heading_envs
+        or command.cfg.rel_standing_envs
+        or env.cfg.curriculum.terrain_levels is not None
+        or env.cfg.scene.terrain.terrain_generator.num_rows != 1
+    ):
+        raise ValueError(
+            "Require fresh native GRU/PPO with direct commands and fixed easy terrain"
+        )
+    recipe = copy.deepcopy(runner_cfg)
+    output = Path(output)
+    profiles = tuple(dict.fromkeys(PROFILE_BY_COLUMN))
+    columns = env.scene.terrain.terrain_types
+    if tuple(profiles) != (
+        "plane",
+        "rough_flat",
+        "hills",
+        "step_hills",
+        "tilted_ramps",
+    ) or torch.any((columns < 0) | (columns >= 20)):
+        raise ValueError("Require the declared five-profile supported terrain layout")
+    profile_ids = columns // 4
+    counts = torch.zeros(5, 9, dtype=torch.int64, device=env.device)
+    errors = torch.zeros(5, 3, dtype=torch.float64, device=env.device)
+    stats = {
+        "learning_updates": 0,
+        "control_steps": 0,
+        "partial_reset_steps": 0,
+        "adapter_comparisons": 0,
+    }
+    robot, term = env.scene["robot"].data, env.action_manager.get_term("joint_pos")
+
+    def metrics():
+        return {
+            name: dict(
+                zip(
+                    (
+                        "samples",
+                        "moving_commands",
+                        "moving_nonflat_region",
+                        "physical_failures",
+                        "workspace_timeouts",
+                        "timeouts",
+                        "stop_commands",
+                        "pivot_commands",
+                        "reverse_commands",
+                    ),
+                    counts[i].cpu().tolist(),
+                ),
+                mean_abs_twist_error=(errors[i] / counts[i, 0].clamp_min(1))
+                .cpu()
+                .tolist(),
+            )
+            for i, name in enumerate(profiles)
+        }
+
+    class DeliveredEnvironment(RslRlVecEnvWrapper):
+        def __init__(self):
+            super().__init__(env, clip_actions=None)
+            # Sample once after the wrapper's native reset, then never resample
+            # corruption in get_observations() or in the shadow adapter.
+            self.observations = super().get_observations()
+            self.validate_observations(self.observations)
+            self.done = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+            self.runner = self.session = None
+
+        def get_observations(self):
+            return self.observations
+
+        def validate_observations(self, observation):
+            for name, width in (("proprio", 45), ("policy", 48), ("terrain", 264)):
+                _check_tensor(observation[name], (self.num_envs, width), name)
+
+        def step(self, actions):
+            if not is_running():
+                raise RuntimeError("Simulator closed during recurrent training")
+            frame = self.observations["proprio"]
+            _check_tensor(actions, (self.num_envs, 12), "sampled PPO action")
+            desired = command.command
+            if (
+                not torch.equal(frame[:, 6:9], desired)
+                or not torch.equal(frame[:, 33:], env.action_manager.action)
+                or torch.any(frame[self.done, 33:] != 0)
+            ):
+                raise RuntimeError(
+                    "Delivered command/previous action/reset differs from the native actor frame"
+                )
+            if stats["learning_updates"] == 0:
+                now = stats["control_steps"] * env.step_dt
+                slices = ((0, 3), (3, 6), (9, 21), (21, 33), (33, 45))
+                samples = {
+                    name: Sample(
+                        frame[:, lo:hi],
+                        now,
+                        torch.ones_like(self.done),
+                        spec.units,
+                        spec.frame,
+                    )
+                    for (name, spec), (lo, hi) in zip(
+                        self.session.controller.spec.sensors.items(),
+                        slices,
+                        strict=True,
+                    )
+                }
+                inferred = self.session.step(
+                    time_s=now,
+                    command=desired,
+                    command_time_s=now,
+                    sensors=samples,
+                    reset_mask=self.done,
+                )
+                if not torch.allclose(
+                    inferred.raw_action,
+                    self.runner.alg.policy.action_mean,
+                    atol=1e-6,
+                    rtol=0,
+                ):
+                    raise RuntimeError(
+                        "Native recurrent actor differs from same-frame extracted adapter"
+                    )
+                stats["adapter_comparisons"] += self.num_envs
+            local = (robot.root_pos_w[:, :2] - env.scene.env_origins[:, :2]).abs()
+            nonflat = (
+                (profile_ids != 0)
+                & (local.max(dim=1).values > SPAWN_HALF_WIDTH)
+                & (local[:, 1] > FLAT_BAND_HALF_WIDTH)
+                & (local.max(dim=1).values < 8.0 - BORDER_WIDTH)
+            )
+            moving = desired[:, :2].norm(dim=-1) > 0.1
+            exposure = (
+                nonflat & moving & (robot.root_lin_vel_b[:, :2].norm(dim=-1) > 0.1)
+            )
+            tracking = torch.cat(
+                (robot.root_lin_vel_b[:, :2], robot.root_ang_vel_b[:, 2:3]), dim=-1
+            )
+            errors.index_add_(0, profile_ids, (tracking - desired).abs().double())
+            counts[:, 0] += torch.bincount(profile_ids, minlength=5)
+            counts[:, 1] += torch.bincount(profile_ids[moving], minlength=5)
+            counts[:, 2] += torch.bincount(profile_ids[exposure], minlength=5)
+            for index, mask in (
+                (6, desired.abs().amax(dim=-1) < 1e-6),
+                (7, ~moving & (desired[:, 2].abs() > 0.1)),
+                (8, desired[:, 0] < -0.05),
+            ):
+                counts[:, index] += torch.bincount(profile_ids[mask], minlength=5)
+            observation, reward, done, extras = super().step(actions)
+            self.validate_observations(observation)
+            _check_tensor(reward, (self.num_envs,), "native reward")
+            expected = robot.default_joint_pos + 0.25 * actions
+            if not torch.equal(term.processed_actions, expected):
+                raise RuntimeError(
+                    "Native processed joint target differs from the stock affine map"
+                )
+            self.done = done.bool()
+            if not torch.equal(
+                robot.joint_pos_target[~self.done], expected[~self.done]
+            ):
+                raise RuntimeError("Native surviving joint target buffer differs")
+            previous = actions.clone()
+            previous[self.done] = 0
+            if not torch.equal(observation["proprio"][:, 33:], previous):
+                raise RuntimeError(
+                    "Next frame does not contain the previous delivered action"
+                )
+            self.observations = observation
+            for index, mask in (
+                (3, env.reset_terminated),
+                (4, env.termination_manager.get_term("procedural_workspace")),
+                (5, env.reset_time_outs),
+            ):
+                counts[:, index] += torch.bincount(
+                    profile_ids[mask.bool()], minlength=5
+                )
+            stats["partial_reset_steps"] += int(self.done.any() and not self.done.all())
+            stats["control_steps"] += 1
+            return observation, reward, done, extras
+
+    wrapped = DeliveredEnvironment()
+    binding, motor_hash = _runtime_motor_binding(env)
+
+    def extract(policy):
+        digest = hashlib.sha256()
+        for prefix, module in (
+            ("memory", policy.memory_a.rnn),
+            ("actor", policy.actor),
+        ):
+            for name, value in module.state_dict().items():
+                digest.update(
+                    f"{prefix}.{name}:{value.dtype}:{tuple(value.shape)}".encode()
+                )
+                digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+        return RecurrentOperatorAdapter(
+            policy,
+            joint_names=tuple(binding["joint_names"]),
+            default_position_rad=robot.default_joint_pos[0],
+            artifact_sha256=digest.hexdigest(),
+            actuator_profile="native_motor_sha256:" + motor_hash,
+        )
+
+    class TrainingRunner(OnPolicyRunner):
+        saved_updates = 0
+        checkpoint = None
+
+        def save(self, path, infos=None):
+            completed = stats["learning_updates"]
+            if completed == self.saved_updates or (
+                completed != iterations and completed % self.save_interval
+            ):
+                return
+            self.checkpoint = f"model_{completed}.pt"
+            metadata = {
+                "policy_version": RECURRENT_OPERATOR_VERSION,
+                **stats,
+                "environment_transitions": stats["control_steps"] * env.num_envs,
+                "recipe": recipe,
+                "controller_manifest": extract(self.alg.policy).spec.manifest(),
+                "actor_artifact_identity": "named_actor_state_tensor_sha256",
+                "motor_binding_sha256": motor_hash,
+                "metrics": metrics(),
+                "exit_allowed": False,
+                "resume_supported": False,
+            }
+            super().save(
+                str(output / self.checkpoint),
+                infos={
+                    "learning_updates": completed,
+                    "recurrent_training": metadata,
+                },
+            )
+            temporary = output / "training_progress.json.tmp"
+            temporary.write_text(json.dumps(metadata, indent=2, allow_nan=False) + "\n")
+            temporary.replace(output / "training_progress.json")
+            self.saved_updates = completed
+
+        def log(self, locs, *args, **kwargs):
+            super().log(locs, *args, **kwargs)
+            self.save(
+                None
+            )  # Exact completed-update milestones, not native zero-based filenames.
+
+    runner = TrainingRunner(wrapped, copy.deepcopy(runner_cfg), str(output), env.device)
+    wrapped.runner = runner
+    adapter = extract(runner.alg.policy)
+    wrapped.session = ControllerSession(
+        adapter,
+        joint_names=adapter.spec.joint_names,
+        actuator_profile=adapter.spec.actuator_profile,
+    )
+    groups = ("memory_a.", "memory_c.", "actor.", "critic.")
+    initial = {
+        prefix: torch.cat(
+            [
+                p.detach().flatten()
+                for name, p in runner.alg.policy.named_parameters()
+                if name.startswith(prefix)
+            ]
+        ).clone()
+        for prefix in groups
+    }
+    native_update = runner.alg.update
+
+    def checked_update():
+        losses = native_update()
+        if (
+            not losses
+            or any(not math.isfinite(value) for value in losses.values())
+            or not all(torch.isfinite(p).all() for p in runner.alg.policy.parameters())
+        ):
+            raise RuntimeError("Nonfinite native PPO loss or policy parameters")
+        if stats["learning_updates"] == 0:
+            for prefix, before in initial.items():
+                after = torch.cat(
+                    [
+                        p.detach().flatten()
+                        for name, p in runner.alg.policy.named_parameters()
+                        if name.startswith(prefix)
+                    ]
+                )
+                if torch.equal(before, after):
+                    raise RuntimeError(
+                        f"First native PPO update left {prefix} unchanged"
+                    )
+            initial.clear()
+        stats["learning_updates"] += 1
+        stats["last_losses"] = losses
+        return losses
+
+    runner.alg.update = checked_update
+    try:
+        runner.learn(num_learning_iterations=iterations, init_at_random_ep_len=False)
+    finally:
+        if runner.writer is not None:
+            runner.writer.flush()
+            runner.writer.close()
+    if (
+        stats["learning_updates"] != iterations
+        or stats["control_steps"] != iterations * runner.num_steps_per_env
+        or runner.saved_updates != iterations
+    ):
+        raise RuntimeError("Incomplete recurrent learning budget or final checkpoint")
+    optimizer_steps = (
+        iterations * runner.alg.num_learning_epochs * runner.alg.num_mini_batches
+    )
+    if set(runner.alg.optimizer.state) != set(runner.alg.policy.parameters()):
+        raise RuntimeError("Native Adam state does not cover every policy parameter")
+    for state in runner.alg.optimizer.state.values():
+        if state["step"].item() != optimizer_steps or any(
+            not torch.isfinite(value).all() for value in state.values()
+        ):
+            raise RuntimeError("Native Adam update count or moments are invalid")
+    return {
+        "status": "TRAINING_COMPLETED_NOT_ACCEPTED",
+        "policy_version": RECURRENT_OPERATOR_VERSION,
+        **stats,
+        "environment_transitions": stats["control_steps"] * env.num_envs,
+        "checkpoint": runner.checkpoint,
+        "optimizer_steps": optimizer_steps,
+        "updated_parameter_groups": list(groups),
+        "metrics": metrics(),
+        "controller_manifest": extract(runner.alg.policy).spec.manifest(),
+        "actor_artifact_identity": "named_actor_state_tensor_sha256",
+        "motor_binding": binding,
+        "motor_binding_sha256": motor_hash,
+        "metric_scope": "pooled pre-action tracking and moving exposure outside flat pad/band/border; command counts distinguish stops/pivots/reverse; not terrain traversal or acceptance",
+        "adapter_scope": "initial frozen-policy rollout, same noisy frames and natural resets; deterministic means within 1e-6, not sampled actions or hardware validation",
+        "target_scope": "native processed affine targets and surviving joint target buffers, not a per-substep actuator-delivery audit",
+        "exit_allowed": False,
+    }
+
+
 def run_controller_rollout(env, actor, checkpoint_sha256, *, is_running, steps=200):
     """Bounded native integration check; caller owns reset, artifacts and cleanup.
 
