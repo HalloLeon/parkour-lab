@@ -2459,14 +2459,128 @@ def recurrent_training_identity(checkpoint):
     }
 
 
-def recurrent_training_main(args, parser):
-    """One native acquisition run; no test/docs dependency or implicit promotion."""
+def _canonical_runtime_config(value):
+    """Compare data only; script and module names denote the same local binding."""
+    value = yaml.load(yaml.dump(value), Loader=yaml.BaseLoader)
+
+    def normalize(item):
+        if isinstance(item, dict):
+            return {key: normalize(value) for key, value in item.items()}
+        if isinstance(item, list):
+            return [normalize(value) for value in item]
+        if isinstance(item, str) and item.startswith("scripts.rsl_rl."):
+            return item.removeprefix("scripts.rsl_rl.")
+        return item
+
+    return normalize(value)
+
+
+def recurrent_evaluation_files(checkpoint):
+    return {
+        "checkpoint": file_sha256(checkpoint),
+        **{
+            name: file_sha256(checkpoint.parent / name)
+            for name in (
+                "training_protocol.json",
+                "params/env.yaml",
+                "params/agent.yaml",
+            )
+        },
+    }
+
+
+def recurrent_evaluation_source(checkpoint, physical_identity):
+    """Read an immutable learned snapshot without requiring its training to finish."""
+    try:
+        from .operator_student_bridge import load_recurrent_checkpoint
+    except ImportError:
+        from operator_student_bridge import load_recurrent_checkpoint
+
+    files = recurrent_evaluation_files(checkpoint)
+    policy, metadata, digest = load_recurrent_checkpoint(checkpoint, device="cpu")
+    protocol = json.loads((checkpoint.parent / "training_protocol.json").read_text())
+    recipe = metadata["recipe"]
+    archived_agent = read_yaml_data(checkpoint.parent / "params/agent.yaml")
     if (
-        not 1 <= args.iterations <= 3000
-        or not 80 <= args.num_envs <= 5120
-        or args.num_envs % 20
-        or args.seed < 0
-        or args.seed in (43, 44, 45)
+        digest != files["checkpoint"]
+        or protocol["version"] != "operator_proprio_acquisition_v1"
+        or protocol["policy_version"] != metadata["policy_version"]
+        or protocol["source_identity"]["physical_reference"] != physical_identity
+        or protocol["terrain"] != "operator_procedural_surface_v2"
+        or protocol["difficulty_range"] != list(PROCEDURAL_EASY_DIFFICULTY)
+        or protocol["adaptive_terrain_promotion"] is not False
+        or protocol["gaps"] is not False
+        or protocol["stage"] != "fixed_easy_acquisition"
+        or type(protocol["seed"]) is not int
+        or protocol["seed"] < 0
+        or protocol["seed"] in (43, 44, 45)
+        or type(protocol["num_envs"]) is not int
+        or not 80 <= protocol["num_envs"] <= 5120
+        or protocol["num_envs"] % 20
+        or type(protocol["learning_updates"]) is not int
+        or not 1 <= protocol["learning_updates"] <= 3000
+        or protocol["seed"] != recipe["seed"]
+        or protocol["learning_updates"] != recipe["max_iterations"]
+        or not 1 <= metadata["learning_updates"] <= protocol["learning_updates"]
+        or metadata["environment_transitions"]
+        != metadata["learning_updates"] * 24 * protocol["num_envs"]
+        or _canonical_runtime_config(recipe)
+        != _canonical_runtime_config(archived_agent)
+    ):
+        raise ValueError(
+            "Learned checkpoint, training archive or physical reference differs"
+        )
+    if recurrent_evaluation_files(checkpoint) != files:
+        raise ValueError("Evaluation source changed during preflight")
+    return policy, metadata, protocol, files
+
+
+def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata):
+    """Validate the full training recipe first, then apply only evaluation overrides."""
+    original = copy.copy(args)
+    original.num_envs = training_protocol["num_envs"]
+    original.seed = training_protocol["seed"]
+    original.iterations = training_protocol["learning_updates"]
+    original.device = metadata["recipe"]["device"]
+    cfg, runner = proprioceptive_procedural_configs(saved, agent, original)
+    archived = args.procedural_evaluate_checkpoint.parent / "params"
+    if _canonical_runtime_config(cfg.to_dict()) != _canonical_runtime_config(
+        read_yaml_data(archived / "env.yaml")
+    ) or _canonical_runtime_config(runner) != _canonical_runtime_config(
+        read_yaml_data(archived / "agent.yaml")
+    ):
+        raise ValueError(
+            "Reconstructed training configuration differs from learned archive"
+        )
+    try:
+        from .operator_benchmark import make_recorder_cfg
+    except ImportError:
+        from operator_benchmark import make_recorder_cfg
+    cfg.seed = cfg.scene.terrain.terrain_generator.seed = args.seed
+    cfg.scene.num_envs = args.num_envs
+    cfg.sim.device = args.device
+    cfg.observations.proprio.enable_corruption = False
+    cfg.recorders = make_recorder_cfg(procedural=True)
+    runner.update(seed=args.seed, device=args.device, max_iterations=0, resume=False)
+    return cfg, runner
+
+
+def recurrent_training_main(args, parser):
+    """Shared supervised acquisition/evaluation lifecycle; never implicit promotion."""
+    evaluation = args.procedural_evaluate_checkpoint is not None
+    invalid_budget = (
+        (args.iterations, args.num_envs, args.seed) != (0, 80, 43)
+        if evaluation
+        else (
+            not 1 <= args.iterations <= 3000
+            or not 80 <= args.num_envs <= 5120
+            or args.num_envs % 20
+            or args.seed < 0
+            or args.seed in (43, 44, 45)
+        )
+    )
+    if (
+        invalid_budget
         or not math.isfinite(args.timeout)
         or args.timeout <= 0
         or args.curriculum != VERSION
@@ -2493,7 +2607,8 @@ def recurrent_training_main(args, parser):
     ):
         parser.error(
             "Procedural acquisition requires 1–3000 updates, 80–5120 environments "
-            "in multiples of 20, positive timeout and a training seed outside 43–45. "
+            "in multiples of 20 and a training seed outside 43–45; evaluation requires "
+            "exactly 0 updates, 80 environments and seed 43. Use a positive timeout. "
             "No legacy training, refinement, retention, skip-check or resume flags."
         )
     try:
@@ -2509,6 +2624,22 @@ def recurrent_training_main(args, parser):
         if importlib.metadata.version("rsl-rl-lib") != "3.1.2":
             raise ValueError("Recurrent acquisition requires RSL-RL 3.1.2")
         identity = recurrent_training_identity(checkpoint)
+        if evaluation:
+            args.procedural_evaluate_checkpoint = (
+                args.procedural_evaluate_checkpoint.resolve(strict=True)
+            )
+            target = args.worker_output or args.output_parent
+            if target.resolve().is_relative_to(
+                args.procedural_evaluate_checkpoint.parent
+            ):
+                raise ValueError(
+                    "Evaluation output must be outside the immutable training run"
+                )
+            policy, metadata, archived_protocol, evaluation_files = (
+                recurrent_evaluation_source(
+                    args.procedural_evaluate_checkpoint, identity["physical_reference"]
+                )
+            )
     except Exception as error:
         parser.error(f"Invalid physical reference or runtime: {error}")
     protocol = {
@@ -2534,10 +2665,48 @@ def recurrent_training_main(args, parser):
         "scope": "Acquire a causal gait before progression; short budgets are integration only. No terrain exit acceptance or deployment claim.",
         "exit_allowed": False,
     }
+    if evaluation:
+        try:
+            from .operator_student_bridge import recurrent_evaluation_protocol
+        except ImportError:
+            from operator_student_bridge import recurrent_evaluation_protocol
+        protocol = {
+            **recurrent_evaluation_protocol(),
+            "source_identity": identity,
+            "training_producer_identity": archived_protocol["source_identity"],
+            "evaluation_sources": evaluation_files,
+            "checkpoint_learning_updates": metadata["learning_updates"],
+            "policy_version": RECURRENT_OPERATOR_VERSION,
+            "learning_updates": 0,
+            "configuration_check": "reconstruct and compare full archived training config before evaluation-only overrides in native worker",
+            "exit_allowed": False,
+        }
+    protocol_name = (
+        "evaluation_protocol.json" if evaluation else "training_protocol.json"
+    )
+    receipt_name = "measurement_report.json" if evaluation else "training_status.json"
+    success = (
+        "DEVELOPMENT_EVALUATED_NOT_ACCEPTED"
+        if evaluation
+        else "ACQUISITION_COMPLETE_NOT_ACCEPTED"
+    )
+    artifact_names = {
+        "params/env.yaml",
+        "params/agent.yaml",
+        "trace.npz" if evaluation else f"model_{args.iterations}.pt",
+    }
     if args.validate_only:
         print(
             json.dumps(
-                {"status": "SOURCE_VALIDATED_NOT_SIMULATED", "protocol": protocol},
+                {
+                    "status": "SOURCE_VALIDATED_NOT_SIMULATED",
+                    "protocol": protocol,
+                    **(
+                        {"native_configuration_comparison": "UNRUN"}
+                        if evaluation
+                        else {}
+                    ),
+                },
                 indent=2,
             )
         )
@@ -2545,19 +2714,34 @@ def recurrent_training_main(args, parser):
     if args.worker_output is None:
         args.output_parent.mkdir(parents=True, exist_ok=True)
         output = Path(
-            tempfile.mkdtemp(prefix="operator_proprio_", dir=args.output_parent)
+            tempfile.mkdtemp(
+                prefix=(
+                    "operator_proprio_screen_" if evaluation else "operator_proprio_"
+                ),
+                dir=args.output_parent,
+            )
         ).resolve()
         args.procedural_output = output
         write_run_provenance(output, __file__)
-        write_json(output / "training_protocol.json", protocol)
-        print(f"Fresh recurrent acquisition: {output}", flush=True)
+        write_json(output / protocol_name, protocol)
+        print(
+            f"{'Frozen recurrent evaluation' if evaluation else 'Fresh recurrent acquisition'}: {output}",
+            flush=True,
+        )
         result = supervise(
             [
                 sys.executable,
                 "-u",
                 str(Path(__file__).resolve()),
                 str(checkpoint),
-                "--procedural-train",
+                *(
+                    [
+                        "--procedural-evaluate-checkpoint",
+                        str(args.procedural_evaluate_checkpoint),
+                    ]
+                    if evaluation
+                    else ["--procedural-train"]
+                ),
                 "--iterations",
                 str(args.iterations),
                 "--num-envs",
@@ -2571,71 +2755,105 @@ def recurrent_training_main(args, parser):
             ],
             output,
             timeout_s=args.timeout,
-            report_filename="training_status.json",
-            valid_statuses=("ACQUISITION_COMPLETE_NOT_ACCEPTED", "ERROR"),
+            report_filename=receipt_name,
+            valid_statuses=(success, "ERROR"),
         )
         try:
             if identity != recurrent_training_identity(checkpoint):
                 raise ValueError(
                     "Physical reference or runtime changed during training"
                 )
-            if result.get("status") == "ACQUISITION_COMPLETE_NOT_ACCEPTED":
+            if (
+                evaluation
+                and recurrent_evaluation_files(args.procedural_evaluate_checkpoint)
+                != evaluation_files
+            ):
+                raise ValueError("Frozen evaluation source changed during execution")
+            if result.get("status") == success:
                 expected = {
                     "policy_version": RECURRENT_OPERATOR_VERSION,
                     "learning_updates": args.iterations,
-                    "environment_transitions": args.iterations * 24 * args.num_envs,
-                    "protocol_sha256": file_sha256(output / "training_protocol.json"),
+                    "environment_transitions": (
+                        80000 if evaluation else args.iterations * 24 * args.num_envs
+                    ),
+                    "protocol_sha256": file_sha256(output / protocol_name),
                     "exit_allowed": False,
                 }
+                if evaluation:
+                    expected.update(
+                        control_steps=1000,
+                        checkpoint_sha256=evaluation_files["checkpoint"],
+                        checkpoint_learning_updates=metadata["learning_updates"],
+                        evaluation_sources=evaluation_files,
+                    )
+                    if len(result.get("trials", [])) != 80:
+                        raise ValueError(
+                            "Require all 80 first-attempt evaluation trials"
+                        )
                 if any(result.get(k) != v for k, v in expected.items()):
                     raise ValueError("Incomplete recurrent training receipt")
                 artifacts = result["sha256"]
-                required = {
-                    f"model_{args.iterations}.pt",
-                    "params/env.yaml",
-                    "params/agent.yaml",
-                }
-                if set(artifacts) != required or any(
+                if set(artifacts) != artifact_names or any(
                     file_sha256(output / name) != digest
                     for name, digest in artifacts.items()
                 ):
                     raise ValueError("Recurrent checkpoint/configuration hashes differ")
-                # A matching file hash alone does not make a usable checkpoint.
-                import torch
+                if evaluation:
+                    import numpy as np
 
-                learned = torch.load(
-                    output / f"model_{args.iterations}.pt",
-                    map_location="cpu",
-                    weights_only=True,
-                )
-                info = learned["infos"]
-                metadata = info["recurrent_training"]
-                weights = learned["model_state_dict"]
-                adam = learned["optimizer_state_dict"]["state"]
-                if (
-                    learned["iter"] != args.iterations - 1
-                    or info["learning_updates"] != args.iterations
-                    or any(
-                        metadata.get(k) != expected[k]
-                        for k in (
-                            "policy_version",
-                            "learning_updates",
-                            "environment_transitions",
+                    try:
+                        from .operator_student_bridge import (
+                            summarize_recurrent_evaluation,
                         )
+                    except ImportError:
+                        from operator_student_bridge import (
+                            summarize_recurrent_evaluation,
+                        )
+                    with np.load(output / "trace.npz", allow_pickle=False) as archive:
+                        summary = summarize_recurrent_evaluation(
+                            dict(archive), recurrent_evaluation_protocol()
+                        )
+                    if any(result.get(key) != value for key, value in summary.items()):
+                        raise ValueError(
+                            "Evaluation measurements differ from raw first-attempt trace"
+                        )
+                if not evaluation:
+                    # A matching file hash alone does not make a usable checkpoint.
+                    import torch
+
+                    learned = torch.load(
+                        output / f"model_{args.iterations}.pt",
+                        map_location="cpu",
+                        weights_only=True,
                     )
-                    or not weights
-                    or any(not torch.isfinite(v).all() for v in weights.values())
-                    or not adam
-                    or any(
-                        state["step"].item() != 20 * args.iterations
-                        or not torch.isfinite(state["exp_avg"]).all()
-                        or not torch.isfinite(state["exp_avg_sq"]).all()
-                        for state in adam.values()
-                    )
-                ):
-                    raise ValueError(
-                        "Invalid saved recurrent weights, Adam state or update counts"
-                    )
+                    info = learned["infos"]
+                    metadata = info["recurrent_training"]
+                    weights = learned["model_state_dict"]
+                    adam = learned["optimizer_state_dict"]["state"]
+                    if (
+                        learned["iter"] != args.iterations - 1
+                        or info["learning_updates"] != args.iterations
+                        or any(
+                            metadata.get(k) != expected[k]
+                            for k in (
+                                "policy_version",
+                                "learning_updates",
+                                "environment_transitions",
+                            )
+                        )
+                        or not weights
+                        or any(not torch.isfinite(v).all() for v in weights.values())
+                        or not adam
+                        or any(
+                            state["step"].item() != 20 * args.iterations
+                            or not torch.isfinite(state["exp_avg"]).all()
+                            or not torch.isfinite(state["exp_avg_sq"]).all()
+                            for state in adam.values()
+                        )
+                    ):
+                        raise ValueError(
+                            "Invalid saved recurrent weights, Adam state or update counts"
+                        )
         except Exception as error:
             result = {
                 "status": "ERROR",
@@ -2647,11 +2865,11 @@ def recurrent_training_main(args, parser):
         print(f"{result['status']}: {output / 'report.json'}", flush=True)
         if result["status"] == "ERROR":
             print(json.dumps(result, indent=2), flush=True)
-        return 0 if result["status"] == "ACQUISITION_COMPLETE_NOT_ACCEPTED" else 2
+        return 0 if result["status"] == success else 2
 
     output, app, env = args.worker_output, None, None
     try:
-        if json.loads((output / "training_protocol.json").read_text()) != protocol:
+        if json.loads((output / protocol_name).read_text()) != protocol:
             raise ValueError("Training inputs differ from the predeclared protocol")
         detected = importlib.metadata.version("isaaclab")
         if detected not in PROCEDURAL_ISAACLAB_DISTRIBUTIONS:
@@ -2667,49 +2885,79 @@ def recurrent_training_main(args, parser):
             from .operator_student_bridge import run_recurrent_training
         except ImportError:
             from operator_student_bridge import run_recurrent_training
-        cfg, runner_cfg = proprioceptive_procedural_configs(saved, agent, args)
+        if evaluation:
+            cfg, runner_cfg = recurrent_evaluation_configs(
+                saved, agent, args, archived_protocol, metadata
+            )
+        else:
+            cfg, runner_cfg = proprioceptive_procedural_configs(saved, agent, args)
         cfg.validate()
         params = output / "params"
         params.mkdir()
         (params / "env.yaml").write_text(yaml.dump(cfg.to_dict(), sort_keys=False))
         (params / "agent.yaml").write_text(yaml.dump(runner_cfg, sort_keys=False))
         env = ManagerBasedRLEnv(cfg=cfg)
-        result = run_recurrent_training(
-            env,
-            runner_cfg,
-            output,
-            is_running=app.is_running,
-            iterations=args.iterations,
-        )
+        if evaluation:
+            import numpy as np
+
+            try:
+                from .operator_student_bridge import evaluate_recurrent_operator
+            except ImportError:
+                from operator_student_bridge import evaluate_recurrent_operator
+            result, trace = evaluate_recurrent_operator(
+                env,
+                policy.to(args.device),
+                evaluation_files["checkpoint"],
+                metadata,
+                is_running=app.is_running,
+            )
+            np.savez_compressed(output / "trace.npz", **trace)
+            if (
+                recurrent_evaluation_files(args.procedural_evaluate_checkpoint)
+                != evaluation_files
+            ):
+                raise ValueError("Frozen evaluation source changed during execution")
+            result["evaluation_sources"] = evaluation_files
+        else:
+            result = run_recurrent_training(
+                env,
+                runner_cfg,
+                output,
+                is_running=app.is_running,
+                iterations=args.iterations,
+            )
         if identity != recurrent_training_identity(checkpoint):
             raise ValueError("Physical reference or runtime changed during training")
         result.update(
-            status="ACQUISITION_COMPLETE_NOT_ACCEPTED",
+            status=success,
             policy_version=RECURRENT_OPERATOR_VERSION,
-            protocol_sha256=file_sha256(output / "training_protocol.json"),
+            protocol_sha256=file_sha256(output / protocol_name),
             packages={"isaaclab": detected, "rsl-rl-lib": "3.1.2"},
-            sha256={
-                name: file_sha256(output / name)
-                for name in (
-                    f"model_{args.iterations}.pt",
-                    "params/env.yaml",
-                    "params/agent.yaml",
-                )
-            },
+            sha256={name: file_sha256(output / name) for name in artifact_names},
             exit_allowed=False,
         )
-        write_json(output / "training_status.json", result)
+        write_json(output / receipt_name, result)
         return 0
     except Exception as error:
-        write_json(
-            output / "training_status.json",
-            {
-                "status": "ERROR",
-                "error": str(error),
-                "traceback": traceback.format_exc(),
-                "exit_allowed": False,
-            },
-        )
+        failure = {
+            "status": "ERROR",
+            "error": str(error),
+            "traceback": traceback.format_exc(),
+            "exit_allowed": False,
+        }
+        capture = getattr(env, "operator_capture", None)
+        if evaluation and capture is not None and capture.samples:
+            try:
+                import numpy as np
+
+                np.savez_compressed(output / "partial_trace.npz", **capture.finish())
+                failure["partial_trace"] = {
+                    "sha256": file_sha256(output / "partial_trace.npz"),
+                    "scope": "diagnostic partial capture only; not complete evaluation evidence",
+                }
+            except Exception as capture_error:
+                failure["partial_trace_error"] = str(capture_error)
+        write_json(output / receipt_name, failure)
         return 2
     finally:
         for name, resource in (("environment", env), ("application", app)):
@@ -2726,6 +2974,11 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("checkpoint", type=Path)
     procedural = parser.add_mutually_exclusive_group()
+    procedural.add_argument(
+        "--procedural-evaluate-checkpoint",
+        type=Path,
+        help="Evaluate one frozen causal checkpoint on a fixed 80-trial seed-43 tape; no learning, optimizer resume or exit acceptance",
+    )
     procedural.add_argument(
         "--procedural-train",
         action="store_true",
@@ -2788,7 +3041,7 @@ def main(argv=None):
         help="PPO updates (default: procedural acquisition 1000; refinement 300)",
     )
     parser.add_argument("--num-envs", type=int, default=None)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--moving-retention",
@@ -2844,19 +3097,23 @@ def main(argv=None):
     )
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    evaluation = args.procedural_evaluate_checkpoint is not None
     if args.iterations is None:
-        args.iterations = 1000 if args.procedural_train else 300
+        args.iterations = 0 if evaluation else (1000 if args.procedural_train else 300)
     if args.num_envs is None:
-        args.num_envs = 1280 if args.procedural_train else 4096
+        args.num_envs = 80 if evaluation else (1280 if args.procedural_train else 4096)
+    if args.seed is None:
+        args.seed = 43 if evaluation else 42
     if (
         args.procedural_train
+        or evaluation
         or args.procedural_config_check
         or args.procedural_rollout_check
     ):
         try:
             return (
                 recurrent_training_main(args, parser)
-                if args.procedural_train
+                if args.procedural_train or evaluation
                 else procedural_config_main(args, parser)
             )
         except Exception as error:

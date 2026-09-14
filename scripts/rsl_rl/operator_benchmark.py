@@ -63,7 +63,7 @@ except ImportError:
     )
 
 
-def make_recorder_cfg():
+def make_recorder_cfg(*, procedural=False):
     """Use Isaac Lab's post-step/pre-reset hook; no environment monkeypatching."""
     from isaaclab.managers import (
         DatasetExportMode,
@@ -81,6 +81,7 @@ def make_recorder_cfg():
             self.control_trace = None
             self.motor_parity = False
             self.course = None
+            self.procedural = procedural
             env.operator_capture = self
 
         def record_pre_step(self):
@@ -88,6 +89,11 @@ def make_recorder_cfg():
                 self.command = self._env.command_manager.get_command(
                     "base_velocity"
                 ).clone()
+                if self.procedural:
+                    self.pre_position = self._env.scene["robot"].data.root_pos_w.clone()
+                    self.pre_quaternion = self._env.scene[
+                        "robot"
+                    ].data.root_quat_w.clone()
             return None, None
 
         def record_post_physics_decimation_step(self):
@@ -115,6 +121,17 @@ def make_recorder_cfg():
                         action=self._env.action_manager.action,
                         joint_target=robot.joint_pos_target,
                         default_joint_position=robot.default_joint_pos,
+                    )
+                if self.procedural:
+                    sample.update(
+                        pre_position=self.pre_position,
+                        pre_quaternion=self.pre_quaternion,
+                        procedural_workspace=self._env.termination_manager.get_term(
+                            "procedural_workspace"
+                        ),
+                        base_height_ray=self._env.scene[
+                            "base_height_scanner"
+                        ].data.ray_hits_w[:, 0],
                     )
                 if self.course is not None:
                     route_state = self._env._parkour_runtime.route

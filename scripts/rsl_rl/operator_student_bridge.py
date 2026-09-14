@@ -10,7 +10,9 @@ automatic checkpoint conversion or trained recurrent checkpoint here.
 from __future__ import annotations
 
 import copy
+import contextlib
 import hashlib
+import io
 import json
 import math
 from pathlib import Path
@@ -38,6 +40,43 @@ CONTROLLER_ROLLOUT_COMMANDS = (
     (0.55, 0.0, 0.0),
 )
 RECURRENT_OPERATOR_VERSION = "go2_operator_proprio_gru_v1"
+
+
+def recurrent_evaluation_protocol():
+    """Predeclared clean-sensor first-attempt screen, not an acceptance gate."""
+    phases = (
+        ("cold_stand", 1, (0, 0, 0)),
+        ("forward", 4, (0.55, 0, 0)),
+        ("arc_positive", 2, (0.55, 0, 0.45)),
+        ("arc_negative", 2, (0.55, 0, -0.45)),
+        ("stop_after_arcs", 2, (0, 0, 0)),
+        ("reverse_flat_or_forward_rough", 3, (-0.3, 0, 0)),
+        ("pivot_positive", 2, (0, 0, 0.5)),
+        ("pivot_negative", 2, (0, 0, -0.5)),
+        ("final_stop", 2, (0, 0, 0)),
+    )
+    return {
+        "version": "go2_operator_proprio_screen_v1",
+        "seed": 43,
+        "num_envs": 80,
+        "period_s": 0.02,
+        "steps": 1000,
+        "settling_s": 0.4,
+        "noise": False,
+        "phases": [
+            {
+                "name": name,
+                "duration_s": seconds,
+                "flat_command": list(command),
+                "rough_command": list((0.45, 0, 0) if index == 5 else command),
+            }
+            for index, (name, seconds, command) in enumerate(phases)
+        ],
+        "trial": "one cold-start first attempt per environment; first termination ends scoring permanently",
+        "finished_rows": "zero body-twist packets for excluded housekeeping, not zero motor actions",
+        "scope": "deterministic actor mean, fixed packets and seed; clean-sensor development only, not robust sensing or terrain acceptance",
+        "exit_allowed": False,
+    }
 
 
 def recurrent_policy_config():
@@ -78,6 +117,107 @@ def build_recurrent_operator_policy(observations):
         12,
         **config,
     ).to(proprio)
+
+
+def _recurrent_actor_sha256(policy):
+    """Preserve the named actor-tensor identity used in acquisition checkpoints."""
+    digest = hashlib.sha256()
+    for prefix, module in (("memory", policy.memory_a.rnn), ("actor", policy.actor)):
+        for name, value in module.state_dict().items():
+            digest.update(
+                f"{prefix}.{name}:{value.dtype}:{tuple(value.shape)}".encode()
+            )
+            digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def load_recurrent_checkpoint(path, device="cpu"):
+    """Strict native state loading; no pickled callables, resume or oracle adapter."""
+    from tensordict import TensorDict
+
+    try:
+        from .operator_benchmark_core import file_sha256
+    except ImportError:
+        from operator_benchmark_core import file_sha256
+
+    path = Path(path).resolve(strict=True)
+    digest = file_sha256(path)
+    saved = torch.load(path, map_location="cpu", weights_only=True)
+    try:
+        metadata = saved["infos"]["recurrent_training"]
+        updates = metadata["learning_updates"]
+        recipe = metadata["recipe"]
+        manifest = metadata["controller_manifest"]
+        if (
+            type(updates) is not int
+            or updates < 1
+            or type(saved["iter"]) is not int
+            or saved["iter"] != updates - 1
+            or type(saved["infos"]["learning_updates"]) is not int
+            or saved["infos"]["learning_updates"] != updates
+            or metadata["policy_version"] != RECURRENT_OPERATOR_VERSION
+            or recipe["policy"] != recurrent_policy_config()
+            or recipe["obs_groups"]
+            != {"policy": ["proprio"], "critic": ["policy", "terrain"]}
+            or recipe["algorithm"]["class_name"] != "PPO"
+            or recipe.get("resume")
+            or type(recipe["num_steps_per_env"]) is not int
+            or recipe["num_steps_per_env"] < 1
+            or type(metadata["control_steps"]) is not int
+            or metadata["control_steps"] != updates * recipe["num_steps_per_env"]
+            or type(metadata["environment_transitions"]) is not int
+            or metadata["environment_transitions"] < metadata["control_steps"]
+            or metadata["environment_transitions"] % metadata["control_steps"]
+            or metadata["exit_allowed"] is not False
+            or metadata["resume_supported"] is not False
+            or metadata["actor_artifact_identity"] != "named_actor_state_tensor_sha256"
+            or manifest["actuator_profile"]
+            != "native_motor_sha256:" + metadata["motor_binding_sha256"]
+        ):
+            raise ValueError(
+                "Recurrent checkpoint metadata differs from the native recipe"
+            )
+        json.dumps(metadata, allow_nan=False)
+        observations = TensorDict(
+            {
+                name: torch.zeros(1, width)
+                for name, width in (("proprio", 45), ("policy", 48), ("terrain", 264))
+            },
+            batch_size=[1],
+        )
+        with torch.random.fork_rng(devices=[]), contextlib.redirect_stdout(
+            io.StringIO()
+        ):
+            policy = build_recurrent_operator_policy(observations)
+        expected = policy.state_dict()
+        state = saved["model_state_dict"]
+        if set(state) != set(expected):
+            raise ValueError("Recurrent checkpoint state keys differ")
+        for name, value in state.items():
+            _check_tensor(value, expected[name].shape, name)
+            if value.dtype != expected[name].dtype:
+                raise ValueError("Recurrent checkpoint parameter dtype differs")
+        policy.load_state_dict(state, strict=True)
+        policy.eval().requires_grad_(False)
+        adapter = RecurrentOperatorAdapter(
+            policy,
+            joint_names=tuple(manifest["joint_names"]),
+            default_position_rad=torch.tensor(
+                manifest["configuration"]["default_position_rad"]
+            ),
+            artifact_sha256=_recurrent_actor_sha256(policy),
+            actuator_profile=manifest["actuator_profile"],
+        )
+        # JSON canonicalization accounts only for tuple/list serialization.
+        if json.dumps(adapter.spec.manifest(), sort_keys=True) != json.dumps(
+            manifest, sort_keys=True
+        ):
+            raise ValueError("Recurrent checkpoint actor identity/interface differs")
+    except (KeyError, TypeError, AttributeError) as error:
+        raise ValueError("Incomplete native recurrent checkpoint metadata") from error
+    if file_sha256(path) != digest:
+        raise ValueError("Recurrent checkpoint changed while loading")
+    return policy.to(device), copy.deepcopy(metadata), digest
 
 
 class RecurrentOperatorAdapter:
@@ -1086,21 +1226,11 @@ def run_recurrent_training(env, runner_cfg, output, *, is_running, iterations):
     binding, motor_hash = _runtime_motor_binding(env)
 
     def extract(policy):
-        digest = hashlib.sha256()
-        for prefix, module in (
-            ("memory", policy.memory_a.rnn),
-            ("actor", policy.actor),
-        ):
-            for name, value in module.state_dict().items():
-                digest.update(
-                    f"{prefix}.{name}:{value.dtype}:{tuple(value.shape)}".encode()
-                )
-                digest.update(value.detach().cpu().contiguous().numpy().tobytes())
         return RecurrentOperatorAdapter(
             policy,
             joint_names=tuple(binding["joint_names"]),
             default_position_rad=robot.default_joint_pos[0],
-            artifact_sha256=digest.hexdigest(),
+            artifact_sha256=_recurrent_actor_sha256(policy),
             actuator_profile="native_motor_sha256:" + motor_hash,
         )
 
@@ -1233,6 +1363,399 @@ def run_recurrent_training(env, runner_cfg, output, *, is_running, iterations):
         "target_scope": "native processed affine targets and surviving joint target buffers, not a per-substep actuator-delivery audit",
         "exit_allowed": False,
     }
+
+
+def summarize_recurrent_evaluation(trace, protocol=None):
+    """Pure terminal-safe first-attempt metrics; no pass threshold or promotion."""
+    import numpy as np
+
+    protocol = recurrent_evaluation_protocol() if protocol is None else protocol
+    names = ("plane", "rough_flat", "hills", "step_hills", "tilted_ramps")
+    shape = (protocol["steps"], protocol["num_envs"])
+    phase_ids = np.repeat(
+        np.arange(len(protocol["phases"])),
+        [round(p["duration_s"] / protocol["period_s"]) for p in protocol["phases"]],
+    )
+    profiles = trace["terrain_profile_id"]
+    if (
+        profiles.shape != (shape[1],)
+        or not np.issubdtype(profiles.dtype, np.integer)
+        or np.any((profiles < 0) | (profiles >= len(names)))
+        or not np.array_equal(np.bincount(profiles, minlength=5), np.full(5, 16))
+        or not np.array_equal(trace["phase_index"], phase_ids)
+    ):
+        raise ValueError("Evaluation terrain assignment or phase tape differs")
+    for key, width in (
+        ("command", 3),
+        ("position", 3),
+        ("pre_position", 3),
+        ("quaternion", 4),
+        ("pre_quaternion", 4),
+        ("linear_velocity_b", 3),
+        ("angular_velocity_b", 3),
+        ("base_height_ray", 3),
+    ):
+        if trace[key].shape != (*shape, width):
+            raise ValueError(f"Invalid evaluation field shape: {key}")
+    for key in ("terminated", "time_out", "procedural_workspace"):
+        if trace[key].shape != shape or trace[key].dtype != np.bool_:
+            raise ValueError(f"Invalid evaluation termination field: {key}")
+    if trace["env_origins"].shape != (shape[1], 3):
+        raise ValueError("Invalid evaluation environment origins")
+    valid = trace["valid_first_attempt"]
+    if (
+        valid.shape != (protocol["steps"], protocol["num_envs"])
+        or valid.dtype != np.bool_
+    ):
+        raise ValueError("Invalid first-attempt evaluation mask")
+    done = trace["terminated"] | trace["time_out"]
+    expected_valid = np.concatenate(
+        (np.ones_like(done[:1]), ~np.maximum.accumulate(done[:-1], axis=0))
+    )
+    if not np.array_equal(valid, expected_valid):
+        raise ValueError("First-attempt mask includes post-reset replacement trials")
+    expected_command = np.asarray(
+        [
+            [
+                phase["flat_command"] if profile < 2 else phase["rough_command"]
+                for profile in profiles
+            ]
+            for phase in protocol["phases"]
+        ],
+        dtype=trace["command"].dtype,
+    )[phase_ids]
+    expected_command[~valid] = 0
+    if not np.array_equal(trace["command"], expected_command):
+        raise ValueError(
+            "Recorded command differs from the first-attempt operator tape"
+        )
+    for key in (
+        "command",
+        "position",
+        "pre_position",
+        "quaternion",
+        "pre_quaternion",
+        "linear_velocity_b",
+        "angular_velocity_b",
+        "env_origins",
+    ):
+        if not np.isfinite(trace[key]).all():
+            raise ValueError(f"Nonfinite evaluation field: {key}")
+    if np.isnan(trace["base_height_ray"]).any():
+        raise ValueError(
+            "Corrupt support rays; only finite hits or infinity misses are valid"
+        )
+    if any(
+        not np.allclose(np.linalg.norm(trace[key], axis=-1), 1.0, atol=1e-3, rtol=0)
+        for key in ("quaternion", "pre_quaternion")
+    ):
+        raise ValueError("Invalid evaluation quaternion norm")
+    dt, settle = protocol["period_s"], round(
+        protocol["settling_s"] / protocol["period_s"]
+    )
+    twist = np.concatenate(
+        (trace["linear_velocity_b"][..., :2], trace["angular_velocity_b"][..., 2:3]),
+        axis=-1,
+    )
+    error = np.abs(twist - trace["command"])
+    delta = trace["position"][..., :2] - trace["pre_position"][..., :2]
+    distance = np.linalg.norm(delta, axis=-1)
+    local = np.abs(trace["position"][..., :2] - trace["env_origins"][None, :, :2])
+    moving = np.linalg.norm(trace["command"][..., :2], axis=-1) > 0.1
+    # Spatial exclusion avoids awarding the exact support pad, band and border.
+    # Finite ray-height variation below is separate evidence, not a profile label.
+    nonflat = (
+        (trace["terrain_profile_id"][None] != 0)
+        & (local.max(-1) > 1.0)
+        & (local[..., 1] > 0.6)
+        & (local.max(-1) < 7.0)
+    )
+    exposed = valid & moving & nonflat & (np.linalg.norm(twist[..., :2], axis=-1) > 0.1)
+    hits = trace["base_height_ray"]
+    hit_valid = np.isfinite(hits).all(-1)
+    quaternion = trace["quaternion"]
+    w, x, y, z = np.moveaxis(quaternion, -1, 0)
+    heading = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    w, x, y, z = np.moveaxis(trace["pre_quaternion"], -1, 0)
+    pre_heading = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    trials = []
+    for row in range(valid.shape[1]):
+        count = int(valid[:, row].sum())
+        selected = valid[:, row]
+        if np.any(trace["terminated"][:, row] & selected):
+            outcome = "physical_failure"
+        elif np.any(trace["procedural_workspace"][:, row] & selected):
+            outcome = "workspace_censored"
+        elif count == protocol["steps"]:
+            outcome = "horizon_completed"
+        else:
+            outcome = "incomplete"
+        heights = hits[selected & hit_valid[:, row], row, 2]
+        phases = []
+        for index, phase in enumerate(protocol["phases"]):
+            phase_steps = np.flatnonzero(trace["phase_index"] == index)
+            surviving = phase_steps[selected[phase_steps]]
+            steady = surviving[surviving >= phase_steps[0] + settle]
+            final_block = phase_steps[-settle:]
+            final_complete = len(final_block) == settle and selected[final_block].all()
+            entry = {
+                "name": phase["name"],
+                "recorded_steps": len(surviving),
+                "complete": len(surviving) == len(phase_steps),
+                "mean_abs_twist_error_after_settle": (
+                    error[steady, row].mean(0).tolist() if len(steady) else None
+                ),
+                "final_block_mean_abs_twist_error": (
+                    error[final_block, row].mean(0).tolist() if final_complete else None
+                ),
+                "travel_distance_m": float(distance[surviving, row].sum()),
+                "moving_nonflat_time_s": float(exposed[surviving, row].sum() * dt),
+            }
+            if len(surviving) and not np.any(trace["command"][surviving, row]):
+                onset = trace["pre_position"][phase_steps[0], row, :2]
+                start_heading = pre_heading[phase_steps[0], row]
+                change = (
+                    np.unwrap(np.r_[start_heading, heading[surviving, row]])[1:]
+                    - start_heading
+                )
+                entry["stop_onset_max_displacement_m"] = float(
+                    np.linalg.norm(
+                        trace["position"][surviving, row, :2] - onset, axis=-1
+                    ).max()
+                )
+                entry["stop_onset_max_heading_change_rad"] = float(np.abs(change).max())
+            phases.append(entry)
+        trials.append(
+            {
+                "env_id": row,
+                "terrain": names[int(trace["terrain_profile_id"][row])],
+                "outcome": outcome,
+                "recorded_steps": count,
+                "travel_distance_m": float(distance[selected, row].sum()),
+                "moving_nonflat_time_s": float(exposed[:, row].sum() * dt),
+                "moving_nonflat_distance_m": float(
+                    distance[exposed[:, row], row].sum()
+                ),
+                "support_height_span_m": (
+                    float(np.ptp(heights)) if len(heights) else None
+                ),
+                "missing_support_ray_steps": int((selected & ~hit_valid[:, row]).sum()),
+                "phases": phases,
+            }
+        )
+    profiles = {}
+    for name in names:
+        group = [trial for trial in trials if trial["terrain"] == name]
+        profiles[name] = {
+            "initial_trials": len(group),
+            **{
+                outcome: sum(trial["outcome"] == outcome for trial in group)
+                for outcome in (
+                    "physical_failure",
+                    "workspace_censored",
+                    "horizon_completed",
+                    "incomplete",
+                )
+            },
+            "trials_with_moving_nonflat_exposure": sum(
+                trial["moving_nonflat_time_s"] > 0 for trial in group
+            ),
+        }
+    return {"profiles": profiles, "trials": trials}
+
+
+def evaluate_recurrent_operator(env, policy, checkpoint_sha, metadata, *, is_running):
+    """Replay one clean deterministic first attempt; only the actor drives motors."""
+    import numpy as np
+    from parkour_lab.learning.controller import ControllerSession, Sample
+
+    protocol = recurrent_evaluation_protocol()
+    if (
+        env.num_envs != protocol["num_envs"]
+        or env.max_episode_length != protocol["steps"]
+        or not math.isclose(env.step_dt, protocol["period_s"], abs_tol=1e-9)
+        or not math.isclose(env.physics_dt, 0.005, abs_tol=1e-9)
+        or env.cfg.decimation != 4
+        or env.cfg.observations.proprio.enable_corruption
+        or tuple(env.observation_manager.active_terms["proprio"])
+        != tuple(name for name, _ in FRAME_TERMS)
+        or policy.training
+        or any(parameter.requires_grad for parameter in policy.parameters())
+        or policy.memory_a.hidden_state is not None
+        or policy.memory_c.hidden_state is not None
+        or _recurrent_actor_sha256(policy)
+        != metadata["controller_manifest"]["artifact_sha256"]
+    ):
+        raise ValueError(
+            "Require a frozen fresh-memory GRU and the clean 80-trial evaluation configuration"
+        )
+    command = env.command_manager.get_term("base_velocity")
+    if (
+        command.cfg.heading_command
+        or command.cfg.rel_heading_envs
+        or command.cfg.rel_standing_envs
+    ):
+        raise ValueError("Evaluation forbids heading or standing command assistance")
+    capture = env.operator_capture
+    if (
+        capture.enabled
+        or capture.samples
+        or capture.course is not None
+        or capture.control_trace is not None
+        or not capture.procedural
+    ):
+        raise ValueError(
+            "Evaluation requires a fresh procedural terminal-safe recorder"
+        )
+    env.reset(seed=protocol["seed"])
+    binding, motor_hash = _runtime_motor_binding(env)
+    robot = env.scene["robot"].data
+    if (
+        binding["joint_names"] != metadata["controller_manifest"]["joint_names"]
+        or binding["default_position_rad"]
+        != metadata["controller_manifest"]["configuration"]["default_position_rad"]
+    ):
+        raise ValueError(
+            "Evaluation joint order or default pose differs from the learned interface"
+        )
+    columns = env.scene.terrain.terrain_types
+    if torch.any((columns < 0) | (columns >= 20)):
+        raise ValueError("Unexpected procedural terrain columns")
+    profile_ids = columns // 4
+    if not torch.equal(
+        torch.bincount(profile_ids, minlength=5),
+        torch.full((5,), 16, device=env.device),
+    ):
+        raise ValueError(
+            "Evaluation requires sixteen initial trials per terrain profile"
+        )
+    flat = profile_ids < 2
+    adapter = RecurrentOperatorAdapter(
+        policy,
+        joint_names=tuple(binding["joint_names"]),
+        default_position_rad=robot.default_joint_pos[0],
+        artifact_sha256=checkpoint_sha,
+        actuator_profile="native_motor_sha256:" + motor_hash,
+    )
+    session = ControllerSession(
+        adapter,
+        joint_names=adapter.spec.joint_names,
+        actuator_profile=adapter.spec.actuator_profile,
+    )
+    phase_ids = np.repeat(
+        np.arange(len(protocol["phases"])),
+        [round(p["duration_s"] / env.step_dt) for p in protocol["phases"]],
+    )
+    valid = []
+    finished = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    reset = torch.ones_like(finished)
+    partial_resets = 0
+    capture.motor_parity = capture.enabled = True
+    try:
+        with torch.inference_mode():
+            for step, phase_id in enumerate(phase_ids):
+                if not is_running():
+                    raise RuntimeError(
+                        f"Simulator closed at recurrent evaluation step {step}"
+                    )
+                phase = protocol["phases"][phase_id]
+                desired = robot.joint_pos.new_tensor(phase["rough_command"]).repeat(
+                    env.num_envs, 1
+                )
+                desired[flat] = desired.new_tensor(phase["flat_command"])
+                desired[finished] = 0  # Housekeeping packets, never replacement trials.
+                command.time_left.fill_(float("inf"))
+                command.is_standing_env.fill_(False)
+                command.is_heading_env.fill_(False)
+                command.vel_command_b.copy_(desired)
+                frame = env.observation_manager.compute()["proprio"]
+                values = (
+                    robot.root_ang_vel_b,
+                    robot.projected_gravity_b,
+                    robot.joint_pos - robot.default_joint_pos,
+                    robot.joint_vel,
+                    env.action_manager.action,
+                )
+                independent = torch.cat((*values[:2], desired, *values[2:]), dim=-1)
+                if not torch.equal(frame, independent) or torch.any(
+                    values[-1][reset] != 0
+                ):
+                    raise RuntimeError(
+                        "Clean causal frame or previous-action reset differs from native sensors"
+                    )
+                now = step * env.step_dt
+                samples = {
+                    name: Sample(
+                        value, now, torch.ones_like(reset), spec.units, spec.frame
+                    )
+                    for (name, spec), value in zip(
+                        adapter.spec.sensors.items(), values, strict=True
+                    )
+                }
+                result = session.step(
+                    time_s=now,
+                    command=desired,
+                    command_time_s=now,
+                    sensors=samples,
+                    reset_mask=reset,
+                )
+                policy.reset(reset)
+                shadow = policy.act_inference({"proprio": frame})
+                if not torch.allclose(result.raw_action, shadow, atol=1e-6, rtol=0):
+                    raise RuntimeError(
+                        "Learned actor-only adapter differs from native deterministic inference"
+                    )
+                capture.observation = frame.detach().clone()
+                valid.append((~finished).cpu().numpy().copy())
+                _, reward, terminated, timed_out, _ = env.step(result.raw_action)
+                _check_tensor(reward, (env.num_envs,), "evaluation reward")
+                if len(capture.samples) != step + 1:
+                    raise RuntimeError(
+                        "Missing terminal-safe recurrent evaluation sample"
+                    )
+                if not np.array_equal(
+                    capture.samples[-1]["joint_target"],
+                    result.position_rad.cpu().numpy(),
+                ):
+                    raise RuntimeError(
+                        "Learned adapter target differs from native pre-reset joint target"
+                    )
+                reset = (terminated | timed_out).detach().clone()
+                partial_resets += int(reset.any() and not reset.all())
+                finished |= reset
+    finally:
+        capture.enabled = capture.motor_parity = False
+    trace = capture.finish()
+    trace.update(
+        valid_first_attempt=np.stack(valid),
+        phase_index=phase_ids,
+        terrain_profile_id=profile_ids.cpu().numpy(),
+        env_origins=env.scene.env_origins.detach().cpu().numpy().copy(),
+    )
+    if (
+        _recurrent_actor_sha256(policy)
+        != metadata["controller_manifest"]["artifact_sha256"]
+    ):
+        raise RuntimeError("Evaluation modified the learned actor weights")
+    return {
+        "status": "DEVELOPMENT_EVALUATED_NOT_ACCEPTED",
+        "policy_version": RECURRENT_OPERATOR_VERSION,
+        "checkpoint_sha256": checkpoint_sha,
+        "checkpoint_learning_updates": metadata["learning_updates"],
+        "learning_updates": 0,
+        "control_steps": len(phase_ids),
+        "environment_transitions": len(phase_ids) * env.num_envs,
+        "partial_reset_steps": partial_resets,
+        "protocol": protocol,
+        "motor_binding": binding,
+        "motor_binding_sha256": motor_hash,
+        "training_motor_binding_sha256": metadata["motor_binding_sha256"],
+        "controller_manifest": session.manifest,
+        "interface_sha256": session.interface_sha256,
+        **summarize_recurrent_evaluation(trace, protocol),
+        "metric_scope": "post-physics/pre-reset first attempts; final block only when fully observed; nonflat-region motion and center-ray height variation are separate descriptive evidence, not traversal acceptance",
+        "exit_allowed": False,
+    }, trace
 
 
 def run_controller_rollout(env, actor, checkpoint_sha256, *, is_running, steps=200):
