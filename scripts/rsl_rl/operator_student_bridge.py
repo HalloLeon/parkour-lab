@@ -916,6 +916,10 @@ def run_recurrent_training(env, runner_cfg, output, *, is_running, iterations):
             ):
                 counts[:, index] += torch.bincount(profile_ids[mask], minlength=5)
             observation, reward, done, extras = super().step(actions)
+            # Native wrappers can report both a physical failure and a time
+            # limit on the same step. Only genuine truncations bootstrap PPO.
+            if "time_outs" in extras:
+                extras["time_outs"] = extras["time_outs"] & ~env.reset_terminated
             self.validate_observations(observation)
             _check_tensor(reward, (self.num_envs,), "native reward")
             expected = robot.default_joint_pos + 0.25 * actions

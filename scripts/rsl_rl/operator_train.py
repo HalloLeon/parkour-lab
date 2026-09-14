@@ -392,14 +392,31 @@ PROCEDURAL_TERRAIN_VERSION = "go2_operator_procedural_terrain_v2"
 # are not admitted by this wheel-only check. Do not use a broad 2.3.* match.
 PROCEDURAL_ISAACLAB_DISTRIBUTIONS = ("2.3.2", "2.3.2.post1")
 PROCEDURAL_EASY_DIFFICULTY = (0.05, 0.15)
-PROPRIO_ACQUISITION_VERSION = "operator_proprio_acquisition_v2"
+PROPRIO_ACQUISITION_VERSION = "operator_proprio_acquisition_v3"
+PROPRIO_JOINT_LIMIT_VERSION = "operator_proprio_acquisition_v2"
 PROPRIO_LEGACY_ACQUISITION_VERSION = "operator_proprio_acquisition_v1"
+PROPRIO_ACQUISITION_VERSIONS = (
+    PROPRIO_LEGACY_ACQUISITION_VERSION,
+    PROPRIO_JOINT_LIMIT_VERSION,
+    PROPRIO_ACQUISITION_VERSION,
+)
 PROPRIO_REWARD_CHANGE = {
     "term": "dof_pos_limits",
     "function": "isaaclab.envs.mdp.rewards:joint_pos_limits",
     "from_weight": 0.0,
     "to_weight": -10.0,
     "soft_joint_pos_limit_factor": 0.9,
+}
+PROPRIO_POSTURE_CHANGE = {
+    "reward": {"term": "flat_orientation_l2", "from_weight": 0.0, "to_weight": -2.5},
+    "termination": {
+        "term": "procedural_physical_failure",
+        "max_tilt_rad": math.pi / 4,
+        "time_out": False,
+        "bootstrap": "physical failures take precedence over simultaneous time limits",
+        "criterion": "total body tilt from world upright; projected_gravity_b.z > -cos(max_tilt_rad)",
+    },
+    "scope": "fixed easy difficulty 0.05–0.15 only; task repair, not a single-factor ablation or terrain acceptance",
 }
 PROCEDURAL_ROLLOUT_STEPS = 200
 PROCEDURAL_SCAN_INTERFACE = {
@@ -570,10 +587,7 @@ def proprioceptive_procedural_configs(
             recurrent_policy_config,
         )
 
-    if acquisition_version not in (
-        PROPRIO_ACQUISITION_VERSION,
-        PROPRIO_LEGACY_ACQUISITION_VERSION,
-    ):
+    if acquisition_version not in PROPRIO_ACQUISITION_VERSIONS:
         raise ValueError("Unsupported proprioceptive acquisition version")
     cfg, runner_cfg = _procedural_environment_configs(saved, agent, args)
     # Do not inherit the source8500 fine stationary kernels into a fresh actor.
@@ -581,12 +595,32 @@ def proprioceptive_procedural_configs(
     apply_reward_profile(cfg, PROFILES["stock"])
     # One-term fresh-learning ablation, not target clipping or a motor change.
     # Preserve the zero-weight recipe when reconstructing archived v1 runs.
-    if acquisition_version == PROPRIO_ACQUISITION_VERSION:
+    if acquisition_version != PROPRIO_LEGACY_ACQUISITION_VERSION:
         if cfg.scene.robot.soft_joint_pos_limit_factor != 0.9:
             raise ValueError(
                 "The joint-limit ablation requires the stock 0.9 soft factor"
             )
         cfg.rewards.dof_pos_limits.weight = PROPRIO_REWARD_CHANGE["to_weight"]
+    if acquisition_version == PROPRIO_ACQUISITION_VERSION:
+        generator = cfg.scene.terrain.terrain_generator
+        if (
+            tuple(generator.difficulty_range) != (0.05, 0.15)
+            or generator.num_rows != 1
+            or cfg.curriculum.terrain_levels is not None
+        ):
+            raise ValueError(
+                "The posture repair requires fixed easy acquisition terrain"
+            )
+        # The pinned Go2 flat baseline supplies this smooth posture objective.
+        # Keep failure in the existing physical term, BEFORE workspace timeout.
+        cfg.rewards.flat_orientation_l2.weight = PROPRIO_POSTURE_CHANGE["reward"][
+            "to_weight"
+        ]
+        failure = cfg.terminations.procedural_physical_failure
+        failure.params["max_tilt_rad"] = PROPRIO_POSTURE_CHANGE["termination"][
+            "max_tilt_rad"
+        ]
+        failure.time_out = False
     # Copy the noisy sensor group BEFORE making the privileged critic noiseless.
     # Removing this term at the manager boundary avoids passing oracle velocity
     # into actor normalization, recurrent state or inference preprocessing.
@@ -2527,11 +2561,16 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
     archived_agent = read_yaml_data(checkpoint.parent / "params/agent.yaml")
     if (
         digest != files["checkpoint"]
-        or protocol["version"]
-        not in (PROPRIO_LEGACY_ACQUISITION_VERSION, PROPRIO_ACQUISITION_VERSION)
+        or protocol["version"] not in PROPRIO_ACQUISITION_VERSIONS
         or protocol.get("reward_change")
         != (
             PROPRIO_REWARD_CHANGE
+            if protocol["version"] != PROPRIO_LEGACY_ACQUISITION_VERSION
+            else None
+        )
+        or protocol.get("posture_change")
+        != (
+            PROPRIO_POSTURE_CHANGE
             if protocol["version"] == PROPRIO_ACQUISITION_VERSION
             else None
         )
@@ -2691,8 +2730,9 @@ def recurrent_training_main(args, parser):
         "gaps": False,
         "stage": "fixed_easy_acquisition",
         "ppo": {"learning_rate": 1e-3, "schedule": "adaptive", "entropy_coef": 0.01},
-        "reward_profile": "stock broad tracking kernels; flat_orientation_l2=0, feet_air_time=0.01, dof_pos_limits=-10; no other reward changes, stationary precision or action-retention loss",
+        "reward_profile": "stock broad tracking kernels; flat_orientation_l2=-2.5, feet_air_time=0.01, dof_pos_limits=-10; no stationary precision or action-retention loss",
         "reward_change": copy.deepcopy(PROPRIO_REWARD_CHANGE),
+        "posture_change": copy.deepcopy(PROPRIO_POSTURE_CHANGE),
         "initial_action_std": 0.5,
         "metrics": "per-profile command tracking, measured moving/nonflat exposure, physical failures and timeouts; training data, not held-out success rates",
         "checkpoint_selection": "save every 50 completed updates and final; no automatic selection or promotion",

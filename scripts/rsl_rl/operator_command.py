@@ -159,6 +159,7 @@ def procedural_physical_failure(
     fall_margin_m: float,
     sensor_cfg: SceneEntityCfg = SceneEntityCfg("base_height_scanner"),
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    max_tilt_rad: float | None = None,
 ):
     """Terrain-relative physical failure; downhill elevation is not a fall.
 
@@ -166,6 +167,8 @@ def procedural_physical_failure(
     A plunge below the lowest possible generated surface minus a declared
     margin is nevertheless a failure, even for a floorless hole. This bound
     must come from the geometry envelope, not a fixed offset below spawn.
+    An optional total body tilt bound rejects tipped equilibria even when the
+    center ray clears the floor. None preserves archived v1/v2 episode rules.
     """
     if (
         not math.isfinite(minimum_m)
@@ -174,8 +177,18 @@ def procedural_physical_failure(
         or minimum_surface_z_m > 0
         or not math.isfinite(fall_margin_m)
         or fall_margin_m <= 0
+        or (
+            max_tilt_rad is not None
+            and (
+                isinstance(max_tilt_rad, bool)
+                or not math.isfinite(max_tilt_rad)
+                or not 0 < max_tilt_rad < math.pi / 2
+            )
+        )
     ):
-        raise ValueError("Procedural clearance and geometry fall bounds are invalid")
+        raise ValueError(
+            "Procedural clearance, geometry or tilt fall bounds are invalid"
+        )
     hits = env.scene[sensor_cfg.name].data.ray_hits_w
     if hits.shape != (env.num_envs, 1, 3):
         raise ValueError("Procedural base clearance requires exactly one center ray")
@@ -188,7 +201,15 @@ def procedural_physical_failure(
         root_position[:, 2] - env.scene.env_origins[:, 2]
         < minimum_surface_z_m - fall_margin_m
     )
-    return (valid & (clearance < minimum_m)) | below_geometry
+    failed = (valid & (clearance < minimum_m)) | below_geometry
+    if max_tilt_rad is not None:
+        gravity = env.scene[asset_cfg.name].data.projected_gravity_b
+        if gravity.shape != (env.num_envs, 3) or not torch.isfinite(gravity).all():
+            raise RuntimeError("Invalid projected gravity for procedural tilt failure")
+        # Isaac Lab bad_orientation's gravity-angle criterion, in cosine form
+        # to avoid acos domain NaNs from floating-point roundoff at +/-1.
+        failed |= gravity[:, 2] > -math.cos(max_tilt_rad)
+    return failed
 
 
 def procedural_workspace(env, margin_m: float):
