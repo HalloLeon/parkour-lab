@@ -2588,7 +2588,7 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         or not 80 <= protocol["num_envs"] <= 5120
         or protocol["num_envs"] % 20
         or type(protocol["learning_updates"]) is not int
-        or not 1 <= protocol["learning_updates"] <= 3000
+        or protocol["learning_updates"] < 1
         or protocol["seed"] != recipe["seed"]
         or protocol["learning_updates"] != recipe["max_iterations"]
         or not 1 <= metadata["learning_updates"] <= protocol["learning_updates"]
@@ -2644,7 +2644,7 @@ def recurrent_training_main(args, parser):
         (args.iterations, args.num_envs, args.seed) != (0, 80, 43)
         if evaluation
         else (
-            not 1 <= args.iterations <= 3000
+            args.iterations < 1
             or not 80 <= args.num_envs <= 5120
             or args.num_envs % 20
             or args.seed < 0
@@ -2653,8 +2653,11 @@ def recurrent_training_main(args, parser):
     )
     if (
         invalid_budget
-        or not math.isfinite(args.timeout)
-        or args.timeout <= 0
+        or (evaluation and args.timeout is None)
+        or (
+            args.timeout is not None
+            and (not math.isfinite(args.timeout) or args.timeout <= 0)
+        )
         or args.curriculum != VERSION
         or args.refinement_profile != "source"
         or args.skip_check
@@ -2678,9 +2681,10 @@ def recurrent_training_main(args, parser):
         or (args.validate_only and args.worker_output is not None)
     ):
         parser.error(
-            "Procedural acquisition requires 1–3000 updates, 80–5120 environments "
+            "Procedural acquisition requires positive updates, 80–5120 environments "
             "in multiples of 20 and a training seed outside 43–45; evaluation requires "
-            "exactly 0 updates, 80 environments and seed 43. Use a positive timeout. "
+            "exactly 0 updates, 80 environments and seed 43. An explicit timeout must "
+            "be finite and positive; omit it for acquisition without a time limit. "
             "No legacy training, refinement, retention, skip-check or resume flags."
         )
     try:
@@ -3056,7 +3060,7 @@ def main(argv=None):
     procedural.add_argument(
         "--procedural-train",
         action="store_true",
-        help="Train a fresh proprioceptive GRU with the v2 soft-joint-limit objective on fixed easy supported terrain; reference binds physics only; no resume or exit acceptance",
+        help="Train a fresh proprioceptive GRU with the v3 joint-limit and upright-posture objective on fixed easy supported terrain; reference binds physics only; no resume or exit acceptance",
     )
     procedural.add_argument(
         "--procedural-config-check",
@@ -3112,7 +3116,7 @@ def main(argv=None):
         "--iterations",
         type=int,
         default=None,
-        help="PPO updates (default: procedural acquisition 1000; refinement 300)",
+        help="PPO updates (default: procedural acquisition 1000, no upper cap; refinement 300)",
     )
     parser.add_argument("--num-envs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -3161,8 +3165,8 @@ def main(argv=None):
     parser.add_argument(
         "--timeout",
         type=float,
-        default=3600,
-        help="Training worker time limit, seconds",
+        default=None,
+        help="Optional positive finite worker time limit in seconds (default: no limit for --procedural-train; 3600 for other modes)",
     )
     parser.add_argument(
         "--skip-check",
@@ -3172,6 +3176,8 @@ def main(argv=None):
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     evaluation = args.procedural_evaluate_checkpoint is not None
+    if args.timeout is None and not args.procedural_train:
+        args.timeout = 3600
     if args.iterations is None:
         args.iterations = 0 if evaluation else (1000 if args.procedural_train else 300)
     if args.num_envs is None:
