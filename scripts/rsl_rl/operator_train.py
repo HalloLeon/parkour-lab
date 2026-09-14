@@ -392,6 +392,15 @@ PROCEDURAL_TERRAIN_VERSION = "go2_operator_procedural_terrain_v2"
 # are not admitted by this wheel-only check. Do not use a broad 2.3.* match.
 PROCEDURAL_ISAACLAB_DISTRIBUTIONS = ("2.3.2", "2.3.2.post1")
 PROCEDURAL_EASY_DIFFICULTY = (0.05, 0.15)
+PROPRIO_ACQUISITION_VERSION = "operator_proprio_acquisition_v2"
+PROPRIO_LEGACY_ACQUISITION_VERSION = "operator_proprio_acquisition_v1"
+PROPRIO_REWARD_CHANGE = {
+    "term": "dof_pos_limits",
+    "function": "isaaclab.envs.mdp.rewards:joint_pos_limits",
+    "from_weight": 0.0,
+    "to_weight": -10.0,
+    "soft_joint_pos_limit_factor": 0.9,
+}
 PROCEDURAL_ROLLOUT_STEPS = 200
 PROCEDURAL_SCAN_INTERFACE = {
     "version": "privileged_centered_height_valid_132_v1",
@@ -541,7 +550,9 @@ def procedural_terrain_configs(saved, agent, args):
     return cfg, runner_cfg
 
 
-def proprioceptive_procedural_configs(saved, agent, args):
+def proprioceptive_procedural_configs(
+    saved, agent, args, *, acquisition_version=PROPRIO_ACQUISITION_VERSION
+):
     """Fresh causal GRU recipe on the fixed easy supported acquisition stage.
 
     The source configuration binds the physical motor only. This policy starts
@@ -559,10 +570,23 @@ def proprioceptive_procedural_configs(saved, agent, args):
             recurrent_policy_config,
         )
 
+    if acquisition_version not in (
+        PROPRIO_ACQUISITION_VERSION,
+        PROPRIO_LEGACY_ACQUISITION_VERSION,
+    ):
+        raise ValueError("Unsupported proprioceptive acquisition version")
     cfg, runner_cfg = _procedural_environment_configs(saved, agent, args)
     # Do not inherit the source8500 fine stationary kernels into a fresh actor.
     # Keep the rough orientation/air-time adjustments and physical motor.
     apply_reward_profile(cfg, PROFILES["stock"])
+    # One-term fresh-learning ablation, not target clipping or a motor change.
+    # Preserve the zero-weight recipe when reconstructing archived v1 runs.
+    if acquisition_version == PROPRIO_ACQUISITION_VERSION:
+        if cfg.scene.robot.soft_joint_pos_limit_factor != 0.9:
+            raise ValueError(
+                "The joint-limit ablation requires the stock 0.9 soft factor"
+            )
+        cfg.rewards.dof_pos_limits.weight = PROPRIO_REWARD_CHANGE["to_weight"]
     # Copy the noisy sensor group BEFORE making the privileged critic noiseless.
     # Removing this term at the manager boundary avoids passing oracle velocity
     # into actor normalization, recurrent state or inference preprocessing.
@@ -2503,7 +2527,14 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
     archived_agent = read_yaml_data(checkpoint.parent / "params/agent.yaml")
     if (
         digest != files["checkpoint"]
-        or protocol["version"] != "operator_proprio_acquisition_v1"
+        or protocol["version"]
+        not in (PROPRIO_LEGACY_ACQUISITION_VERSION, PROPRIO_ACQUISITION_VERSION)
+        or protocol.get("reward_change")
+        != (
+            PROPRIO_REWARD_CHANGE
+            if protocol["version"] == PROPRIO_ACQUISITION_VERSION
+            else None
+        )
         or protocol["policy_version"] != metadata["policy_version"]
         or protocol["source_identity"]["physical_reference"] != physical_identity
         or protocol["terrain"] != "operator_procedural_surface_v2"
@@ -2542,7 +2573,9 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
     original.seed = training_protocol["seed"]
     original.iterations = training_protocol["learning_updates"]
     original.device = metadata["recipe"]["device"]
-    cfg, runner = proprioceptive_procedural_configs(saved, agent, original)
+    cfg, runner = proprioceptive_procedural_configs(
+        saved, agent, original, acquisition_version=training_protocol["version"]
+    )
     archived = args.procedural_evaluate_checkpoint.parent / "params"
     if _canonical_runtime_config(cfg.to_dict()) != _canonical_runtime_config(
         read_yaml_data(archived / "env.yaml")
@@ -2643,7 +2676,7 @@ def recurrent_training_main(args, parser):
     except Exception as error:
         parser.error(f"Invalid physical reference or runtime: {error}")
     protocol = {
-        "version": "operator_proprio_acquisition_v1",
+        "version": PROPRIO_ACQUISITION_VERSION,
         "policy_version": RECURRENT_OPERATOR_VERSION,
         "source_identity": identity,
         "initialization": "fresh actor, critic and Adam; physical reference weights NOT loaded",
@@ -2658,7 +2691,8 @@ def recurrent_training_main(args, parser):
         "gaps": False,
         "stage": "fixed_easy_acquisition",
         "ppo": {"learning_rate": 1e-3, "schedule": "adaptive", "entropy_coef": 0.01},
-        "reward_profile": "stock broad tracking kernels; flat_orientation_l2=0, feet_air_time=0.01; no stationary precision or action-retention loss",
+        "reward_profile": "stock broad tracking kernels; flat_orientation_l2=0, feet_air_time=0.01, dof_pos_limits=-10; no other reward changes, stationary precision or action-retention loss",
+        "reward_change": copy.deepcopy(PROPRIO_REWARD_CHANGE),
         "initial_action_std": 0.5,
         "metrics": "per-profile command tracking, measured moving/nonflat exposure, physical failures and timeouts; training data, not held-out success rates",
         "checkpoint_selection": "save every 50 completed updates and final; no automatic selection or promotion",
@@ -2982,7 +3016,7 @@ def main(argv=None):
     procedural.add_argument(
         "--procedural-train",
         action="store_true",
-        help="Train a fresh proprioceptive GRU on fixed easy supported terrain; reference checkpoint binds physics only; no resume or exit acceptance",
+        help="Train a fresh proprioceptive GRU with the v2 soft-joint-limit objective on fixed easy supported terrain; reference binds physics only; no resume or exit acceptance",
     )
     procedural.add_argument(
         "--procedural-config-check",
