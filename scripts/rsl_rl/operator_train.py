@@ -3383,6 +3383,12 @@ def recurrent_training_main(args, parser):
             except Exception as capture_error:
                 failure["partial_trace_error"] = str(capture_error)
         write_json(output / receipt_name, failure)
+        # Kit cleanup can block or exit Python; expose the error before closing it.
+        print(
+            f"ERROR: {error} (details: {output / receipt_name})",
+            file=sys.stderr,
+            flush=True,
+        )
         return 2
     finally:
         for name, resource in (("environment", env), ("application", app)):
