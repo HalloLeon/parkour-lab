@@ -397,6 +397,7 @@ PROCEDURAL_ISAACLAB_DISTRIBUTIONS = ("2.3.2", "2.3.2.post1")
 PROCEDURAL_EASY_DIFFICULTY = (0.05, 0.15)
 PROPRIO_ACQUISITION_VERSION = "operator_proprio_acquisition_v3"
 PROPRIO_STOP_PRECISION_VERSION = "operator_proprio_stop_precision_v1"
+PROPRIO_TERRAIN_EXPOSURE_VERSION = "operator_proprio_terrain_exposure_v1"
 PROPRIO_JOINT_LIMIT_VERSION = "operator_proprio_acquisition_v2"
 PROPRIO_LEGACY_ACQUISITION_VERSION = "operator_proprio_acquisition_v1"
 PROPRIO_ACQUISITION_VERSIONS = (
@@ -407,7 +408,21 @@ PROPRIO_ACQUISITION_VERSIONS = (
 PROPRIO_TRAINING_VERSIONS = (
     *PROPRIO_ACQUISITION_VERSIONS,
     PROPRIO_STOP_PRECISION_VERSION,
+    PROPRIO_TERRAIN_EXPOSURE_VERSION,
 )
+PROPRIO_UPRIGHT_VERSIONS = (
+    PROPRIO_ACQUISITION_VERSION,
+    PROPRIO_STOP_PRECISION_VERSION,
+    PROPRIO_TERRAIN_EXPOSURE_VERSION,
+)
+PROPRIO_TERRAIN_EXPOSURE_CHANGE = {
+    "difficulty_range": [0.05, 0.35],
+    "num_rows": 3,
+    "row_bands": [[0.05, 0.15], [0.15, 0.25], [0.25, 0.35]],
+    "assignment": "native uniform initial row sampling, fixed for the run; realized row/profile counts are recorded, not assumed balanced",
+    "retention": "20 percent plane columns in every row; lowest row retains the acquisition amplitude band, not the identical old meshes",
+    "scope": "one static mixed-amplitude exposure stage; no adaptive promotion, reward, command, episode-duration, policy or motor change",
+}
 PROPRIO_STOP_PRECISION_CHANGE = {
     "gate": "exact zero body twist only; moving and pure-pivot rewards unchanged",
     "broad_std": 0.5,
@@ -450,6 +465,32 @@ PROCEDURAL_SCAN_INTERFACE = {
     "deployment_claim": "privileged teacher only; causal student sensing unresolved",
     "checkpoint_compatibility": "stock 48-D warm start only; no legacy terrain resume",
 }
+
+
+def _proprio_posture_change(version):
+    if version not in PROPRIO_UPRIGHT_VERSIONS:
+        return None
+    result = copy.deepcopy(PROPRIO_POSTURE_CHANGE)
+    if version == PROPRIO_TERRAIN_EXPOSURE_VERSION:
+        result["scope"] = (
+            "retain the v3 posture objective and physical failure guard during bounded terrain exposure; not terrain acceptance"
+        )
+    return result
+
+
+def _configure_recurrent_terrain(cfg, difficulty_range, *, num_rows=1):
+    """Set static layout and its derived floor bound together, before construction."""
+    from parkour_lab.tasks.manager_based.parkour_lab.mdp.terrain.operator_terrain import (
+        ENVELOPES,
+    )
+
+    generator = cfg.scene.terrain.terrain_generator
+    generator.difficulty_range = tuple(difficulty_range)
+    generator.num_rows = num_rows
+    cfg.scene.terrain.max_init_terrain_level = num_rows - 1
+    cfg.terminations.procedural_physical_failure.params["minimum_surface_z_m"] = (
+        -max(height for height, _ in ENVELOPES.values()) * difficulty_range[1]
+    )
 
 
 def _procedural_environment_configs(saved, agent, args):
@@ -587,7 +628,7 @@ def procedural_terrain_configs(saved, agent, args):
 def proprioceptive_procedural_configs(
     saved, agent, args, *, acquisition_version=PROPRIO_ACQUISITION_VERSION
 ):
-    """Causal GRU recipe on fixed easy supported terrain.
+    """Causal GRU recipe on versioned, static supported terrain.
 
     The source configuration binds the physical motor only. This policy starts
     from fresh weights unless a separately validated recurrent source is supplied;
@@ -619,10 +660,7 @@ def proprioceptive_procedural_configs(
                 "The joint-limit ablation requires the stock 0.9 soft factor"
             )
         cfg.rewards.dof_pos_limits.weight = PROPRIO_REWARD_CHANGE["to_weight"]
-    if acquisition_version in (
-        PROPRIO_ACQUISITION_VERSION,
-        PROPRIO_STOP_PRECISION_VERSION,
-    ):
+    if acquisition_version in PROPRIO_UPRIGHT_VERSIONS:
         generator = cfg.scene.terrain.terrain_generator
         if (
             tuple(generator.difficulty_range) != (0.05, 0.15)
@@ -642,6 +680,12 @@ def proprioceptive_procedural_configs(
             "max_tilt_rad"
         ]
         failure.time_out = False
+    if acquisition_version == PROPRIO_TERRAIN_EXPOSURE_VERSION:
+        _configure_recurrent_terrain(
+            cfg,
+            PROPRIO_TERRAIN_EXPOSURE_CHANGE["difficulty_range"],
+            num_rows=PROPRIO_TERRAIN_EXPOSURE_CHANGE["num_rows"],
+        )
     if acquisition_version == PROPRIO_STOP_PRECISION_VERSION:
         try:
             from .operator_rewards import (
@@ -2604,6 +2648,7 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
     policy, metadata, digest = load_recurrent_checkpoint(checkpoint, device="cpu")
     protocol = json.loads((checkpoint.parent / "training_protocol.json").read_text())
     recipe = metadata["recipe"]
+    exposure = protocol["version"] == PROPRIO_TERRAIN_EXPOSURE_VERSION
     save_interval = protocol.get("save_interval", 50)
     archived_agent = read_yaml_data(checkpoint.parent / "params/agent.yaml")
     if (
@@ -2620,12 +2665,7 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
             else None
         )
         or protocol.get("posture_change")
-        != (
-            PROPRIO_POSTURE_CHANGE
-            if protocol["version"]
-            in (PROPRIO_ACQUISITION_VERSION, PROPRIO_STOP_PRECISION_VERSION)
-            else None
-        )
+        != _proprio_posture_change(protocol["version"])
         or protocol.get("stop_precision_change")
         != (
             PROPRIO_STOP_PRECISION_CHANGE
@@ -2633,13 +2673,21 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
             else None
         )
         or protocol.get("warm_start") != metadata.get("warm_start")
+        or protocol.get("terrain_exposure_change")
+        != (PROPRIO_TERRAIN_EXPOSURE_CHANGE if exposure else None)
         or protocol["policy_version"] != metadata["policy_version"]
         or protocol["source_identity"]["physical_reference"] != physical_identity
         or protocol["terrain"] != "operator_procedural_surface_v2"
-        or protocol["difficulty_range"] != list(PROCEDURAL_EASY_DIFFICULTY)
+        or protocol["difficulty_range"]
+        != (
+            PROPRIO_TERRAIN_EXPOSURE_CHANGE["difficulty_range"]
+            if exposure
+            else list(PROCEDURAL_EASY_DIFFICULTY)
+        )
         or protocol["adaptive_terrain_promotion"] is not False
         or protocol["gaps"] is not False
-        or protocol["stage"] != "fixed_easy_acquisition"
+        or protocol["stage"]
+        != ("fixed_mixed_terrain_exposure" if exposure else "fixed_easy_acquisition")
         or type(protocol["seed"]) is not int
         or protocol["seed"] < 0
         or protocol["seed"] in (43, 44, 45)
@@ -2660,12 +2708,18 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
             "Learned checkpoint, training archive or physical reference differs"
         )
     warm_start = protocol.get("warm_start")
-    if protocol["version"] == PROPRIO_STOP_PRECISION_VERSION and warm_start is None:
-        raise ValueError("Stop precision requires a bound recurrent warm start")
+    if (
+        protocol["version"]
+        in (
+            PROPRIO_STOP_PRECISION_VERSION,
+            PROPRIO_TERRAIN_EXPOSURE_VERSION,
+        )
+        and warm_start is None
+    ):
+        raise ValueError("Refinement requires a bound recurrent warm start")
     if warm_start is not None:
         if (
-            protocol["version"]
-            not in (PROPRIO_ACQUISITION_VERSION, PROPRIO_STOP_PRECISION_VERSION)
+            protocol["version"] not in PROPRIO_UPRIGHT_VERSIONS
             or warm_start["version"] != PROPRIO_ACQUISITION_VERSION
             or type(warm_start["learning_updates"]) is not int
             or warm_start["learning_updates"] < 1
@@ -2745,18 +2799,11 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
     cfg.sim.device = args.device
     cfg.observations.proprio.enable_corruption = False
     cfg.episode_length_s = tape["steps"] * tape["period_s"]
-    difficulty = getattr(args, "evaluation_difficulty", None)
-    if difficulty is not None:
-        from parkour_lab.tasks.manager_based.parkour_lab.mdp.terrain.operator_terrain import (
-            ENVELOPES,
-        )
-
-        # Only after the archived training configuration has matched. Keep the
-        # same layout seed, support masks, commands, motors and termination rules.
-        cfg.scene.terrain.terrain_generator.difficulty_range = tuple(difficulty)
-        cfg.terminations.procedural_physical_failure.params["minimum_surface_z_m"] = (
-            -max(height for height, _ in ENVELOPES.values()) * difficulty[1]
-        )
+    # Only after the complete training archive has matched. Every checkpoint
+    # uses the same one-row evaluation fixture, even after multi-row training.
+    _configure_recurrent_terrain(
+        cfg, getattr(args, "evaluation_difficulty", None) or PROCEDURAL_EASY_DIFFICULTY
+    )
     cfg.recorders = make_recorder_cfg(procedural=True)
     runner.update(seed=args.seed, device=args.device, max_iterations=0, resume=False)
     return cfg, runner
@@ -2846,9 +2893,10 @@ def recurrent_training_main(args, parser):
                     learned_source, identity["physical_reference"]
                 )
             )
-            if args.evaluation_difficulty is not None and archived_protocol[
-                "version"
-            ] not in (PROPRIO_ACQUISITION_VERSION, PROPRIO_STOP_PRECISION_VERSION):
+            if (
+                args.evaluation_difficulty is not None
+                and archived_protocol["version"] not in PROPRIO_UPRIGHT_VERSIONS
+            ):
                 raise ValueError(
                     "Terrain probes require a v3 upright-posture checkpoint"
                 )
@@ -2934,11 +2982,16 @@ def recurrent_training_main(args, parser):
     }
     if refinement:
         precision = args.procedural_refinement == "stop_precision"
+        exposure = args.procedural_refinement == "terrain_exposure"
         protocol.update(
             version=(
-                PROPRIO_STOP_PRECISION_VERSION
-                if precision
-                else PROPRIO_ACQUISITION_VERSION
+                PROPRIO_TERRAIN_EXPOSURE_VERSION
+                if exposure
+                else (
+                    PROPRIO_STOP_PRECISION_VERSION
+                    if precision
+                    else PROPRIO_ACQUISITION_VERSION
+                )
             ),
             warm_start=warm_start,
             initialization="exact actor, critic and action std from recurrent checkpoint; retain scalar LR; fresh Adam moments, recurrent/episode state and local update counters; NOT uninterrupted resume",
@@ -2954,6 +3007,18 @@ def recurrent_training_main(args, parser):
         if precision:
             protocol["stop_precision_change"] = copy.deepcopy(
                 PROPRIO_STOP_PRECISION_CHANGE
+            )
+        if exposure:
+            protocol.update(
+                stage="fixed_mixed_terrain_exposure",
+                difficulty_range=list(
+                    PROPRIO_TERRAIN_EXPOSURE_CHANGE["difficulty_range"]
+                ),
+                terrain_exposure_change=copy.deepcopy(PROPRIO_TERRAIN_EXPOSURE_CHANGE),
+                posture_change=_proprio_posture_change(
+                    PROPRIO_TERRAIN_EXPOSURE_VERSION
+                ),
+                scope="Terrain-exposure experiment from a bound v3 checkpoint; compare against equal-budget stock refinement and the source on the same easy/stress screens; no automatic selection or acceptance",
             )
     if evaluation:
         try:
@@ -3270,6 +3335,16 @@ def recurrent_training_main(args, parser):
                     if refinement
                     else {}
                 ),
+                **(
+                    {
+                        "terrain_rows": PROPRIO_TERRAIN_EXPOSURE_CHANGE["num_rows"],
+                        "terrain_difficulty": tuple(
+                            PROPRIO_TERRAIN_EXPOSURE_CHANGE["difficulty_range"]
+                        ),
+                    }
+                    if protocol["version"] == PROPRIO_TERRAIN_EXPOSURE_VERSION
+                    else {}
+                ),
             )
             if (
                 refinement
@@ -3336,8 +3411,8 @@ def main(argv=None):
     )
     parser.add_argument(
         "--procedural-refinement",
-        choices=("stock", "stop_precision"),
-        help="With --procedural-refine-checkpoint: stop_precision (default) changes only full-zero-twist tracking; stock is the matched unchanged-objective restart control",
+        choices=("stock", "terrain_exposure", "stop_precision"),
+        help="With --procedural-refine-checkpoint: stock (default) is an unchanged-objective restart; terrain_exposure adds three fixed difficulty bands through 0.35; stop_precision reproduces the rejected historical reward ablation",
     )
     procedural.add_argument(
         "--procedural-train",
@@ -3480,7 +3555,7 @@ def main(argv=None):
     if args.procedural_refinement is not None and not refinement:
         parser.error("--procedural-refinement requires --procedural-refine-checkpoint")
     if refinement and args.procedural_refinement is None:
-        args.procedural_refinement = "stop_precision"
+        args.procedural_refinement = "stock"
     if args.evaluation_difficulty is not None or args.evaluation_long_stops:
         if not evaluation:
             parser.error(

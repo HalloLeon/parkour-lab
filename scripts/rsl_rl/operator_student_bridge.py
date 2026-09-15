@@ -28,7 +28,6 @@ from parkour_lab.learning.recurrent_operator import (
     recurrent_policy_config,
 )
 
-
 VERSION = "go2_operator_velocity_student_v1"
 HISTORY_LENGTH = 10
 FRAME_DIM = 45
@@ -788,6 +787,8 @@ def run_recurrent_training(
     iterations,
     initial_policy=None,
     warm_start=None,
+    terrain_rows=1,
+    terrain_difficulty=(0.05, 0.15),
 ):
     """Native PPO with fresh Adam and bounded-memory audits; no acceptance claim.
 
@@ -814,6 +815,9 @@ def run_recurrent_training(
         {} if warm_start is None else {"warm_start": copy.deepcopy(warm_start)}
     )
     command = env.command_manager.get_term("base_velocity")
+    terrain_cfg = env.cfg.scene.terrain
+    generator = terrain_cfg.terrain_generator
+    configured_difficulty = getattr(generator, "difficulty_range", None)
     if (
         type(iterations) is not int
         or iterations < 1
@@ -836,26 +840,86 @@ def run_recurrent_training(
         or command.cfg.rel_heading_envs
         or command.cfg.rel_standing_envs
         or env.cfg.curriculum.terrain_levels is not None
-        or env.cfg.scene.terrain.terrain_generator.num_rows != 1
+        or type(terrain_rows) is not int
+        or terrain_rows not in (1, 3)
+        or not isinstance(terrain_difficulty, (tuple, list))
+        or len(terrain_difficulty) != 2
+        or any(
+            type(value) not in (int, float) or not math.isfinite(value)
+            for value in terrain_difficulty
+        )
+        or not 0 <= terrain_difficulty[0] < terrain_difficulty[1] <= 1
+        or generator.num_rows != terrain_rows
+        or getattr(generator, "num_cols", None) != 20
+        or getattr(generator, "curriculum", None) is not True
+        or not isinstance(configured_difficulty, (tuple, list))
+        or tuple(configured_difficulty) != tuple(terrain_difficulty)
+        or getattr(terrain_cfg, "max_init_terrain_level", None) != terrain_rows - 1
     ):
         raise ValueError(
-            "Require fresh native GRU/PPO with direct commands and fixed easy terrain"
+            "Require fresh native GRU/PPO with direct commands and matching static terrain rows/range"
         )
     recipe = copy.deepcopy(runner_cfg)
     output = Path(output)
     profiles = tuple(dict.fromkeys(PROFILE_BY_COLUMN))
-    columns = env.scene.terrain.terrain_types
-    if tuple(profiles) != (
+    terrain = env.scene.terrain
+    if profiles != (
         "plane",
         "rough_flat",
         "hills",
         "step_hills",
         "tilted_ramps",
-    ) or torch.any((columns < 0) | (columns >= 20)):
+    ):
         raise ValueError("Require the declared five-profile supported terrain layout")
+    assignments = {}
+    for name, bound in (("terrain_types", 20), ("terrain_levels", terrain_rows)):
+        value = getattr(terrain, name, None)
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.shape != (env.num_envs,)
+            or value.dtype not in (torch.int32, torch.int64)
+            or value.device != torch.device(env.device)
+            or torch.any((value < 0) | (value >= bound))
+        ):
+            raise ValueError(f"Invalid static terrain assignment: {name}")
+        assignments[name] = value.detach().clone()
+    columns, rows = assignments["terrain_types"], assignments["terrain_levels"]
+
+    def validate_terrain_assignment():
+        for name, initial in assignments.items():
+            current = getattr(terrain, name, None)
+            if (
+                not isinstance(current, torch.Tensor)
+                or current.dtype != initial.dtype
+                or current.device != initial.device
+                or not torch.equal(current, initial)
+            ):
+                raise RuntimeError(f"Static terrain assignment changed: {name}")
+
     profile_ids = columns // 4
-    counts = torch.zeros(5, 9, dtype=torch.int64, device=env.device)
-    errors = torch.zeros(5, 3, dtype=torch.float64, device=env.device)
+    group_ids = (rows * 5 + profile_ids).long()
+    group_count = terrain_rows * 5
+    counts = torch.zeros(group_count, 9, dtype=torch.int64, device=env.device)
+    errors = torch.zeros(group_count, 3, dtype=torch.float64, device=env.device)
+    allocation = {}
+    if terrain_rows > 1:
+        initial_counts = torch.bincount(group_ids, minlength=group_count)
+        allocation = {
+            "num_rows": terrain_rows,
+            "difficulty_range": list(terrain_difficulty),
+            "assignment": "native initial row draw, fixed thereafter; measured allocation, not guaranteed balanced",
+            "initial_terrain_levels": rows.cpu().tolist(),
+            "initial_terrain_columns": columns.cpu().tolist(),
+            "initial_row_profile_env_counts": {
+                str(row): dict(
+                    zip(
+                        profiles,
+                        initial_counts[row * 5 : (row + 1) * 5].cpu().tolist(),
+                    )
+                )
+                for row in range(terrain_rows)
+            },
+        }
     stats = {
         "learning_updates": 0,
         "control_steps": 0,
@@ -864,7 +928,13 @@ def run_recurrent_training(
     }
     robot, term = env.scene["robot"].data, env.action_manager.get_term("joint_pos")
 
-    def metrics():
+    def metrics(row=None):
+        # Preserve the five-profile summary by pooling rows, while retaining
+        # each observed row/profile denominator for the exposure-only stage.
+        grouped_counts = counts.reshape(terrain_rows, 5, 9)
+        grouped_errors = errors.reshape(terrain_rows, 5, 3)
+        selected_counts = grouped_counts.sum(0) if row is None else grouped_counts[row]
+        selected_errors = grouped_errors.sum(0) if row is None else grouped_errors[row]
         return {
             name: dict(
                 zip(
@@ -879,18 +949,54 @@ def run_recurrent_training(
                         "pivot_commands",
                         "reverse_commands",
                     ),
-                    counts[i].cpu().tolist(),
+                    selected_counts[i].cpu().tolist(),
                 ),
-                mean_abs_twist_error=(errors[i] / counts[i, 0].clamp_min(1))
-                .cpu()
-                .tolist(),
+                mean_abs_twist_error=(
+                    None
+                    if row is not None and selected_counts[i, 0] == 0
+                    else (selected_errors[i] / selected_counts[i, 0].clamp_min(1))
+                    .cpu()
+                    .tolist()
+                ),
             )
             for i, name in enumerate(profiles)
         }
 
+    def exposure_metrics():
+        if terrain_rows == 1:
+            return {}
+        row_metrics = {str(row): metrics(row) for row in range(terrain_rows)}
+        return {
+            "terrain_exposure": {
+                **allocation,
+                "row_profile_metrics": row_metrics,
+                **{
+                    label: [
+                        {"row": row, "profile": name}
+                        for row in range(terrain_rows)
+                        for name in profiles
+                        if row_metrics[str(row)][name][metric] == 0
+                        and (metric != "moving_nonflat_region" or name != "plane")
+                    ]
+                    for label, metric in (
+                        ("zero_sample_groups", "samples"),
+                        (
+                            "zero_moving_nonflat_exposure_groups",
+                            "moving_nonflat_region",
+                        ),
+                    )
+                },
+            }
+        }
+
+    def add_counts(index, mask=None):
+        ids = group_ids if mask is None else group_ids[mask]
+        counts[:, index] += torch.bincount(ids, minlength=group_count)
+
     class DeliveredEnvironment(RslRlVecEnvWrapper):
         def __init__(self):
             super().__init__(env, clip_actions=None)
+            validate_terrain_assignment()
             # Sample once after the wrapper's native reset, then never resample
             # corruption in get_observations() or in the shadow adapter.
             self.observations = super().get_observations()
@@ -908,6 +1014,7 @@ def run_recurrent_training(
         def step(self, actions):
             if not is_running():
                 raise RuntimeError("Simulator closed during recurrent training")
+            validate_terrain_assignment()
             frame = self.observations["proprio"]
             _check_tensor(actions, (self.num_envs, 12), "sampled PPO action")
             desired = command.command
@@ -967,17 +1074,18 @@ def run_recurrent_training(
             tracking = torch.cat(
                 (robot.root_lin_vel_b[:, :2], robot.root_ang_vel_b[:, 2:3]), dim=-1
             )
-            errors.index_add_(0, profile_ids, (tracking - desired).abs().double())
-            counts[:, 0] += torch.bincount(profile_ids, minlength=5)
-            counts[:, 1] += torch.bincount(profile_ids[moving], minlength=5)
-            counts[:, 2] += torch.bincount(profile_ids[exposure], minlength=5)
+            errors.index_add_(0, group_ids, (tracking - desired).abs().double())
+            add_counts(0)
+            add_counts(1, moving)
+            add_counts(2, exposure)
             for index, mask in (
                 (6, desired.abs().amax(dim=-1) < 1e-6),
                 (7, ~moving & (desired[:, 2].abs() > 0.1)),
                 (8, desired[:, 0] < -0.05),
             ):
-                counts[:, index] += torch.bincount(profile_ids[mask], minlength=5)
+                add_counts(index, mask)
             observation, reward, done, extras = super().step(actions)
+            validate_terrain_assignment()
             # Native wrappers can report both a physical failure and a time
             # limit on the same step. Only genuine truncations bootstrap PPO.
             if "time_outs" in extras:
@@ -1006,9 +1114,7 @@ def run_recurrent_training(
                 (4, env.termination_manager.get_term("procedural_workspace")),
                 (5, env.reset_time_outs),
             ):
-                counts[:, index] += torch.bincount(
-                    profile_ids[mask.bool()], minlength=5
-                )
+                add_counts(index, mask.bool())
             stats["partial_reset_steps"] += int(self.done.any() and not self.done.all())
             stats["control_steps"] += 1
             return observation, reward, done, extras
@@ -1054,6 +1160,7 @@ def run_recurrent_training(
                 "actor_artifact_identity": "named_actor_state_tensor_sha256",
                 "motor_binding_sha256": motor_hash,
                 "metrics": metrics(),
+                **exposure_metrics(),
                 "exit_allowed": False,
                 "resume_supported": False,
                 **initialization,
@@ -1191,6 +1298,7 @@ def run_recurrent_training(
         "optimizer_steps": optimizer_steps,
         "updated_parameter_groups": list(groups),
         "metrics": metrics(),
+        **exposure_metrics(),
         "controller_manifest": extract(runner.alg.policy).spec.manifest(),
         "actor_artifact_identity": "named_actor_state_tensor_sha256",
         "motor_binding": binding,
