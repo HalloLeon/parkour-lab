@@ -2639,6 +2639,18 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
     cfg.scene.num_envs = args.num_envs
     cfg.sim.device = args.device
     cfg.observations.proprio.enable_corruption = False
+    difficulty = getattr(args, "evaluation_difficulty", None)
+    if difficulty is not None:
+        from parkour_lab.tasks.manager_based.parkour_lab.mdp.terrain.operator_terrain import (
+            ENVELOPES,
+        )
+
+        # Only after the archived training configuration has matched. Keep the
+        # same layout seed, support masks, commands, motors and termination rules.
+        cfg.scene.terrain.terrain_generator.difficulty_range = tuple(difficulty)
+        cfg.terminations.procedural_physical_failure.params["minimum_surface_z_m"] = (
+            -max(height for height, _ in ENVELOPES.values()) * difficulty[1]
+        )
     cfg.recorders = make_recorder_cfg(procedural=True)
     runner.update(seed=args.seed, device=args.device, max_iterations=0, resume=False)
     return cfg, runner
@@ -2723,6 +2735,13 @@ def recurrent_training_main(args, parser):
                     args.procedural_evaluate_checkpoint, identity["physical_reference"]
                 )
             )
+            if (
+                args.evaluation_difficulty is not None
+                and archived_protocol["version"] != PROPRIO_ACQUISITION_VERSION
+            ):
+                raise ValueError(
+                    "Terrain probes require a v3 upright-posture checkpoint"
+                )
     except Exception as error:
         parser.error(f"Invalid physical reference or runtime: {error}")
     protocol = {
@@ -2756,8 +2775,11 @@ def recurrent_training_main(args, parser):
             from .operator_student_bridge import recurrent_evaluation_protocol
         except ImportError:
             from operator_student_bridge import recurrent_evaluation_protocol
+        evaluation_tape = recurrent_evaluation_protocol(
+            difficulty_range=args.evaluation_difficulty
+        )
         protocol = {
-            **recurrent_evaluation_protocol(),
+            **evaluation_tape,
             "source_identity": identity,
             "training_producer_identity": archived_protocol["source_identity"],
             "evaluation_sources": evaluation_files,
@@ -2824,6 +2846,14 @@ def recurrent_training_main(args, parser):
                     [
                         "--procedural-evaluate-checkpoint",
                         str(args.procedural_evaluate_checkpoint),
+                        *(
+                            [
+                                "--evaluation-difficulty",
+                                *map(str, args.evaluation_difficulty),
+                            ]
+                            if args.evaluation_difficulty is not None
+                            else []
+                        ),
                     ]
                     if evaluation
                     else [
@@ -2871,6 +2901,7 @@ def recurrent_training_main(args, parser):
                 }
                 if evaluation:
                     expected.update(
+                        protocol=evaluation_tape,
                         control_steps=1000,
                         checkpoint_sha256=evaluation_files["checkpoint"],
                         checkpoint_learning_updates=metadata["learning_updates"],
@@ -2901,7 +2932,7 @@ def recurrent_training_main(args, parser):
                         )
                     with np.load(output / "trace.npz", allow_pickle=False) as archive:
                         summary = summarize_recurrent_evaluation(
-                            dict(archive), recurrent_evaluation_protocol()
+                            dict(archive), evaluation_tape
                         )
                     if any(result.get(key) != value for key, value in summary.items()):
                         raise ValueError(
@@ -3000,6 +3031,7 @@ def recurrent_training_main(args, parser):
                 evaluation_files["checkpoint"],
                 metadata,
                 is_running=app.is_running,
+                difficulty_range=args.evaluation_difficulty,
             )
             np.savez_compressed(output / "trace.npz", **trace)
             if (
@@ -3073,6 +3105,13 @@ def main(argv=None):
         "--procedural-train",
         action="store_true",
         help="Train a fresh proprioceptive GRU with the v3 joint-limit and upright-posture objective on fixed easy supported terrain; reference binds physics only; no resume or exit acceptance",
+    )
+    parser.add_argument(
+        "--evaluation-difficulty",
+        type=float,
+        nargs=2,
+        metavar=("LOW", "HIGH"),
+        help="Frozen v3 evaluation only: change terrain amplitude within [0,1] and capture joint/actuator/contact diagnostics; omitted preserves the original easy screen. Does not change training or enable a curriculum",
     )
     procedural.add_argument(
         "--procedural-config-check",
@@ -3193,6 +3232,19 @@ def main(argv=None):
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     evaluation = args.procedural_evaluate_checkpoint is not None
+    if args.evaluation_difficulty is not None:
+        if not evaluation:
+            parser.error(
+                "--evaluation-difficulty requires --procedural-evaluate-checkpoint"
+            )
+        try:
+            try:
+                from .operator_student_bridge import recurrent_evaluation_protocol
+            except ImportError:
+                from operator_student_bridge import recurrent_evaluation_protocol
+            recurrent_evaluation_protocol(difficulty_range=args.evaluation_difficulty)
+        except ValueError as error:
+            parser.error(str(error))
     if args.save_interval is not None and (
         not args.procedural_train or args.save_interval < 1
     ):

@@ -82,6 +82,7 @@ def make_recorder_cfg(*, procedural=False):
             self.motor_parity = False
             self.course = None
             self.procedural = procedural
+            self.actuator_diagnostics = False
             env.operator_capture = self
 
         def record_pre_step(self):
@@ -94,11 +95,20 @@ def make_recorder_cfg(*, procedural=False):
                     self.pre_quaternion = self._env.scene[
                         "robot"
                     ].data.root_quat_w.clone()
+                if self.actuator_diagnostics:
+                    self.actuator_substeps = []
             return None, None
 
         def record_post_physics_decimation_step(self):
             if self.enabled and self.control_trace is not None:
                 self.control_trace.after_substep()
+            if self.enabled and self.actuator_diagnostics:
+                # This hook precedes scene.update: explicit actuator commands
+                # are current, but cached joint/contact state is not current yet.
+                robot = self._env.scene["robot"].data
+                self.actuator_substeps.append(
+                    (robot.computed_torque.clone(), robot.applied_torque.clone())
+                )
             return None, None
 
         def record_post_step(self):
@@ -133,6 +143,22 @@ def make_recorder_cfg(*, procedural=False):
                             "base_height_scanner"
                         ].data.ray_hits_w[:, 0],
                     )
+                if self.actuator_diagnostics:
+                    import torch
+
+                    if len(self.actuator_substeps) != self._env.cfg.decimation:
+                        raise RuntimeError("Incomplete procedural actuator substeps")
+                    sample.update(
+                        joint_position_post=robot.joint_pos,
+                        joint_velocity_post=robot.joint_vel,
+                        contact_force_norm_n=self._env.scene[
+                            "contact_forces"
+                        ].data.net_forces_w.norm(dim=-1),
+                    )
+                    for index, name in enumerate(("computed_torque", "applied_torque")):
+                        sample[name + "_substeps"] = torch.stack(
+                            [pair[index] for pair in self.actuator_substeps], dim=1
+                        )
                 if self.course is not None:
                     route_state = self._env._parkour_runtime.route
                     params = self._env.termination_manager.get_term_cfg(

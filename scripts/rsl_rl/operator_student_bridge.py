@@ -49,7 +49,7 @@ CONTROLLER_ROLLOUT_COMMANDS = (
 )
 
 
-def recurrent_evaluation_protocol():
+def recurrent_evaluation_protocol(*, difficulty_range=None):
     """Predeclared clean-sensor first-attempt screen, not an acceptance gate."""
     phases = (
         ("cold_stand", 1, (0, 0, 0)),
@@ -62,7 +62,7 @@ def recurrent_evaluation_protocol():
         ("pivot_negative", 2, (0, 0, -0.5)),
         ("final_stop", 2, (0, 0, 0)),
     )
-    return {
+    protocol = {
         "version": "go2_operator_proprio_screen_v1",
         "seed": 43,
         "num_envs": 80,
@@ -84,6 +84,29 @@ def recurrent_evaluation_protocol():
         "scope": "deterministic actor mean, fixed packets and seed; clean-sensor development only, not robust sensing or terrain acceptance",
         "exit_allowed": False,
     }
+    if difficulty_range is not None:
+        if (
+            len(difficulty_range) != 2
+            or any(
+                isinstance(value, bool) or not math.isfinite(value)
+                for value in difficulty_range
+            )
+            or not 0 <= difficulty_range[0] <= difficulty_range[1] <= 1
+        ):
+            raise ValueError(
+                "Evaluation difficulty must be two finite ordered values in [0, 1]"
+            )
+        protocol.update(
+            version="go2_operator_proprio_terrain_probe_v1",
+            difficulty_range=list(difficulty_range),
+            native_diagnostics="joint_actuator_contact_v1",
+            scope=(
+                "Frozen mean-policy terrain-amplitude probe on the seed-43 development "
+                "layouts and unchanged clean-sensor command tape; no learning, curriculum "
+                "promotion, held-out confirmation or stair/terrain acceptance"
+            ),
+        )
+    return protocol
 
 
 def interface_manifest(
@@ -1114,6 +1137,9 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
     if type(version) is not int or version not in (1, 2, 3):
         raise ValueError("Unsupported recurrent evaluation summary version")
     protocol = recurrent_evaluation_protocol() if protocol is None else protocol
+    native = protocol.get("native_diagnostics") == "joint_actuator_contact_v1"
+    if native and version != 3:
+        raise ValueError("Native terrain probes require summary version 3")
     names = ("plane", "rough_flat", "hills", "step_hills", "tilted_ramps")
     shape = (protocol["steps"], protocol["num_envs"])
     phase_ids = np.repeat(
@@ -1183,6 +1209,48 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
             or np.any(limits[..., 0] >= limits[..., 1])
         ):
             raise ValueError("Invalid recorded native soft joint position limits")
+    if native:
+        contact_names = trace["contact_body_names"]
+        columns = trace["terrain_column_id"]
+        if (
+            contact_names.ndim != 1
+            or contact_names.dtype.kind != "U"
+            or not len(contact_names)
+            or len(set(contact_names)) != len(contact_names)
+            or any(not name for name in contact_names)
+            or limits is None
+        ):
+            raise ValueError("Invalid native contact names or missing soft bounds")
+        if (
+            columns.shape != (shape[1],)
+            or not np.issubdtype(columns.dtype, np.integer)
+            or np.any((columns < 0) | (columns >= 20))
+            or not np.array_equal(columns // 4, profiles)
+        ):
+            raise ValueError("Invalid native terrain column assignment")
+        for key, field_shape in (
+            ("joint_position_post", (*shape, 12)),
+            ("joint_velocity_post", (*shape, 12)),
+            ("computed_torque_substeps", (*shape, 4, 12)),
+            ("applied_torque_substeps", (*shape, 4, 12)),
+            ("contact_force_norm_n", (*shape, len(contact_names))),
+            ("joint_pos_limits", (shape[1], 12, 2)),
+        ):
+            value = trace[key]
+            if (
+                value.shape != field_shape
+                or not np.issubdtype(value.dtype, np.floating)
+                or not np.isfinite(value).all()
+            ):
+                raise ValueError(f"Invalid native diagnostic field: {key}")
+        hard = trace["joint_pos_limits"]
+        if (
+            np.any(hard[..., 0] >= hard[..., 1])
+            or np.any(hard[..., 0] > limits[..., 0])
+            or np.any(hard[..., 1] < limits[..., 1])
+            or np.any(trace["contact_force_norm_n"] < 0)
+        ):
+            raise ValueError("Invalid native joint bounds or contact force norms")
     if version >= 2:
         for key, width in (
             ("observation", 45),
@@ -1302,6 +1370,37 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
                     excess.mean(0).tolist() if excess is not None else None
                 ),
             )
+        if native:
+            diagnostics = None
+            if len(indices):
+                joint = trace["joint_position_post"][indices, row]
+                excess = np.maximum(hard[row, :, 0] - joint, 0) + np.maximum(
+                    joint - hard[row, :, 1], 0
+                )
+                computed = trace["computed_torque_substeps"][indices, row]
+                applied = trace["applied_torque_substeps"][indices, row]
+                diagnostics = {
+                    "post_joint_hard_bound_exceedance_fraction": (excess > 0)
+                    .mean(0)
+                    .tolist(),
+                    "post_joint_hard_bound_max_excess_rad": excess.max(0).tolist(),
+                    "post_joint_velocity_abs_max_rad_s": np.abs(
+                        trace["joint_velocity_post"][indices, row]
+                    )
+                    .max(0)
+                    .tolist(),
+                    "computed_torque_abs_max_nm": np.abs(computed).max((0, 1)).tolist(),
+                    "applied_torque_abs_max_nm": np.abs(applied).max((0, 1)).tolist(),
+                    "torque_clipping_fraction": (np.abs(computed - applied) > 1e-5)
+                    .mean((0, 1))
+                    .tolist(),
+                    "contact_force_norm_max_n": trace["contact_force_norm_n"][
+                        indices, row
+                    ]
+                    .max(0)
+                    .tolist(),
+                }
+            result["native_actuator"] = diagnostics
         return result
 
     w, x, y, z = np.moveaxis(trace["pre_quaternion"], -1, 0)
@@ -1385,6 +1484,8 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
         )
         if version >= 2:
             trials[-1]["health"] = health(np.flatnonzero(selected), row)
+        if native:
+            trials[-1]["terrain_column_id"] = int(columns[row])
     profiles = {}
     for name in names:
         group = [trial for trial in trials if trial["terrain"] == name]
@@ -1421,15 +1522,58 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
                 " Soft-bound diagnostics use recorded native limits only and strict "
                 "exceedance; absent limits yield null."
             )
+    if native:
+        summary.update(
+            contact_body_names=contact_names.tolist(),
+            health_scope=(
+                "Post-physics/pre-reset center-ray vertical clearance and world roll/pitch; "
+                "pre-action joint state and requested targets. Soft-bound diagnostics use "
+                "strict exceedance. Additional native_actuator fields include terminal "
+                "joint state; see actuator_health_scope. No health acceptance."
+            ),
+            actuator_health_scope=(
+                "First attempts including terminal samples: post-physics/pre-reset joint "
+                "position and velocity at 50 Hz; strict excess over recorded simulator "
+                "joint bounds; computed and applied actuator COMMAND torques at all four "
+                "200 Hz substeps, not hardware measured torque. Clipping threshold 1e-5 Nm. "
+                "Contacts are 50 Hz norms of net world force vectors per named body, not "
+                "contact-point peaks, terrain-normal loads, slip or support proof. "
+                "Requested targets are not measured joint positions. No health acceptance."
+            ),
+        )
     return summary
 
 
-def evaluate_recurrent_operator(env, policy, checkpoint_sha, metadata, *, is_running):
+def evaluate_recurrent_operator(
+    env, policy, checkpoint_sha, metadata, *, is_running, difficulty_range=None
+):
     """Replay one clean deterministic first attempt; only the actor drives motors."""
     import numpy as np
     from parkour_lab.learning.controller import ControllerSession, Sample
 
-    protocol = recurrent_evaluation_protocol()
+    protocol = recurrent_evaluation_protocol(difficulty_range=difficulty_range)
+    native = difficulty_range is not None
+    if native:
+        from parkour_lab.tasks.manager_based.parkour_lab.mdp.terrain.operator_terrain import (
+            ENVELOPES,
+        )
+
+        generator = env.cfg.scene.terrain.terrain_generator
+        failure = env.cfg.terminations.procedural_physical_failure
+        if (
+            tuple(generator.difficulty_range) != tuple(difficulty_range)
+            or generator.seed != protocol["seed"]
+            or generator.num_rows != 1
+            or env.cfg.curriculum.terrain_levels is not None
+            or not math.isclose(
+                failure.params["minimum_surface_z_m"],
+                -max(height for height, _ in ENVELOPES.values()) * difficulty_range[1],
+                abs_tol=1e-12,
+            )
+            or failure.params.get("max_tilt_rad") != math.pi / 4
+            or failure.time_out
+        ):
+            raise ValueError("Native terrain differs from the predeclared frozen probe")
     if (
         env.num_envs != protocol["num_envs"]
         or env.max_episode_length != protocol["steps"]
@@ -1474,6 +1618,18 @@ def evaluate_recurrent_operator(env, policy, checkpoint_sha, metadata, *, is_run
     _check_tensor(limits, (env.num_envs, 12, 2), "native soft joint position limits")
     if torch.any(limits[..., 0] >= limits[..., 1]):
         raise ValueError("Native soft joint position limits must be ordered")
+    native_trace = {}
+    if native:
+        hard_limits = robot.joint_pos_limits.detach().clone()
+        _check_tensor(
+            hard_limits, (env.num_envs, 12, 2), "native joint position limits"
+        )
+        native_trace.update(
+            joint_pos_limits=hard_limits.cpu().numpy().copy(),
+            contact_body_names=np.asarray(
+                env.scene["contact_forces"].body_names, dtype=str
+            ),
+        )
     if (
         binding["joint_names"] != metadata["controller_manifest"]["joint_names"]
         or binding["default_position_rad"]
@@ -1486,6 +1642,8 @@ def evaluate_recurrent_operator(env, policy, checkpoint_sha, metadata, *, is_run
     if torch.any((columns < 0) | (columns >= 20)):
         raise ValueError("Unexpected procedural terrain columns")
     profile_ids = columns // 4
+    if native:
+        native_trace["terrain_column_id"] = columns.cpu().numpy().copy()
     if not torch.equal(
         torch.bincount(profile_ids, minlength=5),
         torch.full((5,), 16, device=env.device),
@@ -1514,6 +1672,7 @@ def evaluate_recurrent_operator(env, policy, checkpoint_sha, metadata, *, is_run
     finished = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
     reset = torch.ones_like(finished)
     partial_resets = 0
+    capture.actuator_diagnostics = native
     capture.motor_parity = capture.enabled = True
     try:
         with torch.inference_mode():
@@ -1589,18 +1748,22 @@ def evaluate_recurrent_operator(env, policy, checkpoint_sha, metadata, *, is_run
                 finished |= reset
     finally:
         capture.enabled = capture.motor_parity = False
+        capture.actuator_diagnostics = False
     trace = capture.finish()
     if not torch.equal(limits, robot.soft_joint_pos_limits):
         raise RuntimeError(
             "Native soft joint position limits changed during evaluation"
         )
     trace.update(
+        **native_trace,
         valid_first_attempt=np.stack(valid),
         phase_index=phase_ids,
         terrain_profile_id=profile_ids.cpu().numpy(),
         env_origins=env.scene.env_origins.detach().cpu().numpy().copy(),
         soft_joint_pos_limits=limits.cpu().numpy().copy(),
     )
+    if native and not torch.equal(hard_limits, robot.joint_pos_limits):
+        raise RuntimeError("Native joint bounds changed during evaluation")
     if (
         _recurrent_actor_sha256(policy)
         != metadata["controller_manifest"]["artifact_sha256"]
