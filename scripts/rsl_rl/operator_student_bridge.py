@@ -49,8 +49,10 @@ CONTROLLER_ROLLOUT_COMMANDS = (
 )
 
 
-def recurrent_evaluation_protocol(*, difficulty_range=None):
+def recurrent_evaluation_protocol(*, difficulty_range=None, long_stops=False):
     """Predeclared clean-sensor first-attempt screen, not an acceptance gate."""
+    if long_stops and difficulty_range is None:
+        raise ValueError("Long-stop evaluation requires an explicit terrain difficulty")
     phases = (
         ("cold_stand", 1, (0, 0, 0)),
         ("forward", 4, (0.55, 0, 0)),
@@ -104,6 +106,25 @@ def recurrent_evaluation_protocol(*, difficulty_range=None):
                 "Frozen mean-policy terrain-amplitude probe on the seed-43 development "
                 "layouts and unchanged clean-sensor command tape; no learning, curriculum "
                 "promotion, held-out confirmation or stair/terrain acceptance"
+            ),
+        )
+    if long_stops:
+        for phase in protocol["phases"]:
+            if phase["name"] in ("stop_after_arcs", "final_stop"):
+                phase["duration_s"] = 10
+        protocol.update(
+            version="go2_operator_proprio_stop_probe_v1",
+            steps=round(
+                sum(p["duration_s"] for p in protocol["phases"]) / protocol["period_s"]
+            ),
+            stop_hold_windows_s=[[0.6, 1.0], [1.6, 2.0], [8.0, 10.0]],
+            common_prefix_control_steps=550,
+            scope=(
+                "Frozen seed-43 terrain probe with only the two post-motion stops "
+                "extended from 2 to 10 seconds. Commands match the short probe through "
+                "11 seconds; GRU memory persists across phases. Windows retain the "
+                "1-second acquisition deadline and 2-second comparison before measuring "
+                "late recovery. No relaxed stop requirement, learning or acceptance."
             ),
         )
     return protocol
@@ -1463,6 +1484,51 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
                     ).max()
                 )
                 entry["stop_onset_max_heading_change_rad"] = float(np.abs(change).max())
+            if "stop_hold_windows_s" in protocol and phase["name"] in (
+                "stop_after_arcs",
+                "final_stop",
+            ):
+                windows = []
+                for start_s, end_s in protocol["stop_hold_windows_s"]:
+                    block = phase_steps[round(start_s / dt) : round(end_s / dt)]
+                    complete = len(block) == round((end_s - start_s) / dt) and bool(
+                        selected[block].all()
+                    )
+                    windows.append(
+                        {
+                            "start_s": start_s,
+                            "end_s": end_s,
+                            "complete": complete,
+                            "mean_planar_speed_m_s": (
+                                float(
+                                    np.linalg.norm(
+                                        twist[block, row, :2], axis=-1
+                                    ).mean()
+                                )
+                                if complete
+                                else None
+                            ),
+                            "mean_abs_yaw_rate_rad_s": (
+                                float(np.abs(twist[block, row, 2]).mean())
+                                if complete
+                                else None
+                            ),
+                            "travel_distance_m": (
+                                float(distance[block, row].sum()) if complete else None
+                            ),
+                            "displacement_m": (
+                                float(
+                                    np.linalg.norm(
+                                        trace["position"][block[-1], row, :2]
+                                        - trace["pre_position"][block[0], row, :2]
+                                    )
+                                )
+                                if complete
+                                else None
+                            ),
+                        }
+                    )
+                entry["stop_hold_windows"] = windows
             phases.append(entry)
         trials.append(
             {
@@ -1545,13 +1611,22 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
 
 
 def evaluate_recurrent_operator(
-    env, policy, checkpoint_sha, metadata, *, is_running, difficulty_range=None
+    env,
+    policy,
+    checkpoint_sha,
+    metadata,
+    *,
+    is_running,
+    difficulty_range=None,
+    long_stops=False,
 ):
     """Replay one clean deterministic first attempt; only the actor drives motors."""
     import numpy as np
     from parkour_lab.learning.controller import ControllerSession, Sample
 
-    protocol = recurrent_evaluation_protocol(difficulty_range=difficulty_range)
+    protocol = recurrent_evaluation_protocol(
+        difficulty_range=difficulty_range, long_stops=long_stops
+    )
     native = difficulty_range is not None
     if native:
         from parkour_lab.tasks.manager_based.parkour_lab.mdp.terrain.operator_terrain import (

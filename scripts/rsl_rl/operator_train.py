@@ -2633,12 +2633,19 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
         )
     try:
         from .operator_benchmark import make_recorder_cfg
+        from .operator_student_bridge import recurrent_evaluation_protocol
     except ImportError:
         from operator_benchmark import make_recorder_cfg
+        from operator_student_bridge import recurrent_evaluation_protocol
+    tape = recurrent_evaluation_protocol(
+        difficulty_range=getattr(args, "evaluation_difficulty", None),
+        long_stops=getattr(args, "evaluation_long_stops", False),
+    )
     cfg.seed = cfg.scene.terrain.terrain_generator.seed = args.seed
     cfg.scene.num_envs = args.num_envs
     cfg.sim.device = args.device
     cfg.observations.proprio.enable_corruption = False
+    cfg.episode_length_s = tape["steps"] * tape["period_s"]
     difficulty = getattr(args, "evaluation_difficulty", None)
     if difficulty is not None:
         from parkour_lab.tasks.manager_based.parkour_lab.mdp.terrain.operator_terrain import (
@@ -2776,7 +2783,8 @@ def recurrent_training_main(args, parser):
         except ImportError:
             from operator_student_bridge import recurrent_evaluation_protocol
         evaluation_tape = recurrent_evaluation_protocol(
-            difficulty_range=args.evaluation_difficulty
+            difficulty_range=args.evaluation_difficulty,
+            long_stops=args.evaluation_long_stops,
         )
         protocol = {
             **evaluation_tape,
@@ -2854,6 +2862,11 @@ def recurrent_training_main(args, parser):
                             if args.evaluation_difficulty is not None
                             else []
                         ),
+                        *(
+                            ["--evaluation-long-stops"]
+                            if args.evaluation_long_stops
+                            else []
+                        ),
                     ]
                     if evaluation
                     else [
@@ -2894,7 +2907,9 @@ def recurrent_training_main(args, parser):
                     "policy_version": RECURRENT_OPERATOR_VERSION,
                     "learning_updates": args.iterations,
                     "environment_transitions": (
-                        80000 if evaluation else args.iterations * 24 * args.num_envs
+                        evaluation_tape["steps"] * evaluation_tape["num_envs"]
+                        if evaluation
+                        else args.iterations * 24 * args.num_envs
                     ),
                     "protocol_sha256": file_sha256(output / protocol_name),
                     "exit_allowed": False,
@@ -2902,7 +2917,7 @@ def recurrent_training_main(args, parser):
                 if evaluation:
                     expected.update(
                         protocol=evaluation_tape,
-                        control_steps=1000,
+                        control_steps=evaluation_tape["steps"],
                         checkpoint_sha256=evaluation_files["checkpoint"],
                         checkpoint_learning_updates=metadata["learning_updates"],
                         evaluation_sources=evaluation_files,
@@ -3032,6 +3047,7 @@ def recurrent_training_main(args, parser):
                 metadata,
                 is_running=app.is_running,
                 difficulty_range=args.evaluation_difficulty,
+                long_stops=args.evaluation_long_stops,
             )
             np.savez_compressed(output / "trace.npz", **trace)
             if (
@@ -3112,6 +3128,11 @@ def main(argv=None):
         nargs=2,
         metavar=("LOW", "HIGH"),
         help="Frozen v3 evaluation only: change terrain amplitude within [0,1] and capture joint/actuator/contact diagnostics; omitted preserves the original easy screen. Does not change training or enable a curriculum",
+    )
+    parser.add_argument(
+        "--evaluation-long-stops",
+        action="store_true",
+        help="With --evaluation-difficulty: extend the two post-motion stops from 2 to 10 seconds (36-second frozen probe); keep the approach, native diagnostics and short-stop deadline unchanged",
     )
     procedural.add_argument(
         "--procedural-config-check",
@@ -3232,17 +3253,20 @@ def main(argv=None):
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     evaluation = args.procedural_evaluate_checkpoint is not None
-    if args.evaluation_difficulty is not None:
+    if args.evaluation_difficulty is not None or args.evaluation_long_stops:
         if not evaluation:
             parser.error(
-                "--evaluation-difficulty requires --procedural-evaluate-checkpoint"
+                "Evaluation difficulty/long stops require --procedural-evaluate-checkpoint"
             )
         try:
             try:
                 from .operator_student_bridge import recurrent_evaluation_protocol
             except ImportError:
                 from operator_student_bridge import recurrent_evaluation_protocol
-            recurrent_evaluation_protocol(difficulty_range=args.evaluation_difficulty)
+            recurrent_evaluation_protocol(
+                difficulty_range=args.evaluation_difficulty,
+                long_stops=args.evaluation_long_stops,
+            )
         except ValueError as error:
             parser.error(str(error))
     if args.save_interval is not None and (
