@@ -9,6 +9,8 @@ learning. Its simulator scan is a privileged fixture, not a deployed sensor.
 --procedural-train learns a fresh proprioceptive GRU on supported easy terrain;
 the positional checkpoint supplies only validated physical configuration, never
 policy weights. The old four-family recipe is retired; archived readers remain.
+--procedural-refine-checkpoint starts a separate recurrent refinement or matched
+control run from learned weights and scalar LR, never from old optimizer state.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -393,6 +396,7 @@ PROCEDURAL_TERRAIN_VERSION = "go2_operator_procedural_terrain_v2"
 PROCEDURAL_ISAACLAB_DISTRIBUTIONS = ("2.3.2", "2.3.2.post1")
 PROCEDURAL_EASY_DIFFICULTY = (0.05, 0.15)
 PROPRIO_ACQUISITION_VERSION = "operator_proprio_acquisition_v3"
+PROPRIO_STOP_PRECISION_VERSION = "operator_proprio_stop_precision_v1"
 PROPRIO_JOINT_LIMIT_VERSION = "operator_proprio_acquisition_v2"
 PROPRIO_LEGACY_ACQUISITION_VERSION = "operator_proprio_acquisition_v1"
 PROPRIO_ACQUISITION_VERSIONS = (
@@ -400,6 +404,19 @@ PROPRIO_ACQUISITION_VERSIONS = (
     PROPRIO_JOINT_LIMIT_VERSION,
     PROPRIO_ACQUISITION_VERSION,
 )
+PROPRIO_TRAINING_VERSIONS = (
+    *PROPRIO_ACQUISITION_VERSIONS,
+    PROPRIO_STOP_PRECISION_VERSION,
+)
+PROPRIO_STOP_PRECISION_CHANGE = {
+    "gate": "exact zero body twist only; moving and pure-pivot rewards unchanged",
+    "broad_std": 0.5,
+    "planar_std_m_s": 0.05,
+    "yaw_std_rad_s": 0.1,
+    "precision_fraction": 1.0 / 3.0,
+    "kernel": "(1-f)*exp(-error_squared/broad_std**2) + f*exp(-error_squared/fine_std**2)",
+    "scope": "reward-only refinement; no pose anchor, command override, entropy or terrain change",
+}
 PROPRIO_REWARD_CHANGE = {
     "term": "dof_pos_limits",
     "function": "isaaclab.envs.mdp.rewards:joint_pos_limits",
@@ -570,10 +587,11 @@ def procedural_terrain_configs(saved, agent, args):
 def proprioceptive_procedural_configs(
     saved, agent, args, *, acquisition_version=PROPRIO_ACQUISITION_VERSION
 ):
-    """Fresh causal GRU recipe on the fixed easy supported acquisition stage.
+    """Causal GRU recipe on fixed easy supported terrain.
 
     The source configuration binds the physical motor only. This policy starts
-    from fresh weights; neither stock8500 nor the terrain teacher can be resumed.
+    from fresh weights unless a separately validated recurrent source is supplied;
+    neither stock8500 nor the terrain teacher can initialize this actor.
     Terrain promotion and held-out behavior qualification remain separate work.
     """
     try:
@@ -587,7 +605,7 @@ def proprioceptive_procedural_configs(
             recurrent_policy_config,
         )
 
-    if acquisition_version not in PROPRIO_ACQUISITION_VERSIONS:
+    if acquisition_version not in PROPRIO_TRAINING_VERSIONS:
         raise ValueError("Unsupported proprioceptive acquisition version")
     cfg, runner_cfg = _procedural_environment_configs(saved, agent, args)
     # Do not inherit the source8500 fine stationary kernels into a fresh actor.
@@ -601,7 +619,10 @@ def proprioceptive_procedural_configs(
                 "The joint-limit ablation requires the stock 0.9 soft factor"
             )
         cfg.rewards.dof_pos_limits.weight = PROPRIO_REWARD_CHANGE["to_weight"]
-    if acquisition_version == PROPRIO_ACQUISITION_VERSION:
+    if acquisition_version in (
+        PROPRIO_ACQUISITION_VERSION,
+        PROPRIO_STOP_PRECISION_VERSION,
+    ):
         generator = cfg.scene.terrain.terrain_generator
         if (
             tuple(generator.difficulty_range) != (0.05, 0.15)
@@ -621,6 +642,30 @@ def proprioceptive_procedural_configs(
             "max_tilt_rad"
         ]
         failure.time_out = False
+    if acquisition_version == PROPRIO_STOP_PRECISION_VERSION:
+        try:
+            from .operator_rewards import (
+                track_lin_vel_xy_stationary,
+                track_ang_vel_z_stopped,
+            )
+        except ImportError:
+            from operator_rewards import (
+                track_lin_vel_xy_stationary,
+                track_ang_vel_z_stopped,
+            )
+        change = PROPRIO_STOP_PRECISION_CHANGE
+        for name, function, width in (
+            ("track_lin_vel_xy_exp", track_lin_vel_xy_stationary, "planar_std_m_s"),
+            ("track_ang_vel_z_exp", track_ang_vel_z_stopped, "yaw_std_rad_s"),
+        ):
+            term = getattr(cfg.rewards, name)
+            term.func = function
+            term.params.update(
+                std=change["broad_std"],
+                stationary_std=change[width],
+                precision_fraction=change["precision_fraction"],
+            )
+        cfg.rewards.track_lin_vel_xy_exp.params["full_stop_only"] = True
     # Copy the noisy sensor group BEFORE making the privileged critic noiseless.
     # Removing this term at the manager boundary avoids passing oracle velocity
     # into actor normalization, recurrent state or inference preprocessing.
@@ -2567,7 +2612,7 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         or save_interval < 1
         or type(recipe.get("save_interval")) is not int
         or save_interval != recipe["save_interval"]
-        or protocol["version"] not in PROPRIO_ACQUISITION_VERSIONS
+        or protocol["version"] not in PROPRIO_TRAINING_VERSIONS
         or protocol.get("reward_change")
         != (
             PROPRIO_REWARD_CHANGE
@@ -2577,9 +2622,17 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         or protocol.get("posture_change")
         != (
             PROPRIO_POSTURE_CHANGE
-            if protocol["version"] == PROPRIO_ACQUISITION_VERSION
+            if protocol["version"]
+            in (PROPRIO_ACQUISITION_VERSION, PROPRIO_STOP_PRECISION_VERSION)
             else None
         )
+        or protocol.get("stop_precision_change")
+        != (
+            PROPRIO_STOP_PRECISION_CHANGE
+            if protocol["version"] == PROPRIO_STOP_PRECISION_VERSION
+            else None
+        )
+        or protocol.get("warm_start") != metadata.get("warm_start")
         or protocol["policy_version"] != metadata["policy_version"]
         or protocol["source_identity"]["physical_reference"] != physical_identity
         or protocol["terrain"] != "operator_procedural_surface_v2"
@@ -2606,13 +2659,42 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         raise ValueError(
             "Learned checkpoint, training archive or physical reference differs"
         )
+    warm_start = protocol.get("warm_start")
+    if protocol["version"] == PROPRIO_STOP_PRECISION_VERSION and warm_start is None:
+        raise ValueError("Stop precision requires a bound recurrent warm start")
+    if warm_start is not None:
+        if (
+            protocol["version"]
+            not in (PROPRIO_ACQUISITION_VERSION, PROPRIO_STOP_PRECISION_VERSION)
+            or warm_start["version"] != PROPRIO_ACQUISITION_VERSION
+            or type(warm_start["learning_updates"]) is not int
+            or warm_start["learning_updates"] < 1
+            or type(warm_start["optimizer_steps"]) is not int
+            or warm_start["optimizer_steps"] != 20 * warm_start["learning_updates"]
+            or set(warm_start["sources"]) != set(files)
+            or any(
+                not re.fullmatch(r"[0-9a-f]{64}", v)
+                for v in warm_start["sources"].values()
+            )
+            or not re.fullmatch(r"[0-9a-f]{64}", warm_start["actor_sha256"])
+            or warm_start["joint_names"]
+            != metadata["controller_manifest"]["joint_names"]
+            or warm_start["default_position_rad"]
+            != metadata["controller_manifest"]["configuration"]["default_position_rad"]
+            or not math.isfinite(warm_start["learning_rate"])
+            or not 0 < warm_start["learning_rate"] <= 0.01
+            or warm_start["learning_rate"] != recipe["algorithm"]["learning_rate"]
+        ):
+            raise ValueError("Invalid recurrent warm-start lineage or learning rate")
     if recurrent_evaluation_files(checkpoint) != files:
         raise ValueError("Evaluation source changed during preflight")
     return policy, metadata, protocol, files
 
 
-def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata):
-    """Validate the full training recipe first, then apply only evaluation overrides."""
+def recurrent_source_configs(
+    saved, agent, args, training_protocol, metadata, checkpoint
+):
+    """Reconstruct the complete source recipe before evaluation or refinement."""
     original = copy.copy(args)
     original.num_envs = training_protocol["num_envs"]
     original.seed = training_protocol["seed"]
@@ -2622,7 +2704,11 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
     cfg, runner = proprioceptive_procedural_configs(
         saved, agent, original, acquisition_version=training_protocol["version"]
     )
-    archived = args.procedural_evaluate_checkpoint.parent / "params"
+    if training_protocol.get("warm_start") is not None:
+        runner["algorithm"]["learning_rate"] = training_protocol["warm_start"][
+            "learning_rate"
+        ]
+    archived = checkpoint.parent / "params"
     if _canonical_runtime_config(cfg.to_dict()) != _canonical_runtime_config(
         read_yaml_data(archived / "env.yaml")
     ) or _canonical_runtime_config(runner) != _canonical_runtime_config(
@@ -2631,6 +2717,19 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
         raise ValueError(
             "Reconstructed training configuration differs from learned archive"
         )
+    return cfg, runner
+
+
+def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata):
+    """Validate the full training recipe first, then apply only evaluation overrides."""
+    cfg, runner = recurrent_source_configs(
+        saved,
+        agent,
+        args,
+        training_protocol,
+        metadata,
+        args.procedural_evaluate_checkpoint,
+    )
     try:
         from .operator_benchmark import make_recorder_cfg
         from .operator_student_bridge import recurrent_evaluation_protocol
@@ -2666,6 +2765,11 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
 def recurrent_training_main(args, parser):
     """Shared supervised acquisition/evaluation lifecycle; never implicit promotion."""
     evaluation = args.procedural_evaluate_checkpoint is not None
+    refinement = args.procedural_refine_checkpoint is not None
+    learned_source = (
+        args.procedural_evaluate_checkpoint or args.procedural_refine_checkpoint
+    )
+    warm_start = None
     invalid_budget = (
         (args.iterations, args.num_envs, args.seed) != (0, 80, 43)
         if evaluation
@@ -2726,29 +2830,80 @@ def recurrent_training_main(args, parser):
         if importlib.metadata.version("rsl-rl-lib") != "3.1.2":
             raise ValueError("Recurrent acquisition requires RSL-RL 3.1.2")
         identity = recurrent_training_identity(checkpoint)
-        if evaluation:
-            args.procedural_evaluate_checkpoint = (
-                args.procedural_evaluate_checkpoint.resolve(strict=True)
-            )
+        if learned_source is not None:
+            learned_source = learned_source.resolve(strict=True)
+            if evaluation:
+                args.procedural_evaluate_checkpoint = learned_source
+            else:
+                args.procedural_refine_checkpoint = learned_source
             target = args.worker_output or args.output_parent
-            if target.resolve().is_relative_to(
-                args.procedural_evaluate_checkpoint.parent
-            ):
+            if target.resolve().is_relative_to(learned_source.parent):
                 raise ValueError(
-                    "Evaluation output must be outside the immutable training run"
+                    "Evaluation/refinement output must be outside the immutable training run"
                 )
             policy, metadata, archived_protocol, evaluation_files = (
                 recurrent_evaluation_source(
-                    args.procedural_evaluate_checkpoint, identity["physical_reference"]
+                    learned_source, identity["physical_reference"]
                 )
             )
-            if (
-                args.evaluation_difficulty is not None
-                and archived_protocol["version"] != PROPRIO_ACQUISITION_VERSION
-            ):
+            if args.evaluation_difficulty is not None and archived_protocol[
+                "version"
+            ] not in (PROPRIO_ACQUISITION_VERSION, PROPRIO_STOP_PRECISION_VERSION):
                 raise ValueError(
                     "Terrain probes require a v3 upright-posture checkpoint"
                 )
+            if refinement:
+                import torch
+
+                if archived_protocol["version"] != PROPRIO_ACQUISITION_VERSION:
+                    raise ValueError(
+                        "Refinement requires an upright v3 recurrent source"
+                    )
+                # Carry only the adaptive scalar, not Adam moments or its step count.
+                # Resetting it to the original recipe's 1e-3 can be a large LR jump.
+                source = torch.load(
+                    learned_source, map_location="cpu", weights_only=True
+                )
+                groups = source["optimizer_state_dict"]["param_groups"]
+                adam = source["optimizer_state_dict"]["state"]
+                parameter_ids = list(range(len(list(policy.parameters()))))
+                source_steps = metadata["learning_updates"] * 20
+                if (
+                    len(groups) != 1
+                    or groups[0]["params"] != parameter_ids
+                    or tuple(groups[0]["betas"]) != (0.9, 0.999)
+                    or groups[0]["eps"] != 1e-8
+                    or groups[0]["weight_decay"] != 0
+                    or groups[0]["amsgrad"] is not False
+                    or groups[0].get("maximize", False) is not False
+                    or groups[0].get("decoupled_weight_decay", False) is not False
+                    or type(groups[0]["lr"]) is not float
+                    or not math.isfinite(groups[0]["lr"])
+                    or not 0 < groups[0]["lr"] <= 0.01
+                    or set(adam) != set(parameter_ids)
+                    or any(
+                        state["step"].item() != source_steps for state in adam.values()
+                    )
+                    or not torch.isfinite(policy.log_std.exp()).all()
+                    or torch.any(policy.log_std.exp() <= 0)
+                ):
+                    raise ValueError(
+                        "Invalid source Adam groups, update count, learning rate or action std"
+                    )
+                warm_start = {
+                    "sources": evaluation_files,
+                    "version": archived_protocol["version"],
+                    "learning_updates": metadata["learning_updates"],
+                    "learning_rate": groups[0]["lr"],
+                    "optimizer_steps": source_steps,
+                    "actor_sha256": metadata["controller_manifest"]["artifact_sha256"],
+                    "joint_names": metadata["controller_manifest"]["joint_names"],
+                    "default_position_rad": metadata["controller_manifest"][
+                        "configuration"
+                    ]["default_position_rad"],
+                }
+                if recurrent_evaluation_files(learned_source) != evaluation_files:
+                    raise ValueError("Refinement source changed during preflight")
     except Exception as error:
         parser.error(f"Invalid physical reference or runtime: {error}")
     protocol = {
@@ -2777,6 +2932,29 @@ def recurrent_training_main(args, parser):
         "scope": "Acquire a causal gait before progression; short budgets are integration only. No terrain exit acceptance or deployment claim.",
         "exit_allowed": False,
     }
+    if refinement:
+        precision = args.procedural_refinement == "stop_precision"
+        protocol.update(
+            version=(
+                PROPRIO_STOP_PRECISION_VERSION
+                if precision
+                else PROPRIO_ACQUISITION_VERSION
+            ),
+            warm_start=warm_start,
+            initialization="exact actor, critic and action std from recurrent checkpoint; retain scalar LR; fresh Adam moments, recurrent/episode state and local update counters; NOT uninterrupted resume",
+            initial_action_std="copied exactly from source checkpoint",
+            reward_profile=(
+                "full-zero precision blend; other v3 rewards unchanged"
+                if precision
+                else protocol["reward_profile"]
+            ),
+            scope="Matched warm-start refinement: compare stock and stop_precision at equal additional transitions/seed; changed rewards are not comparable returns; no automatic selection or acceptance",
+        )
+        protocol["ppo"]["learning_rate"] = warm_start["learning_rate"]
+        if precision:
+            protocol["stop_precision_change"] = copy.deepcopy(
+                PROPRIO_STOP_PRECISION_CHANGE
+            )
     if evaluation:
         try:
             from .operator_student_bridge import recurrent_evaluation_protocol
@@ -2819,7 +2997,7 @@ def recurrent_training_main(args, parser):
                     "protocol": protocol,
                     **(
                         {"native_configuration_comparison": "UNRUN"}
-                        if evaluation
+                        if learned_source is not None
                         else {}
                     ),
                 },
@@ -2832,7 +3010,13 @@ def recurrent_training_main(args, parser):
         output = Path(
             tempfile.mkdtemp(
                 prefix=(
-                    "operator_proprio_screen_" if evaluation else "operator_proprio_"
+                    "operator_proprio_screen_"
+                    if evaluation
+                    else (
+                        f"operator_proprio_{args.procedural_refinement}_"
+                        if refinement
+                        else "operator_proprio_"
+                    )
                 ),
                 dir=args.output_parent,
             )
@@ -2841,7 +3025,7 @@ def recurrent_training_main(args, parser):
         write_run_provenance(output, __file__)
         write_json(output / protocol_name, protocol)
         print(
-            f"{'Frozen recurrent evaluation' if evaluation else 'Fresh recurrent acquisition'}: {output}",
+            f"{'Frozen recurrent evaluation' if evaluation else 'Recurrent refinement' if refinement else 'Fresh recurrent acquisition'}: {output}",
             flush=True,
         )
         result = supervise(
@@ -2870,7 +3054,16 @@ def recurrent_training_main(args, parser):
                     ]
                     if evaluation
                     else [
-                        "--procedural-train",
+                        *(
+                            [
+                                "--procedural-refine-checkpoint",
+                                str(learned_source),
+                                "--procedural-refinement",
+                                args.procedural_refinement,
+                            ]
+                            if refinement
+                            else ["--procedural-train"]
+                        ),
                         "--save-interval",
                         str(args.save_interval),
                     ]
@@ -2897,9 +3090,8 @@ def recurrent_training_main(args, parser):
                     "Physical reference or runtime changed during training"
                 )
             if (
-                evaluation
-                and recurrent_evaluation_files(args.procedural_evaluate_checkpoint)
-                != evaluation_files
+                learned_source is not None
+                and recurrent_evaluation_files(learned_source) != evaluation_files
             ):
                 raise ValueError("Frozen evaluation source changed during execution")
             if result.get("status") == success:
@@ -2969,6 +3161,8 @@ def recurrent_training_main(args, parser):
                     if (
                         learned["iter"] != args.iterations - 1
                         or info["learning_updates"] != args.iterations
+                        or metadata.get("warm_start") != warm_start
+                        or result.get("warm_start") != warm_start
                         or any(
                             metadata.get(k) != expected[k]
                             for k in (
@@ -3026,7 +3220,15 @@ def recurrent_training_main(args, parser):
                 saved, agent, args, archived_protocol, metadata
             )
         else:
-            cfg, runner_cfg = proprioceptive_procedural_configs(saved, agent, args)
+            if refinement:
+                recurrent_source_configs(
+                    saved, agent, args, archived_protocol, metadata, learned_source
+                )
+            cfg, runner_cfg = proprioceptive_procedural_configs(
+                saved, agent, args, acquisition_version=protocol["version"]
+            )
+            if refinement:
+                runner_cfg["algorithm"]["learning_rate"] = warm_start["learning_rate"]
         cfg.validate()
         params = output / "params"
         params.mkdir()
@@ -3063,7 +3265,17 @@ def recurrent_training_main(args, parser):
                 output,
                 is_running=app.is_running,
                 iterations=args.iterations,
+                **(
+                    {"initial_policy": policy, "warm_start": warm_start}
+                    if refinement
+                    else {}
+                ),
             )
+            if (
+                refinement
+                and recurrent_evaluation_files(learned_source) != evaluation_files
+            ):
+                raise ValueError("Refinement source changed during execution")
         if identity != recurrent_training_identity(checkpoint):
             raise ValueError("Physical reference or runtime changed during training")
         result.update(
@@ -3116,6 +3328,16 @@ def main(argv=None):
         "--procedural-evaluate-checkpoint",
         type=Path,
         help="Evaluate one frozen causal checkpoint on a fixed 80-trial seed-43 tape; no learning, optimizer resume or exit acceptance",
+    )
+    procedural.add_argument(
+        "--procedural-refine-checkpoint",
+        type=Path,
+        help="Warm-start a new run from an immutable v3 recurrent checkpoint; exact model/std and saved scalar LR, fresh Adam moments and recurrent state; not uninterrupted resume",
+    )
+    parser.add_argument(
+        "--procedural-refinement",
+        choices=("stock", "stop_precision"),
+        help="With --procedural-refine-checkpoint: stop_precision (default) changes only full-zero-twist tracking; stock is the matched unchanged-objective restart control",
     )
     procedural.add_argument(
         "--procedural-train",
@@ -3188,7 +3410,7 @@ def main(argv=None):
         "--iterations",
         type=int,
         default=None,
-        help="PPO updates (default: procedural acquisition 1000, no upper cap; refinement 300)",
+        help="Additional PPO updates (default: procedural training/refinement 1000, no upper cap; legacy refinement 300; frozen evaluation 0)",
     )
     parser.add_argument("--num-envs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -3196,7 +3418,7 @@ def main(argv=None):
     parser.add_argument(
         "--save-interval",
         type=int,
-        help="Procedural-training checkpoint interval in completed PPO updates (default: 50); the final checkpoint is always saved",
+        help="Procedural training/refinement checkpoint interval in completed PPO updates (default: 50); the final checkpoint is always saved",
     )
     parser.add_argument(
         "--moving-retention",
@@ -3232,7 +3454,7 @@ def main(argv=None):
     parser.add_argument(
         "--validate-only",
         action="store_true",
-        help="v3, procedural-config or procedural-train source-only CPU preflight; no output or simulator launch",
+        help="Source-only CPU preflight for sequence v3 and procedural modes; no output or simulator launch; native configuration comparison remains unrun",
     )
     parser.add_argument(
         "--output-parent",
@@ -3243,7 +3465,7 @@ def main(argv=None):
         "--timeout",
         type=float,
         default=None,
-        help="Optional positive finite worker time limit in seconds (default: no limit for --procedural-train; 3600 for other modes)",
+        help="Optional positive finite worker time limit in seconds (default: no limit for procedural training/refinement; 3600 for other modes)",
     )
     parser.add_argument(
         "--skip-check",
@@ -3253,6 +3475,12 @@ def main(argv=None):
     parser.add_argument("--worker-output", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     evaluation = args.procedural_evaluate_checkpoint is not None
+    refinement = args.procedural_refine_checkpoint is not None
+    learning = args.procedural_train or refinement
+    if args.procedural_refinement is not None and not refinement:
+        parser.error("--procedural-refinement requires --procedural-refine-checkpoint")
+    if refinement and args.procedural_refinement is None:
+        args.procedural_refinement = "stop_precision"
     if args.evaluation_difficulty is not None or args.evaluation_long_stops:
         if not evaluation:
             parser.error(
@@ -3269,24 +3497,22 @@ def main(argv=None):
             )
         except ValueError as error:
             parser.error(str(error))
-    if args.save_interval is not None and (
-        not args.procedural_train or args.save_interval < 1
-    ):
+    if args.save_interval is not None and (not learning or args.save_interval < 1):
         parser.error(
-            "--save-interval requires --procedural-train and a positive integer"
+            "--save-interval requires procedural training/refinement and a positive integer"
         )
-    if args.procedural_train and args.save_interval is None:
+    if learning and args.save_interval is None:
         args.save_interval = 50
-    if args.timeout is None and not args.procedural_train:
+    if args.timeout is None and not learning:
         args.timeout = 3600
     if args.iterations is None:
-        args.iterations = 0 if evaluation else (1000 if args.procedural_train else 300)
+        args.iterations = 0 if evaluation else (1000 if learning else 300)
     if args.num_envs is None:
-        args.num_envs = 80 if evaluation else (1280 if args.procedural_train else 4096)
+        args.num_envs = 80 if evaluation else (1280 if learning else 4096)
     if args.seed is None:
         args.seed = 43 if evaluation else 42
     if (
-        args.procedural_train
+        learning
         or evaluation
         or args.procedural_config_check
         or args.procedural_rollout_check
@@ -3294,7 +3520,7 @@ def main(argv=None):
         try:
             return (
                 recurrent_training_main(args, parser)
-                if args.procedural_train or evaluation
+                if learning or evaluation
                 else procedural_config_main(args, parser)
             )
         except Exception as error:

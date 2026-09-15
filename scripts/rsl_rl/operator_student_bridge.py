@@ -779,8 +779,17 @@ def _runtime_motor_binding(env):
     return binding, digest
 
 
-def run_recurrent_training(env, runner_cfg, output, *, is_running, iterations):
-    """Fresh native PPO with bounded-memory runtime audits; no acceptance claim.
+def run_recurrent_training(
+    env,
+    runner_cfg,
+    output,
+    *,
+    is_running,
+    iterations,
+    initial_policy=None,
+    warm_start=None,
+):
+    """Native PPO with fresh Adam and bounded-memory audits; no acceptance claim.
 
     The caller owns the environment, protocol and artifact publication. Native
     PPO/rollout storage are unchanged. Only observation delivery, update checks,
@@ -797,6 +806,13 @@ def run_recurrent_training(env, runner_cfg, output, *, is_running, iterations):
     )
 
     expected_groups = {"policy": ["proprio"], "critic": ["policy", "terrain"]}
+    if (initial_policy is None) != (warm_start is None):
+        raise ValueError(
+            "A recurrent warm start requires both policy and source lineage"
+        )
+    initialization = (
+        {} if warm_start is None else {"warm_start": copy.deepcopy(warm_start)}
+    )
     command = env.command_manager.get_term("base_velocity")
     if (
         type(iterations) is not int
@@ -999,6 +1015,13 @@ def run_recurrent_training(env, runner_cfg, output, *, is_running, iterations):
 
     wrapped = DeliveredEnvironment()
     binding, motor_hash = _runtime_motor_binding(env)
+    if warm_start is not None and any(
+        binding[key] != warm_start[key]
+        for key in ("joint_names", "default_position_rad")
+    ):
+        raise ValueError(
+            "Warm-start native joint order/default pose differs from the learned source"
+        )
 
     def extract(policy):
         return RecurrentOperatorAdapter(
@@ -1033,6 +1056,7 @@ def run_recurrent_training(env, runner_cfg, output, *, is_running, iterations):
                 "metrics": metrics(),
                 "exit_allowed": False,
                 "resume_supported": False,
+                **initialization,
             }
             if completed == iterations or completed % self.save_interval == 0:
                 self.checkpoint = f"model_{completed}.pt"
@@ -1062,6 +1086,32 @@ def run_recurrent_training(env, runner_cfg, output, *, is_running, iterations):
             )  # Exact completed-update milestones, not native zero-based filenames.
 
     runner = TrainingRunner(wrapped, copy.deepcopy(runner_cfg), str(output), env.device)
+    if initial_policy is not None:
+        policy = runner.alg.policy
+        expected = {
+            k: v.detach().to(env.device) for k, v in initial_policy.state_dict().items()
+        }
+        policy.load_state_dict(expected, strict=True)
+        if (
+            any(
+                not torch.equal(value, expected[key])
+                for key, value in policy.state_dict().items()
+            )
+            or _recurrent_actor_sha256(policy) != warm_start["actor_sha256"]
+            or not torch.isfinite(policy.log_std.exp()).all()
+            or torch.any(policy.log_std.exp() <= 0)
+            or not all(p.requires_grad for p in policy.parameters())
+            or runner.alg.optimizer.state
+            or runner.alg.learning_rate != warm_start["learning_rate"]
+            or any(
+                g["lr"] != warm_start["learning_rate"]
+                for g in runner.alg.optimizer.param_groups
+            )
+            or any(h is not None for h in policy.get_hidden_states())
+        ):
+            raise RuntimeError(
+                "Warm-start model, fresh optimizer/LR or recurrent state differs"
+            )
     wrapped.runner = runner
     adapter = extract(runner.alg.policy)
     wrapped.session = ControllerSession(
@@ -1134,6 +1184,7 @@ def run_recurrent_training(env, runner_cfg, output, *, is_running, iterations):
     return {
         "status": "TRAINING_COMPLETED_NOT_ACCEPTED",
         "policy_version": RECURRENT_OPERATOR_VERSION,
+        **initialization,
         **stats,
         "environment_transitions": stats["control_steps"] * env.num_envs,
         "checkpoint": runner.checkpoint,

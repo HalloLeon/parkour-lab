@@ -1,7 +1,8 @@
-"""Observable, command-gated fine tracking for the stock flat-ground teacher.
+"""Command-gated fine tracking for operator training.
 
 These are training rewards, not inference-time feedback. They use the same
-body-frame velocities and command observed by the stock policy. They contain no
+body-frame velocities and command. Velocity may be privileged for a causal
+actor; this reward does not add it to the actor's observations. They contain no
 pose anchor, timer, phase label, action override or persistent state. In
 particular, zero velocity is NOT absolute position/heading restoration.
 """
@@ -45,18 +46,25 @@ def _kernels(error_squared, std, stationary_std, precision_fraction):
 
 
 def track_lin_vel_xy_stationary(
-    env, command_name: str, std: float, stationary_std: float, precision_fraction: float
+    env,
+    command_name: str,
+    std: float,
+    stationary_std: float,
+    precision_fraction: float,
+    full_stop_only: bool = False,
 ):
     """Blend fine planar tracking only when commanded planar velocity is zero.
 
     Both yaw signs use identical gating. Nonzero planar commands, even small
-    ones, retain the exact broad reward. Training command modes emit exact zeros.
+    ones, retain the exact broad reward. With full_stop_only, pure pivots also
+    retain the broad reward. Training command modes emit exact zeros.
     """
     command = env.command_manager.get_command(command_name)
     velocity = env.scene["robot"].data.root_lin_vel_b[:, :2]
     error_squared = torch.sum(torch.square(command[:, :2] - velocity), dim=1)
     broad, fine = _kernels(error_squared, std, stationary_std, precision_fraction)
-    return torch.where(torch.all(command[:, :2] == 0, dim=1), fine, broad)
+    stopped = torch.all((command if full_stop_only else command[:, :2]) == 0, dim=1)
+    return torch.where(stopped, fine, broad)
 
 
 def track_ang_vel_z_stopped(

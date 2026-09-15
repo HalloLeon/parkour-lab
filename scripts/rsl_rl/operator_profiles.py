@@ -121,6 +121,11 @@ def select_profile(saved, agent, requested="source"):
 
 def apply_reward_profile(cfg, profile):
     """Reconstruct a known objective; never load a saved function or parameter."""
+    # This option belongs only to the recurrent stop-only refinement, not the
+    # legacy stationary profile (whose planar precision also applies to pivots).
+    planar = getattr(cfg.rewards, "track_lin_vel_xy_exp", None)
+    if planar is not None:
+        planar.params.pop("full_stop_only", None)
     cfg.rewards.track_ang_vel_z_exp.params["std"] = profile.yaw_tracking_std
     if profile.stationary_precision:
         try:
