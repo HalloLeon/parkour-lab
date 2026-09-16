@@ -48,8 +48,10 @@ CONTROLLER_ROLLOUT_COMMANDS = (
 )
 
 
-def recurrent_evaluation_protocol(*, difficulty_range=None, long_stops=False):
+def recurrent_evaluation_protocol(*, difficulty_range=None, long_stops=False, seed=43):
     """Predeclared clean-sensor first-attempt screen, not an acceptance gate."""
+    if type(seed) is not int or seed not in (43, 44, 45):
+        raise ValueError("Recurrent development evaluation requires seed 43, 44 or 45")
     if long_stops and difficulty_range is None:
         raise ValueError("Long-stop evaluation requires an explicit terrain difficulty")
     phases = (
@@ -65,7 +67,7 @@ def recurrent_evaluation_protocol(*, difficulty_range=None, long_stops=False):
     )
     protocol = {
         "version": "go2_operator_proprio_screen_v1",
-        "seed": 43,
+        "seed": seed,
         "num_envs": 80,
         "period_s": 0.02,
         "steps": 1000,
@@ -102,7 +104,7 @@ def recurrent_evaluation_protocol(*, difficulty_range=None, long_stops=False):
             difficulty_range=list(difficulty_range),
             native_diagnostics="joint_actuator_contact_v1",
             scope=(
-                "Frozen mean-policy terrain-amplitude probe on the seed-43 development "
+                f"Frozen mean-policy terrain-amplitude probe on the seed-{seed} development "
                 "layouts and unchanged clean-sensor command tape; no learning, curriculum "
                 "promotion, held-out confirmation or stair/terrain acceptance"
             ),
@@ -119,7 +121,7 @@ def recurrent_evaluation_protocol(*, difficulty_range=None, long_stops=False):
             stop_hold_windows_s=[[0.6, 1.0], [1.6, 2.0], [8.0, 10.0]],
             common_prefix_control_steps=550,
             scope=(
-                "Frozen seed-43 terrain probe with only the two post-motion stops "
+                f"Frozen seed-{seed} terrain probe with only the two post-motion stops "
                 "extended from 2 to 10 seconds. Commands match the short probe through "
                 "11 seconds; GRU memory persists across phases. Windows retain the "
                 "1-second acquisition deadline and 2-second comparison before measuring "
@@ -1778,25 +1780,29 @@ def evaluate_recurrent_operator(
     is_running,
     difficulty_range=None,
     long_stops=False,
+    seed=43,
 ):
     """Replay one clean deterministic first attempt; only the actor drives motors."""
     import numpy as np
     from parkour_lab.learning.controller import ControllerSession, Sample
 
     protocol = recurrent_evaluation_protocol(
-        difficulty_range=difficulty_range, long_stops=long_stops
+        difficulty_range=difficulty_range, long_stops=long_stops, seed=seed
     )
+    generator = env.cfg.scene.terrain.terrain_generator
+    if env.cfg.seed != protocol["seed"] or generator.seed != protocol["seed"]:
+        raise ValueError(
+            "Evaluation environment and terrain seeds differ from the protocol"
+        )
     native = difficulty_range is not None
     if native:
         from parkour_lab.tasks.manager_based.parkour_lab.mdp.terrain.operator_terrain import (
             ENVELOPES,
         )
 
-        generator = env.cfg.scene.terrain.terrain_generator
         failure = env.cfg.terminations.procedural_physical_failure
         if (
             tuple(generator.difficulty_range) != tuple(difficulty_range)
-            or generator.seed != protocol["seed"]
             or generator.num_rows != 1
             or env.cfg.curriculum.terrain_levels is not None
             or not math.isclose(

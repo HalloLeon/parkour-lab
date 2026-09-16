@@ -2793,6 +2793,7 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
     tape = recurrent_evaluation_protocol(
         difficulty_range=getattr(args, "evaluation_difficulty", None),
         long_stops=getattr(args, "evaluation_long_stops", False),
+        seed=args.seed,
     )
     cfg.seed = cfg.scene.terrain.terrain_generator.seed = args.seed
     cfg.scene.num_envs = args.num_envs
@@ -2818,7 +2819,7 @@ def recurrent_training_main(args, parser):
     )
     warm_start = None
     invalid_budget = (
-        (args.iterations, args.num_envs, args.seed) != (0, 80, 43)
+        ((args.iterations, args.num_envs) != (0, 80) or args.seed not in (43, 44, 45))
         if evaluation
         else (
             args.iterations < 1
@@ -2860,7 +2861,7 @@ def recurrent_training_main(args, parser):
         parser.error(
             "Procedural acquisition requires positive updates, 80–5120 environments "
             "in multiples of 20 and a training seed outside 43–45; evaluation requires "
-            "exactly 0 updates, 80 environments and seed 43. An explicit timeout must "
+            "exactly 0 updates, 80 environments and seed 43, 44 or 45. An explicit timeout must "
             "be finite and positive; omit it for acquisition without a time limit. "
             "No legacy training, refinement, retention, skip-check or resume flags."
         )
@@ -3028,6 +3029,7 @@ def recurrent_training_main(args, parser):
         evaluation_tape = recurrent_evaluation_protocol(
             difficulty_range=args.evaluation_difficulty,
             long_stops=args.evaluation_long_stops,
+            seed=args.seed,
         )
         protocol = {
             **evaluation_tape,
@@ -3315,6 +3317,7 @@ def recurrent_training_main(args, parser):
                 is_running=app.is_running,
                 difficulty_range=args.evaluation_difficulty,
                 long_stops=args.evaluation_long_stops,
+                seed=args.seed,
             )
             np.savez_compressed(output / "trace.npz", **trace)
             if (
@@ -3408,7 +3411,7 @@ def main(argv=None):
     procedural.add_argument(
         "--procedural-evaluate-checkpoint",
         type=Path,
-        help="Evaluate one frozen causal checkpoint on a fixed 80-trial seed-43 tape; no learning, optimizer resume or exit acceptance",
+        help="Evaluate one frozen causal checkpoint on the fixed 80-trial tape; --seed 43 (default), 44 or 45 selects development layouts, not exit acceptance; no learning or optimizer resume",
     )
     procedural.add_argument(
         "--procedural-refine-checkpoint",
@@ -3575,6 +3578,7 @@ def main(argv=None):
             recurrent_evaluation_protocol(
                 difficulty_range=args.evaluation_difficulty,
                 long_stops=args.evaluation_long_stops,
+                seed=args.seed if args.seed is not None else 43,
             )
         except ValueError as error:
             parser.error(str(error))
