@@ -63,6 +63,7 @@ try:
     from .operator_sequences import (
         VERSION as SEQUENCE_VERSION,
         sequence_manifest,
+        arrival_hold_manifest,
         SequenceExposureWrapper,
     )
     from .operator_sequence_resume import sequence_resume_preflight
@@ -98,6 +99,7 @@ except ImportError:
     from operator_sequences import (
         VERSION as SEQUENCE_VERSION,
         sequence_manifest,
+        arrival_hold_manifest,
         SequenceExposureWrapper,
     )
     from operator_sequence_resume import sequence_resume_preflight
@@ -398,6 +400,11 @@ PROCEDURAL_EASY_DIFFICULTY = (0.05, 0.15)
 PROPRIO_ACQUISITION_VERSION = "operator_proprio_acquisition_v3"
 PROPRIO_STOP_PRECISION_VERSION = "operator_proprio_stop_precision_v1"
 PROPRIO_TERRAIN_EXPOSURE_VERSION = "operator_proprio_terrain_exposure_v1"
+PROPRIO_ARRIVAL_HOLD_VERSION = "operator_proprio_arrival_hold_v1"
+PROPRIO_MIXED_TERRAIN_VERSIONS = (
+    PROPRIO_TERRAIN_EXPOSURE_VERSION,
+    PROPRIO_ARRIVAL_HOLD_VERSION,
+)
 PROPRIO_JOINT_LIMIT_VERSION = "operator_proprio_acquisition_v2"
 PROPRIO_LEGACY_ACQUISITION_VERSION = "operator_proprio_acquisition_v1"
 PROPRIO_ACQUISITION_VERSIONS = (
@@ -408,12 +415,12 @@ PROPRIO_ACQUISITION_VERSIONS = (
 PROPRIO_TRAINING_VERSIONS = (
     *PROPRIO_ACQUISITION_VERSIONS,
     PROPRIO_STOP_PRECISION_VERSION,
-    PROPRIO_TERRAIN_EXPOSURE_VERSION,
+    *PROPRIO_MIXED_TERRAIN_VERSIONS,
 )
 PROPRIO_UPRIGHT_VERSIONS = (
     PROPRIO_ACQUISITION_VERSION,
     PROPRIO_STOP_PRECISION_VERSION,
-    PROPRIO_TERRAIN_EXPOSURE_VERSION,
+    *PROPRIO_MIXED_TERRAIN_VERSIONS,
 )
 PROPRIO_TERRAIN_EXPOSURE_CHANGE = {
     "difficulty_range": [0.05, 0.35],
@@ -471,7 +478,7 @@ def _proprio_posture_change(version):
     if version not in PROPRIO_UPRIGHT_VERSIONS:
         return None
     result = copy.deepcopy(PROPRIO_POSTURE_CHANGE)
-    if version == PROPRIO_TERRAIN_EXPOSURE_VERSION:
+    if version in PROPRIO_MIXED_TERRAIN_VERSIONS:
         result["scope"] = (
             "retain the v3 posture objective and physical failure guard during bounded terrain exposure; not terrain acceptance"
         )
@@ -680,12 +687,22 @@ def proprioceptive_procedural_configs(
             "max_tilt_rad"
         ]
         failure.time_out = False
-    if acquisition_version == PROPRIO_TERRAIN_EXPOSURE_VERSION:
+    if acquisition_version in PROPRIO_MIXED_TERRAIN_VERSIONS:
         _configure_recurrent_terrain(
             cfg,
             PROPRIO_TERRAIN_EXPOSURE_CHANGE["difficulty_range"],
             num_rows=PROPRIO_TERRAIN_EXPOSURE_CHANGE["num_rows"],
         )
+    if acquisition_version == PROPRIO_ARRIVAL_HOLD_VERSION:
+        if cfg.episode_length_s != 20.0:
+            raise ValueError(
+                "Arrival/hold training requires the unchanged 20-second horizon"
+            )
+        try:
+            from .operator_command import ProceduralArrivalHoldCommand
+        except ImportError:
+            from operator_command import ProceduralArrivalHoldCommand
+        cfg.commands.base_velocity.class_type = ProceduralArrivalHoldCommand
     if acquisition_version == PROPRIO_STOP_PRECISION_VERSION:
         try:
             from .operator_rewards import (
@@ -2648,7 +2665,7 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
     policy, metadata, digest = load_recurrent_checkpoint(checkpoint, device="cpu")
     protocol = json.loads((checkpoint.parent / "training_protocol.json").read_text())
     recipe = metadata["recipe"]
-    exposure = protocol["version"] == PROPRIO_TERRAIN_EXPOSURE_VERSION
+    exposure = protocol["version"] in PROPRIO_MIXED_TERRAIN_VERSIONS
     save_interval = protocol.get("save_interval", 50)
     archived_agent = read_yaml_data(checkpoint.parent / "params/agent.yaml")
     if (
@@ -2675,6 +2692,12 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         or protocol.get("warm_start") != metadata.get("warm_start")
         or protocol.get("terrain_exposure_change")
         != (PROPRIO_TERRAIN_EXPOSURE_CHANGE if exposure else None)
+        or protocol.get("arrival_hold_change")
+        != (
+            arrival_hold_manifest()
+            if protocol["version"] == PROPRIO_ARRIVAL_HOLD_VERSION
+            else None
+        )
         or protocol["policy_version"] != metadata["policy_version"]
         or protocol["source_identity"]["physical_reference"] != physical_identity
         or protocol["terrain"] != "operator_procedural_surface_v2"
@@ -2712,7 +2735,7 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         protocol["version"]
         in (
             PROPRIO_STOP_PRECISION_VERSION,
-            PROPRIO_TERRAIN_EXPOSURE_VERSION,
+            *PROPRIO_MIXED_TERRAIN_VERSIONS,
         )
         and warm_start is None
     ):
@@ -2720,7 +2743,12 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
     if warm_start is not None:
         if (
             protocol["version"] not in PROPRIO_UPRIGHT_VERSIONS
-            or warm_start["version"] != PROPRIO_ACQUISITION_VERSION
+            or warm_start["version"]
+            != (
+                PROPRIO_TERRAIN_EXPOSURE_VERSION
+                if protocol["version"] == PROPRIO_ARRIVAL_HOLD_VERSION
+                else PROPRIO_ACQUISITION_VERSION
+            )
             or type(warm_start["learning_updates"]) is not int
             or warm_start["learning_updates"] < 1
             or type(warm_start["optimizer_steps"]) is not int
@@ -2800,6 +2828,14 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
     cfg.sim.device = args.device
     cfg.observations.proprio.enable_corruption = False
     cfg.episode_length_s = tape["steps"] * tape["period_s"]
+    if training_protocol["version"] == PROPRIO_ARRIVAL_HOLD_VERSION:
+        # Reconstruct/validate the training recipe above, but preserve the
+        # existing evaluator's command-reset RNG and externally owned tape.
+        try:
+            from .operator_command import ProceduralTerrainCommand
+        except ImportError:
+            from operator_command import ProceduralTerrainCommand
+        cfg.commands.base_velocity.class_type = ProceduralTerrainCommand
     # Only after the complete training archive has matched. Every checkpoint
     # uses the same one-row evaluation fixture, even after multi-row training.
     _configure_recurrent_terrain(
@@ -2904,9 +2940,14 @@ def recurrent_training_main(args, parser):
             if refinement:
                 import torch
 
-                if archived_protocol["version"] != PROPRIO_ACQUISITION_VERSION:
+                required_source = (
+                    PROPRIO_TERRAIN_EXPOSURE_VERSION
+                    if args.procedural_refinement == "arrival_hold"
+                    else PROPRIO_ACQUISITION_VERSION
+                )
+                if archived_protocol["version"] != required_source:
                     raise ValueError(
-                        "Refinement requires an upright v3 recurrent source"
+                        f"This refinement requires a {required_source} recurrent source"
                     )
                 # Carry only the adaptive scalar, not Adam moments or its step count.
                 # Resetting it to the original recipe's 1e-3 can be a large LR jump.
@@ -2983,10 +3024,15 @@ def recurrent_training_main(args, parser):
     }
     if refinement:
         precision = args.procedural_refinement == "stop_precision"
-        exposure = args.procedural_refinement == "terrain_exposure"
+        arrival = args.procedural_refinement == "arrival_hold"
+        exposure = args.procedural_refinement in ("terrain_exposure", "arrival_hold")
         protocol.update(
             version=(
-                PROPRIO_TERRAIN_EXPOSURE_VERSION
+                (
+                    PROPRIO_ARRIVAL_HOLD_VERSION
+                    if arrival
+                    else PROPRIO_TERRAIN_EXPOSURE_VERSION
+                )
                 if exposure
                 else (
                     PROPRIO_STOP_PRECISION_VERSION
@@ -3020,6 +3066,11 @@ def recurrent_training_main(args, parser):
                     PROPRIO_TERRAIN_EXPOSURE_VERSION
                 ),
                 scope="Terrain-exposure experiment from a bound v3 checkpoint; compare against equal-budget stock refinement and the source on the same easy/stress screens; no automatic selection or acceptance",
+            )
+        if arrival:
+            protocol.update(
+                arrival_hold_change=arrival_hold_manifest(),
+                scope="Arrival/long-hold/restart candidate from a bound terrain-exposure checkpoint; fresh Adam is NOT a matched continuation. Compare with the frozen source; no sampler-only causal claim, automatic selection or acceptance",
             )
     if evaluation:
         try:
@@ -3345,7 +3396,7 @@ def recurrent_training_main(args, parser):
                             PROPRIO_TERRAIN_EXPOSURE_CHANGE["difficulty_range"]
                         ),
                     }
-                    if protocol["version"] == PROPRIO_TERRAIN_EXPOSURE_VERSION
+                    if protocol["version"] in PROPRIO_MIXED_TERRAIN_VERSIONS
                     else {}
                 ),
             )
@@ -3416,12 +3467,12 @@ def main(argv=None):
     procedural.add_argument(
         "--procedural-refine-checkpoint",
         type=Path,
-        help="Warm-start a new run from an immutable v3 recurrent checkpoint; exact model/std and saved scalar LR, fresh Adam moments and recurrent state; not uninterrupted resume",
+        help="Warm-start from an immutable recurrent checkpoint (v3, or terrain_exposure for arrival_hold); exact model/std and saved scalar LR, fresh Adam moments and recurrent state; not uninterrupted resume",
     )
     parser.add_argument(
         "--procedural-refinement",
-        choices=("stock", "terrain_exposure", "stop_precision"),
-        help="With --procedural-refine-checkpoint: stock (default) is an unchanged-objective restart; terrain_exposure adds three fixed difficulty bands through 0.35; stop_precision reproduces the rejected historical reward ablation",
+        choices=("stock", "terrain_exposure", "arrival_hold", "stop_precision"),
+        help="With --procedural-refine-checkpoint: stock (default) restarts v3; terrain_exposure adds three fixed difficulty bands; arrival_hold retains those bands and adds randomized long arrival/hold/restart commands; stop_precision reproduces the rejected historical reward ablation",
     )
     procedural.add_argument(
         "--procedural-train",

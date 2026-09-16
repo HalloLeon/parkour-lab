@@ -154,6 +154,34 @@ class ProceduralTerrainCommand(OperatorTransitionCommand):
         return "ProceduralTerrainCommand: operator body twist on every row; no route guidance"
 
 
+class ProceduralArrivalHoldCommand(ProceduralTerrainCommand):
+    """Mix long arrival/hold sequences into training, never into live control."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        try:
+            from .operator_sequences import ArrivalHoldPlan
+        except ImportError:
+            from operator_sequences import ArrivalHoldPlan
+
+        self.arrival_plan = ArrivalHoldPlan(self.num_envs, self.device)
+
+    def _resample_command(self, env_ids):
+        ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        super()._resample_command(ids)
+        selected, commands, categories, seconds = self.arrival_plan.resample(
+            ids, self.command_counter[ids] == 0
+        )
+        # Discard any background flat reversal chain; never resume it halfway
+        # through after the arrival sequence. Unselected episodes are unchanged.
+        self.sequence_plan.phase[selected] = -1
+        self.category[selected] = categories
+        self.vel_command_b[selected] = commands
+        self.is_heading_env[selected] = False
+        self.is_standing_env[selected] = categories == 0
+        self.time_left[selected] = seconds
+
+
 def procedural_physical_failure(
     env,
     minimum_m: float,

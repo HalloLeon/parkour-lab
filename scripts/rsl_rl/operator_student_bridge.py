@@ -929,6 +929,37 @@ def run_recurrent_training(
         "adapter_comparisons": 0,
     }
     robot, term = env.scene["robot"].data, env.action_manager.get_term("joint_pos")
+    arrival = None
+    if hasattr(command, "arrival_plan"):
+        try:
+            from .operator_sequences import ArrivalHoldExposure
+        except ImportError:
+            from operator_sequences import ArrivalHoldExposure
+        arrival = ArrivalHoldExposure(
+            command.arrival_plan, group_ids, group_count, env.step_dt
+        )
+        contacts = env.scene["contact_forces"]
+        feet = [
+            i for i, name in enumerate(contacts.body_names) if name.endswith("_foot")
+        ]
+        if len(feet) != 4:
+            raise ValueError(
+                "Arrival exposure requires all four named Go2 foot contacts"
+            )
+
+    def arrival_metrics():
+        if arrival is None:
+            return {}
+        return {
+            "arrival_hold_exposure": {
+                **arrival.report(),
+                "group_order": [
+                    {"row": row, "profile": name}
+                    for row in range(terrain_rows)
+                    for name in profiles
+                ],
+            }
+        }
 
     def metrics(row=None):
         # Preserve the five-profile summary by pooling rows, while retaining
@@ -1086,6 +1117,22 @@ def run_recurrent_training(
                 (8, desired[:, 0] < -0.05),
             ):
                 add_counts(index, mask)
+            if arrival is not None:
+                phase = command.arrival_plan.phase.clone()
+                orientation = command.arrival_plan.orientation.clone()
+                hits = env.scene["height_scanner"].data.ray_hits_w
+                if hits.shape != (env.num_envs, 132, 3) or torch.isnan(hits).any():
+                    raise RuntimeError("Invalid arrival exposure height scan")
+                valid = torch.isfinite(hits).all(dim=(1, 2))
+                relief = valid & (
+                    (hits[:, :, 2].amax(1) - hits[:, :, 2].amin(1)) > 0.02
+                )
+                force = contacts.data.net_forces_w[:, feet]
+                _check_tensor(force, (env.num_envs, 4, 3), "arrival foot forces")
+                four_contacts = (force.norm(dim=-1) > 1.0).all(dim=-1)
+                actual_motion = (tracking[:, :2].norm(dim=-1) > 0.1) | (
+                    tracking[:, 2].abs() > 0.1
+                )
             observation, reward, done, extras = super().step(actions)
             validate_terrain_assignment()
             # Native wrappers can report both a physical failure and a time
@@ -1100,6 +1147,19 @@ def run_recurrent_training(
                     "Native processed joint target differs from the stock affine map"
                 )
             self.done = done.bool()
+            if arrival is not None:
+                arrival.observe(
+                    phase,
+                    orientation,
+                    command.arrival_plan.phase,
+                    env.reset_terminated.bool(),
+                    env.reset_time_outs.bool(),
+                    env.termination_manager.get_term("procedural_workspace").bool(),
+                    nonflat,
+                    relief,
+                    actual_motion,
+                    four_contacts,
+                )
             if not torch.equal(
                 robot.joint_pos_target[~self.done], expected[~self.done]
             ):
@@ -1163,6 +1223,7 @@ def run_recurrent_training(
                 "motor_binding_sha256": motor_hash,
                 "metrics": metrics(),
                 **exposure_metrics(),
+                **arrival_metrics(),
                 "exit_allowed": False,
                 "resume_supported": False,
                 **initialization,
@@ -1301,6 +1362,7 @@ def run_recurrent_training(
         "updated_parameter_groups": list(groups),
         "metrics": metrics(),
         **exposure_metrics(),
+        **arrival_metrics(),
         "controller_manifest": extract(runner.alg.policy).spec.manifest(),
         "actor_artifact_identity": "named_actor_state_tensor_sha256",
         "motor_binding": binding,
