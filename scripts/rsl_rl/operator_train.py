@@ -401,10 +401,19 @@ PROPRIO_ACQUISITION_VERSION = "operator_proprio_acquisition_v3"
 PROPRIO_STOP_PRECISION_VERSION = "operator_proprio_stop_precision_v1"
 PROPRIO_TERRAIN_EXPOSURE_VERSION = "operator_proprio_terrain_exposure_v1"
 PROPRIO_ARRIVAL_HOLD_VERSION = "operator_proprio_arrival_hold_v1"
+PROPRIO_STANCE_VERSION = "operator_proprio_stance_v1"
+PROPRIO_ARRIVAL_VERSIONS = (PROPRIO_ARRIVAL_HOLD_VERSION, PROPRIO_STANCE_VERSION)
 PROPRIO_MIXED_TERRAIN_VERSIONS = (
     PROPRIO_TERRAIN_EXPOSURE_VERSION,
-    PROPRIO_ARRIVAL_HOLD_VERSION,
+    *PROPRIO_ARRIVAL_VERSIONS,
 )
+PROPRIO_REFINEMENT_VERSIONS = {
+    "stock": PROPRIO_ACQUISITION_VERSION,
+    "terrain_exposure": PROPRIO_TERRAIN_EXPOSURE_VERSION,
+    "arrival_hold": PROPRIO_ARRIVAL_HOLD_VERSION,
+    "stance": PROPRIO_STANCE_VERSION,
+    "stop_precision": PROPRIO_STOP_PRECISION_VERSION,
+}
 PROPRIO_JOINT_LIMIT_VERSION = "operator_proprio_acquisition_v2"
 PROPRIO_LEGACY_ACQUISITION_VERSION = "operator_proprio_acquisition_v1"
 PROPRIO_ACQUISITION_VERSIONS = (
@@ -438,6 +447,15 @@ PROPRIO_STOP_PRECISION_CHANGE = {
     "precision_fraction": 1.0 / 3.0,
     "kernel": "(1-f)*exp(-error_squared/broad_std**2) + f*exp(-error_squared/fine_std**2)",
     "scope": "reward-only refinement; no pose anchor, command override, entropy or terrain change",
+}
+PROPRIO_STANCE_CHANGE = {
+    "term": "joint_posture_stopped",
+    "function": "operator_rewards:joint_posture_stopped",
+    "weight": -0.1,
+    "gate": "exact zero body twist only; no measured-speed gate",
+    "cost": "L2 norm of all 12 measured joint positions minus native default positions, radians; not squared",
+    "integration": "native RewardManager weight * step_dt exactly once",
+    "scope": "soft posture prior, not a rigid stance or world-pose anchor; arrival sampler, moving/pivot rewards, actor and motors unchanged",
 }
 PROPRIO_REWARD_CHANGE = {
     "term": "dof_pos_limits",
@@ -693,7 +711,7 @@ def proprioceptive_procedural_configs(
             PROPRIO_TERRAIN_EXPOSURE_CHANGE["difficulty_range"],
             num_rows=PROPRIO_TERRAIN_EXPOSURE_CHANGE["num_rows"],
         )
-    if acquisition_version == PROPRIO_ARRIVAL_HOLD_VERSION:
+    if acquisition_version in PROPRIO_ARRIVAL_VERSIONS:
         if cfg.episode_length_s != 20.0:
             raise ValueError(
                 "Arrival/hold training requires the unchanged 20-second horizon"
@@ -703,6 +721,18 @@ def proprioceptive_procedural_configs(
         except ImportError:
             from operator_command import ProceduralArrivalHoldCommand
         cfg.commands.base_velocity.class_type = ProceduralArrivalHoldCommand
+    if acquisition_version == PROPRIO_STANCE_VERSION:
+        from isaaclab.managers import RewardTermCfg
+
+        try:
+            from .operator_rewards import joint_posture_stopped
+        except ImportError:
+            from operator_rewards import joint_posture_stopped
+        cfg.rewards.joint_posture_stopped = RewardTermCfg(
+            func=joint_posture_stopped,
+            weight=PROPRIO_STANCE_CHANGE["weight"],
+            params={"command_name": "base_velocity"},
+        )
     if acquisition_version == PROPRIO_STOP_PRECISION_VERSION:
         try:
             from .operator_rewards import (
@@ -2695,7 +2725,13 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         or protocol.get("arrival_hold_change")
         != (
             arrival_hold_manifest()
-            if protocol["version"] == PROPRIO_ARRIVAL_HOLD_VERSION
+            if protocol["version"] in PROPRIO_ARRIVAL_VERSIONS
+            else None
+        )
+        or protocol.get("stance_change")
+        != (
+            PROPRIO_STANCE_CHANGE
+            if protocol["version"] == PROPRIO_STANCE_VERSION
             else None
         )
         or protocol["policy_version"] != metadata["policy_version"]
@@ -2746,7 +2782,7 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
             or warm_start["version"]
             != (
                 PROPRIO_TERRAIN_EXPOSURE_VERSION
-                if protocol["version"] == PROPRIO_ARRIVAL_HOLD_VERSION
+                if protocol["version"] in PROPRIO_ARRIVAL_VERSIONS
                 else PROPRIO_ACQUISITION_VERSION
             )
             or type(warm_start["learning_updates"]) is not int
@@ -2828,7 +2864,7 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
     cfg.sim.device = args.device
     cfg.observations.proprio.enable_corruption = False
     cfg.episode_length_s = tape["steps"] * tape["period_s"]
-    if training_protocol["version"] == PROPRIO_ARRIVAL_HOLD_VERSION:
+    if training_protocol["version"] in PROPRIO_ARRIVAL_VERSIONS:
         # Reconstruct/validate the training recipe above, but preserve the
         # existing evaluator's command-reset RNG and externally owned tape.
         try:
@@ -2942,7 +2978,8 @@ def recurrent_training_main(args, parser):
 
                 required_source = (
                     PROPRIO_TERRAIN_EXPOSURE_VERSION
-                    if args.procedural_refinement == "arrival_hold"
+                    if PROPRIO_REFINEMENT_VERSIONS[args.procedural_refinement]
+                    in PROPRIO_ARRIVAL_VERSIONS
                     else PROPRIO_ACQUISITION_VERSION
                 )
                 if archived_protocol["version"] != required_source:
@@ -3023,23 +3060,12 @@ def recurrent_training_main(args, parser):
         "exit_allowed": False,
     }
     if refinement:
-        precision = args.procedural_refinement == "stop_precision"
-        arrival = args.procedural_refinement == "arrival_hold"
-        exposure = args.procedural_refinement in ("terrain_exposure", "arrival_hold")
+        version = PROPRIO_REFINEMENT_VERSIONS[args.procedural_refinement]
+        precision = version == PROPRIO_STOP_PRECISION_VERSION
+        arrival = version in PROPRIO_ARRIVAL_VERSIONS
+        exposure = version in PROPRIO_MIXED_TERRAIN_VERSIONS
         protocol.update(
-            version=(
-                (
-                    PROPRIO_ARRIVAL_HOLD_VERSION
-                    if arrival
-                    else PROPRIO_TERRAIN_EXPOSURE_VERSION
-                )
-                if exposure
-                else (
-                    PROPRIO_STOP_PRECISION_VERSION
-                    if precision
-                    else PROPRIO_ACQUISITION_VERSION
-                )
-            ),
+            version=version,
             warm_start=warm_start,
             initialization="exact actor, critic and action std from recurrent checkpoint; retain scalar LR; fresh Adam moments, recurrent/episode state and local update counters; NOT uninterrupted resume",
             initial_action_std="copied exactly from source checkpoint",
@@ -3071,6 +3097,13 @@ def recurrent_training_main(args, parser):
             protocol.update(
                 arrival_hold_change=arrival_hold_manifest(),
                 scope="Arrival/long-hold/restart candidate from a bound terrain-exposure checkpoint; fresh Adam is NOT a matched continuation. Compare with the frozen source; no sampler-only causal claim, automatic selection or acceptance",
+            )
+        if version == PROPRIO_STANCE_VERSION:
+            protocol.update(
+                stance_change=copy.deepcopy(PROPRIO_STANCE_CHANGE),
+                reward_profile=protocol["reward_profile"]
+                + "; exact-zero joint-posture L2 norm cost, weight=-0.1",
+                scope="Single stance-cost candidate with the unchanged arrival sampler. Compare equal-update arrival_hold and stance restarts from the same exposure checkpoint, seed and scalar LR; no automatic selection or acceptance",
             )
     if evaluation:
         try:
@@ -3467,12 +3500,12 @@ def main(argv=None):
     procedural.add_argument(
         "--procedural-refine-checkpoint",
         type=Path,
-        help="Warm-start from an immutable recurrent checkpoint (v3, or terrain_exposure for arrival_hold); exact model/std and saved scalar LR, fresh Adam moments and recurrent state; not uninterrupted resume",
+        help="Warm-start from an immutable recurrent checkpoint (v3, or terrain_exposure for arrival_hold/stance); exact model/std and saved scalar LR, fresh Adam moments and recurrent state; not uninterrupted resume",
     )
     parser.add_argument(
         "--procedural-refinement",
-        choices=("stock", "terrain_exposure", "arrival_hold", "stop_precision"),
-        help="With --procedural-refine-checkpoint: stock (default) restarts v3; terrain_exposure adds three fixed difficulty bands; arrival_hold retains those bands and adds randomized long arrival/hold/restart commands; stop_precision reproduces the rejected historical reward ablation",
+        choices=tuple(PROPRIO_REFINEMENT_VERSIONS),
+        help="With --procedural-refine-checkpoint: stock (default) restarts v3; terrain_exposure adds three fixed difficulty bands; arrival_hold adds long arrival/hold/restart commands; stance adds only a weak exact-zero posture cost to arrival_hold; stop_precision reproduces the rejected historical reward ablation",
     )
     procedural.add_argument(
         "--procedural-train",

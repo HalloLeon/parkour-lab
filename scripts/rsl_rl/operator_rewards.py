@@ -1,15 +1,31 @@
-"""Command-gated fine tracking for operator training.
+"""Command-gated tracking and soft stance objectives for operator training.
 
-These are training rewards, not inference-time feedback. They use the same
-body-frame velocities and command. Velocity may be privileged for a causal
-actor; this reward does not add it to the actor's observations. They contain no
-pose anchor, timer, phase label, action override or persistent state. In
-particular, zero velocity is NOT absolute position/heading restoration.
+These rewards use native commands and robot state, not inference-time feedback.
+Privileged reward inputs do not enter the causal actor's observations. There
+is no world-position/heading anchor, timer, phase label, action override or
+persistent state. A soft joint-posture prior is not a rigid stance, and zero
+velocity is NOT absolute position/heading restoration.
 """
 
 import math
 
 import torch
+
+
+def joint_posture_stopped(env, command_name: str):
+    """Soft default-pose cost for exact zero twist, not a joint-target override.
+
+    Use the L2 norm (not its square) in native radians. Moving commands,
+    including pure pivots and arbitrarily small commands, pay no new cost.
+    No speed gate lets the policy escape the cost by moving during a stop.
+    The caller supplies the negative weight; RewardManager integrates dt.
+    """
+    command = env.command_manager.get_command(command_name)
+    data = env.scene["robot"].data
+    deviation = torch.linalg.vector_norm(
+        data.joint_pos - data.default_joint_pos, dim=-1
+    )
+    return torch.where(torch.all(command == 0, dim=-1), deviation, 0.0)
 
 
 def teacher_physical_failure(
