@@ -2857,6 +2857,7 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
     tape = recurrent_evaluation_protocol(
         difficulty_range=getattr(args, "evaluation_difficulty", None),
         long_stops=getattr(args, "evaluation_long_stops", False),
+        command_coverage=getattr(args, "evaluation_command_coverage", False),
         seed=args.seed,
     )
     cfg.seed = cfg.scene.terrain.terrain_generator.seed = args.seed
@@ -3113,6 +3114,7 @@ def recurrent_training_main(args, parser):
         evaluation_tape = recurrent_evaluation_protocol(
             difficulty_range=args.evaluation_difficulty,
             long_stops=args.evaluation_long_stops,
+            command_coverage=args.evaluation_command_coverage,
             seed=args.seed,
         )
         protocol = {
@@ -3200,6 +3202,11 @@ def recurrent_training_main(args, parser):
                         *(
                             ["--evaluation-long-stops"]
                             if args.evaluation_long_stops
+                            else []
+                        ),
+                        *(
+                            ["--evaluation-command-coverage"]
+                            if args.evaluation_command_coverage
                             else []
                         ),
                     ]
@@ -3401,6 +3408,7 @@ def recurrent_training_main(args, parser):
                 is_running=app.is_running,
                 difficulty_range=args.evaluation_difficulty,
                 long_stops=args.evaluation_long_stops,
+                command_coverage=args.evaluation_command_coverage,
                 seed=args.seed,
             )
             np.savez_compressed(output / "trace.npz", **trace)
@@ -3523,6 +3531,11 @@ def main(argv=None):
         "--evaluation-long-stops",
         action="store_true",
         help="With --evaluation-difficulty: extend the two post-motion stops from 2 to 10 seconds (36-second frozen probe); keep the approach, native diagnostics and short-stop deadline unchanged",
+    )
+    parser.add_argument(
+        "--evaluation-command-coverage",
+        action="store_true",
+        help="With --evaluation-difficulty, instead of --evaluation-long-stops: fixed 63-second frozen screen with longer reverse/pivots, flat slow/lateral commands and prospective development control limits; no acceptance",
     )
     procedural.add_argument(
         "--procedural-config-check",
@@ -3649,11 +3662,13 @@ def main(argv=None):
         parser.error("--procedural-refinement requires --procedural-refine-checkpoint")
     if refinement and args.procedural_refinement is None:
         args.procedural_refinement = "stock"
-    if args.evaluation_difficulty is not None or args.evaluation_long_stops:
+    if (
+        args.evaluation_difficulty is not None
+        or args.evaluation_long_stops
+        or args.evaluation_command_coverage
+    ):
         if not evaluation:
-            parser.error(
-                "Evaluation difficulty/long stops require --procedural-evaluate-checkpoint"
-            )
+            parser.error("Evaluation options require --procedural-evaluate-checkpoint")
         try:
             try:
                 from .operator_student_bridge import recurrent_evaluation_protocol
@@ -3662,6 +3677,7 @@ def main(argv=None):
             recurrent_evaluation_protocol(
                 difficulty_range=args.evaluation_difficulty,
                 long_stops=args.evaluation_long_stops,
+                command_coverage=args.evaluation_command_coverage,
                 seed=args.seed if args.seed is not None else 43,
             )
         except ValueError as error:

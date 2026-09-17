@@ -48,12 +48,16 @@ CONTROLLER_ROLLOUT_COMMANDS = (
 )
 
 
-def recurrent_evaluation_protocol(*, difficulty_range=None, long_stops=False, seed=43):
+def recurrent_evaluation_protocol(
+    *, difficulty_range=None, long_stops=False, command_coverage=False, seed=43
+):
     """Predeclared clean-sensor first-attempt screen, not an acceptance gate."""
     if type(seed) is not int or seed not in (43, 44, 45):
         raise ValueError("Recurrent development evaluation requires seed 43, 44 or 45")
-    if long_stops and difficulty_range is None:
-        raise ValueError("Long-stop evaluation requires an explicit terrain difficulty")
+    if (long_stops or command_coverage) and difficulty_range is None:
+        raise ValueError("Extended evaluation requires an explicit terrain difficulty")
+    if long_stops and command_coverage:
+        raise ValueError("Choose long stops or command coverage, not both")
     phases = (
         ("cold_stand", 1, (0, 0, 0)),
         ("forward", 4, (0.55, 0, 0)),
@@ -109,7 +113,7 @@ def recurrent_evaluation_protocol(*, difficulty_range=None, long_stops=False, se
                 "promotion, held-out confirmation or stair/terrain acceptance"
             ),
         )
-    if long_stops:
+    if long_stops or command_coverage:
         for phase in protocol["phases"]:
             if phase["name"] in ("stop_after_arcs", "final_stop"):
                 phase["duration_s"] = 10
@@ -126,6 +130,52 @@ def recurrent_evaluation_protocol(*, difficulty_range=None, long_stops=False, se
                 "11 seconds; GRU memory persists across phases. Windows retain the "
                 "1-second acquisition deadline and 2-second comparison before measuring "
                 "late recovery. No relaxed stop requirement, learning or acceptance."
+            ),
+        )
+    if command_coverage:
+        from dataclasses import asdict
+
+        try:
+            from .operator_benchmark_core import Thresholds
+        except ImportError:
+            from operator_benchmark_core import Thresholds
+        phases = protocol["phases"]
+        phases[5]["duration_s"] = 6
+        # Preserve the existing rough restart's 1.35 m ideal travel within the tile.
+        phases[5]["rough_command"] = [0.225, 0, 0]
+        phases[6]["duration_s"] = phases[7]["duration_s"] = 6
+        phases[8:8] = [
+            {
+                "name": name,
+                "duration_s": seconds,
+                "flat_command": list(flat),
+                "rough_command": list(rough),
+            }
+            for name, seconds, flat, rough in (
+                ("stop_after_pivots", 2, (0, 0, 0), (0, 0, 0)),
+                ("slow_forward_flat_or_pivot_rough", 3, (0.2, 0, 0), (0, 0, 0.3)),
+                ("slow_reverse_flat_or_pivot_rough", 3, (-0.2, 0, 0), (0, 0, -0.3)),
+                ("stop_after_slow", 2, (0, 0, 0), (0, 0, 0)),
+                ("lateral_positive_flat_or_pivot_rough", 3, (0, 0.2, 0), (0, 0, 0.3)),
+                ("lateral_negative_flat_or_pivot_rough", 3, (0, -0.2, 0), (0, 0, -0.3)),
+            )
+        ]
+        limits = asdict(Thresholds())
+        # A flat-world attitude gate is not a slope gate.
+        limits.pop("flat_attitude_rad")
+        protocol.update(
+            version="go2_operator_proprio_command_coverage_v1",
+            steps=round(sum(p["duration_s"] for p in phases) / protocol["period_s"]),
+            command_limits=limits,
+            common_prefix_control_steps=950,
+            scope=(
+                "Frozen 63-second development command coverage; command packets match the "
+                "long-stop probe through 19 seconds. GRU memory persists. Reverse/lateral commands "
+                "only on plane/rough-flat; rough suffix pivots are explicit operator requests. "
+                "Minimum tested planar command is 0.20 m/s, not near-zero/deadband coverage. "
+                "Prospective legacy kinematic limits, body-z AND world-up yaw convention; "
+                "settled drift uses up-to-2-second available windows (null for cold stand). "
+                "No terrain, health, sensing, watchdog, deployment or exit acceptance."
             ),
         )
     return protocol
@@ -1382,6 +1432,19 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
         raise ValueError("Unsupported recurrent evaluation summary version")
     protocol = recurrent_evaluation_protocol() if protocol is None else protocol
     native = protocol.get("native_diagnostics") == "joint_actuator_contact_v1"
+    coverage = protocol.get("version") == "go2_operator_proprio_command_coverage_v1"
+    if coverage or "command_limits" in protocol:
+        expected = recurrent_evaluation_protocol(
+            difficulty_range=protocol.get("difficulty_range"),
+            seed=protocol.get("seed"),
+            command_coverage=True,
+        )
+        if any(protocol.get(key) != value for key, value in expected.items()):
+            raise ValueError("Command coverage tape or development limits differ")
+        try:
+            from .operator_benchmark_core import score_command_phase
+        except ImportError:
+            from operator_benchmark_core import score_command_phase
     if native and version != 3:
         raise ValueError("Native terrain probes require summary version 3")
     names = ("plane", "rough_flat", "hills", "step_hills", "tilted_ramps")
@@ -1563,6 +1626,13 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
     quaternion = trace["quaternion"]
     w, x, y, z = np.moveaxis(quaternion, -1, 0)
     heading = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    if coverage:
+        wx, wy, wz = np.moveaxis(trace["angular_velocity_b"], -1, 0)
+        world_yaw = (
+            2 * (x * z - w * y) * wx
+            + 2 * (y * z + w * x) * wy
+            + (1 - 2 * (x * x + y * y)) * wz
+        )
     if version >= 2:
         roll = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
         pitch = np.arcsin(np.clip(2 * (w * y - z * x), -1, 1))
@@ -1752,6 +1822,33 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
                         }
                     )
                 entry["stop_hold_windows"] = windows
+            if coverage:
+                quality = {
+                    "complete": False,
+                    "kinematic_passed": False,
+                    "failures": ["incomplete first-attempt phase"],
+                }
+                if entry["complete"]:
+                    quality = score_command_phase(
+                        trace["command"][phase_steps[0], row],
+                        twist[phase_steps, row, :2],
+                        twist[phase_steps, row, 2],
+                        world_yaw[phase_steps, row],
+                        np.vstack(
+                            (
+                                trace["pre_position"][phase_steps[0], row, :2],
+                                trace["position"][phase_steps, row, :2],
+                            )
+                        ),
+                        np.unwrap(
+                            np.r_[
+                                pre_heading[phase_steps[0], row],
+                                heading[phase_steps, row],
+                            ]
+                        ),
+                        dt=dt,
+                    )
+                entry["command_quality"] = quality
             phases.append(entry)
         trials.append(
             {
@@ -1775,6 +1872,13 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
             trials[-1]["health"] = health(np.flatnonzero(selected), row)
         if native:
             trials[-1]["terrain_column_id"] = int(columns[row])
+        if coverage:
+            trials[-1]["command_screen_passed"] = (
+                outcome == "horizon_completed"
+                and all(
+                    phase["command_quality"]["kinematic_passed"] for phase in phases
+                )
+            )
     profiles = {}
     for name in names:
         group = [trial for trial in trials if trial["terrain"] == name]
@@ -1794,6 +1898,37 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
             ),
         }
     summary = {"profiles": profiles, "trials": trials}
+    if coverage:
+        passed = sum(trial["command_screen_passed"] for trial in trials)
+        summary["command_screen"] = {
+            "status": (
+                "DEVELOPMENT_PASS" if passed == len(trials) else "DEVELOPMENT_FAIL"
+            ),
+            "passed": passed,
+            "total": len(trials),
+            "limits": protocol["command_limits"],
+            "scope": protocol["scope"],
+            "profiles": {
+                name: sum(
+                    t["command_screen_passed"] for t in trials if t["terrain"] == name
+                )
+                for name in names
+            },
+            "phases": {
+                phase["name"]: {
+                    "expected": len(trials),
+                    "complete": sum(
+                        t["phases"][i]["command_quality"]["complete"] for t in trials
+                    ),
+                    "kinematic_passed": sum(
+                        t["phases"][i]["command_quality"]["kinematic_passed"]
+                        for t in trials
+                    ),
+                }
+                for i, phase in enumerate(protocol["phases"])
+            },
+            "exit_allowed": False,
+        }
     if version >= 2:
         summary.update(
             summary_version=f"go2_operator_proprio_summary_v{version}",
@@ -1842,6 +1977,7 @@ def evaluate_recurrent_operator(
     is_running,
     difficulty_range=None,
     long_stops=False,
+    command_coverage=False,
     seed=43,
 ):
     """Replay one clean deterministic first attempt; only the actor drives motors."""
@@ -1849,7 +1985,10 @@ def evaluate_recurrent_operator(
     from parkour_lab.learning.controller import ControllerSession, Sample
 
     protocol = recurrent_evaluation_protocol(
-        difficulty_range=difficulty_range, long_stops=long_stops, seed=seed
+        difficulty_range=difficulty_range,
+        long_stops=long_stops,
+        command_coverage=command_coverage,
+        seed=seed,
     )
     generator = env.cfg.scene.terrain.terrain_generator
     if env.cfg.seed != protocol["seed"] or generator.seed != protocol["seed"]:

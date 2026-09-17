@@ -14,7 +14,6 @@ from pathlib import Path
 import numpy as np
 import yaml
 
-
 DT = 0.02
 DURATION_S = 20.0
 STEPS = round(DURATION_S / DT)
@@ -489,6 +488,111 @@ def score_course_trace(trace: dict[str, np.ndarray], course: dict) -> dict:
     }
 
 
+def score_command_phase(
+    command, velocity, body_yaw, world_yaw, position, heading, *, dt=DT, thresholds=None
+):
+    """Complete-phase kinematics, not trajectory/terrain acceptance.
+
+    Position and unwrapped heading include the pre-command pose as sample zero;
+    velocities contain only post-physics samples. Callers retain failure/censoring.
+    """
+    th = thresholds or Thresholds()
+    cmd = np.asarray(command)
+    length = len(velocity)
+    block, settling = round(th.block_s / dt), round(th.settling_s / dt)
+    if (
+        length < settling
+        or velocity.shape != (length, 2)
+        or body_yaw.shape != (length,)
+        or world_yaw.shape != (length,)
+        or position.shape != (length + 1, 2)
+        or heading.shape != (length + 1,)
+        or cmd.shape != (3,)
+        or not all(
+            np.isfinite(a).all()
+            for a in (cmd, velocity, body_yaw, world_yaw, position, heading)
+        )
+    ):
+        raise ValueError(
+            "Command scoring requires a complete finite phase and onset pose"
+        )
+    planar_error = np.linalg.norm(velocity - cmd[:2], axis=-1)
+    yaw_error = np.maximum(np.abs(world_yaw - cmd[2]), np.abs(body_yaw - cmd[2]))
+    stationary = np.linalg.norm(cmd[:2]) == 0
+    yaw_limit = th.pivot_yaw_error_rad_s if stationary else th.moving_yaw_error_rad_s
+    planar_limit = th.stationary_speed_m_s if stationary else th.planar_error_m_s
+    # The first block ENDS at the acquisition deadline; late recovery cannot pass it.
+    blocks = [
+        {
+            "start_s": offset * dt,
+            "duration_s": (min(offset + block, length) - offset) * dt,
+            "planar_error_m_s": float(planar_error[offset : offset + block].mean()),
+            "yaw_error_rad_s": float(yaw_error[offset : offset + block].mean()),
+        }
+        for offset in range(settling - block, length, block)
+    ]
+    failed_blocks = [
+        i
+        for i, b in enumerate(blocks)
+        if b["planar_error_m_s"] > planar_limit or b["yaw_error_rad_s"] > yaw_limit
+    ]
+    failures = ["tracking not sustained after 1 s"] if failed_blocks else []
+    details = {
+        "complete": True,
+        "command": cmd.tolist(),
+        "blocks": blocks,
+        "failed_tracking_blocks": failed_blocks,
+        "acquisition_failed": 0 in failed_blocks,
+        "later_tracking_failed": any(i > 0 for i in failed_blocks),
+        "mean_body_yaw_rate_rad_s": (
+            float(body_yaw[settling:].mean()) if length > settling else None
+        ),
+        "mean_world_up_yaw_rate_rad_s": (
+            float(world_yaw[settling:].mean()) if length > settling else None
+        ),
+    }
+    if cmd[2] != 0:
+        wrong_sign = (
+            max(
+                float(np.mean(rate[settling:] * cmd[2] < 0))
+                for rate in (world_yaw, body_yaw)
+            )
+            if length > settling
+            else None
+        )
+        details["wrong_sign_fraction"] = wrong_sign
+        if wrong_sign is None:
+            failures.append("missing settled yaw samples")
+        elif wrong_sign > th.wrong_sign_fraction:
+            failures.append("excessive wrong-sign yaw")
+    if stationary:
+        excursion = float(np.linalg.norm(position[1:] - position[0], axis=-1).max())
+        drift = None
+        if length > settling:
+            drift = max(
+                float(
+                    np.linalg.norm(
+                        position[offset : offset + round(2 / dt) + 1]
+                        - position[offset],
+                        axis=-1,
+                    ).max()
+                )
+                for offset in range(settling + 1, len(position))
+            )
+        details.update(onset_excursion_m=excursion, maximum_settled_drift_2s_m=drift)
+        if excursion > th.stationary_onset_excursion_m or (
+            drift is not None and drift > th.stationary_drift_2s_m
+        ):
+            failures.append("excessive stationary drift/braking distance")
+        if cmd[2] == 0:
+            excursion = float(np.abs(heading[1:] - heading[0]).max())
+            details["heading_onset_excursion_rad"] = excursion
+            if excursion > th.zero_twist_heading_excursion_rad:
+                failures.append("excessive zero-twist heading drift")
+    details.update(failures=failures, kinematic_passed=not failures)
+    return details
+
+
 def score_trace(
     trace: dict[str, np.ndarray], labels: list[str], thresholds=None
 ) -> dict:
@@ -526,8 +630,6 @@ def score_trace(
         if trace[key].dtype != np.bool_:
             raise ValueError(f"{key} must be a boolean mask")
     results = []
-    block = round(th.block_s / DT)
-    settling = round(th.settling_s / DT)
     for env_id, label in enumerate(labels):
         failures, phase_reports = [], []
         sequence_failures = []
@@ -576,104 +678,25 @@ def score_trace(
                     phase_reports.append({"name": phase.name, "complete": False})
                     start = end
                     continue
-                failure_start = len(failures)
-                cmd = np.asarray(phase.command)
-                velocity = trace["linear_velocity_b"][start:end, env_id, :2]
-                yaw = trace["angular_velocity_w"][start:end, env_id, 2]
-                body_yaw = trace["angular_velocity_b"][start:end, env_id, 2]
-                planar_error = np.linalg.norm(velocity - cmd[:2], axis=-1)
-                # Keep both conventions explicit; require body and world-up rate.
-                yaw_error = np.maximum(np.abs(yaw - cmd[2]), np.abs(body_yaw - cmd[2]))
-                stationary = np.linalg.norm(cmd[:2]) == 0
-                yaw_limit = (
-                    th.pivot_yaw_error_rad_s
-                    if stationary
-                    else th.moving_yaw_error_rad_s
+                onset = (
+                    trace["initial_position"][env_id, :2]
+                    if start == 0
+                    else trace["position"][start - 1, env_id, :2]
                 )
-                planar_limit = (
-                    th.stationary_speed_m_s if stationary else th.planar_error_m_s
+                details = score_command_phase(
+                    phase.command,
+                    trace["linear_velocity_b"][start:end, env_id, :2],
+                    trace["angular_velocity_b"][start:end, env_id, 2],
+                    trace["angular_velocity_w"][start:end, env_id, 2],
+                    np.vstack((onset, trace["position"][start:end, env_id, :2])),
+                    heading[start : end + 1],
+                    thresholds=th,
                 )
-                blocks = []
-                # The block ENDING at the 1-s deadline must already track;
-                # good behavior starting later cannot satisfy acquisition.
-                for offset in range(settling - block, end - start, block):
-                    tail = slice(offset, min(offset + block, end - start))
-                    blocks.append(
-                        {
-                            "start_s": offset * DT,
-                            "duration_s": (tail.stop - offset) * DT,
-                            "planar_error_m_s": float(planar_error[tail].mean()),
-                            "yaw_error_rad_s": float(yaw_error[tail].mean()),
-                        }
-                    )
-                failed_blocks = [
-                    index
-                    for index, b in enumerate(blocks)
-                    if (
-                        b["planar_error_m_s"] > planar_limit
-                        or b["yaw_error_rad_s"] > yaw_limit
-                    )
+                details.update(name=phase.name, start_s=start * DT)
+                details["failures"] = [
+                    f"{phase.name}: {reason}" for reason in details["failures"]
                 ]
-                if failed_blocks:
-                    failures.append(f"{phase.name}: tracking not sustained after 1 s")
-                details = {
-                    "name": phase.name,
-                    "complete": True,
-                    "start_s": start * DT,
-                    "command": list(phase.command),
-                    "blocks": blocks,
-                    "failed_tracking_blocks": failed_blocks,
-                    "acquisition_failed": 0 in failed_blocks,
-                    "later_tracking_failed": any(i > 0 for i in failed_blocks),
-                    "mean_body_yaw_rate_rad_s": float(body_yaw[settling:].mean()),
-                    "mean_world_up_yaw_rate_rad_s": float(yaw[settling:].mean()),
-                }
-                if cmd[2] != 0:
-                    wrong_sign = max(
-                        float(np.mean(rate[settling:] * cmd[2] < 0))
-                        for rate in (yaw, body_yaw)
-                    )
-                    details["wrong_sign_fraction"] = wrong_sign
-                    if wrong_sign > th.wrong_sign_fraction:
-                        failures.append(f"{phase.name}: excessive wrong-sign yaw")
-                if stationary:
-                    position = trace["position"][start:end, env_id, :2]
-                    onset = (
-                        trace["initial_position"][env_id, :2]
-                        if start == 0
-                        else trace["position"][start - 1, env_id, :2]
-                    )
-                    excursion = float(np.linalg.norm(position - onset, axis=-1).max())
-                    drift = 0.0
-                    for offset in range(settling, len(position)):
-                        window = position[
-                            offset : min(offset + round(2 / DT) + 1, len(position))
-                        ]
-                        drift = max(
-                            drift,
-                            float(np.linalg.norm(window - window[0], axis=-1).max()),
-                        )
-                    details.update(
-                        onset_excursion_m=excursion, maximum_settled_drift_2s_m=drift
-                    )
-                    if (
-                        excursion > th.stationary_onset_excursion_m
-                        or drift > th.stationary_drift_2s_m
-                    ):
-                        failures.append(
-                            f"{phase.name}: excessive stationary drift/braking distance"
-                        )
-                    if cmd[2] == 0:
-                        # heading[start] is the pre-command pose, including at t=0.
-                        heading_excursion = float(
-                            np.abs(heading[start + 1 : end + 1] - heading[start]).max()
-                        )
-                        details["heading_onset_excursion_rad"] = heading_excursion
-                        if heading_excursion > th.zero_twist_heading_excursion_rad:
-                            failures.append(
-                                f"{phase.name}: excessive zero-twist heading drift"
-                            )
-                details["failures"] = failures[failure_start:]
+                failures.extend(details["failures"])
                 # Phase-local kinematics never override a whole-sequence fall,
                 # invalid state or attitude violation. This is NOT acceptance.
                 details["kinematic_passed"] = not details["failures"]
