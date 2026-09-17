@@ -402,7 +402,9 @@ PROPRIO_STOP_PRECISION_VERSION = "operator_proprio_stop_precision_v1"
 PROPRIO_TERRAIN_EXPOSURE_VERSION = "operator_proprio_terrain_exposure_v1"
 PROPRIO_ARRIVAL_HOLD_VERSION = "operator_proprio_arrival_hold_v1"
 PROPRIO_STANCE_VERSION = "operator_proprio_stance_v1"
-PROPRIO_ARRIVAL_VERSIONS = (PROPRIO_ARRIVAL_HOLD_VERSION, PROPRIO_STANCE_VERSION)
+PROPRIO_PIVOT_PRECISION_VERSION = "operator_proprio_pivot_precision_v1"
+PROPRIO_STANCE_VERSIONS = (PROPRIO_STANCE_VERSION, PROPRIO_PIVOT_PRECISION_VERSION)
+PROPRIO_ARRIVAL_VERSIONS = (PROPRIO_ARRIVAL_HOLD_VERSION, *PROPRIO_STANCE_VERSIONS)
 PROPRIO_MIXED_TERRAIN_VERSIONS = (
     PROPRIO_TERRAIN_EXPOSURE_VERSION,
     *PROPRIO_ARRIVAL_VERSIONS,
@@ -412,6 +414,7 @@ PROPRIO_REFINEMENT_VERSIONS = {
     "terrain_exposure": PROPRIO_TERRAIN_EXPOSURE_VERSION,
     "arrival_hold": PROPRIO_ARRIVAL_HOLD_VERSION,
     "stance": PROPRIO_STANCE_VERSION,
+    "pivot_precision": PROPRIO_PIVOT_PRECISION_VERSION,
     "stop_precision": PROPRIO_STOP_PRECISION_VERSION,
 }
 PROPRIO_JOINT_LIMIT_VERSION = "operator_proprio_acquisition_v2"
@@ -431,6 +434,16 @@ PROPRIO_UPRIGHT_VERSIONS = (
     PROPRIO_STOP_PRECISION_VERSION,
     *PROPRIO_MIXED_TERRAIN_VERSIONS,
 )
+# Shared by launch preflight and archived-checkpoint validation. A stance
+# restart is the unchanged-objective control, not an uninterrupted resume.
+PROPRIO_WARM_START_SOURCES = {
+    PROPRIO_ACQUISITION_VERSION: (PROPRIO_ACQUISITION_VERSION,),
+    PROPRIO_STOP_PRECISION_VERSION: (PROPRIO_ACQUISITION_VERSION,),
+    PROPRIO_TERRAIN_EXPOSURE_VERSION: (PROPRIO_ACQUISITION_VERSION,),
+    PROPRIO_ARRIVAL_HOLD_VERSION: (PROPRIO_TERRAIN_EXPOSURE_VERSION,),
+    PROPRIO_STANCE_VERSION: (PROPRIO_TERRAIN_EXPOSURE_VERSION, PROPRIO_STANCE_VERSION),
+    PROPRIO_PIVOT_PRECISION_VERSION: (PROPRIO_STANCE_VERSION,),
+}
 PROPRIO_TERRAIN_EXPOSURE_CHANGE = {
     "difficulty_range": [0.05, 0.35],
     "num_rows": 3,
@@ -456,6 +469,18 @@ PROPRIO_STANCE_CHANGE = {
     "cost": "L2 norm of all 12 measured joint positions minus native default positions, radians; not squared",
     "integration": "native RewardManager weight * step_dt exactly once",
     "scope": "soft posture prior, not a rigid stance or world-pose anchor; arrival sampler, moving/pivot rewards, actor and motors unchanged",
+}
+PROPRIO_PIVOT_PRECISION_CHANGE = {
+    "term": "track_lin_vel_xy_exp",
+    "function": "operator_rewards:track_lin_vel_xy_stationary",
+    "gate": "exact zero planar command and nonzero yaw command, either sign; no measured-speed gate",
+    "broad_std_m_s": 0.5,
+    "planar_std_m_s": 0.05,
+    "precision_fraction": 0.1,
+    "weight": 1.5,
+    "kernel": "0.9*exp(-planar_error_squared/0.5**2) + 0.1*exp(-planar_error_squared/0.05**2)",
+    "integration": "native RewardManager weight * step_dt exactly once",
+    "scope": "pure-pivot planar reward only; exact-zero and translating rewards, yaw objective, stance cost, commands, terrain, actor and motors unchanged; no pose anchor or inference assistance",
 }
 PROPRIO_REWARD_CHANGE = {
     "term": "dof_pos_limits",
@@ -721,7 +746,7 @@ def proprioceptive_procedural_configs(
         except ImportError:
             from operator_command import ProceduralArrivalHoldCommand
         cfg.commands.base_velocity.class_type = ProceduralArrivalHoldCommand
-    if acquisition_version == PROPRIO_STANCE_VERSION:
+    if acquisition_version in PROPRIO_STANCE_VERSIONS:
         from isaaclab.managers import RewardTermCfg
 
         try:
@@ -732,6 +757,26 @@ def proprioceptive_procedural_configs(
             func=joint_posture_stopped,
             weight=PROPRIO_STANCE_CHANGE["weight"],
             params={"command_name": "base_velocity"},
+        )
+    if acquisition_version == PROPRIO_PIVOT_PRECISION_VERSION:
+        try:
+            from .operator_rewards import track_lin_vel_xy_stationary
+        except ImportError:
+            from operator_rewards import track_lin_vel_xy_stationary
+        change = PROPRIO_PIVOT_PRECISION_CHANGE
+        term = cfg.rewards.track_lin_vel_xy_exp
+        if (
+            term.weight != change["weight"]
+            or term.params["std"] != change["broad_std_m_s"]
+        ):
+            raise ValueError(
+                "Pivot precision requires the unchanged stock tracking scale"
+            )
+        term.func = track_lin_vel_xy_stationary
+        term.params.update(
+            stationary_std=change["planar_std_m_s"],
+            precision_fraction=change["precision_fraction"],
+            pivot_only=True,
         )
     if acquisition_version == PROPRIO_STOP_PRECISION_VERSION:
         try:
@@ -2731,7 +2776,13 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         or protocol.get("stance_change")
         != (
             PROPRIO_STANCE_CHANGE
-            if protocol["version"] == PROPRIO_STANCE_VERSION
+            if protocol["version"] in PROPRIO_STANCE_VERSIONS
+            else None
+        )
+        or protocol.get("pivot_precision_change")
+        != (
+            PROPRIO_PIVOT_PRECISION_CHANGE
+            if protocol["version"] == PROPRIO_PIVOT_PRECISION_VERSION
             else None
         )
         or protocol["policy_version"] != metadata["policy_version"]
@@ -2780,11 +2831,7 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         if (
             protocol["version"] not in PROPRIO_UPRIGHT_VERSIONS
             or warm_start["version"]
-            != (
-                PROPRIO_TERRAIN_EXPOSURE_VERSION
-                if protocol["version"] in PROPRIO_ARRIVAL_VERSIONS
-                else PROPRIO_ACQUISITION_VERSION
-            )
+            not in PROPRIO_WARM_START_SOURCES.get(protocol["version"], ())
             or type(warm_start["learning_updates"]) is not int
             or warm_start["learning_updates"] < 1
             or type(warm_start["optimizer_steps"]) is not int
@@ -2977,15 +3024,12 @@ def recurrent_training_main(args, parser):
             if refinement:
                 import torch
 
-                required_source = (
-                    PROPRIO_TERRAIN_EXPOSURE_VERSION
-                    if PROPRIO_REFINEMENT_VERSIONS[args.procedural_refinement]
-                    in PROPRIO_ARRIVAL_VERSIONS
-                    else PROPRIO_ACQUISITION_VERSION
-                )
-                if archived_protocol["version"] != required_source:
+                required_sources = PROPRIO_WARM_START_SOURCES[
+                    PROPRIO_REFINEMENT_VERSIONS[args.procedural_refinement]
+                ]
+                if archived_protocol["version"] not in required_sources:
                     raise ValueError(
-                        f"This refinement requires a {required_source} recurrent source"
+                        f"This refinement requires a recurrent source in {required_sources}"
                     )
                 # Carry only the adaptive scalar, not Adam moments or its step count.
                 # Resetting it to the original recipe's 1e-3 can be a large LR jump.
@@ -3099,13 +3143,24 @@ def recurrent_training_main(args, parser):
                 arrival_hold_change=arrival_hold_manifest(),
                 scope="Arrival/long-hold/restart candidate from a bound terrain-exposure checkpoint; fresh Adam is NOT a matched continuation. Compare with the frozen source; no sampler-only causal claim, automatic selection or acceptance",
             )
-        if version == PROPRIO_STANCE_VERSION:
+        if version in PROPRIO_STANCE_VERSIONS:
             protocol.update(
                 stance_change=copy.deepcopy(PROPRIO_STANCE_CHANGE),
                 reward_profile=protocol["reward_profile"]
                 + "; exact-zero joint-posture L2 norm cost, weight=-0.1",
                 scope="Single stance-cost candidate with the unchanged arrival sampler. Compare equal-update arrival_hold and stance restarts from the same exposure checkpoint, seed and scalar LR; no automatic selection or acceptance",
             )
+        if warm_start["version"] == PROPRIO_STANCE_VERSION:
+            protocol["scope"] = (
+                "Matched stance versus pivot_precision restarts from the same stance checkpoint, seed, saved scalar LR and additional transitions. Fresh Adam in both arms; frozen source is a regression reference, not the matched control. Predeclare one endpoint; require joint yaw/translation/stop/physical-health retention, not improved return alone. Development only; no automatic selection or acceptance."
+            )
+        if version == PROPRIO_PIVOT_PRECISION_VERSION:
+            protocol["pivot_precision_change"] = copy.deepcopy(
+                PROPRIO_PIVOT_PRECISION_CHANGE
+            )
+            protocol[
+                "reward_profile"
+            ] += "; pure-pivot planar precision blend, fraction=0.1, std=0.05 m/s; yaw reward unchanged"
     if evaluation:
         try:
             from .operator_student_bridge import recurrent_evaluation_protocol
@@ -3508,12 +3563,12 @@ def main(argv=None):
     procedural.add_argument(
         "--procedural-refine-checkpoint",
         type=Path,
-        help="Warm-start from an immutable recurrent checkpoint (v3, or terrain_exposure for arrival_hold/stance); exact model/std and saved scalar LR, fresh Adam moments and recurrent state; not uninterrupted resume",
+        help="Warm-start from an immutable recurrent checkpoint: v3, terrain_exposure for arrival_hold/stance, or stance for stance/pivot_precision; exact model/std and saved scalar LR, fresh Adam moments and recurrent state; not uninterrupted resume",
     )
     parser.add_argument(
         "--procedural-refinement",
         choices=tuple(PROPRIO_REFINEMENT_VERSIONS),
-        help="With --procedural-refine-checkpoint: stock (default) restarts v3; terrain_exposure adds three fixed difficulty bands; arrival_hold adds long arrival/hold/restart commands; stance adds only a weak exact-zero posture cost to arrival_hold; stop_precision reproduces the rejected historical reward ablation",
+        help="With --procedural-refine-checkpoint: stock (default) restarts v3; terrain_exposure adds three fixed difficulty bands; arrival_hold adds long arrival/hold/restart commands; stance adds an exact-zero posture cost from exposure or restarts stance unchanged; pivot_precision changes only pure-pivot planar tracking from stance; stop_precision reproduces the rejected historical ablation",
     )
     procedural.add_argument(
         "--procedural-train",

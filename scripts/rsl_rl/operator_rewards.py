@@ -68,18 +68,25 @@ def track_lin_vel_xy_stationary(
     stationary_std: float,
     precision_fraction: float,
     full_stop_only: bool = False,
+    pivot_only: bool = False,
 ):
     """Blend fine planar tracking only when commanded planar velocity is zero.
 
     Both yaw signs use identical gating. Nonzero planar commands, even small
     ones, retain the exact broad reward. With full_stop_only, pure pivots also
-    retain the broad reward. Training command modes emit exact zeros.
+    retain the broad reward. With pivot_only, exact zero twist retains it
+    instead. These restrictions are mutually exclusive; defaults preserve
+    historical recipes. Training command modes emit exact zeros.
     """
+    if full_stop_only and pivot_only:
+        raise ValueError("full_stop_only and pivot_only are mutually exclusive")
     command = env.command_manager.get_command(command_name)
     velocity = env.scene["robot"].data.root_lin_vel_b[:, :2]
     error_squared = torch.sum(torch.square(command[:, :2] - velocity), dim=1)
     broad, fine = _kernels(error_squared, std, stationary_std, precision_fraction)
     stopped = torch.all((command if full_stop_only else command[:, :2]) == 0, dim=1)
+    if pivot_only:
+        stopped &= command[:, 2] != 0
     return torch.where(stopped, fine, broad)
 
 
