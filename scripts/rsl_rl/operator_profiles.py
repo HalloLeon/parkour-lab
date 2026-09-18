@@ -127,7 +127,9 @@ def apply_reward_profile(cfg, profile):
     if planar is not None:
         planar.params.pop("full_stop_only", None)
         planar.params.pop("pivot_only", None)
-    cfg.rewards.track_ang_vel_z_exp.params["std"] = profile.yaw_tracking_std
+    yaw = cfg.rewards.track_ang_vel_z_exp
+    yaw.params.pop("include_pivots", None)
+    yaw.params["std"] = profile.yaw_tracking_std
     if profile.stationary_precision:
         try:
             from . import operator_rewards

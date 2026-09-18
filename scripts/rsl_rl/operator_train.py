@@ -403,7 +403,12 @@ PROPRIO_TERRAIN_EXPOSURE_VERSION = "operator_proprio_terrain_exposure_v1"
 PROPRIO_ARRIVAL_HOLD_VERSION = "operator_proprio_arrival_hold_v1"
 PROPRIO_STANCE_VERSION = "operator_proprio_stance_v1"
 PROPRIO_PIVOT_PRECISION_VERSION = "operator_proprio_pivot_precision_v1"
-PROPRIO_STANCE_VERSIONS = (PROPRIO_STANCE_VERSION, PROPRIO_PIVOT_PRECISION_VERSION)
+PROPRIO_STATIONARY_YAW_VERSION = "operator_proprio_stationary_yaw_v1"
+PROPRIO_PIVOT_VERSIONS = (
+    PROPRIO_PIVOT_PRECISION_VERSION,
+    PROPRIO_STATIONARY_YAW_VERSION,
+)
+PROPRIO_STANCE_VERSIONS = (PROPRIO_STANCE_VERSION, *PROPRIO_PIVOT_VERSIONS)
 PROPRIO_ARRIVAL_VERSIONS = (PROPRIO_ARRIVAL_HOLD_VERSION, *PROPRIO_STANCE_VERSIONS)
 PROPRIO_MIXED_TERRAIN_VERSIONS = (
     PROPRIO_TERRAIN_EXPOSURE_VERSION,
@@ -415,6 +420,7 @@ PROPRIO_REFINEMENT_VERSIONS = {
     "arrival_hold": PROPRIO_ARRIVAL_HOLD_VERSION,
     "stance": PROPRIO_STANCE_VERSION,
     "pivot_precision": PROPRIO_PIVOT_PRECISION_VERSION,
+    "stationary_yaw": PROPRIO_STATIONARY_YAW_VERSION,
     "stop_precision": PROPRIO_STOP_PRECISION_VERSION,
 }
 PROPRIO_JOINT_LIMIT_VERSION = "operator_proprio_acquisition_v2"
@@ -443,6 +449,7 @@ PROPRIO_WARM_START_SOURCES = {
     PROPRIO_ARRIVAL_HOLD_VERSION: (PROPRIO_TERRAIN_EXPOSURE_VERSION,),
     PROPRIO_STANCE_VERSION: (PROPRIO_TERRAIN_EXPOSURE_VERSION, PROPRIO_STANCE_VERSION),
     PROPRIO_PIVOT_PRECISION_VERSION: (PROPRIO_STANCE_VERSION,),
+    PROPRIO_STATIONARY_YAW_VERSION: (PROPRIO_STANCE_VERSION,),
 }
 PROPRIO_TERRAIN_EXPOSURE_CHANGE = {
     "difficulty_range": [0.05, 0.35],
@@ -481,6 +488,18 @@ PROPRIO_PIVOT_PRECISION_CHANGE = {
     "kernel": "0.9*exp(-planar_error_squared/0.5**2) + 0.1*exp(-planar_error_squared/0.05**2)",
     "integration": "native RewardManager weight * step_dt exactly once",
     "scope": "pure-pivot planar reward only; exact-zero and translating rewards, yaw objective, stance cost, commands, terrain, actor and motors unchanged; no pose anchor or inference assistance",
+}
+PROPRIO_STATIONARY_YAW_CHANGE = {
+    "term": "track_ang_vel_z_exp",
+    "function": "operator_rewards:track_ang_vel_z_stopped",
+    "gate": "exact zero planar command; full stops and pure pivots of either sign; no measured-speed gate",
+    "broad_std_rad_s": 0.5,
+    "yaw_std_rad_s": 0.1,
+    "precision_fraction": 0.1,
+    "weight": 0.75,
+    "kernel": "0.9*exp(-yaw_error_squared/0.5**2) + 0.1*exp(-yaw_error_squared/0.1**2)",
+    "integration": "native RewardManager weight * step_dt exactly once",
+    "scope": "angular delta on top of pivot_precision; keep its planar term and stance cost; translating/arc rewards, commands, terrain, actor and motors unchanged; no heading anchor or inference assistance",
 }
 PROPRIO_REWARD_CHANGE = {
     "term": "dof_pos_limits",
@@ -758,7 +777,7 @@ def proprioceptive_procedural_configs(
             weight=PROPRIO_STANCE_CHANGE["weight"],
             params={"command_name": "base_velocity"},
         )
-    if acquisition_version == PROPRIO_PIVOT_PRECISION_VERSION:
+    if acquisition_version in PROPRIO_PIVOT_VERSIONS:
         try:
             from .operator_rewards import track_lin_vel_xy_stationary
         except ImportError:
@@ -777,6 +796,26 @@ def proprioceptive_procedural_configs(
             stationary_std=change["planar_std_m_s"],
             precision_fraction=change["precision_fraction"],
             pivot_only=True,
+        )
+    if acquisition_version == PROPRIO_STATIONARY_YAW_VERSION:
+        try:
+            from .operator_rewards import track_ang_vel_z_stopped
+        except ImportError:
+            from operator_rewards import track_ang_vel_z_stopped
+        change = PROPRIO_STATIONARY_YAW_CHANGE
+        term = cfg.rewards.track_ang_vel_z_exp
+        if (
+            term.weight != change["weight"]
+            or term.params["std"] != change["broad_std_rad_s"]
+        ):
+            raise ValueError(
+                "Stationary yaw requires the unchanged stock tracking scale"
+            )
+        term.func = track_ang_vel_z_stopped
+        term.params.update(
+            stationary_std=change["yaw_std_rad_s"],
+            precision_fraction=change["precision_fraction"],
+            include_pivots=True,
         )
     if acquisition_version == PROPRIO_STOP_PRECISION_VERSION:
         try:
@@ -2782,7 +2821,13 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         or protocol.get("pivot_precision_change")
         != (
             PROPRIO_PIVOT_PRECISION_CHANGE
-            if protocol["version"] == PROPRIO_PIVOT_PRECISION_VERSION
+            if protocol["version"] in PROPRIO_PIVOT_VERSIONS
+            else None
+        )
+        or protocol.get("stationary_yaw_change")
+        != (
+            PROPRIO_STATIONARY_YAW_CHANGE
+            if protocol["version"] == PROPRIO_STATIONARY_YAW_VERSION
             else None
         )
         or protocol["policy_version"] != metadata["policy_version"]
@@ -3154,13 +3199,20 @@ def recurrent_training_main(args, parser):
             protocol["scope"] = (
                 "Matched stance versus pivot_precision restarts from the same stance checkpoint, seed, saved scalar LR and additional transitions. Fresh Adam in both arms; frozen source is a regression reference, not the matched control. Predeclare one endpoint; require joint yaw/translation/stop/physical-health retention, not improved return alone. Development only; no automatic selection or acceptance."
             )
-        if version == PROPRIO_PIVOT_PRECISION_VERSION:
+        if version in PROPRIO_PIVOT_VERSIONS:
             protocol["pivot_precision_change"] = copy.deepcopy(
                 PROPRIO_PIVOT_PRECISION_CHANGE
             )
+        if version == PROPRIO_PIVOT_PRECISION_VERSION:
             protocol[
                 "reward_profile"
             ] += "; pure-pivot planar precision blend, fraction=0.1, std=0.05 m/s; yaw reward unchanged"
+        if version == PROPRIO_STATIONARY_YAW_VERSION:
+            protocol.update(
+                stationary_yaw_change=copy.deepcopy(PROPRIO_STATIONARY_YAW_CHANGE),
+                reward_profile="stance cost and pure-pivot planar precision retained; stop/pure-pivot angular precision fraction=0.1, std=0.1 rad/s; translating kernels unchanged; flat_orientation_l2=-2.5, feet_air_time=0.01, dof_pos_limits=-10; no action-retention loss",
+                scope="One angular-reward delta versus pivot_precision from the same stance checkpoint, seed, saved scalar LR and additional transitions; fresh Adam in both. An archived comparator is valid only after configuration/source compatibility checks. Sequential single-seed development ablation, not independent replication or held-out acceptance. Predeclare one endpoint; require joint stop/yaw/translation/physical-health retention; retain the frozen stance source if neither improves. No automatic selection or extension.",
+            )
     if evaluation:
         try:
             from .operator_student_bridge import recurrent_evaluation_protocol
@@ -3563,12 +3615,12 @@ def main(argv=None):
     procedural.add_argument(
         "--procedural-refine-checkpoint",
         type=Path,
-        help="Warm-start from an immutable recurrent checkpoint: v3, terrain_exposure for arrival_hold/stance, or stance for stance/pivot_precision; exact model/std and saved scalar LR, fresh Adam moments and recurrent state; not uninterrupted resume",
+        help="Warm-start from an immutable recurrent checkpoint: v3, terrain_exposure for arrival_hold/stance, or stance for stance/pivot_precision/stationary_yaw; exact model/std and saved scalar LR, fresh Adam moments and recurrent state; not uninterrupted resume",
     )
     parser.add_argument(
         "--procedural-refinement",
         choices=tuple(PROPRIO_REFINEMENT_VERSIONS),
-        help="With --procedural-refine-checkpoint: stock (default) restarts v3; terrain_exposure adds three fixed difficulty bands; arrival_hold adds long arrival/hold/restart commands; stance adds an exact-zero posture cost from exposure or restarts stance unchanged; pivot_precision changes only pure-pivot planar tracking from stance; stop_precision reproduces the rejected historical ablation",
+        help="With --procedural-refine-checkpoint: stock (default) restarts v3; terrain_exposure adds three fixed difficulty bands; arrival_hold adds long arrival/hold/restart commands; stance adds an exact-zero posture cost from exposure or restarts stance unchanged; pivot_precision changes only pure-pivot planar tracking from stance; stationary_yaw adds stop/pure-pivot angular precision to that recipe, also starting from stance; stop_precision reproduces the rejected historical ablation",
     )
     procedural.add_argument(
         "--procedural-train",
