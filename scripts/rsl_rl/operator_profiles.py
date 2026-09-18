@@ -129,6 +129,7 @@ def apply_reward_profile(cfg, profile):
         planar.params.pop("pivot_only", None)
     yaw = cfg.rewards.track_ang_vel_z_exp
     yaw.params.pop("include_pivots", None)
+    yaw.params.pop("full_stop_std", None)
     yaw.params["std"] = profile.yaw_tracking_std
     if profile.stationary_precision:
         try:

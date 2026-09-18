@@ -97,17 +97,23 @@ def track_ang_vel_z_stopped(
     stationary_std: float,
     precision_fraction: float,
     include_pivots: bool = False,
+    full_stop_std: float | None = None,
 ):
     """Blend fine yaw tracking at zero twist, optionally including pure pivots.
 
     The default preserves historical stop-only recipes. With include_pivots,
     both yaw signs track their commanded rate, not zero. Every nonzero planar
     command retains the exact broad reward, including tiny commands and arcs.
+    full_stop_std optionally changes only the fine width at exact zero twist;
+    the mixture fraction and pure-pivot kernel stay unchanged.
     This stateless rate objective is not absolute heading restoration.
     """
     command = env.command_manager.get_command(command_name)
     yaw_rate = env.scene["robot"].data.root_ang_vel_b[:, 2]
     error_squared = torch.square(command[:, 2] - yaw_rate)
     broad, fine = _kernels(error_squared, std, stationary_std, precision_fraction)
+    if full_stop_std is not None:
+        _, stop_fine = _kernels(error_squared, std, full_stop_std, precision_fraction)
+        fine = torch.where(torch.all(command == 0, dim=1), stop_fine, fine)
     stationary = torch.all((command[:, :2] if include_pivots else command) == 0, dim=1)
     return torch.where(stationary, fine, broad)
