@@ -21,11 +21,13 @@ from torch import nn
 # Compatibility exports for existing training, audit and evaluation callers.
 from parkour_lab.learning.recurrent_operator import (
     RECURRENT_OPERATOR_VERSION,
+    RECURRENT_RESUME_MODE,
     RecurrentOperatorAdapter,
     _recurrent_actor_sha256,
     build_recurrent_operator_policy as build_recurrent_operator_policy,
     load_recurrent_checkpoint as load_recurrent_checkpoint,
     recurrent_policy_config,
+    restore_recurrent_optimizer,
 )
 
 VERSION = "go2_operator_velocity_student_v1"
@@ -839,10 +841,12 @@ def run_recurrent_training(
     iterations,
     initial_policy=None,
     warm_start=None,
+    resume_from=None,
+    optimizer_state=None,
     terrain_rows=1,
     terrain_difficulty=(0.05, 0.15),
 ):
-    """Native PPO with fresh Adam and bounded-memory audits; no acceptance claim.
+    """Native PPO with explicit initialization and bounded-memory training audits.
 
     The caller owns the environment, protocol and artifact publication. Native
     PPO/rollout storage are unchanged. Only observation delivery, update checks,
@@ -859,13 +863,31 @@ def run_recurrent_training(
     )
 
     expected_groups = {"policy": ["proprio"], "critic": ["policy", "terrain"]}
-    if (initial_policy is None) != (warm_start is None):
+    source_binding = resume_from if resume_from is not None else warm_start
+    if (initial_policy is None) != (source_binding is None):
         raise ValueError(
             "A recurrent warm start requires both policy and source lineage"
         )
     initialization = (
         {} if warm_start is None else {"warm_start": copy.deepcopy(warm_start)}
     )
+    if (resume_from is None) != (optimizer_state is None):
+        raise ValueError("Resume requires both source lineage and saved Adam state")
+    start_updates = 0
+    if resume_from is not None:
+        start_updates = resume_from["learning_updates"]
+        if (
+            resume_from["mode"] != RECURRENT_RESUME_MODE
+            or type(start_updates) is not int
+            or start_updates < 1
+            or resume_from["optimizer_steps"]
+            != start_updates
+            * runner_cfg["algorithm"]["num_learning_epochs"]
+            * runner_cfg["algorithm"]["num_mini_batches"]
+        ):
+            raise ValueError("Invalid recurrent resume mode or update counters")
+        initialization["resume_from"] = copy.deepcopy(resume_from)
+    final_updates = start_updates + iterations
     command = env.command_manager.get_term("base_velocity")
     terrain_cfg = env.cfg.scene.terrain
     generator = terrain_cfg.terrain_generator
@@ -909,7 +931,7 @@ def run_recurrent_training(
         or getattr(terrain_cfg, "max_init_terrain_level", None) != terrain_rows - 1
     ):
         raise ValueError(
-            "Require fresh native GRU/PPO with direct commands and matching static terrain rows/range"
+            "Require native GRU/PPO with direct commands and matching static terrain rows/range"
         )
     recipe = copy.deepcopy(runner_cfg)
     output = Path(output)
@@ -978,6 +1000,29 @@ def run_recurrent_training(
         "partial_reset_steps": 0,
         "adapter_comparisons": 0,
     }
+
+    def training_counts():
+        control_steps = (
+            start_updates * runner_cfg["num_steps_per_env"] + stats["control_steps"]
+        )
+        return {
+            **stats,
+            "learning_updates": start_updates + stats["learning_updates"],
+            "control_steps": control_steps,
+            "environment_transitions": control_steps * env.num_envs,
+            **(
+                {
+                    "session_learning_updates": stats["learning_updates"],
+                    "session_control_steps": stats["control_steps"],
+                    "session_environment_transitions": stats["control_steps"]
+                    * env.num_envs,
+                    "training_metrics_scope": "current session only; prior exposures, resets and simulator/command/GRU/RNG state are not restored",
+                }
+                if resume_from is not None
+                else {}
+            ),
+        }
+
     robot, term = env.scene["robot"].data, env.action_manager.get_term("joint_pos")
     arrival = None
     if hasattr(command, "arrival_plan"):
@@ -1233,8 +1278,8 @@ def run_recurrent_training(
 
     wrapped = DeliveredEnvironment()
     binding, motor_hash = _runtime_motor_binding(env)
-    if warm_start is not None and any(
-        binding[key] != warm_start[key]
+    if source_binding is not None and any(
+        binding[key] != source_binding[key]
         for key in ("joint_names", "default_position_rad")
     ):
         raise ValueError(
@@ -1256,17 +1301,16 @@ def run_recurrent_training(
         checkpoint = None
 
         def save(self, path, infos=None):
-            completed = stats["learning_updates"]
+            completed = start_updates + stats["learning_updates"]
             if completed == self.published_updates or (
-                completed != iterations
+                completed != final_updates
                 and completed % self.save_interval
                 and completed % 50
             ):
                 return
             metadata = {
                 "policy_version": RECURRENT_OPERATOR_VERSION,
-                **stats,
-                "environment_transitions": stats["control_steps"] * env.num_envs,
+                **training_counts(),
                 "recipe": recipe,
                 "controller_manifest": extract(self.alg.policy).spec.manifest(),
                 "actor_artifact_identity": "named_actor_state_tensor_sha256",
@@ -1275,10 +1319,10 @@ def run_recurrent_training(
                 **exposure_metrics(),
                 **arrival_metrics(),
                 "exit_allowed": False,
-                "resume_supported": False,
+                "resume_supported": True,
                 **initialization,
             }
-            if completed == iterations or completed % self.save_interval == 0:
+            if completed == final_updates or completed % self.save_interval == 0:
                 self.checkpoint = f"model_{completed}.pt"
                 super().save(
                     str(output / self.checkpoint),
@@ -1308,6 +1352,11 @@ def run_recurrent_training(
     runner = TrainingRunner(wrapped, copy.deepcopy(runner_cfg), str(output), env.device)
     if initial_policy is not None:
         policy = runner.alg.policy
+        initial_rate = (
+            runner_cfg["algorithm"]["learning_rate"]
+            if resume_from is not None
+            else warm_start["learning_rate"]
+        )
         expected = {
             k: v.detach().to(env.device) for k, v in initial_policy.state_dict().items()
         }
@@ -1317,20 +1366,27 @@ def run_recurrent_training(
                 not torch.equal(value, expected[key])
                 for key, value in policy.state_dict().items()
             )
-            or _recurrent_actor_sha256(policy) != warm_start["actor_sha256"]
+            or _recurrent_actor_sha256(policy) != source_binding["actor_sha256"]
             or not torch.isfinite(policy.log_std.exp()).all()
             or torch.any(policy.log_std.exp() <= 0)
             or not all(p.requires_grad for p in policy.parameters())
             or runner.alg.optimizer.state
-            or runner.alg.learning_rate != warm_start["learning_rate"]
-            or any(
-                g["lr"] != warm_start["learning_rate"]
-                for g in runner.alg.optimizer.param_groups
-            )
+            or runner.alg.learning_rate != initial_rate
+            or any(g["lr"] != initial_rate for g in runner.alg.optimizer.param_groups)
             or any(h is not None for h in policy.get_hidden_states())
         ):
             raise RuntimeError(
                 "Warm-start model, fresh optimizer/LR or recurrent state differs"
+            )
+        if resume_from is not None:
+            restore_recurrent_optimizer(
+                runner.alg, optimizer_state, resume_from["optimizer_steps"]
+            )
+            if runner.alg.learning_rate != resume_from["learning_rate"]:
+                raise ValueError("Restored live LR differs from resume lineage")
+            runner.current_learning_iteration = start_updates
+            runner.tot_timesteps = (
+                start_updates * runner.num_steps_per_env * env.num_envs
             )
     wrapped.runner = runner
     adapter = extract(runner.alg.policy)
@@ -1388,11 +1444,11 @@ def run_recurrent_training(
     if (
         stats["learning_updates"] != iterations
         or stats["control_steps"] != iterations * runner.num_steps_per_env
-        or runner.saved_updates != iterations
+        or runner.saved_updates != final_updates
     ):
         raise RuntimeError("Incomplete recurrent learning budget or final checkpoint")
     optimizer_steps = (
-        iterations * runner.alg.num_learning_epochs * runner.alg.num_mini_batches
+        final_updates * runner.alg.num_learning_epochs * runner.alg.num_mini_batches
     )
     if set(runner.alg.optimizer.state) != set(runner.alg.policy.parameters()):
         raise RuntimeError("Native Adam state does not cover every policy parameter")
@@ -1405,8 +1461,7 @@ def run_recurrent_training(
         "status": "TRAINING_COMPLETED_NOT_ACCEPTED",
         "policy_version": RECURRENT_OPERATOR_VERSION,
         **initialization,
-        **stats,
-        "environment_transitions": stats["control_steps"] * env.num_envs,
+        **training_counts(),
         "checkpoint": runner.checkpoint,
         "optimizer_steps": optimizer_steps,
         "updated_parameter_groups": list(groups),

@@ -17,6 +17,7 @@ import contextlib
 import hashlib
 import io
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -24,6 +25,7 @@ from torch import nn
 
 
 RECURRENT_OPERATOR_VERSION = "go2_operator_proprio_gru_v1"
+RECURRENT_RESUME_MODE = "model_adam_fresh_environment_v1"
 FRAME_DIM = 45
 FRAME_TERMS = (
     ("base_ang_vel", 3),
@@ -97,7 +99,7 @@ def _recurrent_actor_sha256(policy):
 
 
 def load_recurrent_checkpoint(path, device="cpu"):
-    """Strict native state loading; no pickled callables, resume or oracle adapter."""
+    """Strict policy loading; training continuation restores Adam separately."""
     from tensordict import TensorDict
 
     def file_sha256(path):
@@ -133,7 +135,7 @@ def load_recurrent_checkpoint(path, device="cpu"):
             or metadata["environment_transitions"] < metadata["control_steps"]
             or metadata["environment_transitions"] % metadata["control_steps"]
             or metadata["exit_allowed"] is not False
-            or metadata["resume_supported"] is not False
+            or type(metadata["resume_supported"]) is not bool
             or metadata["actor_artifact_identity"] != "named_actor_state_tensor_sha256"
             or manifest["actuator_profile"]
             != "native_motor_sha256:" + metadata["motor_binding_sha256"]
@@ -141,6 +143,24 @@ def load_recurrent_checkpoint(path, device="cpu"):
             raise ValueError(
                 "Recurrent checkpoint metadata differs from the native recipe"
             )
+        resumed = metadata.get("resume_from")
+        if resumed is not None:
+            start = resumed["learning_updates"]
+            if (
+                metadata["resume_supported"] is not True
+                or resumed["mode"] != RECURRENT_RESUME_MODE
+                or type(start) is not int
+                or not 0 < start < updates
+                or type(metadata["session_learning_updates"]) is not int
+                or metadata["session_learning_updates"] != updates - start
+                or type(metadata["session_control_steps"]) is not int
+                or metadata["session_control_steps"]
+                != (updates - start) * recipe["num_steps_per_env"]
+                or type(metadata["session_environment_transitions"]) is not int
+                or metadata["session_environment_transitions"]
+                != metadata["environment_transitions"] // updates * (updates - start)
+            ):
+                raise ValueError("Invalid resumed checkpoint/session accounting")
         json.dumps(metadata, allow_nan=False)
         observations = TensorDict(
             {
@@ -182,6 +202,75 @@ def load_recurrent_checkpoint(path, device="cpu"):
     if file_sha256(path) != digest:
         raise ValueError("Recurrent checkpoint changed while loading")
     return policy.to(device), copy.deepcopy(metadata), digest
+
+
+def validate_recurrent_optimizer(policy, state, expected_steps):
+    """Validate native Adam's order, options, moments and completed step count."""
+    groups = state["param_groups"]
+    if len(groups) != 1 or set(state) != {"state", "param_groups"}:
+        raise ValueError("Require one complete native Adam parameter group")
+    rate = groups[0]["lr"]
+    if type(rate) is not float or not math.isfinite(rate) or not 0 < rate <= 0.01:
+        raise ValueError("Invalid saved Adam learning rate")
+    parameters = list(policy.parameters())
+    template = torch.optim.Adam(parameters, lr=rate).state_dict()["param_groups"][0]
+    actual = dict(groups[0])
+    # Newer PyTorch writes this explicit false default; older Adam omits it.
+    template.setdefault("decoupled_weight_decay", False)
+    actual.setdefault("decoupled_weight_decay", False)
+    if (
+        actual != template
+        or type(expected_steps) is not int
+        or expected_steps < 1
+        or set(state["state"]) != set(range(len(parameters)))
+    ):
+        raise ValueError("Saved Adam options, parameter order or coverage differs")
+    for index, parameter in enumerate(parameters):
+        values = state["state"][index]
+        if set(values) != {"step", "exp_avg", "exp_avg_sq"}:
+            raise ValueError("Incomplete Adam moments")
+        step = values["step"]
+        if (
+            not isinstance(step, torch.Tensor)
+            or step.shape != ()
+            or step.dtype != torch.float32
+            or not torch.isfinite(step)
+            or step.item() != expected_steps
+        ):
+            raise ValueError("Saved Adam step count differs from completed updates")
+        for name in ("exp_avg", "exp_avg_sq"):
+            value = values[name]
+            _check_tensor(value, parameter.shape, f"Adam {index} {name}")
+            if value.dtype != parameter.dtype or (
+                name == "exp_avg_sq" and torch.any(value < 0)
+            ):
+                raise ValueError("Invalid Adam moment dtype or variance")
+    return rate
+
+
+def restore_recurrent_optimizer(algorithm, state, expected_steps):
+    """Restore Adam and PPO's adaptive LR scalar without a silent fresh restart."""
+    if type(algorithm.optimizer) is not torch.optim.Adam or algorithm.optimizer.state:
+        raise ValueError("Restore Adam once into a fresh native optimizer")
+    parameters = list(algorithm.policy.parameters())
+    groups = algorithm.optimizer.param_groups
+    if len(groups) != 1 or [id(p) for p in groups[0]["params"]] != [
+        id(p) for p in parameters
+    ]:
+        raise ValueError("Native Adam parameters differ from policy order")
+    rate = validate_recurrent_optimizer(algorithm.policy, state, expected_steps)
+    algorithm.optimizer.load_state_dict(copy.deepcopy(state))
+    algorithm.learning_rate = rate
+    restored = algorithm.optimizer.state_dict()
+    expected_groups = copy.deepcopy(state["param_groups"])
+    for group in (*restored["param_groups"], *expected_groups):
+        group.setdefault("decoupled_weight_decay", False)
+    if restored["param_groups"] != expected_groups or any(
+        not torch.equal(value.cpu(), restored["state"][index][key].cpu())
+        for index, values in state["state"].items()
+        for key, value in values.items()
+    ):
+        raise RuntimeError("Adam state was not restored exactly")
 
 
 class RecurrentOperatorAdapter:
