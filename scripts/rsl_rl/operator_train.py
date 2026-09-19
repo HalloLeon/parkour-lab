@@ -3010,6 +3010,7 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
         difficulty_range=getattr(args, "evaluation_difficulty", None),
         long_stops=getattr(args, "evaluation_long_stops", False),
         command_coverage=getattr(args, "evaluation_command_coverage", False),
+        negative_pivot_first=getattr(args, "evaluation_negative_pivot_first", False),
         seed=args.seed,
     )
     cfg.seed = cfg.scene.terrain.terrain_generator.seed = args.seed
@@ -3350,6 +3351,7 @@ def recurrent_training_main(args, parser):
             difficulty_range=args.evaluation_difficulty,
             long_stops=args.evaluation_long_stops,
             command_coverage=args.evaluation_command_coverage,
+            negative_pivot_first=args.evaluation_negative_pivot_first,
             seed=args.seed,
         )
         protocol = {
@@ -3446,6 +3448,11 @@ def recurrent_training_main(args, parser):
                         *(
                             ["--evaluation-command-coverage"]
                             if args.evaluation_command_coverage
+                            else []
+                        ),
+                        *(
+                            ["--evaluation-negative-pivot-first"]
+                            if args.evaluation_negative_pivot_first
                             else []
                         ),
                     ]
@@ -3686,6 +3693,7 @@ def recurrent_training_main(args, parser):
                 difficulty_range=args.evaluation_difficulty,
                 long_stops=args.evaluation_long_stops,
                 command_coverage=args.evaluation_command_coverage,
+                negative_pivot_first=args.evaluation_negative_pivot_first,
                 seed=args.seed,
             )
             np.savez_compressed(output / "trace.npz", **trace)
@@ -3823,6 +3831,11 @@ def main(argv=None):
         action="store_true",
         help="With --evaluation-difficulty, instead of --evaluation-long-stops: fixed 63-second frozen screen with longer reverse/pivots, flat slow/lateral commands and prospective development control limits; no acceptance",
     )
+    parser.add_argument(
+        "--evaluation-negative-pivot-first",
+        action="store_true",
+        help="With --evaluation-command-coverage: swap only the two 6-second pivots; retain the first 25 seconds, suffix and thresholds. Separate frozen order/sign diagnostic, not canonical coverage or acceptance",
+    )
     procedural.add_argument(
         "--procedural-config-check",
         action="store_true",
@@ -3953,6 +3966,7 @@ def main(argv=None):
         args.evaluation_difficulty is not None
         or args.evaluation_long_stops
         or args.evaluation_command_coverage
+        or args.evaluation_negative_pivot_first
     ):
         if not evaluation:
             parser.error("Evaluation options require --procedural-evaluate-checkpoint")
@@ -3965,6 +3979,7 @@ def main(argv=None):
                 difficulty_range=args.evaluation_difficulty,
                 long_stops=args.evaluation_long_stops,
                 command_coverage=args.evaluation_command_coverage,
+                negative_pivot_first=args.evaluation_negative_pivot_first,
                 seed=args.seed if args.seed is not None else 43,
             )
         except ValueError as error:

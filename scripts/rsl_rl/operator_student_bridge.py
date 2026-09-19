@@ -51,7 +51,12 @@ CONTROLLER_ROLLOUT_COMMANDS = (
 
 
 def recurrent_evaluation_protocol(
-    *, difficulty_range=None, long_stops=False, command_coverage=False, seed=43
+    *,
+    difficulty_range=None,
+    long_stops=False,
+    command_coverage=False,
+    negative_pivot_first=False,
+    seed=43,
 ):
     """Predeclared clean-sensor first-attempt screen, not an acceptance gate."""
     if type(seed) is not int or seed not in (43, 44, 45):
@@ -60,6 +65,8 @@ def recurrent_evaluation_protocol(
         raise ValueError("Extended evaluation requires an explicit terrain difficulty")
     if long_stops and command_coverage:
         raise ValueError("Choose long stops or command coverage, not both")
+    if negative_pivot_first and not command_coverage:
+        raise ValueError("Negative-pivot-first diagnostic requires command coverage")
     phases = (
         ("cold_stand", 1, (0, 0, 0)),
         ("forward", 4, (0.55, 0, 0)),
@@ -180,6 +187,26 @@ def recurrent_evaluation_protocol(
                 "No terrain, health, sensing, watchdog, deployment or exit acceptance."
             ),
         )
+        if negative_pivot_first:
+            # Keep phase names attached to their command sign. The entry state
+            # is shared until 25 s, but trajectories can diverge after the swap.
+            phases[6], phases[7] = phases[7], phases[6]
+            protocol.update(
+                version="go2_operator_proprio_negative_pivot_first_v1",
+                comparison_protocol="go2_operator_proprio_command_coverage_v1",
+                common_prefix_control_steps=1250,
+                scope=(
+                    "Frozen 63-second negative-pivot-first diagnostic: swap only the two "
+                    "6-second pure pivots in command coverage. The first 25 seconds, "
+                    "suffix packets, durations and all development limits are unchanged. "
+                    "GRU memory persists. Compare matching checkpoint/seed/difficulty "
+                    "and verify recorded prefix-state parity before attributing differences "
+                    "to the intervention. Later terrain contacts/history may diverge: "
+                    "this tests order versus sign, not isolated yaw-sign causality. "
+                    "No learning, checkpoint selection, replacement of canonical coverage "
+                    "or terrain/health/sensing/watchdog/deployment/exit acceptance."
+                ),
+            )
     return protocol
 
 
@@ -1487,12 +1514,18 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
         raise ValueError("Unsupported recurrent evaluation summary version")
     protocol = recurrent_evaluation_protocol() if protocol is None else protocol
     native = protocol.get("native_diagnostics") == "joint_actuator_contact_v1"
-    coverage = protocol.get("version") == "go2_operator_proprio_command_coverage_v1"
+    negative_pivot_first = (
+        protocol.get("version") == "go2_operator_proprio_negative_pivot_first_v1"
+    )
+    coverage = negative_pivot_first or (
+        protocol.get("version") == "go2_operator_proprio_command_coverage_v1"
+    )
     if coverage or "command_limits" in protocol:
         expected = recurrent_evaluation_protocol(
             difficulty_range=protocol.get("difficulty_range"),
             seed=protocol.get("seed"),
             command_coverage=True,
+            negative_pivot_first=negative_pivot_first,
         )
         if any(protocol.get(key) != value for key, value in expected.items()):
             raise ValueError("Command coverage tape or development limits differ")
@@ -2033,6 +2066,7 @@ def evaluate_recurrent_operator(
     difficulty_range=None,
     long_stops=False,
     command_coverage=False,
+    negative_pivot_first=False,
     seed=43,
 ):
     """Replay one clean deterministic first attempt; only the actor drives motors."""
@@ -2043,6 +2077,7 @@ def evaluate_recurrent_operator(
         difficulty_range=difficulty_range,
         long_stops=long_stops,
         command_coverage=command_coverage,
+        negative_pivot_first=negative_pivot_first,
         seed=seed,
     )
     generator = env.cfg.scene.terrain.terrain_generator
