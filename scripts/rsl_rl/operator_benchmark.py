@@ -83,6 +83,7 @@ def make_recorder_cfg(*, procedural=False):
             self.course = None
             self.procedural = procedural
             self.actuator_diagnostics = False
+            self.root_point_diagnostics = False
             env.operator_capture = self
 
         def record_pre_step(self):
@@ -159,6 +160,12 @@ def make_recorder_cfg(*, procedural=False):
                         sample[name + "_substeps"] = torch.stack(
                             [pair[index] for pair in self.actuator_substeps], dim=1
                         )
+                if self.root_point_diagnostics:
+                    sample.update(
+                        root_com_pos_w=robot.root_com_pos_w.clone(),
+                        root_link_lin_vel_b=robot.root_link_lin_vel_b.clone(),
+                        body_com_pos_b=robot.body_com_pos_b[:, 0].clone(),
+                    )
                 if self.course is not None:
                     route_state = self._env._parkour_runtime.route
                     params = self._env.termination_manager.get_term_cfg(

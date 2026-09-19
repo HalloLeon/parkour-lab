@@ -69,6 +69,7 @@ def track_lin_vel_xy_stationary(
     precision_fraction: float,
     full_stop_only: bool = False,
     pivot_only: bool = False,
+    root_link_velocity: bool = False,
 ):
     """Blend fine planar tracking only when commanded planar velocity is zero.
 
@@ -77,11 +78,17 @@ def track_lin_vel_xy_stationary(
     retain the broad reward. With pivot_only, exact zero twist retains it
     instead. These restrictions are mutually exclusive; defaults preserve
     historical recipes. Training command modes emit exact zeros.
+    root_link_velocity selects the native root-link origin for ALL commands;
+    the historical default uses root-body COM velocity. Neither is whole-robot
+    COM velocity. Only the reference point changes, not the body-frame axes.
     """
     if full_stop_only and pivot_only:
         raise ValueError("full_stop_only and pivot_only are mutually exclusive")
     command = env.command_manager.get_command(command_name)
-    velocity = env.scene["robot"].data.root_lin_vel_b[:, :2]
+    data = env.scene["robot"].data
+    velocity = (
+        data.root_link_lin_vel_b if root_link_velocity else data.root_lin_vel_b
+    )[:, :2]
     error_squared = torch.sum(torch.square(command[:, :2] - velocity), dim=1)
     broad, fine = _kernels(error_squared, std, stationary_std, precision_fraction)
     stopped = torch.all((command if full_stop_only else command[:, :2]) == 0, dim=1)

@@ -127,6 +127,7 @@ def apply_reward_profile(cfg, profile):
     if planar is not None:
         planar.params.pop("full_stop_only", None)
         planar.params.pop("pivot_only", None)
+        planar.params.pop("root_link_velocity", None)
     yaw = cfg.rewards.track_ang_vel_z_exp
     yaw.params.pop("include_pivots", None)
     yaw.params.pop("full_stop_std", None)

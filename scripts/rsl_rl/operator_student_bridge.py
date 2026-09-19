@@ -48,6 +48,33 @@ CONTROLLER_ROLLOUT_COMMANDS = (
     (0.0, 0.0, 0.0),
     (0.55, 0.0, 0.0),
 )
+ROOT_POINT_TELEMETRY_VERSION = "isaaclab_2_3_2_root_reference_points_v1"
+ROOT_POINT_TELEMETRY_FIELDS = (
+    "root_com_pos_w",
+    "root_link_lin_vel_b",
+    "body_com_pos_b",
+)
+ROOT_POINT_ABSOLUTE_TOLERANCE = 2e-5
+ROOT_POINT_ROTATIONAL_LEVERAGE_MIN = 1e-5
+ROOT_POINT_PREFLIGHT_STEPS = 24
+ROOT_POINT_TELEMETRY_MANIFEST = {
+    "version": ROOT_POINT_TELEMETRY_VERSION,
+    "sample_timing": "post_physics_pre_reset",
+    "dtype": "float32",
+    "fields": list(ROOT_POINT_TELEMETRY_FIELDS),
+    "position_identity": (
+        "root_com_pos_w = position + rotate_wxyz(quaternion, body_com_pos_b)"
+    ),
+    "velocity_identity": (
+        "root_link_lin_vel_b = linear_velocity_b - cross(angular_velocity_b, body_com_pos_b)"
+    ),
+    "absolute_tolerance_m": ROOT_POINT_ABSOLUTE_TOLERANCE,
+    "absolute_tolerance_m_s": ROOT_POINT_ABSOLUTE_TOLERANCE,
+    "position_roundoff_tolerance": (
+        "max(absolute_tolerance_m, 4 * float32_eps * max_abs_world_position_component)"
+    ),
+    "diagnostic_only": True,
+}
 
 
 def recurrent_evaluation_protocol(
@@ -56,11 +83,16 @@ def recurrent_evaluation_protocol(
     long_stops=False,
     command_coverage=False,
     negative_pivot_first=False,
+    root_point_diagnostics=False,
     seed=43,
 ):
     """Predeclared clean-sensor first-attempt screen, not an acceptance gate."""
     if type(seed) is not int or seed not in (43, 44, 45):
         raise ValueError("Recurrent development evaluation requires seed 43, 44 or 45")
+    if type(root_point_diagnostics) is not bool:
+        raise ValueError("Root-point diagnostics flag must be boolean")
+    if root_point_diagnostics and difficulty_range is None:
+        raise ValueError("Root-point diagnostics require native terrain diagnostics")
     if (long_stops or command_coverage) and difficulty_range is None:
         raise ValueError("Extended evaluation requires an explicit terrain difficulty")
     if long_stops and command_coverage:
@@ -122,6 +154,10 @@ def recurrent_evaluation_protocol(
                 "promotion, held-out confirmation or stair/terrain acceptance"
             ),
         )
+        if root_point_diagnostics:
+            protocol["root_point_telemetry"] = copy.deepcopy(
+                ROOT_POINT_TELEMETRY_MANIFEST
+            )
     if long_stops or command_coverage:
         for phase in protocol["phases"]:
             if phase["name"] in ("stop_after_arcs", "final_stop"):
@@ -392,6 +428,81 @@ def _check_tensor(value: torch.Tensor, shape: tuple[int, ...], name: str) -> Non
         or not torch.isfinite(value).all()
     ):
         raise ValueError(f"{name} must be a finite floating tensor of shape {shape}")
+
+
+def _validate_root_point_arrays(fields, shape):
+    """Validate Isaac Lab 2.3.2 LINK/COM identities from float32 samples."""
+    import numpy as np
+
+    widths = {
+        "position": 3,
+        "quaternion": 4,
+        "linear_velocity_b": 3,
+        "angular_velocity_b": 3,
+        **{name: 3 for name in ROOT_POINT_TELEMETRY_FIELDS},
+    }
+    for name, width in widths.items():
+        value = fields.get(name)
+        if (
+            not isinstance(value, np.ndarray)
+            or value.shape != (*shape, width)
+            or value.dtype != np.float32
+            or not np.isfinite(value).all()
+        ):
+            raise ValueError(
+                f"Root-point field {name} must be finite float32 with shape {(*shape, width)}"
+            )
+    quaternion = fields["quaternion"]
+    if not np.allclose(np.linalg.norm(quaternion, axis=-1), 1.0, atol=1e-3, rtol=0):
+        raise ValueError("Invalid root-point quaternion norm")
+    offset_b = fields["body_com_pos_b"]
+    vector = quaternion[..., 1:]
+    cross = np.cross(vector, offset_b)
+    offset_w = offset_b + np.float32(2.0) * (
+        quaternion[..., :1] * cross + np.cross(vector, cross)
+    )
+    leverage = np.cross(fields["angular_velocity_b"], offset_b)
+    position_error = np.abs(fields["root_com_pos_w"] - (fields["position"] + offset_w))
+    velocity_error = np.abs(
+        fields["root_link_lin_vel_b"] - (fields["linear_velocity_b"] - leverage)
+    )
+    position_tolerance = np.maximum(
+        np.float32(ROOT_POINT_ABSOLUTE_TOLERANCE),
+        np.float32(4.0)
+        * np.finfo(np.float32).eps
+        * np.maximum(
+            np.abs(fields["root_com_pos_w"]),
+            np.abs(fields["position"] + offset_w),
+        ),
+    )
+    position_max = float(position_error.max())
+    velocity_max = float(velocity_error.max())
+    if (
+        np.any(position_error > position_tolerance)
+        or velocity_max > ROOT_POINT_ABSOLUTE_TOLERANCE
+    ):
+        raise ValueError(
+            "Isaac Lab root LINK/COM reference-point identity exceeds tolerance"
+        )
+    return {
+        "version": ROOT_POINT_TELEMETRY_VERSION,
+        "status": "PASS",
+        "diagnostic_only": True,
+        "samples": math.prod(shape),
+        "root_position_reference": "LINK",
+        "root_linear_velocity_reference": "COM",
+        "body_com_offset_reference": "LINK_BODY",
+        "body_com_offset_min_m": offset_b.reshape(-1, 3).min(0).tolist(),
+        "body_com_offset_max_m": offset_b.reshape(-1, 3).max(0).tolist(),
+        "position_identity_abs_max_m": position_max,
+        "position_identity_effective_tolerance_max_m": max(
+            ROOT_POINT_ABSOLUTE_TOLERANCE, float(position_tolerance.max())
+        ),
+        "velocity_identity_abs_max_m_s": velocity_max,
+        "rotational_leverage_max_m_s": float(np.linalg.norm(leverage, axis=-1).max()),
+        "absolute_tolerance_m": ROOT_POINT_ABSOLUTE_TOLERANCE,
+        "absolute_tolerance_m_s": ROOT_POINT_ABSOLUTE_TOLERANCE,
+    }
 
 
 class CausalOperatorHistory:
@@ -872,6 +983,7 @@ def run_recurrent_training(
     optimizer_state=None,
     terrain_rows=1,
     terrain_difficulty=(0.05, 0.15),
+    root_point_check=False,
 ):
     """Native PPO with explicit initialization and bounded-memory training audits.
 
@@ -924,6 +1036,11 @@ def run_recurrent_training(
         or iterations < 1
         or type(runner_cfg.get("save_interval")) is not int
         or runner_cfg["save_interval"] < 1
+        or type(root_point_check) is not bool
+        or (
+            root_point_check
+            and runner_cfg.get("num_steps_per_env") != ROOT_POINT_PREFLIGHT_STEPS
+        )
         or runner_cfg["policy"] != recurrent_policy_config()
         or runner_cfg["obs_groups"] != expected_groups
         or runner_cfg.get("resume")
@@ -1051,6 +1168,55 @@ def run_recurrent_training(
         }
 
     robot, term = env.scene["robot"].data, env.action_manager.get_term("joint_pos")
+    root_point_samples = (
+        {
+            name: []
+            for name in (
+                "position",
+                "quaternion",
+                "linear_velocity_b",
+                "angular_velocity_b",
+                *ROOT_POINT_TELEMETRY_FIELDS,
+            )
+        }
+        if root_point_check
+        else None
+    )
+    root_point_report = None
+
+    def capture_root_points():
+        if root_point_samples is None:
+            return
+        if len(root_point_samples["position"]) >= ROOT_POINT_PREFLIGHT_STEPS:
+            raise RuntimeError("Root-point preflight exceeded the first PPO rollout")
+        values = {
+            "position": robot.root_pos_w,
+            "quaternion": robot.root_quat_w,
+            "linear_velocity_b": robot.root_lin_vel_b,
+            "angular_velocity_b": robot.root_ang_vel_b,
+            "root_com_pos_w": robot.root_com_pos_w,
+            "root_link_lin_vel_b": robot.root_link_lin_vel_b,
+            "body_com_pos_b": robot.body_com_pos_b[:, 0],
+        }
+        for name, value in values.items():
+            width = 4 if name == "quaternion" else 3
+            if (
+                not isinstance(value, torch.Tensor)
+                or value.shape != (env.num_envs, width)
+                or value.dtype != torch.float32
+                or value.device != torch.device(env.device)
+            ):
+                raise ValueError(
+                    f"Native root-point field {name} must be device float32 with shape "
+                    f"{(env.num_envs, width)}"
+                )
+            root_point_samples[name].append(value.detach().clone())
+
+    def root_point_metrics():
+        return (
+            {} if root_point_report is None else {"root_point_check": root_point_report}
+        )
+
     arrival = None
     if hasattr(command, "arrival_plan"):
         try:
@@ -1181,6 +1347,8 @@ def run_recurrent_training(
                 raise RuntimeError(
                     "Delivered command/previous action/reset differs from the native actor frame"
                 )
+            if stats["learning_updates"] == 0 and root_point_check:
+                capture_root_points()
             if stats["learning_updates"] == 0:
                 now = stats["control_steps"] * env.step_dt
                 slices = ((0, 3), (3, 6), (9, 21), (21, 33), (33, 45))
@@ -1328,6 +1496,8 @@ def run_recurrent_training(
         checkpoint = None
 
         def save(self, path, infos=None):
+            if root_point_check and root_point_report is None:
+                return
             completed = start_updates + stats["learning_updates"]
             if completed == self.published_updates or (
                 completed != final_updates
@@ -1345,6 +1515,7 @@ def run_recurrent_training(
                 "metrics": metrics(),
                 **exposure_metrics(),
                 **arrival_metrics(),
+                **root_point_metrics(),
                 "exit_allowed": False,
                 "resume_supported": True,
                 **initialization,
@@ -1436,6 +1607,42 @@ def run_recurrent_training(
     native_update = runner.alg.update
 
     def checked_update():
+        nonlocal root_point_report
+        if stats["learning_updates"] == 0 and root_point_samples is not None:
+            if any(
+                len(samples) != ROOT_POINT_PREFLIGHT_STEPS
+                for samples in root_point_samples.values()
+            ):
+                raise RuntimeError(
+                    "Root-point preflight did not cover the complete first PPO rollout"
+                )
+            arrays = {
+                name: torch.stack(samples).cpu().numpy()
+                for name, samples in root_point_samples.items()
+            }
+            root_point_report = {
+                **_validate_root_point_arrays(
+                    arrays, (ROOT_POINT_PREFLIGHT_STEPS, env.num_envs)
+                ),
+                "sample_timing": "pre_action_first_rollout",
+                "checked_rollout_steps": ROOT_POINT_PREFLIGHT_STEPS,
+                "minimum_rotational_leverage_m_s": ROOT_POINT_ROTATIONAL_LEVERAGE_MIN,
+            }
+            if (
+                root_point_report["rotational_leverage_max_m_s"]
+                <= ROOT_POINT_ROTATIONAL_LEVERAGE_MIN
+            ):
+                raise ValueError(
+                    "Root-point preflight lacks nonzero angular-velocity leverage"
+                )
+            print(
+                "[INFO] Root-point check PASS before first PPO update: "
+                f"position={root_point_report['position_identity_abs_max_m']:.3g} m, "
+                f"velocity={root_point_report['velocity_identity_abs_max_m_s']:.3g} m/s, "
+                f"leverage={root_point_report['rotational_leverage_max_m_s']:.3g} m/s",
+                flush=True,
+            )
+            root_point_samples.clear()
         losses = native_update()
         if (
             not losses
@@ -1495,6 +1702,7 @@ def run_recurrent_training(
         "metrics": metrics(),
         **exposure_metrics(),
         **arrival_metrics(),
+        **root_point_metrics(),
         "controller_manifest": extract(runner.alg.policy).spec.manifest(),
         "actor_artifact_identity": "named_actor_state_tensor_sha256",
         "motor_binding": binding,
@@ -1503,6 +1711,22 @@ def run_recurrent_training(
         "adapter_scope": "initial frozen-policy rollout, same noisy frames and natural resets; deterministic means within 1e-6, not sampled actions or hardware validation",
         "target_scope": "native processed affine targets and surviving joint target buffers, not a per-substep actuator-delivery audit",
         "exit_allowed": False,
+    }
+
+
+def _evaluation_root_point_diagnostics(trace, protocol, shape):
+    declared = "root_point_telemetry" in protocol
+    present = tuple(name in trace for name in ROOT_POINT_TELEMETRY_FIELDS)
+    if not declared and not any(present):
+        return None
+    if not declared or not all(present):
+        raise ValueError("Root-point telemetry manifest and fields must be all-or-none")
+    if protocol["root_point_telemetry"] != ROOT_POINT_TELEMETRY_MANIFEST:
+        raise ValueError("Root-point telemetry manifest differs from version 1")
+    return {
+        **_validate_root_point_arrays(trace, shape),
+        "sample_timing": protocol["root_point_telemetry"]["sample_timing"],
+        "telemetry_fields": list(ROOT_POINT_TELEMETRY_FIELDS),
     }
 
 
@@ -1526,6 +1750,7 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
             seed=protocol.get("seed"),
             command_coverage=True,
             negative_pivot_first=negative_pivot_first,
+            root_point_diagnostics="root_point_telemetry" in protocol,
         )
         if any(protocol.get(key) != value for key, value in expected.items()):
             raise ValueError("Command coverage tape or development limits differ")
@@ -1688,6 +1913,7 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
         for key in ("quaternion", "pre_quaternion")
     ):
         raise ValueError("Invalid evaluation quaternion norm")
+    root_point_diagnostics = _evaluation_root_point_diagnostics(trace, protocol, shape)
     dt, settle = protocol["period_s"], round(
         protocol["settling_s"] / protocol["period_s"]
     )
@@ -1986,6 +2212,8 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
             ),
         }
     summary = {"profiles": profiles, "trials": trials}
+    if root_point_diagnostics is not None:
+        summary["root_point_diagnostics"] = root_point_diagnostics
     if coverage:
         passed = sum(trial["command_screen_passed"] for trial in trials)
         summary["command_screen"] = {
@@ -2073,11 +2301,13 @@ def evaluate_recurrent_operator(
     import numpy as np
     from parkour_lab.learning.controller import ControllerSession, Sample
 
+    native = difficulty_range is not None
     protocol = recurrent_evaluation_protocol(
         difficulty_range=difficulty_range,
         long_stops=long_stops,
         command_coverage=command_coverage,
         negative_pivot_first=negative_pivot_first,
+        root_point_diagnostics=native,
         seed=seed,
     )
     generator = env.cfg.scene.terrain.terrain_generator
@@ -2085,7 +2315,6 @@ def evaluate_recurrent_operator(
         raise ValueError(
             "Evaluation environment and terrain seeds differ from the protocol"
         )
-    native = difficulty_range is not None
     if native:
         from parkour_lab.tasks.manager_based.parkour_lab.mdp.terrain.operator_terrain import (
             ENVELOPES,
@@ -2137,6 +2366,7 @@ def evaluate_recurrent_operator(
         or capture.samples
         or capture.course is not None
         or capture.control_trace is not None
+        or capture.root_point_diagnostics
         or not capture.procedural
     ):
         raise ValueError(
@@ -2204,6 +2434,7 @@ def evaluate_recurrent_operator(
     reset = torch.ones_like(finished)
     partial_resets = 0
     capture.actuator_diagnostics = native
+    capture.root_point_diagnostics = native
     capture.motor_parity = capture.enabled = True
     try:
         with torch.inference_mode():
@@ -2280,6 +2511,7 @@ def evaluate_recurrent_operator(
     finally:
         capture.enabled = capture.motor_parity = False
         capture.actuator_diagnostics = False
+        capture.root_point_diagnostics = False
     trace = capture.finish()
     if not torch.equal(limits, robot.soft_joint_pos_limits):
         raise RuntimeError(

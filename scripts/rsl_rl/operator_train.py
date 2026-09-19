@@ -407,9 +407,11 @@ PROPRIO_STANCE_VERSION = "operator_proprio_stance_v1"
 PROPRIO_PIVOT_PRECISION_VERSION = "operator_proprio_pivot_precision_v1"
 PROPRIO_STATIONARY_YAW_VERSION = "operator_proprio_stationary_yaw_v1"
 PROPRIO_STOP_YAW_VERSION = "operator_proprio_stop_yaw_v1"
+PROPRIO_LINK_ORIGIN_VERSION = "operator_proprio_link_origin_v1"
+PROPRIO_STOP_YAW_VERSIONS = (PROPRIO_STOP_YAW_VERSION, PROPRIO_LINK_ORIGIN_VERSION)
 PROPRIO_STATIONARY_YAW_VERSIONS = (
     PROPRIO_STATIONARY_YAW_VERSION,
-    PROPRIO_STOP_YAW_VERSION,
+    *PROPRIO_STOP_YAW_VERSIONS,
 )
 PROPRIO_PIVOT_VERSIONS = (
     PROPRIO_PIVOT_PRECISION_VERSION,
@@ -429,6 +431,7 @@ PROPRIO_REFINEMENT_VERSIONS = {
     "pivot_precision": PROPRIO_PIVOT_PRECISION_VERSION,
     "stationary_yaw": PROPRIO_STATIONARY_YAW_VERSION,
     "stop_yaw": PROPRIO_STOP_YAW_VERSION,
+    "link_origin": PROPRIO_LINK_ORIGIN_VERSION,
     "stop_precision": PROPRIO_STOP_PRECISION_VERSION,
 }
 PROPRIO_JOINT_LIMIT_VERSION = "operator_proprio_acquisition_v2"
@@ -458,7 +461,8 @@ PROPRIO_WARM_START_SOURCES = {
     PROPRIO_STANCE_VERSION: (PROPRIO_TERRAIN_EXPOSURE_VERSION, PROPRIO_STANCE_VERSION),
     PROPRIO_PIVOT_PRECISION_VERSION: (PROPRIO_STANCE_VERSION,),
     PROPRIO_STATIONARY_YAW_VERSION: (PROPRIO_STANCE_VERSION,),
-    PROPRIO_STOP_YAW_VERSION: (PROPRIO_STANCE_VERSION,),
+    PROPRIO_STOP_YAW_VERSION: (PROPRIO_STANCE_VERSION, PROPRIO_STOP_YAW_VERSION),
+    PROPRIO_LINK_ORIGIN_VERSION: (PROPRIO_STOP_YAW_VERSION,),
 }
 PROPRIO_TERRAIN_EXPOSURE_CHANGE = {
     "difficulty_range": [0.05, 0.35],
@@ -522,6 +526,15 @@ PROPRIO_STOP_YAW_CHANGE = {
     "kernel": "0.9*exp(-yaw_error_squared/0.5**2) + 0.1*exp(-yaw_error_squared/0.05**2)",
     "integration": "native RewardManager weight * step_dt exactly once",
     "scope": "one full-stop angular width delta versus stationary_yaw; pure-pivot and translating kernels, stance cost, commands, terrain, actor and motors unchanged; no heading anchor or inference assistance",
+}
+PROPRIO_LINK_ORIGIN_CHANGE = {
+    "term": "track_lin_vel_xy_exp",
+    "parameter": "root_link_velocity",
+    "from": "root_lin_vel_b (root-body COM, expressed in link axes)",
+    "to": "root_link_lin_vel_b (root-link origin, expressed in link axes)",
+    "gate": "all commands, both yaw signs; no phase or measured-speed gate",
+    "identity": "v_link_b = v_com_b - cross(omega_b, body_com_pos_b[:, 0])",
+    "scope": "reference-point delta only versus stop_yaw; same kernels, weights, yaw/posture objectives, actor/critic observations, commands, motors and historical evaluation gates; not a world-pose anchor or whole-robot COM controller",
 }
 PROPRIO_REWARD_CHANGE = {
     "term": "dof_pos_limits",
@@ -839,8 +852,10 @@ def proprioceptive_procedural_configs(
             precision_fraction=change["precision_fraction"],
             include_pivots=True,
         )
-        if acquisition_version == PROPRIO_STOP_YAW_VERSION:
+        if acquisition_version in PROPRIO_STOP_YAW_VERSIONS:
             term.params["full_stop_std"] = PROPRIO_STOP_YAW_CHANGE["to_yaw_std_rad_s"]
+    if acquisition_version == PROPRIO_LINK_ORIGIN_VERSION:
+        cfg.rewards.track_lin_vel_xy_exp.params["root_link_velocity"] = True
     if acquisition_version == PROPRIO_STOP_PRECISION_VERSION:
         try:
             from .operator_rewards import (
@@ -2792,6 +2807,65 @@ def recurrent_evaluation_files(checkpoint):
     }
 
 
+def _requires_root_point_check(protocol):
+    return protocol["version"] == PROPRIO_LINK_ORIGIN_VERSION or (
+        protocol["version"] == PROPRIO_STOP_YAW_VERSION
+        and (protocol.get("warm_start") or {}).get("version")
+        == PROPRIO_STOP_YAW_VERSION
+    )
+
+
+def _check_root_point_receipt(receipt, num_envs):
+    if not isinstance(receipt, dict) or any(
+        receipt.get(key) != value
+        for key, value in {
+            "version": "isaaclab_2_3_2_root_reference_points_v1",
+            "status": "PASS",
+            "samples": 24 * num_envs,
+            "checked_rollout_steps": 24,
+            "sample_timing": "pre_action_first_rollout",
+            "diagnostic_only": True,
+            "root_position_reference": "LINK",
+            "root_linear_velocity_reference": "COM",
+            "body_com_offset_reference": "LINK_BODY",
+            "absolute_tolerance_m": 2e-5,
+            "absolute_tolerance_m_s": 2e-5,
+            "minimum_rotational_leverage_m_s": 1e-5,
+        }.items()
+    ):
+        raise ValueError("Missing or incomplete pre-update root-point audit")
+    values = [
+        receipt.get(key)
+        for key in (
+            "position_identity_abs_max_m",
+            "position_identity_effective_tolerance_max_m",
+            "velocity_identity_abs_max_m_s",
+            "rotational_leverage_max_m_s",
+        )
+    ]
+    bounds = [receipt.get(f"body_com_offset_{side}_m") for side in ("min", "max")]
+    if any(
+        type(v) not in (float, int) or not math.isfinite(v) or v < 0 for v in values
+    ) or any(
+        not isinstance(bound, list)
+        or len(bound) != 3
+        or any(type(v) not in (float, int) or not math.isfinite(v) for v in bound)
+        for bound in bounds
+    ):
+        raise ValueError("Invalid root-point residuals, leverage or COM offset bounds")
+    position, tolerance, velocity, leverage = values
+    # The fixed procedural workspace is only hundreds of metres across. This
+    # permits float32 world-origin roundoff, not arbitrary declared tolerances.
+    if not (
+        position <= tolerance
+        and 2e-5 <= tolerance <= 1e-3
+        and velocity <= 2e-5
+        and leverage > 1e-5
+        and all(lo <= hi for lo, hi in zip(*bounds))
+    ):
+        raise ValueError("Failed pre-update root-point identity or rotational leverage")
+
+
 def recurrent_evaluation_source(checkpoint, physical_identity):
     """Read an immutable learned snapshot without requiring its training to finish."""
     try:
@@ -2858,7 +2932,13 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         or protocol.get("stop_yaw_change")
         != (
             PROPRIO_STOP_YAW_CHANGE
-            if protocol["version"] == PROPRIO_STOP_YAW_VERSION
+            if protocol["version"] in PROPRIO_STOP_YAW_VERSIONS
+            else None
+        )
+        or protocol.get("link_origin_change")
+        != (
+            PROPRIO_LINK_ORIGIN_CHANGE
+            if protocol["version"] == PROPRIO_LINK_ORIGIN_VERSION
             else None
         )
         or protocol["policy_version"] != metadata["policy_version"]
@@ -2894,6 +2974,10 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
             "Learned checkpoint, training archive or physical reference differs"
         )
     warm_start = protocol.get("warm_start")
+    if _requires_root_point_check(protocol):
+        _check_root_point_receipt(
+            metadata.get("root_point_check"), protocol["num_envs"]
+        )
     if (
         protocol["version"]
         in (
@@ -3011,6 +3095,7 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
         long_stops=getattr(args, "evaluation_long_stops", False),
         command_coverage=getattr(args, "evaluation_command_coverage", False),
         negative_pivot_first=getattr(args, "evaluation_negative_pivot_first", False),
+        root_point_diagnostics=getattr(args, "evaluation_difficulty", None) is not None,
         seed=args.seed,
     )
     cfg.seed = cfg.scene.terrain.terrain_generator.seed = args.seed
@@ -3318,11 +3403,20 @@ def recurrent_training_main(args, parser):
                 reward_profile="stance cost and pure-pivot planar precision retained; stop/pure-pivot angular precision fraction=0.1, std=0.1 rad/s; translating kernels unchanged; flat_orientation_l2=-2.5, feet_air_time=0.01, dof_pos_limits=-10; no action-retention loss",
                 scope="One angular-reward delta versus pivot_precision from the same stance checkpoint, seed, saved scalar LR and additional transitions; fresh Adam in both. An archived comparator is valid only after configuration/source compatibility checks. Sequential single-seed development ablation, not independent replication or held-out acceptance. Predeclare one endpoint; require joint stop/yaw/translation/physical-health retention; retain the frozen stance source if neither improves. No automatic selection or extension.",
             )
-        if version == PROPRIO_STOP_YAW_VERSION:
+        if version in PROPRIO_STOP_YAW_VERSIONS:
             protocol.update(
                 stop_yaw_change=copy.deepcopy(PROPRIO_STOP_YAW_CHANGE),
                 reward_profile="stationary_yaw recipe with only full-stop fine angular std changed from 0.1 to 0.05 rad/s; fraction=0.1 and broad std=0.5 retained; pivot/translation/stance rewards unchanged",
                 scope="One full-stop angular width delta versus stationary_yaw from the same stance checkpoint, seed, saved scalar LR and additional transitions; fresh Adam in both. Reuse an archived equal-budget comparator only after source/configuration checks. Require all stops, easy and flat-command retention, no lost pivot passes or moving/physical regressions. Sequential single-seed development only; no automatic extension, checkpoint selection or acceptance.",
+            )
+        if version == PROPRIO_LINK_ORIGIN_VERSION:
+            protocol["link_origin_change"] = copy.deepcopy(PROPRIO_LINK_ORIGIN_CHANGE)
+            protocol[
+                "reward_profile"
+            ] += "; all planar tracking uses root-link origin velocity, not root-body COM velocity"
+        if warm_start["version"] == PROPRIO_STOP_YAW_VERSION:
+            protocol["scope"] = (
+                "Matched stop_yaw versus link_origin restarts from the same stop_yaw checkpoint, seed, saved scalar LR and additional transitions; fresh Adam in both. Verify native point identities during the first rollout before any optimizer update. Compare the predeclared endpoint using unchanged canonical command/position gates and additive link diagnostics. Historical velocity scores remain root-body COM based. No automatic extension, selection or acceptance."
             )
     if resuming:
         protocol = copy.deepcopy(archived_protocol)
@@ -3352,6 +3446,7 @@ def recurrent_training_main(args, parser):
             long_stops=args.evaluation_long_stops,
             command_coverage=args.evaluation_command_coverage,
             negative_pivot_first=args.evaluation_negative_pivot_first,
+            root_point_diagnostics=args.evaluation_difficulty is not None,
             seed=args.seed,
         )
         protocol = {
@@ -3503,6 +3598,10 @@ def recurrent_training_main(args, parser):
             ):
                 raise ValueError("Frozen evaluation source changed during execution")
             if result.get("status") == success:
+                if not evaluation and _requires_root_point_check(protocol):
+                    _check_root_point_receipt(
+                        result.get("root_point_check"), args.num_envs
+                    )
                 expected = {
                     "policy_version": RECURRENT_OPERATOR_VERSION,
                     "learning_updates": final_updates,
@@ -3575,6 +3674,14 @@ def recurrent_training_main(args, parser):
                     )
                     info = learned["infos"]
                     metadata = info["recurrent_training"]
+                    if (
+                        _requires_root_point_check(protocol)
+                        and metadata.get("root_point_check")
+                        != result["root_point_check"]
+                    ):
+                        raise ValueError(
+                            "Checkpoint root-point audit differs from receipt"
+                        )
                     weights = learned["model_state_dict"]
                     adam = learned["optimizer_state_dict"]["state"]
                     if (
@@ -3711,6 +3818,11 @@ def recurrent_training_main(args, parser):
                 is_running=app.is_running,
                 iterations=args.iterations,
                 **(
+                    {"root_point_check": True}
+                    if _requires_root_point_check(protocol)
+                    else {}
+                ),
+                **(
                     {"initial_policy": policy, "warm_start": warm_start}
                     if refinement or resuming
                     else {}
@@ -3797,7 +3909,7 @@ def main(argv=None):
     procedural.add_argument(
         "--procedural-refine-checkpoint",
         type=Path,
-        help="Warm-start from an immutable recurrent checkpoint: v3, terrain_exposure for arrival_hold/stance, or stance for stance/pivot_precision/stationary_yaw/stop_yaw; exact model/std and saved scalar LR, fresh Adam moments and recurrent state; not uninterrupted resume",
+        help="Warm-start from an immutable recurrent checkpoint with exact model/std and saved scalar LR, fresh Adam and recurrent state; not resume. stop_yaw sources support matched stop_yaw/link_origin restarts",
     )
     procedural.add_argument(
         "--procedural-resume-checkpoint",
@@ -3807,7 +3919,7 @@ def main(argv=None):
     parser.add_argument(
         "--procedural-refinement",
         choices=tuple(PROPRIO_REFINEMENT_VERSIONS),
-        help="With --procedural-refine-checkpoint: stock (default) restarts v3; terrain_exposure adds three fixed difficulty bands; arrival_hold adds long arrival/hold/restart commands; stance adds an exact-zero posture cost from exposure or restarts stance unchanged; pivot_precision changes only pure-pivot planar tracking from stance; stationary_yaw adds stop/pure-pivot angular precision; stop_yaw narrows only its full-stop angular width (both start from stance); stop_precision reproduces the rejected historical ablation",
+        help="With --procedural-refine-checkpoint: stock restarts v3; terrain_exposure adds fixed difficulty bands; arrival_hold adds arrival/hold/restart sampling; stance adds zero-command posture cost; pivot_precision adds planar pivot precision; stationary_yaw adds angular precision; stop_yaw narrows full-stop angular width or restarts stop_yaw unchanged; link_origin changes only planar velocity reference point from stop_yaw; stop_precision is historical",
     )
     procedural.add_argument(
         "--procedural-train",
