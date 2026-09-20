@@ -38,6 +38,7 @@ try:
     from .operator_benchmark_core import (
         DT,
         OBSERVATION_TERMS,
+        PROPRIO_EVALUATION_SEEDS,
         file_sha256,
         load_reference_checkpoint,
         read_yaml_data,
@@ -74,6 +75,7 @@ except ImportError:
     from operator_benchmark_core import (
         DT,
         OBSERVATION_TERMS,
+        PROPRIO_EVALUATION_SEEDS,
         file_sha256,
         load_reference_checkpoint,
         read_yaml_data,
@@ -2956,6 +2958,8 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         != ("fixed_mixed_terrain_exposure" if exposure else "fixed_easy_acquisition")
         or type(protocol["seed"]) is not int
         or protocol["seed"] < 0
+        # Preserve historical training admissibility; new reservations are
+        # enforced prospectively by the CLI, not retroactively on archives.
         or protocol["seed"] in (43, 44, 45)
         or type(protocol["num_envs"]) is not int
         or not 80 <= protocol["num_envs"] <= 5120
@@ -3151,14 +3155,18 @@ def recurrent_training_main(args, parser):
         except Exception as error:
             parser.error(f"Invalid resume configuration: {error}")
     invalid_budget = (
-        ((args.iterations, args.num_envs) != (0, 80) or args.seed not in (43, 44, 45))
+        (
+            (args.iterations, args.num_envs) != (0, 80)
+            or type(args.seed) is not int
+            or args.seed not in PROPRIO_EVALUATION_SEEDS
+        )
         if evaluation
         else (
             args.iterations < 1
             or not 80 <= args.num_envs <= 5120
             or args.num_envs % 20
             or args.seed < 0
-            or args.seed in (43, 44, 45)
+            or args.seed in PROPRIO_EVALUATION_SEEDS
         )
     )
     if (
@@ -3192,8 +3200,8 @@ def recurrent_training_main(args, parser):
     ):
         parser.error(
             "Procedural acquisition requires positive updates, 80–5120 environments "
-            "in multiples of 20 and a training seed outside 43–45; evaluation requires "
-            "exactly 0 updates, 80 environments and seed 43, 44 or 45. An explicit timeout must "
+            "in multiples of 20 and a training seed outside 43–48; evaluation requires "
+            "exactly 0 updates, 80 environments and a seed in 43–48. An explicit timeout must "
             "be finite and positive; omit it for acquisition without a time limit. "
             "No legacy training, retention, skip-check or retention-resume flags."
         )
@@ -3228,6 +3236,10 @@ def recurrent_training_main(args, parser):
                     learned_source, identity["physical_reference"]
                 )
             )
+            if evaluation and args.seed == archived_protocol["seed"]:
+                raise ValueError(
+                    "Evaluation seed must differ from the archived training seed"
+                )
             if (
                 args.evaluation_difficulty is not None
                 and archived_protocol["version"] not in PROPRIO_UPRIGHT_VERSIONS
@@ -4167,9 +4179,9 @@ def main(argv=None):
         parser.error("Use positive iterations/timeout and at least four environments")
     if args.seed < 0:
         parser.error("Training seed must be a nonnegative integer")
-    if args.seed in (43, 44, 45):
+    if args.seed in PROPRIO_EVALUATION_SEEDS:
         parser.error(
-            "Seeds 43–45 are reserved for evaluation; choose a different training seed"
+            "Seeds 43–48 are reserved for evaluation; choose a different training seed"
         )
     try:
         args.check_offsets = retention_check_offsets(args)

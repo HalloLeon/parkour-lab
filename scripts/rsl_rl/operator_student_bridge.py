@@ -18,6 +18,11 @@ from pathlib import Path
 import torch
 from torch import nn
 
+try:
+    from .operator_benchmark_core import PROPRIO_EVALUATION_SEEDS
+except ImportError:
+    from operator_benchmark_core import PROPRIO_EVALUATION_SEEDS
+
 # Compatibility exports for existing training, audit and evaluation callers.
 from parkour_lab.learning.recurrent_operator import (
     RECURRENT_OPERATOR_VERSION,
@@ -87,8 +92,8 @@ def recurrent_evaluation_protocol(
     seed=43,
 ):
     """Predeclared clean-sensor first-attempt screen, not an acceptance gate."""
-    if type(seed) is not int or seed not in (43, 44, 45):
-        raise ValueError("Recurrent development evaluation requires seed 43, 44 or 45")
+    if type(seed) is not int or seed not in PROPRIO_EVALUATION_SEEDS:
+        raise ValueError("Recurrent development evaluation requires a seed in 43–48")
     if type(root_point_diagnostics) is not bool:
         raise ValueError("Root-point diagnostics flag must be boolean")
     if root_point_diagnostics and difficulty_range is None:

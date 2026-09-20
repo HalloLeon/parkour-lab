@@ -17,6 +17,8 @@ import yaml
 DT = 0.02
 DURATION_S = 20.0
 STEPS = round(DURATION_S / DT)
+# Reserve new layout seeds prospectively; old training archives remain readable.
+PROPRIO_EVALUATION_SEEDS = (43, 44, 45, 46, 47, 48)
 OBSERVATION_TERMS = (
     "base_lin_vel",
     "base_ang_vel",
