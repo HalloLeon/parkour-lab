@@ -410,7 +410,12 @@ PROPRIO_PIVOT_PRECISION_VERSION = "operator_proprio_pivot_precision_v1"
 PROPRIO_STATIONARY_YAW_VERSION = "operator_proprio_stationary_yaw_v1"
 PROPRIO_STOP_YAW_VERSION = "operator_proprio_stop_yaw_v1"
 PROPRIO_LINK_ORIGIN_VERSION = "operator_proprio_link_origin_v1"
-PROPRIO_STOP_YAW_VERSIONS = (PROPRIO_STOP_YAW_VERSION, PROPRIO_LINK_ORIGIN_VERSION)
+PROPRIO_HIGHER_TERRAIN_VERSION = "operator_proprio_higher_terrain_v1"
+PROPRIO_LINK_ORIGIN_VERSIONS = (
+    PROPRIO_LINK_ORIGIN_VERSION,
+    PROPRIO_HIGHER_TERRAIN_VERSION,
+)
+PROPRIO_STOP_YAW_VERSIONS = (PROPRIO_STOP_YAW_VERSION, *PROPRIO_LINK_ORIGIN_VERSIONS)
 PROPRIO_STATIONARY_YAW_VERSIONS = (
     PROPRIO_STATIONARY_YAW_VERSION,
     *PROPRIO_STOP_YAW_VERSIONS,
@@ -434,6 +439,7 @@ PROPRIO_REFINEMENT_VERSIONS = {
     "stationary_yaw": PROPRIO_STATIONARY_YAW_VERSION,
     "stop_yaw": PROPRIO_STOP_YAW_VERSION,
     "link_origin": PROPRIO_LINK_ORIGIN_VERSION,
+    "higher_terrain": PROPRIO_HIGHER_TERRAIN_VERSION,
     "stop_precision": PROPRIO_STOP_PRECISION_VERSION,
 }
 PROPRIO_JOINT_LIMIT_VERSION = "operator_proprio_acquisition_v2"
@@ -464,7 +470,11 @@ PROPRIO_WARM_START_SOURCES = {
     PROPRIO_PIVOT_PRECISION_VERSION: (PROPRIO_STANCE_VERSION,),
     PROPRIO_STATIONARY_YAW_VERSION: (PROPRIO_STANCE_VERSION,),
     PROPRIO_STOP_YAW_VERSION: (PROPRIO_STANCE_VERSION, PROPRIO_STOP_YAW_VERSION),
-    PROPRIO_LINK_ORIGIN_VERSION: (PROPRIO_STOP_YAW_VERSION,),
+    PROPRIO_LINK_ORIGIN_VERSION: (
+        PROPRIO_STOP_YAW_VERSION,
+        PROPRIO_LINK_ORIGIN_VERSION,
+    ),
+    PROPRIO_HIGHER_TERRAIN_VERSION: (PROPRIO_LINK_ORIGIN_VERSION,),
 }
 PROPRIO_TERRAIN_EXPOSURE_CHANGE = {
     "difficulty_range": [0.05, 0.35],
@@ -473,6 +483,13 @@ PROPRIO_TERRAIN_EXPOSURE_CHANGE = {
     "assignment": "native uniform initial row sampling, fixed for the run; realized row/profile counts are recorded, not assumed balanced",
     "retention": "20 percent plane columns in every row; lowest row retains the acquisition amplitude band, not the identical old meshes",
     "scope": "one static mixed-amplitude exposure stage; no adaptive promotion, reward, command, episode-duration, policy or motor change",
+}
+PROPRIO_HIGHER_TERRAIN_CHANGE = {
+    **PROPRIO_TERRAIN_EXPOSURE_CHANGE,
+    "difficulty_range": [0.05, 0.55],
+    "num_rows": 5,
+    "row_bands": [[0.05, 0.15], [0.15, 0.25], [0.25, 0.35], [0.35, 0.45], [0.45, 0.55]],
+    "retention": "20 percent plane columns in every row; three of five row bands retain earlier amplitudes, not identical meshes or equal per-band transition budgets",
 }
 PROPRIO_STOP_PRECISION_CHANGE = {
     "gate": "exact zero body twist only; moving and pure-pivot rewards unchanged",
@@ -582,6 +599,15 @@ def _proprio_posture_change(version):
             "retain the v3 posture objective and physical failure guard during bounded terrain exposure; not terrain acceptance"
         )
     return result
+
+
+def _proprio_terrain_exposure(version):
+    """Immutable stage geometry, shared by reconstruction, validation and launch."""
+    return (
+        PROPRIO_HIGHER_TERRAIN_CHANGE
+        if version == PROPRIO_HIGHER_TERRAIN_VERSION
+        else PROPRIO_TERRAIN_EXPOSURE_CHANGE
+    )
 
 
 def _configure_recurrent_terrain(cfg, difficulty_range, *, num_rows=1):
@@ -787,10 +813,11 @@ def proprioceptive_procedural_configs(
         ]
         failure.time_out = False
     if acquisition_version in PROPRIO_MIXED_TERRAIN_VERSIONS:
+        terrain = _proprio_terrain_exposure(acquisition_version)
         _configure_recurrent_terrain(
             cfg,
-            PROPRIO_TERRAIN_EXPOSURE_CHANGE["difficulty_range"],
-            num_rows=PROPRIO_TERRAIN_EXPOSURE_CHANGE["num_rows"],
+            terrain["difficulty_range"],
+            num_rows=terrain["num_rows"],
         )
     if acquisition_version in PROPRIO_ARRIVAL_VERSIONS:
         if cfg.episode_length_s != 20.0:
@@ -856,7 +883,7 @@ def proprioceptive_procedural_configs(
         )
         if acquisition_version in PROPRIO_STOP_YAW_VERSIONS:
             term.params["full_stop_std"] = PROPRIO_STOP_YAW_CHANGE["to_yaw_std_rad_s"]
-    if acquisition_version == PROPRIO_LINK_ORIGIN_VERSION:
+    if acquisition_version in PROPRIO_LINK_ORIGIN_VERSIONS:
         cfg.rewards.track_lin_vel_xy_exp.params["root_link_velocity"] = True
     if acquisition_version == PROPRIO_STOP_PRECISION_VERSION:
         try:
@@ -2810,7 +2837,7 @@ def recurrent_evaluation_files(checkpoint):
 
 
 def _requires_root_point_check(protocol):
-    return protocol["version"] == PROPRIO_LINK_ORIGIN_VERSION or (
+    return protocol["version"] in PROPRIO_LINK_ORIGIN_VERSIONS or (
         protocol["version"] == PROPRIO_STOP_YAW_VERSION
         and (protocol.get("warm_start") or {}).get("version")
         == PROPRIO_STOP_YAW_VERSION
@@ -2880,6 +2907,7 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
     protocol = json.loads((checkpoint.parent / "training_protocol.json").read_text())
     recipe = metadata["recipe"]
     exposure = protocol["version"] in PROPRIO_MIXED_TERRAIN_VERSIONS
+    terrain = _proprio_terrain_exposure(protocol["version"])
     save_interval = protocol.get("save_interval", 50)
     archived_agent = read_yaml_data(checkpoint.parent / "params/agent.yaml")
     if (
@@ -2905,8 +2933,7 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         )
         or protocol.get("warm_start") != metadata.get("warm_start")
         or protocol.get("resume_from") != metadata.get("resume_from")
-        or protocol.get("terrain_exposure_change")
-        != (PROPRIO_TERRAIN_EXPOSURE_CHANGE if exposure else None)
+        or protocol.get("terrain_exposure_change") != (terrain if exposure else None)
         or protocol.get("arrival_hold_change")
         != (
             arrival_hold_manifest()
@@ -2940,7 +2967,7 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         or protocol.get("link_origin_change")
         != (
             PROPRIO_LINK_ORIGIN_CHANGE
-            if protocol["version"] == PROPRIO_LINK_ORIGIN_VERSION
+            if protocol["version"] in PROPRIO_LINK_ORIGIN_VERSIONS
             else None
         )
         or protocol["policy_version"] != metadata["policy_version"]
@@ -2948,7 +2975,7 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         or protocol["terrain"] != "operator_procedural_surface_v2"
         or protocol["difficulty_range"]
         != (
-            PROPRIO_TERRAIN_EXPOSURE_CHANGE["difficulty_range"]
+            terrain["difficulty_range"]
             if exposure
             else list(PROCEDURAL_EASY_DIFFICULTY)
         )
@@ -3374,12 +3401,11 @@ def recurrent_training_main(args, parser):
                 PROPRIO_STOP_PRECISION_CHANGE
             )
         if exposure:
+            terrain = _proprio_terrain_exposure(version)
             protocol.update(
                 stage="fixed_mixed_terrain_exposure",
-                difficulty_range=list(
-                    PROPRIO_TERRAIN_EXPOSURE_CHANGE["difficulty_range"]
-                ),
-                terrain_exposure_change=copy.deepcopy(PROPRIO_TERRAIN_EXPOSURE_CHANGE),
+                difficulty_range=list(terrain["difficulty_range"]),
+                terrain_exposure_change=copy.deepcopy(terrain),
                 posture_change=_proprio_posture_change(
                     PROPRIO_TERRAIN_EXPOSURE_VERSION
                 ),
@@ -3421,7 +3447,7 @@ def recurrent_training_main(args, parser):
                 reward_profile="stationary_yaw recipe with only full-stop fine angular std changed from 0.1 to 0.05 rad/s; fraction=0.1 and broad std=0.5 retained; pivot/translation/stance rewards unchanged",
                 scope="One full-stop angular width delta versus stationary_yaw from the same stance checkpoint, seed, saved scalar LR and additional transitions; fresh Adam in both. Reuse an archived equal-budget comparator only after source/configuration checks. Require all stops, easy and flat-command retention, no lost pivot passes or moving/physical regressions. Sequential single-seed development only; no automatic extension, checkpoint selection or acceptance.",
             )
-        if version == PROPRIO_LINK_ORIGIN_VERSION:
+        if version in PROPRIO_LINK_ORIGIN_VERSIONS:
             protocol["link_origin_change"] = copy.deepcopy(PROPRIO_LINK_ORIGIN_CHANGE)
             protocol[
                 "reward_profile"
@@ -3429,6 +3455,10 @@ def recurrent_training_main(args, parser):
         if warm_start["version"] == PROPRIO_STOP_YAW_VERSION:
             protocol["scope"] = (
                 "Matched stop_yaw versus link_origin restarts from the same stop_yaw checkpoint, seed, saved scalar LR and additional transitions; fresh Adam in both. Verify native point identities during the first rollout before any optimizer update. Compare the predeclared endpoint using unchanged canonical command/position gates and additive link diagnostics. Historical velocity scores remain root-body COM based. No automatic extension, selection or acceptance."
+            )
+        if warm_start["version"] == PROPRIO_LINK_ORIGIN_VERSION:
+            protocol["scope"] = (
+                "Matched link_origin versus higher_terrain restarts from the same link-origin checkpoint, seed, live scalar LR and additional transitions; fresh Adam in both. Only static terrain exposure changes: three rows through0.35 versus five through0.55, retaining lower bands. Commands, rewards, motor, actor and gates unchanged. Compare the predeclared endpoint on easy, prior-hard and higher bands; retain all source failures. No adaptive promotion, automatic extension, checkpoint selection or acceptance."
             )
     if resuming:
         protocol = copy.deepcopy(archived_protocol)
@@ -3846,9 +3876,13 @@ def recurrent_training_main(args, parser):
                 ),
                 **(
                     {
-                        "terrain_rows": PROPRIO_TERRAIN_EXPOSURE_CHANGE["num_rows"],
+                        "terrain_rows": _proprio_terrain_exposure(protocol["version"])[
+                            "num_rows"
+                        ],
                         "terrain_difficulty": tuple(
-                            PROPRIO_TERRAIN_EXPOSURE_CHANGE["difficulty_range"]
+                            _proprio_terrain_exposure(protocol["version"])[
+                                "difficulty_range"
+                            ]
                         ),
                     }
                     if protocol["version"] in PROPRIO_MIXED_TERRAIN_VERSIONS
@@ -3931,7 +3965,7 @@ def main(argv=None):
     parser.add_argument(
         "--procedural-refinement",
         choices=tuple(PROPRIO_REFINEMENT_VERSIONS),
-        help="With --procedural-refine-checkpoint: stock restarts v3; terrain_exposure adds fixed difficulty bands; arrival_hold adds arrival/hold/restart sampling; stance adds zero-command posture cost; pivot_precision adds planar pivot precision; stationary_yaw adds angular precision; stop_yaw narrows full-stop angular width or restarts stop_yaw unchanged; link_origin changes only planar velocity reference point from stop_yaw; stop_precision is historical",
+        help="With --procedural-refine-checkpoint: stock restarts v3; terrain_exposure adds fixed difficulty bands; arrival_hold adds arrival/hold/restart sampling; stance adds zero-command posture cost; pivot_precision adds planar pivot precision; stationary_yaw adds angular precision; stop_yaw narrows full-stop angular width or restarts stop_yaw unchanged; link_origin changes planar reference point from stop_yaw or restarts link_origin unchanged; higher_terrain extends link_origin to five fixed bands through0.55; stop_precision is historical",
     )
     procedural.add_argument(
         "--procedural-train",

@@ -1064,7 +1064,7 @@ def run_recurrent_training(
         or command.cfg.rel_standing_envs
         or env.cfg.curriculum.terrain_levels is not None
         or type(terrain_rows) is not int
-        or terrain_rows not in (1, 3)
+        or terrain_rows not in (1, 3, 5)
         or not isinstance(terrain_difficulty, (tuple, list))
         or len(terrain_difficulty) != 2
         or any(

@@ -90,7 +90,7 @@ class ProceduralTerrainCommand(OperatorTransitionCommand):
             not generator.curriculum
             or generator.num_cols != len(PROFILE_BY_COLUMN)
             or type(generator.num_rows) is not int
-            or generator.num_rows not in (1, 3)
+            or generator.num_rows not in (1, 3, 5)
             or getattr(env.cfg.curriculum, "terrain_levels", None) is not None
             or tuple(
                 getattr(sub, "profile", None) for sub in generator.sub_terrains.values()
@@ -102,7 +102,7 @@ class ProceduralTerrainCommand(OperatorTransitionCommand):
             )
         ):
             raise ValueError(
-                "Procedural command sampling requires its static one- or three-row profile layout"
+                "Procedural command sampling requires its static one-, three- or five-row profile layout"
             )
         # Difficulty rows share profile columns; they must not change commands.
         flat_columns = torch.tensor(
