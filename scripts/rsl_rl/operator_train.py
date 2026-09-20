@@ -13,6 +13,8 @@ policy weights. The old four-family recipe is retired; archived readers remain.
 control run from learned weights and scalar LR, never from old optimizer state.
 --procedural-resume-checkpoint continues the same recipe with saved Adam and
 cumulative update numbers in a new run; simulator, command and GRU state reset.
+--restart-coverage explicitly starts a low-speed restart sampling stage while
+retaining that optimizer state. Plain resume inherits the archived sampler.
 """
 
 from __future__ import annotations
@@ -67,6 +69,7 @@ try:
         VERSION as SEQUENCE_VERSION,
         sequence_manifest,
         arrival_hold_manifest,
+        restart_coverage_manifest,
         SequenceExposureWrapper,
     )
     from .operator_sequence_resume import sequence_resume_preflight
@@ -104,6 +107,7 @@ except ImportError:
         VERSION as SEQUENCE_VERSION,
         sequence_manifest,
         arrival_hold_manifest,
+        restart_coverage_manifest,
         SequenceExposureWrapper,
     )
     from operator_sequence_resume import sequence_resume_preflight
@@ -2895,6 +2899,53 @@ def _check_root_point_receipt(receipt, num_envs):
         raise ValueError("Failed pre-update root-point identity or rotational leverage")
 
 
+def validate_restart_coverage_change(protocol):
+    """Bind the one optional sampling stage to its immutable optimizer source."""
+    change = protocol.get("restart_coverage_change")
+    if change is None:
+        return
+    if not isinstance(change, dict):
+        raise ValueError("Invalid low-speed restart sampling stage")
+    resumed = protocol.get("resume_from") or {}
+    if not isinstance(resumed, dict) or not isinstance(resumed.get("sources"), dict):
+        raise ValueError("Restart coverage requires a bound optimizer source")
+    start = change.get("started_at_learning_updates")
+    digest = change.get("source_checkpoint_sha256")
+    if (
+        set(change)
+        != {"sampling", "started_at_learning_updates", "source_checkpoint_sha256"}
+        or change["sampling"] != restart_coverage_manifest()
+        or protocol.get("version") != PROPRIO_HIGHER_TERRAIN_VERSION
+        or type(start) is not int
+        or type(resumed.get("learning_updates")) is not int
+        or not 0 < start <= resumed.get("learning_updates", -1)
+        or not isinstance(digest, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or (
+            start == resumed.get("learning_updates")
+            and digest != resumed.get("sources", {}).get("checkpoint")
+        )
+    ):
+        raise ValueError("Invalid low-speed restart sampling stage or source binding")
+
+
+def apply_restart_coverage(cfg):
+    """Change only the training command class, after source reconstruction."""
+    try:
+        from .operator_command import (
+            ProceduralArrivalHoldCommand,
+            ProceduralRestartCoverageCommand,
+        )
+    except ImportError:
+        from operator_command import (
+            ProceduralArrivalHoldCommand,
+            ProceduralRestartCoverageCommand,
+        )
+    if cfg.commands.base_velocity.class_type is not ProceduralArrivalHoldCommand:
+        raise ValueError("Restart coverage requires the original arrival/hold sampler")
+    cfg.commands.base_velocity.class_type = ProceduralRestartCoverageCommand
+
+
 def recurrent_evaluation_source(checkpoint, physical_identity):
     """Read an immutable learned snapshot without requiring its training to finish."""
     try:
@@ -2905,6 +2956,7 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
     files = recurrent_evaluation_files(checkpoint)
     policy, metadata, digest = load_recurrent_checkpoint(checkpoint, device="cpu")
     protocol = json.loads((checkpoint.parent / "training_protocol.json").read_text())
+    validate_restart_coverage_change(protocol)
     recipe = metadata["recipe"]
     exposure = protocol["version"] in PROPRIO_MIXED_TERRAIN_VERSIONS
     terrain = _proprio_terrain_exposure(protocol["version"])
@@ -2933,6 +2985,8 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         )
         or protocol.get("warm_start") != metadata.get("warm_start")
         or protocol.get("resume_from") != metadata.get("resume_from")
+        or protocol.get("restart_coverage_change")
+        != metadata.get("restart_coverage_change")
         or protocol.get("terrain_exposure_change") != (terrain if exposure else None)
         or protocol.get("arrival_hold_change")
         != (
@@ -3089,6 +3143,8 @@ def recurrent_source_configs(
     cfg, runner = proprioceptive_procedural_configs(
         saved, agent, original, acquisition_version=training_protocol["version"]
     )
+    if training_protocol.get("restart_coverage_change") is not None:
+        apply_restart_coverage(cfg)
     if training_protocol.get("warm_start") is not None:
         runner["algorithm"]["learning_rate"] = training_protocol["warm_start"][
             "learning_rate"
@@ -3263,6 +3319,14 @@ def recurrent_training_main(args, parser):
                     learned_source, identity["physical_reference"]
                 )
             )
+            if args.restart_coverage and (
+                archived_protocol["version"] != PROPRIO_HIGHER_TERRAIN_VERSION
+                or archived_protocol.get("restart_coverage_change") is not None
+            ):
+                raise ValueError(
+                    "--restart-coverage starts once from an unchanged higher_terrain "
+                    "checkpoint; omit it to resume an existing restart-coverage stage"
+                )
             if evaluation and args.seed == archived_protocol["seed"]:
                 raise ValueError(
                     "Evaluation seed must differ from the archived training seed"
@@ -3477,6 +3541,21 @@ def recurrent_training_main(args, parser):
             metrics="current session only; cumulative learning/control/transition counters are reported separately from session exposure and resets",
             scope="Optimizer continuation of the unchanged archived recipe in a separate immutable-source run; --iterations adds updates. No behavioral acceptance or automatic extension decision.",
         )
+        if args.restart_coverage:
+            protocol["restart_coverage_change"] = {
+                "sampling": restart_coverage_manifest(),
+                "started_at_learning_updates": start_updates,
+                "source_checkpoint_sha256": resume_from["sources"]["checkpoint"],
+            }
+            protocol["scope"] = (
+                "Explicit training command-distribution stage: enrich low-speed "
+                "post-hold restarts, retain full speed support and all other sampling. "
+                "Preserve model/std, Adam/live LR and cumulative counters; simulator, "
+                "command and GRU state reset. Terrain/rewards/motor/policy/gates unchanged. "
+                "Candidate-only triage, not sampler-only causal attribution. No automatic "
+                "extension, checkpoint selection or acceptance."
+            )
+        validate_restart_coverage_change(protocol)
     final_updates = start_updates + args.iterations
     if evaluation:
         try:
@@ -3534,31 +3613,26 @@ def recurrent_training_main(args, parser):
         return 0
     if args.worker_output is None:
         args.output_parent.mkdir(parents=True, exist_ok=True)
+        if evaluation:
+            name, label = "screen", "Frozen recurrent evaluation"
+        elif args.restart_coverage:
+            name, label = "restart_coverage", "Restart-coverage stage"
+        elif resuming:
+            name, label = "resume", "Recurrent resume"
+        elif refinement:
+            name, label = args.procedural_refinement, "Recurrent refinement"
+        else:
+            name, label = "", "Fresh recurrent acquisition"
         output = Path(
             tempfile.mkdtemp(
-                prefix=(
-                    "operator_proprio_screen_"
-                    if evaluation
-                    else (
-                        "operator_proprio_resume_"
-                        if resuming
-                        else (
-                            f"operator_proprio_{args.procedural_refinement}_"
-                            if refinement
-                            else "operator_proprio_"
-                        )
-                    )
-                ),
+                prefix=f"operator_proprio_{name + '_' if name else ''}",
                 dir=args.output_parent,
             )
         ).resolve()
         args.procedural_output = output
         write_run_provenance(output, __file__)
         write_json(output / protocol_name, protocol)
-        print(
-            f"{'Frozen recurrent evaluation' if evaluation else 'Recurrent resume' if resuming else 'Recurrent refinement' if refinement else 'Fresh recurrent acquisition'}: {output}",
-            flush=True,
-        )
+        print(f"{label}: {output}", flush=True)
         result = supervise(
             [
                 sys.executable,
@@ -3611,6 +3685,7 @@ def recurrent_training_main(args, parser):
                         ),
                         "--save-interval",
                         str(args.save_interval),
+                        *(["--restart-coverage"] if args.restart_coverage else []),
                     ]
                 ),
                 "--iterations",
@@ -3732,6 +3807,10 @@ def recurrent_training_main(args, parser):
                         or metadata.get("warm_start") != warm_start
                         or result.get("warm_start") != warm_start
                         or metadata.get("resume_from") != resume_from
+                        or metadata.get("restart_coverage_change")
+                        != protocol.get("restart_coverage_change")
+                        or result.get("restart_coverage_change")
+                        != protocol.get("restart_coverage_change")
                         or (
                             resuming
                             and any(
@@ -3804,6 +3883,8 @@ def recurrent_training_main(args, parser):
             cfg, runner_cfg = recurrent_source_configs(
                 saved, agent, args, archived_protocol, metadata, learned_source
             )
+            if args.restart_coverage:
+                apply_restart_coverage(cfg)
             cfg.sim.device = args.device
             runner_cfg.update(
                 device=args.device,
@@ -3872,6 +3953,11 @@ def recurrent_training_main(args, parser):
                 **(
                     {"resume_from": resume_from, "optimizer_state": optimizer_state}
                     if resuming
+                    else {}
+                ),
+                **(
+                    {"restart_coverage_change": protocol["restart_coverage_change"]}
+                    if protocol.get("restart_coverage_change") is not None
                     else {}
                 ),
                 **(
@@ -3961,6 +4047,11 @@ def main(argv=None):
         "--procedural-resume-checkpoint",
         type=Path,
         help="Continue the archived recurrent recipe with exact model/std, Adam and live LR in a new run. --iterations adds updates; checkpoint names stay cumulative. Inherit seed, environment count and save interval; simulator/commands/GRU/RNG reset, not bitwise continuation",
+    )
+    parser.add_argument(
+        "--restart-coverage",
+        action="store_true",
+        help="Explicit sampling-stage change with --procedural-resume-checkpoint from higher_terrain: enrich low-speed post-hold restarts, retaining Adam/live LR and all other settings. Omit on subsequent resumes; the stage is inherited",
     )
     parser.add_argument(
         "--procedural-refinement",
@@ -4116,6 +4207,8 @@ def main(argv=None):
     refinement = args.procedural_refine_checkpoint is not None
     resuming = args.procedural_resume_checkpoint is not None
     learning = args.procedural_train or refinement or resuming
+    if args.restart_coverage and not resuming:
+        parser.error("--restart-coverage requires --procedural-resume-checkpoint")
     if args.procedural_refinement is not None and not refinement:
         parser.error("--procedural-refinement requires --procedural-refine-checkpoint")
     if refinement and args.procedural_refinement is None:

@@ -22,6 +22,12 @@ VERSION = "operator_reversal_sequences_v3"
 PROBABILITY = 0.25  # Per physical episode selection, NOT a time fraction.
 PHASES = ("first_yaw", "opposite_yaw", "hold", "restart")
 DURATIONS = ((3.0, 5.0), (3.0, 5.0), (3.0, 5.0), (2.0, 4.0))
+ARRIVAL_FORWARD_M_S = (0.2, 0.7)
+ARRIVAL_FORWARD_SPAN_M_S = 0.5
+RESTART_COVERAGE_VERSION = "operator_restart_coverage_v1"
+RESTART_COVERAGE_FRACTION = 0.5
+RESTART_COVERAGE_LOW_M_S = (0.2, 0.35)
+RESTART_SPEED_BIN_EDGES_M_S = (0.2, 0.25, 0.35, 0.5, 0.7)
 
 
 def sequence_manifest():
@@ -139,6 +145,12 @@ class ArrivalHoldPlan(ReversalSequencePlan):
     )
     durations = ((3.0, 4.0), (1.5, 2.0), (10.0, 11.5), (1.5, 2.0))
 
+    def __init__(self, num_envs, device="cpu", restart_coverage=False):
+        if type(restart_coverage) is not bool:
+            raise ValueError("restart_coverage must be a bool")
+        super().__init__(num_envs, device)
+        self.restart_coverage = restart_coverage
+
     def _orientation(self, draw):
         return (draw * 4).long()
 
@@ -147,7 +159,26 @@ class ArrivalHoldPlan(ReversalSequencePlan):
         turning = phase == 1
         translating = (phase == 0) | (phase == 3) | (turning & (kind < 2))
         command = torch.zeros((len(active), 3), device=self.phase.device)
-        command[translating, 0] = 0.2 + 0.5 * magnitude[translating]
+        command[translating, 0] = (
+            ARRIVAL_FORWARD_M_S[0] + ARRIVAL_FORWARD_SPAN_M_S * magnitude[translating]
+        )
+        if self.restart_coverage:
+            restart = phase == 3
+            draw = magnitude[restart]
+            low = draw < RESTART_COVERAGE_FRACTION
+            unit = torch.where(
+                low,
+                draw / RESTART_COVERAGE_FRACTION,
+                (draw - RESTART_COVERAGE_FRACTION) / (1 - RESTART_COVERAGE_FRACTION),
+            )
+            upper = torch.where(
+                low,
+                draw.new_tensor(RESTART_COVERAGE_LOW_M_S[1]),
+                draw.new_tensor(ARRIVAL_FORWARD_M_S[1]),
+            )
+            command[restart, 0] = (
+                ARRIVAL_FORWARD_M_S[0] + (upper - ARRIVAL_FORWARD_M_S[0]) * unit
+            )
         yaw = torch.rand(len(active), device=self.phase.device, generator=generator)
         command[turning, 2] = (1 - 2 * (kind[turning] % 2)) * (0.2 + 0.6 * yaw[turning])
         category = torch.where(
@@ -166,7 +197,7 @@ def arrival_hold_manifest():
         "arrival_kinds": list(ArrivalHoldPlan.orientation_names),
         "phases": list(ArrivalHoldPlan.phase_names),
         "duration_s": [list(x) for x in ArrivalHoldPlan.durations],
-        "forward_m_s": [0.2, 0.7],
+        "forward_m_s": list(ARRIVAL_FORWARD_M_S),
         "yaw_magnitude_rad_s": [0.2, 0.8],
         "hold_command": [0.0, 0.0, 0.0],
         "maximum_planned_duration_s": 19.5,
@@ -174,6 +205,34 @@ def arrival_hold_manifest():
         "phase_observed_by_policy": False,
         "inference_assistance": False,
         "scope": "command-distribution candidate, not causal attribution without a matched fresh-Adam control; no terrain, reward, motor, policy or episode-duration change",
+    }
+
+
+def restart_coverage_manifest():
+    """Describe the opt-in restart-only command-distribution intervention."""
+    return {
+        "version": RESTART_COVERAGE_VERSION,
+        "base": arrival_hold_manifest()["version"],
+        "phase": "restart",
+        "phase_index": 3,
+        "mixture_fraction": RESTART_COVERAGE_FRACTION,
+        "original_forward_m_s": list(ARRIVAL_FORWARD_M_S),
+        "low_forward_m_s": list(RESTART_COVERAGE_LOW_M_S),
+        "speed_bin_edges_m_s": list(RESTART_SPEED_BIN_EDGES_M_S),
+        "sampling": (
+            "partition the existing restart magnitude draw at 0.5; map each half "
+            "uniformly onto the low or original interval; no additional RNG draw"
+        ),
+        "support": (
+            "explicit training-only higher_terrain optimizer resume; plain resumes "
+            "retain their archived sampler"
+        ),
+        "unchanged": (
+            "selection probability, durations, approach/arrival/hold commands, "
+            "background sampler, rewards, observations, actor and evaluator"
+        ),
+        "phase_observed_by_policy": False,
+        "inference_assistance": False,
     }
 
 
@@ -272,6 +331,24 @@ class ArrivalHoldExposure(SequenceExposure):
             name: torch.zeros_like(self.entered)
             for name in ("physical", "workspace", "other_timeout")
         }
+        self.restart_coverage = getattr(plan, "restart_coverage", False)
+        if type(self.restart_coverage) is not bool:
+            raise ValueError("Arrival plan restart_coverage must be a bool")
+        if self.restart_coverage:
+            bins = len(RESTART_SPEED_BIN_EDGES_M_S) - 1
+            shape = (group_count, bins)
+            self.restart_bin_edges = torch.tensor(
+                RESTART_SPEED_BIN_EDGES_M_S,
+                dtype=torch.float32,
+                device=plan.phase.device,
+            )
+            self.restart_frames = torch.zeros(
+                shape, dtype=torch.int64, device=plan.phase.device
+            )
+            self.restart_entries = torch.zeros_like(self.restart_frames)
+            self.restart_forward_abs_error_sum = torch.zeros(
+                shape, dtype=torch.float64, device=plan.phase.device
+            )
 
     def observe(
         self,
@@ -285,7 +362,24 @@ class ArrivalHoldExposure(SequenceExposure):
         relief,
         moving,
         four_contacts,
+        restart_command_x=None,
+        restart_velocity_x=None,
     ):
+        telemetry = (restart_command_x, restart_velocity_x)
+        if self.restart_coverage:
+            for name, value in zip(
+                ("restart_command_x", "restart_velocity_x"), telemetry, strict=True
+            ):
+                if (
+                    not isinstance(value, torch.Tensor)
+                    or value.shape != self.plan.phase.shape
+                    or not value.is_floating_point()
+                    or value.device != self.plan.phase.device
+                    or not torch.isfinite(value).all()
+                ):
+                    raise ValueError(f"{name} must be a finite device floating vector")
+        elif any(value is not None for value in telemetry):
+            raise ValueError("Restart telemetry requires restart_coverage")
         done = terminated | timeouts
         entering = (phase == 2) & (self.previous != 2)
         hold = phase == 2
@@ -321,6 +415,40 @@ class ArrivalHoldExposure(SequenceExposure):
                 orientation[selected] * 4 + phase[selected],
                 minlength=16,
             ).reshape(4, 4)
+        if self.restart_coverage:
+            restart = phase == 3
+            command_x = restart_command_x[restart]
+            if (command_x < RESTART_SPEED_BIN_EDGES_M_S[0]).any() or (
+                command_x > RESTART_SPEED_BIN_EDGES_M_S[-1]
+            ).any():
+                raise ValueError("Restart command is outside the declared speed bins")
+            speed_bin = torch.bucketize(
+                command_x, self.restart_bin_edges[1:-1], right=True
+            )
+            keys = self.group_ids[restart] * self.restart_frames.shape[1] + speed_bin
+            self.restart_frames += torch.bincount(
+                keys, minlength=self.restart_frames.numel()
+            ).reshape_as(self.restart_frames)
+            restart_entering = restart & (self.previous != 3)
+            entry_bin = torch.bucketize(
+                restart_command_x[restart_entering],
+                self.restart_bin_edges[1:-1],
+                right=True,
+            )
+            entry_keys = (
+                self.group_ids[restart_entering] * self.restart_entries.shape[1]
+                + entry_bin
+            )
+            self.restart_entries += torch.bincount(
+                entry_keys, minlength=self.restart_entries.numel()
+            ).reshape_as(self.restart_entries)
+            self.restart_forward_abs_error_sum.view(-1).index_add_(
+                0,
+                keys,
+                (restart_command_x[restart] - restart_velocity_x[restart])
+                .abs()
+                .double(),
+            )
         super().observe(phase, orientation, post_phase, done)
         self.age = torch.where(hold & ~done, self.age + 1, 0)
         self.arrival_motion = (
@@ -343,6 +471,19 @@ class ArrivalHoldExposure(SequenceExposure):
             },
             measurement="pre-action frames; age bins [0,.6), [.6,2), [2,5), [5,10), [10,infinity); scan relief >2cm with all rays valid is neighborhood geometry, NOT confirmed under-foot support; four foot force norms >1N; arrival motion uses the last arrival frame (planar speed or absolute yaw rate >0.1); interruption takes precedence over phase completion",
         )
+        if self.restart_coverage:
+            result["restart_coverage"] = {
+                "version": RESTART_COVERAGE_VERSION,
+                "axes": ["row_profile_group", "command_speed_bin"],
+                "speed_bin_edges_m_s": list(RESTART_SPEED_BIN_EDGES_M_S),
+                "entered": self.restart_entries.cpu().tolist(),
+                "frames": self.restart_frames.cpu().tolist(),
+                "forward_abs_error_sum_m_s": self.restart_forward_abs_error_sum.cpu().tolist(),
+                "measurement": (
+                    "pre-action phase-3 frames; link-origin forward speed when wired "
+                    "by native training; sums and denominators only, not acceptance"
+                ),
+            }
         return result
 
 

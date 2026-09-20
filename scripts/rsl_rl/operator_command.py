@@ -157,6 +157,8 @@ class ProceduralTerrainCommand(OperatorTransitionCommand):
 class ProceduralArrivalHoldCommand(ProceduralTerrainCommand):
     """Mix long arrival/hold sequences into training, never into live control."""
 
+    restart_coverage = False
+
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
         try:
@@ -164,7 +166,9 @@ class ProceduralArrivalHoldCommand(ProceduralTerrainCommand):
         except ImportError:
             from operator_sequences import ArrivalHoldPlan
 
-        self.arrival_plan = ArrivalHoldPlan(self.num_envs, self.device)
+        self.arrival_plan = ArrivalHoldPlan(
+            self.num_envs, self.device, restart_coverage=self.restart_coverage
+        )
 
     def _resample_command(self, env_ids):
         ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
@@ -180,6 +184,12 @@ class ProceduralArrivalHoldCommand(ProceduralTerrainCommand):
         self.is_heading_env[selected] = False
         self.is_standing_env[selected] = categories == 0
         self.time_left[selected] = seconds
+
+
+class ProceduralRestartCoverageCommand(ProceduralArrivalHoldCommand):
+    """Explicit training-stage override; retain all background command draws."""
+
+    restart_coverage = True
 
 
 def procedural_physical_failure(

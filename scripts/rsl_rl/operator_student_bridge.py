@@ -986,6 +986,7 @@ def run_recurrent_training(
     warm_start=None,
     resume_from=None,
     optimizer_state=None,
+    restart_coverage_change=None,
     terrain_rows=1,
     terrain_difficulty=(0.05, 0.15),
     root_point_check=False,
@@ -1033,6 +1034,16 @@ def run_recurrent_training(
         initialization["resume_from"] = copy.deepcopy(resume_from)
     final_updates = start_updates + iterations
     command = env.command_manager.get_term("base_velocity")
+    if bool(
+        getattr(getattr(command, "arrival_plan", None), "restart_coverage", False)
+    ) != (restart_coverage_change is not None):
+        raise ValueError("Restart-coverage sampler and stage receipt differ")
+    if restart_coverage_change is not None:
+        if resume_from is None:
+            raise ValueError("Restart-coverage stage requires optimizer continuation")
+        initialization["restart_coverage_change"] = copy.deepcopy(
+            restart_coverage_change
+        )
     terrain_cfg = env.cfg.scene.terrain
     generator = terrain_cfg.terrain_generator
     configured_difficulty = getattr(generator, "difficulty_range", None)
@@ -1428,6 +1439,14 @@ def run_recurrent_training(
                 actual_motion = (tracking[:, :2].norm(dim=-1) > 0.1) | (
                     tracking[:, 2].abs() > 0.1
                 )
+                restart_samples = (
+                    {
+                        "restart_command_x": desired[:, 0].clone(),
+                        "restart_velocity_x": robot.root_link_lin_vel_b[:, 0].clone(),
+                    }
+                    if restart_coverage_change is not None
+                    else {}
+                )
             observation, reward, done, extras = super().step(actions)
             validate_terrain_assignment()
             # Native wrappers can report both a physical failure and a time
@@ -1454,6 +1473,7 @@ def run_recurrent_training(
                     relief,
                     actual_motion,
                     four_contacts,
+                    **restart_samples,
                 )
             if not torch.equal(
                 robot.joint_pos_target[~self.done], expected[~self.done]
