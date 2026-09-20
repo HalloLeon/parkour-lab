@@ -138,6 +138,40 @@ def _snapshot(values):
     }
 
 
+def native_reward_snapshot(env, names, weights):
+    """Read once-computed Isaac Lab 2.3.2 rewards before reset; never recompute terms."""
+    names, weights = tuple(names), tuple(weights)
+    if (
+        env.cfg.decimation != 4
+        or not math.isclose(env.step_dt, DT, rel_tol=0, abs_tol=1e-9)
+        or not names
+        or any(not isinstance(name, str) or not name for name in names)
+        or len(set(names)) != len(names)
+        or len(weights) != len(names)
+        or not np.isfinite(weights).all()
+    ):
+        raise ValueError("Invalid native reward timing or term specification")
+    manager = env.reward_manager
+    if (
+        tuple(manager.active_terms) != names
+        or tuple(float(manager.get_term_cfg(name).weight) for name in names) != weights
+    ):
+        raise ValueError("Native reward order or weights changed during capture")
+    # The pinned manager stores weighted rates, not per-step contributions.
+    contribution = manager._step_reward * env.step_dt
+    total = env.reward_buf
+    if (
+        contribution.shape != (env.num_envs, len(names))
+        or total.shape != (env.num_envs,)
+        or not torch.isfinite(contribution).all()
+        or not torch.isfinite(total).all()
+    ):
+        raise ValueError("Invalid native reward matrix or total")
+    if not torch.allclose(contribution.sum(-1), total, atol=2e-6, rtol=1e-5):
+        raise ValueError("Native reward decomposition does not sum to reward_buf")
+    return {"reward_contribution": contribution, "reward_total": total}
+
+
 class OperatorControlTrace:
     """Pair the actual pre-action frame with the post-physics/pre-reset state."""
 
@@ -290,28 +324,14 @@ class OperatorControlTrace:
         if self.native_rewards:
             if len(self.substeps) != 4:
                 raise RuntimeError("Missing actuator substeps")
-            manager = self.env.reward_manager
-            names = self.metadata["reward_names"]
-            if list(manager.active_terms) != names:
-                raise RuntimeError("Reward order changed during capture")
-            # Pinned IsaacLab 2.3.2 stores WEIGHTED RATES in this buffer.
-            contribution = manager._step_reward * self.env.step_dt
-            if (
-                contribution.shape != (self.env.num_envs, len(names))
-                or not torch.isfinite(contribution).all()
-            ):
-                raise ValueError("Invalid native reward matrix")
-            if not torch.allclose(
-                contribution.sum(-1), self.env.reward_buf, atol=2e-6, rtol=1e-5
-            ):
-                raise ValueError(
-                    "Native reward decomposition does not sum to reward_buf"
-                )
             sample.update(
                 self.snapshot(
                     {
-                        "reward_contribution": contribution,
-                        "reward_total": self.env.reward_buf,
+                        **native_reward_snapshot(
+                            self.env,
+                            self.metadata["reward_names"],
+                            self.metadata["reward_weights"],
+                        ),
                         "body_position_post": robot.body_pos_w,
                         "height_scan_post": self.env.scene[
                             "height_scanner"

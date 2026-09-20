@@ -84,6 +84,7 @@ def make_recorder_cfg(*, procedural=False):
             self.procedural = procedural
             self.actuator_diagnostics = False
             self.root_point_diagnostics = False
+            self.reward_terms = None
             env.operator_capture = self
 
         def record_pre_step(self):
@@ -166,6 +167,12 @@ def make_recorder_cfg(*, procedural=False):
                         root_link_lin_vel_b=robot.root_link_lin_vel_b.clone(),
                         body_com_pos_b=robot.body_com_pos_b[:, 0].clone(),
                     )
+                if self.reward_terms is not None:
+                    try:
+                        from .operator_control_trace import native_reward_snapshot
+                    except ImportError:
+                        from operator_control_trace import native_reward_snapshot
+                    sample.update(native_reward_snapshot(self._env, *self.reward_terms))
                 if self.course is not None:
                     route_state = self._env._parkour_runtime.route
                     params = self._env.termination_manager.get_term_cfg(

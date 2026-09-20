@@ -80,6 +80,12 @@ ROOT_POINT_TELEMETRY_MANIFEST = {
     ),
     "diagnostic_only": True,
 }
+REWARD_TELEMETRY_MANIFEST = {
+    "version": "isaaclab_2_3_2_native_rewards_v1",
+    "sample_timing": "post_reward_compute_pre_reset",
+    "contribution": "Native weighted rate times control dt exactly once; sum checked against reward_buf",
+    "scope": "Frozen evaluation returns, not training advantages or counterfactual performance; no scoring change",
+}
 
 
 def recurrent_evaluation_protocol(
@@ -89,6 +95,7 @@ def recurrent_evaluation_protocol(
     command_coverage=False,
     negative_pivot_first=False,
     root_point_diagnostics=False,
+    reward_capture=False,
     seed=43,
 ):
     """Predeclared clean-sensor first-attempt screen, not an acceptance gate."""
@@ -98,6 +105,12 @@ def recurrent_evaluation_protocol(
         raise ValueError("Root-point diagnostics flag must be boolean")
     if root_point_diagnostics and difficulty_range is None:
         raise ValueError("Root-point diagnostics require native terrain diagnostics")
+    if type(reward_capture) is not bool or (
+        reward_capture and difficulty_range is None
+    ):
+        raise ValueError(
+            "Reward capture requires a boolean and explicit terrain difficulty"
+        )
     if (long_stops or command_coverage) and difficulty_range is None:
         raise ValueError("Extended evaluation requires an explicit terrain difficulty")
     if long_stops and command_coverage:
@@ -163,6 +176,8 @@ def recurrent_evaluation_protocol(
             protocol["root_point_telemetry"] = copy.deepcopy(
                 ROOT_POINT_TELEMETRY_MANIFEST
             )
+        if reward_capture:
+            protocol["reward_telemetry"] = copy.deepcopy(REWARD_TELEMETRY_MANIFEST)
     if long_stops or command_coverage:
         for phase in protocol["phases"]:
             if phase["name"] in ("stop_after_arcs", "final_stop"):
@@ -1755,6 +1770,55 @@ def _evaluation_root_point_diagnostics(trace, protocol, shape):
     }
 
 
+def _summarize_evaluation_rewards(trace, protocol, valid, version):
+    """Validate optional native contributions without recomputing stateful rewards."""
+    import numpy as np
+
+    fields = {"reward_names", "reward_weights", "reward_contribution", "reward_total"}
+    declared = "reward_telemetry" in protocol
+    if not declared and not fields.intersection(trace):
+        return None
+    if (
+        not declared
+        or protocol["reward_telemetry"] != REWARD_TELEMETRY_MANIFEST
+        or version != 3
+        or protocol.get("native_diagnostics") != "joint_actuator_contact_v1"
+        or not fields.issubset(trace)
+    ):
+        raise ValueError("Missing, undeclared or incompatible native reward capture")
+    names, weights = trace["reward_names"], trace["reward_weights"]
+    contribution, total = trace["reward_contribution"], trace["reward_total"]
+    if (
+        names.ndim != 1
+        or names.dtype.kind != "U"
+        or not len(names)
+        or len(set(names.tolist())) != len(names)
+        or any(not name for name in names)
+        or weights.shape != names.shape
+        or contribution.shape != (*valid.shape, len(names))
+        or total.shape != valid.shape
+        or any(
+            not np.issubdtype(value.dtype, np.floating) or not np.isfinite(value).all()
+            for value in (weights, contribution, total)
+        )
+    ):
+        raise ValueError("Invalid native reward arrays")
+    residual = contribution.sum(axis=-1, dtype=np.float64) - total
+    if not np.allclose(residual, 0, atol=2e-6 + 1e-5 * np.abs(total), rtol=0):
+        raise ValueError("Native reward contributions do not sum to recorded total")
+    return {
+        "manifest": protocol["reward_telemetry"],
+        "names": names.tolist(),
+        "weights": weights.tolist(),
+        "first_attempt_samples": int(valid.sum()),
+        "first_attempt_contribution_sums": contribution[valid]
+        .sum(axis=0, dtype=np.float64)
+        .tolist(),
+        "first_attempt_total_sum": float(total[valid].sum(dtype=np.float64)),
+        "maximum_checksum_error": float(np.max(np.abs(residual))),
+    }
+
+
 def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
     """Pure first-attempt diagnostics; versions 1 and 2 explicitly replay old schemas."""
     import numpy as np
@@ -1776,6 +1840,7 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
             command_coverage=True,
             negative_pivot_first=negative_pivot_first,
             root_point_diagnostics="root_point_telemetry" in protocol,
+            reward_capture="reward_telemetry" in protocol,
         )
         if any(protocol.get(key) != value for key, value in expected.items()):
             raise ValueError("Command coverage tape or development limits differ")
@@ -2306,6 +2371,9 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
                 "Requested targets are not measured joint positions. No health acceptance."
             ),
         )
+    rewards = _summarize_evaluation_rewards(trace, protocol, valid, version)
+    if rewards is not None:
+        summary["native_rewards"] = rewards
     return summary
 
 
@@ -2320,6 +2388,7 @@ def evaluate_recurrent_operator(
     long_stops=False,
     command_coverage=False,
     negative_pivot_first=False,
+    reward_capture=False,
     seed=43,
 ):
     """Replay one clean deterministic first attempt; only the actor drives motors."""
@@ -2333,6 +2402,7 @@ def evaluate_recurrent_operator(
         command_coverage=command_coverage,
         negative_pivot_first=negative_pivot_first,
         root_point_diagnostics=native,
+        reward_capture=reward_capture,
         seed=seed,
     )
     generator = env.cfg.scene.terrain.terrain_generator
@@ -2392,6 +2462,7 @@ def evaluate_recurrent_operator(
         or capture.course is not None
         or capture.control_trace is not None
         or capture.root_point_diagnostics
+        or capture.reward_terms is not None
         or not capture.procedural
     ):
         raise ValueError(
@@ -2405,6 +2476,14 @@ def evaluate_recurrent_operator(
     if torch.any(limits[..., 0] >= limits[..., 1]):
         raise ValueError("Native soft joint position limits must be ordered")
     native_trace = {}
+    if reward_capture:
+        manager = env.reward_manager
+        reward_names = list(manager.active_terms)
+        reward_weights = [float(manager.get_term_cfg(n).weight) for n in reward_names]
+        native_trace.update(
+            reward_names=np.asarray(reward_names, dtype=str),
+            reward_weights=np.asarray(reward_weights, dtype=np.float64),
+        )
     if native:
         hard_limits = robot.joint_pos_limits.detach().clone()
         _check_tensor(
@@ -2460,6 +2539,8 @@ def evaluate_recurrent_operator(
     partial_resets = 0
     capture.actuator_diagnostics = native
     capture.root_point_diagnostics = native
+    if reward_capture:
+        capture.reward_terms = (reward_names, reward_weights)
     capture.motor_parity = capture.enabled = True
     try:
         with torch.inference_mode():
@@ -2537,6 +2618,7 @@ def evaluate_recurrent_operator(
         capture.enabled = capture.motor_parity = False
         capture.actuator_diagnostics = False
         capture.root_point_diagnostics = False
+        capture.reward_terms = None
     trace = capture.finish()
     if not torch.equal(limits, robot.soft_joint_pos_limits):
         raise RuntimeError(
