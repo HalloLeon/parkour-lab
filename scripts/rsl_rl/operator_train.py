@@ -14,7 +14,8 @@ control run from learned weights and scalar LR, never from old optimizer state.
 --procedural-resume-checkpoint continues the same recipe with saved Adam and
 cumulative update numbers in a new run; simulator, command and GRU state reset.
 --restart-coverage explicitly starts a low-speed restart sampling stage while
-retaining that optimizer state. Plain resume inherits the archived sampler.
+retaining that optimizer state. --pivot-planar-precision instead changes only
+the pure-pivot planar precision mixture. Plain resume inherits either stage.
 """
 
 from __future__ import annotations
@@ -524,6 +525,19 @@ PROPRIO_PIVOT_PRECISION_CHANGE = {
     "kernel": "0.9*exp(-planar_error_squared/0.5**2) + 0.1*exp(-planar_error_squared/0.05**2)",
     "integration": "native RewardManager weight * step_dt exactly once",
     "scope": "pure-pivot planar reward only; exact-zero and translating rewards, yaw objective, stance cost, commands, terrain, actor and motors unchanged; no pose anchor or inference assistance",
+}
+PIVOT_PLANAR_PRECISION_CHANGE = {
+    "term": "track_lin_vel_xy_exp",
+    "function": "operator_rewards:track_lin_vel_xy_stationary",
+    "gate": "exact zero planar command and nonzero yaw command, either sign; no measured-speed gate",
+    "from_precision_fraction": 0.1,
+    "to_precision_fraction": 0.3,
+    "broad_std_m_s": 0.5,
+    "planar_std_m_s": 0.05,
+    "weight": 1.5,
+    "root_link_velocity": True,
+    "kernel": "0.7*exp(-planar_error_squared/0.5**2) + 0.3*exp(-planar_error_squared/0.05**2)",
+    "scope": "one pure-pivot planar mixture delta; exact-stop/translating rewards, yaw/stance objectives, sampler, terrain, actor, motor and evaluation gates unchanged; no pose anchor or inference assistance",
 }
 PROPRIO_STATIONARY_YAW_CHANGE = {
     "term": "track_ang_vel_z_exp",
@@ -2899,23 +2913,27 @@ def _check_root_point_receipt(receipt, num_envs):
         raise ValueError("Failed pre-update root-point identity or rotational leverage")
 
 
-def validate_restart_coverage_change(protocol):
-    """Bind the one optional sampling stage to its immutable optimizer source."""
-    change = protocol.get("restart_coverage_change")
+def _validate_optimizer_stage(protocol, key, manifest_key, manifest):
+    """Bind a single optional stage to its first immutable optimizer source."""
+    change = protocol.get(key)
     if change is None:
         return
     if not isinstance(change, dict):
-        raise ValueError("Invalid low-speed restart sampling stage")
+        raise ValueError(f"Invalid {key} stage")
     resumed = protocol.get("resume_from") or {}
     if not isinstance(resumed, dict) or not isinstance(resumed.get("sources"), dict):
-        raise ValueError("Restart coverage requires a bound optimizer source")
+        raise ValueError(f"{key} requires a bound optimizer source")
     start = change.get("started_at_learning_updates")
     digest = change.get("source_checkpoint_sha256")
     if (
         set(change)
-        != {"sampling", "started_at_learning_updates", "source_checkpoint_sha256"}
-        or change["sampling"] != restart_coverage_manifest()
+        != {manifest_key, "started_at_learning_updates", "source_checkpoint_sha256"}
+        or change[manifest_key] != manifest
         or protocol.get("version") != PROPRIO_HIGHER_TERRAIN_VERSION
+        or all(
+            protocol.get(name) is not None
+            for name in ("restart_coverage_change", "pivot_planar_precision_change")
+        )
         or type(start) is not int
         or type(resumed.get("learning_updates")) is not int
         or not 0 < start <= resumed.get("learning_updates", -1)
@@ -2926,7 +2944,55 @@ def validate_restart_coverage_change(protocol):
             and digest != resumed.get("sources", {}).get("checkpoint")
         )
     ):
-        raise ValueError("Invalid low-speed restart sampling stage or source binding")
+        raise ValueError(f"Invalid {key} stage or source binding")
+
+
+def validate_restart_coverage_change(protocol):
+    _validate_optimizer_stage(
+        protocol, "restart_coverage_change", "sampling", restart_coverage_manifest()
+    )
+
+
+def validate_pivot_planar_precision_change(protocol):
+    _validate_optimizer_stage(
+        protocol,
+        "pivot_planar_precision_change",
+        "reward",
+        PIVOT_PLANAR_PRECISION_CHANGE,
+    )
+
+
+def check_pivot_planar_precision_reward(term, precision_fraction):
+    """Fail closed on every kernel/gate/reference parameter, not just the blend."""
+    try:
+        from .operator_rewards import track_lin_vel_xy_stationary
+    except ImportError:
+        from operator_rewards import track_lin_vel_xy_stationary
+    change = PIVOT_PLANAR_PRECISION_CHANGE
+    if (
+        term.func is not track_lin_vel_xy_stationary
+        or term.weight != change["weight"]
+        or term.params
+        != {
+            "command_name": "base_velocity",
+            "std": change["broad_std_m_s"],
+            "stationary_std": change["planar_std_m_s"],
+            "precision_fraction": precision_fraction,
+            "pivot_only": True,
+            "root_link_velocity": True,
+        }
+    ):
+        raise ValueError(
+            "Pivot planar precision requires the unchanged root-link pure-pivot reward"
+        )
+
+
+def apply_pivot_planar_precision(cfg):
+    """After complete source reconstruction, change exactly one reward scalar."""
+    term = cfg.rewards.track_lin_vel_xy_exp
+    change = PIVOT_PLANAR_PRECISION_CHANGE
+    check_pivot_planar_precision_reward(term, change["from_precision_fraction"])
+    term.params["precision_fraction"] = change["to_precision_fraction"]
 
 
 def apply_restart_coverage(cfg):
@@ -2957,6 +3023,7 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
     policy, metadata, digest = load_recurrent_checkpoint(checkpoint, device="cpu")
     protocol = json.loads((checkpoint.parent / "training_protocol.json").read_text())
     validate_restart_coverage_change(protocol)
+    validate_pivot_planar_precision_change(protocol)
     recipe = metadata["recipe"]
     exposure = protocol["version"] in PROPRIO_MIXED_TERRAIN_VERSIONS
     terrain = _proprio_terrain_exposure(protocol["version"])
@@ -2987,6 +3054,8 @@ def recurrent_evaluation_source(checkpoint, physical_identity):
         or protocol.get("resume_from") != metadata.get("resume_from")
         or protocol.get("restart_coverage_change")
         != metadata.get("restart_coverage_change")
+        or protocol.get("pivot_planar_precision_change")
+        != metadata.get("pivot_planar_precision_change")
         or protocol.get("terrain_exposure_change") != (terrain if exposure else None)
         or protocol.get("arrival_hold_change")
         != (
@@ -3145,6 +3214,8 @@ def recurrent_source_configs(
     )
     if training_protocol.get("restart_coverage_change") is not None:
         apply_restart_coverage(cfg)
+    if training_protocol.get("pivot_planar_precision_change") is not None:
+        apply_pivot_planar_precision(cfg)
     if training_protocol.get("warm_start") is not None:
         runner["algorithm"]["learning_rate"] = training_protocol["warm_start"][
             "learning_rate"
@@ -3320,13 +3391,14 @@ def recurrent_training_main(args, parser):
                     learned_source, identity["physical_reference"]
                 )
             )
-            if args.restart_coverage and (
+            if (args.restart_coverage or args.pivot_planar_precision) and (
                 archived_protocol["version"] != PROPRIO_HIGHER_TERRAIN_VERSION
                 or archived_protocol.get("restart_coverage_change") is not None
+                or archived_protocol.get("pivot_planar_precision_change") is not None
             ):
                 raise ValueError(
-                    "--restart-coverage starts once from an unchanged higher_terrain "
-                    "checkpoint; omit it to resume an existing restart-coverage stage"
+                    "An optimizer stage starts once from an unchanged higher_terrain "
+                    "checkpoint; omit the stage flag to resume its archived settings"
                 )
             if evaluation and args.seed == archived_protocol["seed"]:
                 raise ValueError(
@@ -3556,7 +3628,24 @@ def recurrent_training_main(args, parser):
                 "Candidate-only triage, not sampler-only causal attribution. No automatic "
                 "extension, checkpoint selection or acceptance."
             )
+        if args.pivot_planar_precision:
+            protocol["pivot_planar_precision_change"] = {
+                "reward": copy.deepcopy(PIVOT_PLANAR_PRECISION_CHANGE),
+                "started_at_learning_updates": start_updates,
+                "source_checkpoint_sha256": resume_from["sources"]["checkpoint"],
+            }
+            protocol["scope"] = (
+                "Explicit pure-pivot planar reward stage: precision fraction 0.1 to 0.3; "
+                "same broad/fine widths, weight and root-link reference. Preserve model/std, "
+                "Adam/live LR and cumulative counters; simulator, command and GRU reset. "
+                "Stop/translating rewards, yaw/stance objectives, sampler, terrain, motor, "
+                "policy and gates unchanged. Compare one predeclared endpoint with an "
+                "equal-budget unchanged resume from the same source/seed; frozen-source "
+                "scores are regression references, not a matched control. Development only; "
+                "no automatic extension, checkpoint selection or acceptance."
+            )
         validate_restart_coverage_change(protocol)
+        validate_pivot_planar_precision_change(protocol)
     final_updates = start_updates + args.iterations
     if evaluation:
         try:
@@ -3619,6 +3708,8 @@ def recurrent_training_main(args, parser):
             name, label = "screen", "Frozen recurrent evaluation"
         elif args.restart_coverage:
             name, label = "restart_coverage", "Restart-coverage stage"
+        elif args.pivot_planar_precision:
+            name, label = "pivot_planar_precision", "Pivot-planar-precision stage"
         elif resuming:
             name, label = "resume", "Recurrent resume"
         elif refinement:
@@ -3693,6 +3784,11 @@ def recurrent_training_main(args, parser):
                         "--save-interval",
                         str(args.save_interval),
                         *(["--restart-coverage"] if args.restart_coverage else []),
+                        *(
+                            ["--pivot-planar-precision"]
+                            if args.pivot_planar_precision
+                            else []
+                        ),
                     ]
                 ),
                 "--iterations",
@@ -3818,6 +3914,10 @@ def recurrent_training_main(args, parser):
                         != protocol.get("restart_coverage_change")
                         or result.get("restart_coverage_change")
                         != protocol.get("restart_coverage_change")
+                        or metadata.get("pivot_planar_precision_change")
+                        != protocol.get("pivot_planar_precision_change")
+                        or result.get("pivot_planar_precision_change")
+                        != protocol.get("pivot_planar_precision_change")
                         or (
                             resuming
                             and any(
@@ -3892,6 +3992,8 @@ def recurrent_training_main(args, parser):
             )
             if args.restart_coverage:
                 apply_restart_coverage(cfg)
+            if args.pivot_planar_precision:
+                apply_pivot_planar_precision(cfg)
             cfg.sim.device = args.device
             runner_cfg.update(
                 device=args.device,
@@ -3966,6 +4068,15 @@ def recurrent_training_main(args, parser):
                 **(
                     {"restart_coverage_change": protocol["restart_coverage_change"]}
                     if protocol.get("restart_coverage_change") is not None
+                    else {}
+                ),
+                **(
+                    {
+                        "pivot_planar_precision_change": protocol[
+                            "pivot_planar_precision_change"
+                        ]
+                    }
+                    if protocol.get("pivot_planar_precision_change") is not None
                     else {}
                 ),
                 **(
@@ -4056,10 +4167,16 @@ def main(argv=None):
         type=Path,
         help="Continue the archived recurrent recipe with exact model/std, Adam and live LR in a new run. --iterations adds updates; checkpoint names stay cumulative. Inherit seed, environment count and save interval; simulator/commands/GRU/RNG reset, not bitwise continuation",
     )
-    parser.add_argument(
+    stages = parser.add_mutually_exclusive_group()
+    stages.add_argument(
         "--restart-coverage",
         action="store_true",
         help="Explicit sampling-stage change with --procedural-resume-checkpoint from higher_terrain: enrich low-speed post-hold restarts, retaining Adam/live LR and all other settings. Omit on subsequent resumes; the stage is inherited",
+    )
+    stages.add_argument(
+        "--pivot-planar-precision",
+        action="store_true",
+        help="Explicit one-factor reward stage with --procedural-resume-checkpoint from unchanged higher_terrain: pure-pivot planar precision fraction 0.1 to 0.3, preserving widths, weight, saved Adam/live LR and every other setting. Omit on subsequent resumes; the stage is inherited",
     )
     parser.add_argument(
         "--procedural-refinement",
@@ -4222,6 +4339,8 @@ def main(argv=None):
     learning = args.procedural_train or refinement or resuming
     if args.restart_coverage and not resuming:
         parser.error("--restart-coverage requires --procedural-resume-checkpoint")
+    if args.pivot_planar_precision and not resuming:
+        parser.error("--pivot-planar-precision requires --procedural-resume-checkpoint")
     if args.procedural_refinement is not None and not refinement:
         parser.error("--procedural-refinement requires --procedural-refine-checkpoint")
     if refinement and args.procedural_refinement is None:

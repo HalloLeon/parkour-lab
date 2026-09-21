@@ -990,6 +990,49 @@ def _runtime_motor_binding(env):
     return binding, digest
 
 
+def _check_pivot_planar_precision_stage(env, change, resume_from):
+    """Match the native reward term to its bound optimizer-stage receipt."""
+    manager = getattr(env, "reward_manager", None)
+    term = None if manager is None else manager.get_term_cfg("track_lin_vel_xy_exp")
+    if change is None:
+        if term is not None and (
+            term.params.get("precision_fraction") == 0.3
+            or (
+                term.params.get("pivot_only") is True
+                and term.params.get("root_link_velocity") is True
+                and term.params.get("precision_fraction") != 0.1
+            )
+        ):
+            raise ValueError("Pivot planar precision reward requires its stage receipt")
+        return
+    if resume_from is None or term is None:
+        raise ValueError(
+            "Pivot planar precision requires optimizer continuation and native rewards"
+        )
+    try:
+        from .operator_train import (
+            PIVOT_PLANAR_PRECISION_CHANGE,
+            check_pivot_planar_precision_reward,
+            validate_pivot_planar_precision_change,
+        )
+    except ImportError:
+        from operator_train import (
+            PIVOT_PLANAR_PRECISION_CHANGE,
+            check_pivot_planar_precision_reward,
+            validate_pivot_planar_precision_change,
+        )
+    validate_pivot_planar_precision_change(
+        {
+            "version": resume_from.get("version"),
+            "resume_from": resume_from,
+            "pivot_planar_precision_change": change,
+        }
+    )
+    check_pivot_planar_precision_reward(
+        term, PIVOT_PLANAR_PRECISION_CHANGE["to_precision_fraction"]
+    )
+
+
 def run_recurrent_training(
     env,
     runner_cfg,
@@ -1002,6 +1045,7 @@ def run_recurrent_training(
     resume_from=None,
     optimizer_state=None,
     restart_coverage_change=None,
+    pivot_planar_precision_change=None,
     terrain_rows=1,
     terrain_difficulty=(0.05, 0.15),
     root_point_check=False,
@@ -1058,6 +1102,18 @@ def run_recurrent_training(
             raise ValueError("Restart-coverage stage requires optimizer continuation")
         initialization["restart_coverage_change"] = copy.deepcopy(
             restart_coverage_change
+        )
+    if (
+        restart_coverage_change is not None
+        and pivot_planar_precision_change is not None
+    ):
+        raise ValueError(
+            "Restart coverage and pivot planar precision stages are mutually exclusive"
+        )
+    _check_pivot_planar_precision_stage(env, pivot_planar_precision_change, resume_from)
+    if pivot_planar_precision_change is not None:
+        initialization["pivot_planar_precision_change"] = copy.deepcopy(
+            pivot_planar_precision_change
         )
     terrain_cfg = env.cfg.scene.terrain
     generator = terrain_cfg.terrain_generator
