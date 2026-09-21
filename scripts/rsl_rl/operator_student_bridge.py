@@ -96,6 +96,7 @@ def recurrent_evaluation_protocol(
     negative_pivot_first=False,
     root_point_diagnostics=False,
     reward_capture=False,
+    out_and_back=False,
     seed=43,
 ):
     """Predeclared clean-sensor first-attempt screen, not an acceptance gate."""
@@ -117,6 +118,19 @@ def recurrent_evaluation_protocol(
         raise ValueError("Choose long stops or command coverage, not both")
     if negative_pivot_first and not command_coverage:
         raise ValueError("Negative-pivot-first diagnostic requires command coverage")
+    if type(out_and_back) is not bool or (
+        out_and_back
+        and (
+            difficulty_range is None
+            or long_stops
+            or command_coverage
+            or negative_pivot_first
+            or reward_capture
+        )
+    ):
+        raise ValueError(
+            "Out-and-back requires explicit difficulty and no other tape/reward options"
+        )
     phases = (
         ("cold_stand", 1, (0, 0, 0)),
         ("forward", 4, (0.55, 0, 0)),
@@ -263,7 +277,81 @@ def recurrent_evaluation_protocol(
                     "or terrain/health/sensing/watchdog/deployment/exit acceptance."
                 ),
             )
+    if out_and_back:
+        from dataclasses import asdict
+
+        try:
+            from .operator_benchmark_core import (
+                OUT_AND_BACK_SUPPORT_COVERAGE,
+                Thresholds,
+            )
+        except ImportError:
+            from operator_benchmark_core import (
+                OUT_AND_BACK_SUPPORT_COVERAGE,
+                Thresholds,
+            )
+        limits = asdict(Thresholds())
+        limits.pop("flat_attitude_rad")
+        protocol.update(
+            version="go2_operator_proprio_out_and_back_v1",
+            steps=1514,
+            phases=[
+                {
+                    "name": name,
+                    "duration_s": duration,
+                    "flat_command": list(command),
+                    "rough_command": list(command),
+                }
+                for name, duration, command in (
+                    ("cold_stand", 2, (0, 0, 0)),
+                    ("outbound", 8, (0.4, 0, 0)),
+                    ("stop_outbound", 2, (0, 0, 0)),
+                    ("turnaround", 6.28, (0, 0, 0.5)),
+                    ("stop_after_turn", 2, (0, 0, 0)),
+                    ("return", 8, (0.4, 0, 0)),
+                    ("final_stop", 2, (0, 0, 0)),
+                )
+            ],
+            command_limits=limits,
+            initial_condition={
+                "assignment": "ascending env id within each of 20 columns; four rows per column",
+                "heading_rad": [math.pi / 2, math.pi / 2, -math.pi / 2, -math.pi / 2],
+                "turn_sign": [1, -1, 1, -1],
+                "override": "yaw only, once after initial reset before first action; retain native position/velocity/joint reset",
+            },
+            foot_telemetry="post_physics_pre_reset_foot_regions_v1",
+            support_coverage=copy.deepcopy(OUT_AND_BACK_SUPPORT_COVERAGE),
+            scope=(
+                "Frozen 30.28-second same-episode out-and-back development diagnostic. "
+                "Fixed forward packets and signed 3.14-rad open-loop turn; no heading "
+                "feedback, steering, retry, policy switch or phase-boundary memory reset. "
+                "Measured foot/terrain evidence is separate from command tracking. A missed "
+                "return is uncovered, not proof of terrain incapability. Plane is a control. "
+                "No learning, checkpoint selection, support certification or acceptance."
+            ),
+        )
     return protocol
+
+
+def out_and_back_assignment(columns):
+    """Fixed heading/turn pairs, balanced within each immutable terrain column."""
+    import numpy as np
+
+    columns = np.asarray(columns)
+    if (
+        columns.shape != (80,)
+        or not np.issubdtype(columns.dtype, np.integer)
+        or np.any((columns < 0) | (columns >= 20))
+        or not np.array_equal(np.bincount(columns, minlength=20), np.full(20, 4))
+    ):
+        raise ValueError("Out-and-back requires four initial trials per terrain column")
+    heading = np.empty(80, dtype=np.float32)
+    sign = np.empty(80, dtype=np.int64)
+    for column in range(20):
+        rows = np.flatnonzero(columns == column)
+        heading[rows] = [math.pi / 2, math.pi / 2, -math.pi / 2, -math.pi / 2]
+        sign[rows] = [1, -1, 1, -1]
+    return heading, sign
 
 
 def interface_manifest(
@@ -1916,15 +2004,23 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
     negative_pivot_first = (
         protocol.get("version") == "go2_operator_proprio_negative_pivot_first_v1"
     )
-    coverage = negative_pivot_first or (
-        protocol.get("version") == "go2_operator_proprio_command_coverage_v1"
+    out_and_back = protocol.get("version") == "go2_operator_proprio_out_and_back_v1"
+    if not out_and_back and (
+        "foot_telemetry" in protocol or any(name.startswith("foot_") for name in trace)
+    ):
+        raise ValueError("Undeclared out-and-back foot telemetry")
+    coverage = (
+        out_and_back
+        or negative_pivot_first
+        or (protocol.get("version") == "go2_operator_proprio_command_coverage_v1")
     )
     if coverage or "command_limits" in protocol:
         expected = recurrent_evaluation_protocol(
             difficulty_range=protocol.get("difficulty_range"),
             seed=protocol.get("seed"),
-            command_coverage=True,
+            command_coverage=not out_and_back,
             negative_pivot_first=negative_pivot_first,
+            out_and_back=out_and_back,
             root_point_diagnostics="root_point_telemetry" in protocol,
             reward_capture="reward_telemetry" in protocol,
         )
@@ -1961,7 +2057,9 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
         ("angular_velocity_b", 3),
         ("base_height_ray", 3),
     ):
-        if trace[key].shape != (*shape, width):
+        if trace[key].shape != (*shape, width) or not np.issubdtype(
+            trace[key].dtype, np.floating
+        ):
             raise ValueError(f"Invalid evaluation field shape: {key}")
     for key in ("terminated", "time_out", "procedural_workspace"):
         if trace[key].shape != shape or trace[key].dtype != np.bool_:
@@ -1990,6 +2088,20 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
         ],
         dtype=trace["command"].dtype,
     )[phase_ids]
+    if out_and_back:
+        headings, turn_sign = out_and_back_assignment(trace["terrain_column_id"])
+        if not np.array_equal(
+            trace.get("initial_heading_rad"), headings
+        ) or not np.array_equal(trace.get("turn_sign"), turn_sign):
+            raise ValueError("Out-and-back initial heading/turn assignment differs")
+        expected_command[..., 2] *= turn_sign[None]
+        expected_quat = np.zeros((shape[1], 4), dtype=np.float32)
+        expected_quat[:, 0] = np.cos(headings / 2)
+        expected_quat[:, 3] = np.sin(headings / 2)
+        if not np.allclose(
+            trace["pre_quaternion"][0], expected_quat, atol=1e-6, rtol=0
+        ):
+            raise ValueError("Out-and-back recorded initial heading differs")
     expected_command[~valid] = 0
     if not np.array_equal(trace["command"], expected_command):
         raise ValueError(
@@ -2242,6 +2354,16 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
                 "travel_distance_m": float(distance[surviving, row].sum()),
                 "moving_nonflat_time_s": float(exposed[surviving, row].sum() * dt),
             }
+            if out_and_back and len(surviving):
+                start_heading = pre_heading[phase_steps[0], row]
+                entry["signed_heading_change_rad"] = float(
+                    np.unwrap(np.r_[start_heading, heading[surviving, row]])[-1]
+                    - start_heading
+                )
+                entry["net_link_displacement_xy_m"] = (
+                    trace["position"][surviving[-1], row, :2]
+                    - trace["pre_position"][phase_steps[0], row, :2]
+                ).tolist()
             if version >= 2:
                 entry.update(
                     achieved_twist_after_settle=(
@@ -2460,6 +2582,13 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
     rewards = _summarize_evaluation_rewards(trace, protocol, valid, version)
     if rewards is not None:
         summary["native_rewards"] = rewards
+    if out_and_back:
+        try:
+            from .operator_benchmark_core import summarize_out_and_back_coverage
+        except ImportError:
+            from operator_benchmark_core import summarize_out_and_back_coverage
+
+        summary["out_and_back"] = summarize_out_and_back_coverage(trace, protocol)
     return summary
 
 
@@ -2475,6 +2604,7 @@ def evaluate_recurrent_operator(
     command_coverage=False,
     negative_pivot_first=False,
     reward_capture=False,
+    out_and_back=False,
     seed=43,
 ):
     """Replay one clean deterministic first attempt; only the actor drives motors."""
@@ -2489,6 +2619,7 @@ def evaluate_recurrent_operator(
         negative_pivot_first=negative_pivot_first,
         root_point_diagnostics=native,
         reward_capture=reward_capture,
+        out_and_back=out_and_back,
         seed=seed,
     )
     generator = env.cfg.scene.terrain.terrain_generator
@@ -2549,6 +2680,7 @@ def evaluate_recurrent_operator(
         or capture.control_trace is not None
         or capture.root_point_diagnostics
         or capture.reward_terms is not None
+        or getattr(capture, "foot_diagnostics", False)
         or not capture.procedural
     ):
         raise ValueError(
@@ -2593,6 +2725,18 @@ def evaluate_recurrent_operator(
     if torch.any((columns < 0) | (columns >= 20)):
         raise ValueError("Unexpected procedural terrain columns")
     profile_ids = columns // 4
+    if out_and_back:
+        headings, signs = out_and_back_assignment(columns.cpu().numpy())
+        heading = robot.root_pos_w.new_tensor(headings)
+        turn_sign = torch.as_tensor(signs, device=env.device)
+        # An initial-condition fixture only. Never called at a command edge or
+        # after a failure; the native recurrent state remains causal throughout.
+        pose = torch.cat((robot.root_pos_w, robot.root_quat_w), dim=-1).clone()
+        pose[:, 3:] = 0
+        pose[:, 3] = torch.cos(heading / 2)
+        pose[:, 6] = torch.sin(heading / 2)
+        env.scene["robot"].write_root_pose_to_sim(pose)
+        native_trace.update(initial_heading_rad=headings, turn_sign=signs)
     if native:
         native_trace["terrain_column_id"] = columns.cpu().numpy().copy()
     if not torch.equal(
@@ -2629,6 +2773,8 @@ def evaluate_recurrent_operator(
         capture.reward_terms = (reward_names, reward_weights)
     capture.motor_parity = capture.enabled = True
     try:
+        if out_and_back:
+            native_trace.update(capture.configure_foot_diagnostics())
         with torch.inference_mode():
             for step, phase_id in enumerate(phase_ids):
                 if not is_running():
@@ -2640,6 +2786,8 @@ def evaluate_recurrent_operator(
                     env.num_envs, 1
                 )
                 desired[flat] = desired.new_tensor(phase["flat_command"])
+                if out_and_back:
+                    desired[:, 2] *= turn_sign
                 desired[finished] = 0  # Housekeeping packets, never replacement trials.
                 command.time_left.fill_(float("inf"))
                 command.is_standing_env.fill_(False)
@@ -2705,6 +2853,7 @@ def evaluate_recurrent_operator(
         capture.actuator_diagnostics = False
         capture.root_point_diagnostics = False
         capture.reward_terms = None
+        capture.foot_diagnostics = False
     trace = capture.finish()
     if not torch.equal(limits, robot.soft_joint_pos_limits):
         raise RuntimeError(
@@ -2738,6 +2887,11 @@ def evaluate_recurrent_operator(
         "motor_binding": binding,
         "motor_binding_sha256": motor_hash,
         "training_motor_binding_sha256": metadata["motor_binding_sha256"],
+        **(
+            {"foot_geometry_binding": capture.foot_diagnostics_manifest}
+            if out_and_back
+            else {}
+        ),
         "controller_manifest": session.manifest,
         "interface_sha256": session.interface_sha256,
         **summarize_recurrent_evaluation(trace, protocol),

@@ -63,6 +63,180 @@ except ImportError:
     )
 
 
+def _foot_geometry_binding(env, foot_names, body_ids):
+    """Read native geometry; never substitute an assumed foot/contact radius."""
+    from itertools import product
+
+    import torch
+    from pxr import Usd, UsdGeom, UsdPhysics
+    from isaaclab.sensors.ray_caster.ray_caster import RayCaster
+    from isaaclab.utils.warp import raycast_mesh
+
+    robot = env.scene["robot"]
+    stage = env.scene.stage
+    paths = robot.root_physx_view.link_paths
+    if len(paths) != env.num_envs or any(
+        [str(path).rsplit("/", 1)[-1] for path in row] != list(robot.body_names)
+        for row in paths
+    ):
+        raise ValueError("Native link paths do not match every articulation body")
+    offsets = robot.root_physx_view.get_contact_offsets()
+    if (
+        not isinstance(offsets, torch.Tensor)
+        or offsets.ndim != 2
+        or offsets.shape[0] != env.num_envs
+        or not offsets.numel()
+        or not torch.isfinite(offsets).all()
+        or (offsets < 0).any()
+    ):
+        raise ValueError("Resolved native contact offsets are unavailable")
+    contact_margin = float(offsets.max())
+    radii, evidence = [], []
+    time = Usd.TimeCode.Default()
+    for name, body_id in zip(foot_names, body_ids, strict=True):
+        reference = None
+        geometry_radius = 0.0
+        for instance in paths:
+            link = stage.GetPrimAtPath(instance[body_id])
+            if not link.IsValid() or not link.HasAPI(UsdPhysics.RigidBodyAPI):
+                raise ValueError("Foot link lacks its native rigid-body prim")
+            link_world = np.asarray(
+                UsdGeom.Xformable(link).ComputeLocalToWorldTransform(time), dtype=float
+            ).T
+            if not np.allclose(
+                link_world[:3, :3].T @ link_world[:3, :3], np.eye(3), atol=1e-6, rtol=0
+            ):
+                raise ValueError("Scaled foot rigid-body frames are unsupported")
+            local_colliders = []
+            for prim in Usd.PrimRange(link, Usd.TraverseInstanceProxies()):
+                if not prim.HasAPI(UsdPhysics.CollisionAPI):
+                    continue
+                enabled = UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Get()
+                if type(enabled) is not bool:
+                    raise ValueError("Foot collision-enabled state is unavailable")
+                if not enabled:
+                    continue
+                kind = prim.GetTypeName()
+                approximation = prim.GetAttribute("physics:approximation").Get()
+                if kind not in ("Sphere", "Capsule", "Cylinder", "Cube", "Mesh") or (
+                    kind == "Mesh" and approximation not in (None, "none", "convexHull")
+                ):
+                    raise ValueError("Unsupported native foot collision geometry")
+                # Plugin computation reads geometry, not possibly stale authored extents.
+                extent = np.asarray(
+                    UsdGeom.Boundable.ComputeExtentFromPlugins(
+                        UsdGeom.Boundable(prim), time
+                    ),
+                    dtype=float,
+                )
+                if (
+                    extent.shape != (2, 3)
+                    or not np.isfinite(extent).all()
+                    or np.any(extent[1] < extent[0])
+                ):
+                    raise ValueError("Cannot compute native foot collider extent")
+                transform = (
+                    np.linalg.inv(link_world)
+                    @ np.asarray(
+                        UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(time),
+                        dtype=float,
+                    ).T
+                )
+                corners = np.array(list(product(*zip(extent[0], extent[1]))))
+                corners = (np.c_[corners, np.ones(8)] @ transform.T)[:, :3]
+                if not np.isfinite(corners).all():
+                    raise ValueError("Nonfinite native foot collider transform")
+                local_colliders.append(
+                    {
+                        "path_relative_to_link": str(prim.GetPath()).removeprefix(
+                            str(link.GetPath())
+                        ),
+                        "type": kind,
+                        "approximation": approximation,
+                        "link_frame_extent_corners_m": corners.tolist(),
+                    }
+                )
+                geometry_radius = max(
+                    geometry_radius, float(np.linalg.norm(corners, axis=-1).max())
+                )
+            if not local_colliders:
+                raise ValueError("No enabled collision geometry on a named foot link")
+            if reference is None:
+                reference = local_colliders
+            elif len(reference) != len(local_colliders) or any(
+                any(
+                    left[key] != right[key]
+                    for key in ("path_relative_to_link", "type", "approximation")
+                )
+                or not np.allclose(
+                    left["link_frame_extent_corners_m"],
+                    right["link_frame_extent_corners_m"],
+                    atol=1e-7,
+                    rtol=0,
+                )
+                for left, right in zip(reference, local_colliders, strict=True)
+            ):
+                raise ValueError(
+                    "Foot collider geometry differs across cloned instances"
+                )
+        radius = geometry_radius + contact_margin
+        if not 0 < radius <= 0.10:
+            raise ValueError(
+                "Measured foot collision envelope exceeds the 0.10 m diagnostic contract"
+            )
+        radii.append(radius)
+        evidence.append(
+            {"name": name, "colliders": reference, "geometry_radius_m": geometry_radius}
+        )
+
+    ground = mesh_identity(env)
+    root = stage.GetPrimAtPath(env.cfg.scene.terrain.prim_path)
+    meshes = [p for p in Usd.PrimRange(root) if p.GetTypeName() == "Mesh"]
+    if len(meshes) != 1 or str(meshes[0].GetPath()) != ground["prim_path"]:
+        raise ValueError("Foot rays require the sole generated collidable mesh")
+    prim = meshes[0]
+    points = np.asarray(prim.GetAttribute("points").Get(), dtype=float)
+    faces = np.asarray(prim.GetAttribute("faceVertexIndices").Get(), dtype=np.int32)
+    if not np.all(np.asarray(prim.GetAttribute("faceVertexCounts").Get()) == 3):
+        raise ValueError("Foot rays require triangle terrain faces")
+    transform = np.asarray(
+        UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(time), dtype=float
+    )
+    points = (np.c_[points, np.ones(len(points))] @ transform)[:, :3].astype(np.float32)
+    sensor = env.scene["base_height_scanner"]
+    mesh_paths = sensor.cfg.mesh_prim_paths
+    if len(mesh_paths) != 1 or mesh_paths[0] != env.cfg.scene.terrain.prim_path:
+        raise ValueError("Base sensor ray mesh differs from generated terrain")
+    mesh = RayCaster.meshes.get(mesh_paths[0])
+    if (
+        mesh is None
+        or not np.array_equal(np.asarray(mesh.indices.numpy()).reshape(-1), faces)
+        or not np.allclose(np.asarray(mesh.points.numpy()), points, atol=1e-5, rtol=0)
+    ):
+        raise ValueError(
+            "Existing Warp ray mesh does not match native collision vertices"
+        )
+    if not np.isfinite(points).all():
+        raise ValueError("Nonfinite terrain world coordinates")
+    manifest = {
+        "version": "operator_four_foot_geometry_v1",
+        "foot_names": list(foot_names),
+        "validated_instances": env.num_envs,
+        "colliders": evidence,
+        "maximum_native_robot_contact_offset_m": contact_margin,
+        "foot_collision_radius_m": radii,
+        "radius_method": "link-centered sphere enclosing geometry-plugin local extent corners transformed into link frame, plus maximum native robot contact offset across all shapes/instances; geometry checked across every clone",
+        "mesh": ground,
+        "mesh_world_sha256": hashlib.sha256(
+            points.tobytes() + faces.tobytes()
+        ).hexdigest(),
+        "ray_start_world_z_m": float(points[:, 2].max()) + 1.0,
+        "ray_max_distance_m": float(np.ptp(points[:, 2])) + 2.0,
+        "scope": "foot LINK origins, not contact points; net NORMAL force vectors, not full contact wrench; vertical ray hits/normals at foot-center XY, not reconstructed contact patches; geometric footprint-region evidence only",
+    }
+    return mesh, raycast_mesh, manifest
+
+
 def make_recorder_cfg(*, procedural=False):
     """Use Isaac Lab's post-step/pre-reset hook; no environment monkeypatching."""
     from isaaclab.managers import (
@@ -84,8 +258,38 @@ def make_recorder_cfg(*, procedural=False):
             self.procedural = procedural
             self.actuator_diagnostics = False
             self.root_point_diagnostics = False
+            self.foot_diagnostics = False
+            self.foot_diagnostics_manifest = None
             self.reward_terms = None
             env.operator_capture = self
+
+        def configure_foot_diagnostics(self):
+            """Opt-in setup after reset, before capture; no live sensor/actor changes."""
+            if self.samples or self.foot_diagnostics:
+                raise RuntimeError("Configure foot diagnostics once before capture")
+            names = ("FL_foot", "FR_foot", "RL_foot", "RR_foot")
+            robot = self._env.scene["robot"]
+            contacts = self._env.scene["contact_forces"]
+            for available in (list(robot.body_names), list(contacts.body_names)):
+                if len(available) != len(set(available)) or any(
+                    available.count(name) != 1 for name in names
+                ):
+                    raise ValueError(
+                        "Resolve four unique named articulation/contact feet"
+                    )
+            self.foot_body_ids = [robot.body_names.index(name) for name in names]
+            self.foot_contact_ids = [contacts.body_names.index(name) for name in names]
+            self.foot_mesh, self.foot_raycast, manifest = _foot_geometry_binding(
+                self._env, names, self.foot_body_ids
+            )
+            self.foot_diagnostics_manifest = manifest
+            self.foot_diagnostics = True
+            return {
+                "foot_names": np.asarray(names),
+                "foot_collision_radius_m": np.asarray(
+                    manifest["foot_collision_radius_m"], dtype=np.float64
+                ),
+            }
 
         def record_pre_step(self):
             if self.enabled:
@@ -166,6 +370,54 @@ def make_recorder_cfg(*, procedural=False):
                         root_com_pos_w=robot.root_com_pos_w.clone(),
                         root_link_lin_vel_b=robot.root_link_lin_vel_b.clone(),
                         body_com_pos_b=robot.body_com_pos_b[:, 0].clone(),
+                    )
+                if self.foot_diagnostics:
+                    import torch
+
+                    positions = robot.body_link_pos_w[:, self.foot_body_ids]
+                    forces = self._env.scene["contact_forces"].data.net_forces_w[
+                        :, self.foot_contact_ids
+                    ]
+                    if (
+                        positions.shape != (self._env.num_envs, 4, 3)
+                        or forces.shape != positions.shape
+                        or not (
+                            torch.isfinite(positions).all()
+                            and torch.isfinite(forces).all()
+                        )
+                    ):
+                        raise RuntimeError(
+                            "Invalid post-physics named-foot diagnostics"
+                        )
+                    starts = positions.clone()
+                    starts[:, :, 2] = self.foot_diagnostics_manifest[
+                        "ray_start_world_z_m"
+                    ]
+                    directions = torch.zeros_like(starts)
+                    directions[:, :, 2] = -1
+                    hits, _, normals, _ = self.foot_raycast(
+                        starts,
+                        directions,
+                        mesh=self.foot_mesh,
+                        max_dist=self.foot_diagnostics_manifest["ray_max_distance_m"],
+                        return_normal=True,
+                    )
+                    if (
+                        not isinstance(hits, torch.Tensor)
+                        or not isinstance(normals, torch.Tensor)
+                        or not hits.is_floating_point()
+                        or not normals.is_floating_point()
+                        or hits.shape != positions.shape
+                        or normals.shape != positions.shape
+                        or torch.isnan(hits).any()
+                        or torch.isnan(normals).any()
+                    ):
+                        raise RuntimeError("Invalid foot mesh-ray diagnostics")
+                    sample.update(
+                        foot_link_position_w=positions,
+                        foot_contact_force_w=forces,
+                        foot_ground_hit_w=hits,
+                        foot_ground_normal_w=normals,
                     )
                 if self.reward_terms is not None:
                     try:

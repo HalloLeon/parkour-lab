@@ -3255,6 +3255,7 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
         negative_pivot_first=getattr(args, "evaluation_negative_pivot_first", False),
         root_point_diagnostics=getattr(args, "evaluation_difficulty", None) is not None,
         reward_capture=getattr(args, "evaluation_reward_capture", False),
+        out_and_back=getattr(args, "evaluation_out_and_back", False),
         seed=args.seed,
     )
     cfg.seed = cfg.scene.terrain.terrain_generator.seed = args.seed
@@ -3659,6 +3660,7 @@ def recurrent_training_main(args, parser):
             negative_pivot_first=args.evaluation_negative_pivot_first,
             root_point_diagnostics=args.evaluation_difficulty is not None,
             reward_capture=getattr(args, "evaluation_reward_capture", False),
+            out_and_back=getattr(args, "evaluation_out_and_back", False),
             seed=args.seed,
         )
         protocol = {
@@ -3762,6 +3764,11 @@ def recurrent_training_main(args, parser):
                         *(
                             ["--evaluation-reward-capture"]
                             if getattr(args, "evaluation_reward_capture", False)
+                            else []
+                        ),
+                        *(
+                            ["--evaluation-out-and-back"]
+                            if getattr(args, "evaluation_out_and_back", False)
                             else []
                         ),
                     ]
@@ -4034,6 +4041,7 @@ def recurrent_training_main(args, parser):
                 command_coverage=args.evaluation_command_coverage,
                 negative_pivot_first=args.evaluation_negative_pivot_first,
                 reward_capture=getattr(args, "evaluation_reward_capture", False),
+                out_and_back=getattr(args, "evaluation_out_and_back", False),
                 seed=args.seed,
             )
             np.savez_compressed(output / "trace.npz", **trace)
@@ -4206,6 +4214,11 @@ def main(argv=None):
         help="With --evaluation-difficulty, instead of --evaluation-long-stops: fixed 63-second frozen screen with longer reverse/pivots, flat slow/lateral commands and prospective development control limits; no acceptance",
     )
     parser.add_argument(
+        "--evaluation-out-and-back",
+        action="store_true",
+        help="With explicit difficulty and no other tape/reward options: frozen 30.28-second flat/rough return diagnostic with balanced initial headings/turn signs and passive foot/mesh capture; no steering, learning or acceptance",
+    )
+    parser.add_argument(
         "--evaluation-reward-capture",
         action="store_true",
         help="Frozen evaluation with explicit difficulty only: record native reward contributions in the existing trace; no reward, policy or scoring changes",
@@ -4351,6 +4364,7 @@ def main(argv=None):
         or args.evaluation_command_coverage
         or args.evaluation_negative_pivot_first
         or args.evaluation_reward_capture
+        or args.evaluation_out_and_back
     ):
         if not evaluation:
             parser.error("Evaluation options require --procedural-evaluate-checkpoint")
@@ -4365,6 +4379,7 @@ def main(argv=None):
                 command_coverage=args.evaluation_command_coverage,
                 negative_pivot_first=args.evaluation_negative_pivot_first,
                 reward_capture=args.evaluation_reward_capture,
+                out_and_back=args.evaluation_out_and_back,
                 seed=args.seed if args.seed is not None else 43,
             )
         except ValueError as error:

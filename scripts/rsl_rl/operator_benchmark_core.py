@@ -52,6 +52,318 @@ class Thresholds:
     flat_attitude_rad: float = np.deg2rad(15.0)
 
 
+OUT_AND_BACK_SUPPORT_COVERAGE = {
+    "version": "operator_out_and_back_support_evidence_v1",
+    "foot_order": ["FL_foot", "FR_foot", "RL_foot", "RR_foot"],
+    "normal_contact_force_threshold_n": 1.0,
+    "minimum_contact_feet": 2,
+    "minimum_contiguous_duration_s": 1.0,
+    "final_stop_requires_last_terminal_excluded_second": True,
+    "maximum_verified_foot_collision_radius_m": 0.10,
+    "extra_mesh_boundary_margin_m": 0.10,
+    "flat_height_tolerance_m": 0.0001,
+    "flat_normal_xy_tolerance": 0.001,
+    "spawn_flat_half_width_m": 1.0,
+    "flat_band_half_width_m": 0.6,
+    "transition_width_m": 1.0,
+    "untapered_outer_half_width_m": 6.0,
+    "terminal_samples_receive_coverage_credit": False,
+    "scope": (
+        "Development coverage only: measured foot-center mesh rays plus conservative "
+        "collision-footprint region bounds; not exact contact points, a reconstructed "
+        "support patch, physical qualification, or high-step acceptance. Plane controls "
+        "must visit the same off-pad core, but their measured surface remains flat."
+    ),
+}
+OUT_AND_BACK_PHASE_NAMES = (
+    "cold_stand",
+    "outbound",
+    "stop_outbound",
+    "turnaround",
+    "stop_after_turn",
+    "return",
+    "final_stop",
+)
+
+
+def summarize_out_and_back_coverage(trace, protocol):
+    """Replay ordered support-region evidence, never infer a cause for missed return.
+
+    All dynamic inputs are captured post-physics/pre-reset. The first terminal
+    sample and every later auto-reset episode receive no coverage credit. The
+    ordinary command-phase scorer, not this helper, assesses tracking and drift.
+    """
+    contract = OUT_AND_BACK_SUPPORT_COVERAGE
+    if protocol.get("support_coverage") != contract:
+        raise ValueError("Unreviewed out-and-back support coverage contract")
+    steps, count, dt = (
+        protocol.get("steps"),
+        protocol.get("num_envs"),
+        protocol.get("period_s"),
+    )
+    if (
+        type(steps) is not int
+        or steps <= 0
+        or type(count) is not int
+        or count <= 0
+        or dt != DT
+    ):
+        raise ValueError("Expected a positive fixed 50 Hz out-and-back trace")
+    phases = protocol.get("phases", [])
+    if tuple(phase.get("name") for phase in phases) != OUT_AND_BACK_PHASE_NAMES:
+        raise ValueError("Unexpected out-and-back phase order")
+    bounds, cursor = [], 0
+    for phase in phases:
+        duration = phase.get("duration_s")
+        if (
+            isinstance(duration, bool)
+            or not isinstance(duration, (int, float))
+            or not np.isfinite(duration)
+            or duration <= 0
+            or not np.isclose(duration / dt, round(duration / dt), atol=1e-9, rtol=0)
+        ):
+            raise ValueError(
+                "Out-and-back phase durations must be control-step aligned"
+            )
+        end = cursor + round(duration / dt)
+        bounds.append((phase["name"], cursor, end))
+        cursor = end
+    if cursor != steps:
+        raise ValueError("Out-and-back phases do not fill the captured horizon")
+    shapes = {
+        "foot_link_position_w": (steps, count, 4, 3),
+        "foot_contact_force_w": (steps, count, 4, 3),
+        "foot_ground_hit_w": (steps, count, 4, 3),
+        "foot_ground_normal_w": (steps, count, 4, 3),
+        "foot_collision_radius_m": (4,),
+        "foot_names": (4,),
+        "env_origins": (count, 3),
+        "terrain_column_id": (count,),
+        "terminated": (steps, count),
+        "time_out": (steps, count),
+        "procedural_workspace": (steps, count),
+    }
+    for name, shape in shapes.items():
+        if (
+            name not in trace
+            or not isinstance(trace[name], np.ndarray)
+            or trace[name].shape != shape
+        ):
+            raise ValueError(f"Invalid out-and-back coverage field: {name}")
+    for name in (
+        "foot_link_position_w",
+        "foot_contact_force_w",
+        "foot_ground_hit_w",
+        "foot_ground_normal_w",
+        "foot_collision_radius_m",
+        "env_origins",
+    ):
+        if not np.issubdtype(trace[name].dtype, np.floating):
+            raise ValueError(
+                f"Out-and-back physical fields must be floating point: {name}"
+            )
+    if np.asarray(trace["foot_names"]).tolist() != contract["foot_order"]:
+        raise ValueError("Out-and-back foot order differs from the capture contract")
+    for name in ("terminated", "time_out", "procedural_workspace"):
+        if trace[name].dtype != np.bool_:
+            raise ValueError(f"Out-and-back reset masks must be boolean: {name}")
+    if np.any(trace["procedural_workspace"] & ~trace["time_out"]):
+        raise ValueError("Workspace censoring requires a native timeout")
+    columns = np.asarray(trace["terrain_column_id"])
+    if not np.issubdtype(columns.dtype, np.integer) or np.any(
+        (columns < 0) | (columns >= 20)
+    ):
+        raise ValueError("Invalid procedural terrain column identity")
+    profiles = columns // 4
+    for name in (
+        "foot_link_position_w",
+        "foot_contact_force_w",
+        "foot_collision_radius_m",
+        "env_origins",
+    ):
+        if not np.isfinite(trace[name]).all():
+            raise ValueError(f"Nonfinite out-and-back coverage field: {name}")
+    radii = np.asarray(trace["foot_collision_radius_m"], dtype=np.float64)
+    if np.any(radii <= 0) or np.any(
+        radii > contract["maximum_verified_foot_collision_radius_m"]
+    ):
+        raise ValueError("Unbounded or oversized native foot collision footprint")
+    guard = radii + contract["extra_mesh_boundary_margin_m"]
+    origins = np.asarray(trace["env_origins"], dtype=np.float64)
+    feet = np.asarray(trace["foot_link_position_w"], dtype=np.float64)
+    local_xy = feet[..., :2] - origins[None, :, None, :2]
+    absolute_xy = np.abs(local_xy)
+    largest_xy = absolute_xy.max(axis=-1)
+    flat_region = (
+        (largest_xy + guard <= contract["spawn_flat_half_width_m"])
+        | (absolute_xy[..., 1] + guard <= contract["flat_band_half_width_m"])
+    ) & (largest_xy + guard <= contract["untapered_outer_half_width_m"])
+    core_region = (
+        (
+            largest_xy - guard
+            >= contract["spawn_flat_half_width_m"] + contract["transition_width_m"]
+        )
+        & (
+            absolute_xy[..., 1] - guard
+            >= contract["flat_band_half_width_m"] + contract["transition_width_m"]
+        )
+        & (largest_xy + guard <= contract["untapered_outer_half_width_m"])
+    )
+    hit = np.asarray(trace["foot_ground_hit_w"], dtype=np.float64)
+    normal = np.asarray(trace["foot_ground_normal_w"], dtype=np.float64)
+    ray_valid = np.isfinite(hit).all(axis=-1) & np.isfinite(normal).all(axis=-1)
+    safe_normal = np.where(ray_valid[..., None], normal, 0.0)
+    if np.any(
+        ray_valid
+        & (
+            ~np.isclose(np.linalg.norm(safe_normal, axis=-1), 1.0, atol=1e-3, rtol=0)
+            | (safe_normal[..., 2] <= 0)
+        )
+    ):
+        raise ValueError("Expected upward unit normals from the actual terrain mesh")
+    # Native float32 world coordinates lose precision far from the scene origin.
+    xy_tolerance = np.maximum(
+        2e-5, 4 * np.finfo(np.float32).eps * np.abs(feet[..., :2])
+    )
+    if np.any(
+        ray_valid[..., None]
+        & (
+            np.abs(np.where(ray_valid[..., None], hit, feet)[..., :2] - feet[..., :2])
+            > xy_tolerance
+        )
+    ):
+        raise ValueError(
+            "Foot ground rays are not vertically aligned with the named feet"
+        )
+    height = np.where(ray_valid, hit[..., 2] - origins[None, :, None, 2], 0.0)
+    mesh_flat = (
+        ray_valid
+        & (np.abs(height) <= contract["flat_height_tolerance_m"])
+        & (
+            np.linalg.norm(safe_normal[..., :2], axis=-1)
+            <= contract["flat_normal_xy_tolerance"]
+        )
+    )
+    contact = (
+        np.linalg.norm(trace["foot_contact_force_w"].astype(np.float64), axis=-1)
+        >= contract["normal_contact_force_threshold_n"]
+    )
+    minimum_feet = contract["minimum_contact_feet"]
+    central_flat_support = flat_region.all(axis=-1) & (
+        (contact & mesh_flat).sum(axis=-1) >= minimum_feet
+    )
+    expected_core_mesh = np.where(
+        profiles[None, :, None] == 0, mesh_flat, ray_valid & ~mesh_flat
+    )
+    core_support = (contact & core_region & expected_core_mesh).sum(
+        axis=-1
+    ) >= minimum_feet
+    minimum_samples = round(contract["minimum_contiguous_duration_s"] / dt)
+    names = ("plane", "rough_flat", "hills", "step_hills", "tilted_ramps")
+    trials = []
+    for env_id in range(count):
+        done = np.flatnonzero(
+            trace["terminated"][:, env_id] | trace["time_out"][:, env_id]
+        )
+        terminal = int(done[0]) if len(done) else None
+        eligible_end = steps if terminal is None else terminal
+        physical = terminal is not None and bool(trace["terminated"][terminal, env_id])
+        workspace = terminal is not None and bool(
+            trace["procedural_workspace"][terminal, env_id]
+        )
+        complete = not physical and not workspace and terminal in (None, steps - 1)
+        phase_results = []
+        for name, start, end in bounds:
+            support = (
+                central_flat_support
+                if name in ("cold_stand", "final_stop")
+                else core_support
+            )
+            selected = support[start : min(end, max(start, eligible_end)), env_id]
+            edges = np.flatnonzero(
+                np.diff(np.r_[False, selected, False].astype(np.int8))
+            )
+            longest = int(np.max(edges[1::2] - edges[::2])) if len(edges) else 0
+            observed = longest >= minimum_samples
+            if name == "final_stop":
+                observed = len(selected) >= minimum_samples and bool(
+                    selected[-minimum_samples:].all()
+                )
+            phase_results.append(
+                {
+                    "name": name,
+                    "required_region": (
+                        "central_flat"
+                        if name in ("cold_stand", "final_stop")
+                        else "off_pad_core"
+                    ),
+                    "eligible_samples": int(len(selected)),
+                    "support_samples": int(selected.sum()),
+                    "longest_contiguous_support_s": longest * dt,
+                    "coverage_window": (
+                        "last_terminal_excluded_second"
+                        if name == "final_stop"
+                        else "any_contiguous_second"
+                    ),
+                    "observed": observed,
+                }
+            )
+        uncovered = [phase["name"] for phase in phase_results if not phase["observed"]]
+        observed = complete and not uncovered
+        status = (
+            "physical_failure"
+            if physical
+            else (
+                "workspace_timeout"
+                if workspace
+                else (
+                    "early_timeout"
+                    if not complete
+                    else "coverage_observed" if observed else "coverage_uncovered"
+                )
+            )
+        )
+        trials.append(
+            {
+                "env_id": env_id,
+                "profile": names[int(profiles[env_id])],
+                "plane_control": bool(profiles[env_id] == 0),
+                "status": status,
+                "first_terminal_step": terminal,
+                "first_attempt_complete": complete,
+                "ordered_coverage_observed": observed,
+                "uncovered_phases": uncovered,
+                "phases": phase_results,
+            }
+        )
+    return {
+        "version": contract["version"],
+        "policy_acceptance": False,
+        "scope": contract["scope"],
+        "missed_return_interpretation": (
+            "Uncovered route, not proof of terrain incapability: open-loop yaw or translation "
+            "tracking can prevent return. Inspect separate command-phase diagnostics; no "
+            "feedback steering, reset assistance or retry earns coverage."
+        ),
+        "ordered_coverage_observed": sum(
+            trial["ordered_coverage_observed"] for trial in trials
+        ),
+        "total": count,
+        "profiles": {
+            name: {
+                "ordered_coverage_observed": sum(
+                    t["ordered_coverage_observed"]
+                    for t in trials
+                    if t["profile"] == name
+                ),
+                "total": sum(t["profile"] == name for t in trials),
+            }
+            for name in names
+        },
+        "trials": trials,
+    }
+
+
 def profiles() -> dict[str, tuple[Phase, ...]]:
     """Fixed, complete 20-s trajectories; initial standing also tests cold start."""
     stop = (0.0, 0.0, 0.0)
