@@ -97,6 +97,7 @@ def recurrent_evaluation_protocol(
     root_point_diagnostics=False,
     reward_capture=False,
     out_and_back=False,
+    command_source=False,
     seed=43,
 ):
     """Predeclared clean-sensor first-attempt screen, not an acceptance gate."""
@@ -111,6 +112,20 @@ def recurrent_evaluation_protocol(
     ):
         raise ValueError(
             "Reward capture requires a boolean and explicit terrain difficulty"
+        )
+    if type(command_source) is not bool or (
+        command_source
+        and (
+            difficulty_range is None
+            or long_stops
+            or command_coverage
+            or negative_pivot_first
+            or reward_capture
+            or out_and_back
+        )
+    ):
+        raise ValueError(
+            "Command-source integration requires explicit difficulty and no other tape/reward options"
         )
     if (long_stops or command_coverage) and difficulty_range is None:
         raise ValueError("Extended evaluation requires an explicit terrain difficulty")
@@ -330,6 +345,12 @@ def recurrent_evaluation_protocol(
                 "No learning, checkpoint selection, support certification or acceptance."
             ),
         )
+    if command_source:
+        try:
+            from .operator_command_source import command_source_protocol
+        except ImportError:
+            from operator_command_source import command_source_protocol
+        protocol.update(command_source_protocol())
     return protocol
 
 
@@ -2005,6 +2026,12 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
         protocol.get("version") == "go2_operator_proprio_negative_pivot_first_v1"
     )
     out_and_back = protocol.get("version") == "go2_operator_proprio_out_and_back_v1"
+    command_source = protocol.get("version") == "go2_operator_proprio_command_source_v1"
+    if not command_source and (
+        "source_lease" in protocol
+        or any(name.startswith("command_source_") for name in trace)
+    ):
+        raise ValueError("Undeclared command-source telemetry")
     if not out_and_back and (
         "foot_telemetry" in protocol or any(name.startswith("foot_") for name in trace)
     ):
@@ -2030,6 +2057,15 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
             from .operator_benchmark_core import score_command_phase
         except ImportError:
             from operator_benchmark_core import score_command_phase
+    if command_source:
+        expected = recurrent_evaluation_protocol(
+            difficulty_range=protocol.get("difficulty_range"),
+            seed=protocol.get("seed"),
+            root_point_diagnostics="root_point_telemetry" in protocol,
+            command_source=True,
+        )
+        if any(protocol.get(key) != value for key, value in expected.items()):
+            raise ValueError("Command-source integration protocol differs")
     if native and version != 3:
         raise ValueError("Native terrain probes require summary version 3")
     names = ("plane", "rough_flat", "hills", "step_hills", "tilted_ramps")
@@ -2103,7 +2139,13 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
         ):
             raise ValueError("Out-and-back recorded initial heading differs")
     expected_command[~valid] = 0
-    if not np.array_equal(trace["command"], expected_command):
+    if command_source:
+        try:
+            from .operator_command_source import validate_command_source_trace
+        except ImportError:
+            from operator_command_source import validate_command_source_trace
+        source_summary = validate_command_source_trace(trace, protocol)
+    elif not np.array_equal(trace["command"], expected_command):
         raise ValueError(
             "Recorded command differs from the first-attempt operator tape"
         )
@@ -2589,6 +2631,8 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
             from operator_benchmark_core import summarize_out_and_back_coverage
 
         summary["out_and_back"] = summarize_out_and_back_coverage(trace, protocol)
+    if command_source:
+        summary["command_source"] = source_summary
     return summary
 
 
@@ -2605,6 +2649,7 @@ def evaluate_recurrent_operator(
     negative_pivot_first=False,
     reward_capture=False,
     out_and_back=False,
+    command_source=False,
     seed=43,
 ):
     """Replay one clean deterministic first attempt; only the actor drives motors."""
@@ -2620,6 +2665,7 @@ def evaluate_recurrent_operator(
         root_point_diagnostics=native,
         reward_capture=reward_capture,
         out_and_back=out_and_back,
+        command_source=command_source,
         seed=seed,
     )
     generator = env.cfg.scene.terrain.terrain_generator
@@ -2725,10 +2771,22 @@ def evaluate_recurrent_operator(
     if torch.any((columns < 0) | (columns >= 20)):
         raise ValueError("Unexpected procedural terrain columns")
     profile_ids = columns // 4
-    if out_and_back:
-        headings, signs = out_and_back_assignment(columns.cpu().numpy())
+    source_probe = None
+    source_samples = []
+    if out_and_back or command_source:
+        if command_source:
+            try:
+                from .operator_command_source import CommandSourceProbe, assignment
+            except ImportError:
+                from operator_command_source import CommandSourceProbe, assignment
+            headings, arm_ids = assignment(columns.cpu().numpy())
+            source_probe = CommandSourceProbe(columns.cpu().numpy())
+            native_trace["command_source_arm_id"] = arm_ids
+        else:
+            headings, signs = out_and_back_assignment(columns.cpu().numpy())
+            turn_sign = torch.as_tensor(signs, device=env.device)
+            native_trace["turn_sign"] = signs
         heading = robot.root_pos_w.new_tensor(headings)
-        turn_sign = torch.as_tensor(signs, device=env.device)
         # An initial-condition fixture only. Never called at a command edge or
         # after a failure; the native recurrent state remains causal throughout.
         pose = torch.cat((robot.root_pos_w, robot.root_quat_w), dim=-1).clone()
@@ -2736,7 +2794,7 @@ def evaluate_recurrent_operator(
         pose[:, 3] = torch.cos(heading / 2)
         pose[:, 6] = torch.sin(heading / 2)
         env.scene["robot"].write_root_pose_to_sim(pose)
-        native_trace.update(initial_heading_rad=headings, turn_sign=signs)
+        native_trace["initial_heading_rad"] = headings
     if native:
         native_trace["terrain_column_id"] = columns.cpu().numpy().copy()
     if not torch.equal(
@@ -2788,6 +2846,16 @@ def evaluate_recurrent_operator(
                 desired[flat] = desired.new_tensor(phase["flat_command"])
                 if out_and_back:
                     desired[:, 2] *= turn_sign
+                if source_probe is not None:
+                    # The host resolves actual source events before building the
+                    # observation. Loss of command authority is not a motor or
+                    # sensor fault and never clears the recurrent controller.
+                    resolved, source_record = source_probe.step(step)
+                    desired.copy_(desired.new_tensor(resolved))
+                    source_record["command_source_reset_mask"] = (
+                        reset.cpu().numpy().copy()
+                    )
+                    source_samples.append(source_record)
                 desired[finished] = 0  # Housekeeping packets, never replacement trials.
                 command.time_left.fill_(float("inf"))
                 command.is_standing_env.fill_(False)
@@ -2820,7 +2888,11 @@ def evaluate_recurrent_operator(
                 result = session.step(
                     time_s=now,
                     command=desired,
-                    command_time_s=now,
+                    command_time_s=(
+                        float(source_record["command_source_decision_time_s"][0])
+                        if source_probe is not None
+                        else now
+                    ),
                     sensors=samples,
                     reset_mask=reset,
                 )
@@ -2855,6 +2927,13 @@ def evaluate_recurrent_operator(
         capture.reward_terms = None
         capture.foot_diagnostics = False
     trace = capture.finish()
+    if source_probe is not None:
+        trace.update(
+            {
+                key: np.stack([sample[key] for sample in source_samples])
+                for key in source_samples[0]
+            }
+        )
     if not torch.equal(limits, robot.soft_joint_pos_limits):
         raise RuntimeError(
             "Native soft joint position limits changed during evaluation"
