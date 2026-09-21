@@ -1204,6 +1204,11 @@ def run_recurrent_training(
     profile_ids = columns // 4
     group_ids = (rows * 5 + profile_ids).long()
     group_count = terrain_rows * 5
+    try:
+        from .operator_curriculum import PivotTransitionExposure
+    except ImportError:
+        from operator_curriculum import PivotTransitionExposure
+    pivot_transitions = PivotTransitionExposure(group_ids, group_count, env.step_dt)
     counts = torch.zeros(group_count, 9, dtype=torch.int64, device=env.device)
     errors = torch.zeros(group_count, 3, dtype=torch.float64, device=env.device)
     allocation = {}
@@ -1328,6 +1333,18 @@ def run_recurrent_training(
         return {
             "arrival_hold_exposure": {
                 **arrival.report(),
+                "group_order": [
+                    {"row": row, "profile": name}
+                    for row in range(terrain_rows)
+                    for name in profiles
+                ],
+            }
+        }
+
+    def transition_metrics():
+        return {
+            "pivot_transition_exposure": {
+                **pivot_transitions.report(),
                 "group_order": [
                     {"row": row, "profile": name}
                     for row in range(terrain_rows)
@@ -1518,6 +1535,7 @@ def run_recurrent_training(
                     if restart_coverage_change is not None
                     else {}
                 )
+            pivot_transitions.begin(desired, command.command_counter, self.done)
             observation, reward, done, extras = super().step(actions)
             validate_terrain_assignment()
             # Native wrappers can report both a physical failure and a time
@@ -1532,6 +1550,16 @@ def run_recurrent_training(
                     "Native processed joint target differs from the stock affine map"
                 )
             self.done = done.bool()
+            # Native stepping has already reset terminal rows. The observer
+            # counts their applied commands but never their reset velocities.
+            pivot_transitions.finish(
+                robot.root_link_lin_vel_b[:, :2],
+                robot.root_ang_vel_b[:, 2],
+                robot.root_ang_vel_w[:, 2],
+                env.reset_terminated.bool(),
+                env.reset_time_outs.bool(),
+                env.termination_manager.get_term("procedural_workspace").bool(),
+            )
             if arrival is not None:
                 arrival.observe(
                     phase,
@@ -1611,6 +1639,7 @@ def run_recurrent_training(
                 "metrics": metrics(),
                 **exposure_metrics(),
                 **arrival_metrics(),
+                **transition_metrics(),
                 **root_point_metrics(),
                 "exit_allowed": False,
                 "resume_supported": True,
@@ -1798,6 +1827,7 @@ def run_recurrent_training(
         "metrics": metrics(),
         **exposure_metrics(),
         **arrival_metrics(),
+        **transition_metrics(),
         **root_point_metrics(),
         "controller_manifest": extract(runner.alg.policy).spec.manifest(),
         "actor_artifact_identity": "named_actor_state_tensor_sha256",
