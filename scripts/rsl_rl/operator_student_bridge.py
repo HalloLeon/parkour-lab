@@ -25,6 +25,8 @@ except ImportError:
 
 # Compatibility exports for existing training, audit and evaluation callers.
 from parkour_lab.learning.recurrent_operator import (
+    FRAME_DIM as FRAME_DIM,
+    FRAME_TERMS as FRAME_TERMS,
     RECURRENT_OPERATOR_VERSION,
     RECURRENT_RESUME_MODE,
     RecurrentOperatorAdapter,
@@ -37,15 +39,6 @@ from parkour_lab.learning.recurrent_operator import (
 
 VERSION = "go2_operator_velocity_student_v1"
 HISTORY_LENGTH = 10
-FRAME_DIM = 45
-FRAME_TERMS = (
-    ("base_ang_vel", 3),
-    ("projected_gravity", 3),
-    ("velocity_commands", 3),
-    ("joint_pos", 12),
-    ("joint_vel", 12),
-    ("actions", 12),
-)
 CONTROLLER_ROLLOUT_COMMANDS = (
     (0.0, 0.0, 0.0),
     (0.55, 0.0, 0.5),

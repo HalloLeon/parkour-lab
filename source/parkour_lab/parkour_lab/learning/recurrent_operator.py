@@ -18,32 +18,26 @@ import hashlib
 import io
 import json
 import math
+import os
 from pathlib import Path
+import tempfile
 
 import torch
 from torch import nn
 
 
-RECURRENT_OPERATOR_VERSION = "go2_operator_proprio_gru_v1"
-RECURRENT_RESUME_MODE = "model_adam_fresh_environment_v1"
-FRAME_DIM = 45
-FRAME_TERMS = (
-    ("base_ang_vel", 3),
-    ("projected_gravity", 3),
-    ("velocity_commands", 3),
-    ("joint_pos", 12),
-    ("joint_vel", 12),
-    ("actions", 12),
+from .recurrent_runtime import (
+    FRAME_DIM as FRAME_DIM,
+    FRAME_TERMS as FRAME_TERMS,
+    RECURRENT_OPERATOR_VERSION as RECURRENT_OPERATOR_VERSION,
+    ActorOnlyController,
+    _check_tensor,
+    _load_actor_bytes,
+    actor_bundle,
+    actor_tensor_sha256,
 )
 
-
-def _check_tensor(value: torch.Tensor, shape: tuple[int, ...], name: str) -> None:
-    if (
-        value.shape != shape
-        or not value.is_floating_point()
-        or not torch.isfinite(value).all()
-    ):
-        raise ValueError(f"{name} must be a finite floating tensor of shape {shape}")
+RECURRENT_RESUME_MODE = "model_adam_fresh_environment_v1"
 
 
 def recurrent_policy_config():
@@ -88,14 +82,7 @@ def build_recurrent_operator_policy(observations):
 
 def _recurrent_actor_sha256(policy):
     """Preserve the named actor-tensor identity used in acquisition checkpoints."""
-    digest = hashlib.sha256()
-    for prefix, module in (("memory", policy.memory_a.rnn), ("actor", policy.actor)):
-        for name, value in module.state_dict().items():
-            digest.update(
-                f"{prefix}.{name}:{value.dtype}:{tuple(value.shape)}".encode()
-            )
-            digest.update(value.detach().cpu().contiguous().numpy().tobytes())
-    return digest.hexdigest()
+    return actor_tensor_sha256(policy.memory_a.rnn, policy.actor)
 
 
 def load_recurrent_checkpoint(path, device="cpu"):
@@ -273,8 +260,8 @@ def restore_recurrent_optimizer(algorithm, state, expected_steps):
         raise RuntimeError("Adam state was not restored exactly")
 
 
-class RecurrentOperatorAdapter:
-    """Extract only a causal actor; private zero-start memory never copies a rollout."""
+class RecurrentOperatorAdapter(ActorOnlyController):
+    """Validate the native training policy, then use the shared actor-only runtime."""
 
     def __init__(
         self,
@@ -286,7 +273,6 @@ class RecurrentOperatorAdapter:
         actuator_profile,
     ):
         from rsl_rl.modules import ActorCriticRecurrent
-        from parkour_lab.learning.controller import ControllerSpec, SensorSpec
 
         if (
             type(policy) is not ActorCriticRecurrent
@@ -295,120 +281,90 @@ class RecurrentOperatorAdapter:
             or policy.actor_obs_normalization
             or type(policy.actor_obs_normalizer) is not nn.Identity
             or policy.state_dependent_std
-            or type(policy.memory_a.rnn) is not nn.GRU
             or type(policy.memory_c.rnn) is not nn.GRU
-            or policy.memory_a.rnn.input_size != 45
             or policy.memory_c.rnn.input_size != 312
-            or policy.memory_a.rnn.hidden_size != 128
-            or policy.memory_a.rnn.num_layers != 1
-            or policy.memory_a.rnn.batch_first
-            or policy.memory_a.rnn.bidirectional
-            or policy.memory_a.rnn.dropout != 0
-            or len(policy.actor) != 7
-            or any(
-                type(policy.actor[i]) is not nn.Linear
-                or (policy.actor[i].in_features, policy.actor[i].out_features) != shape
-                for i, shape in (
-                    (0, (128, 128)),
-                    (2, (128, 128)),
-                    (4, (128, 128)),
-                    (6, (128, 12)),
-                )
-            )
-            or any(
-                type(policy.actor[i]) is not nn.ELU or policy.actor[i].alpha != 1.0
-                for i in (1, 3, 5)
-            )
             or any(not torch.isfinite(p).all() for p in policy.parameters())
-            or len(joint_names) != 12
-            or len(set(joint_names)) != 12
         ):
             raise ValueError(
                 "Require the native 45-D GRU operator policy and twelve named joints"
             )
-        _check_tensor(default_position_rad, (12,), "default joint position")
-        parameter = next(policy.actor.parameters())
-        if (
-            default_position_rad.device != parameter.device
-            or default_position_rad.dtype != parameter.dtype
-        ):
-            raise ValueError("Default joint position must match policy device/dtype")
-        self.memory = copy.deepcopy(policy.memory_a.rnn).eval().requires_grad_(False)
-        self.actor = copy.deepcopy(policy.actor).eval().requires_grad_(False)
-        self.default_position_rad = default_position_rad.detach().clone()
-        self.hidden_state = None
-        self.reset_mask = None
-        self.spec = ControllerSpec(
-            name="recurrent_operator_proprio",
+        super().__init__(
+            policy.memory_a.rnn,
+            # RSL's MLP is a Sequential subclass; retain its fixed layers without
+            # carrying the training-library container into the inference runtime.
+            nn.Sequential(*policy.actor),
+            joint_names=joint_names,
+            default_position_rad=default_position_rad,
             artifact_sha256=artifact_sha256,
-            preprocessing_version=RECURRENT_OPERATOR_VERSION,
-            joint_names=tuple(joint_names),
-            period_s=0.02,
             actuator_profile=actuator_profile,
-            sensors={
-                "base_ang_vel": SensorSpec((3,), "rad/s", "body", 0.02),
-                "projected_gravity": SensorSpec((3,), "unitless", "body", 0.02),
-                "joint_position_relative_default": SensorSpec(
-                    (12,), "rad", "joint", 0.02
-                ),
-                "joint_velocity": SensorSpec((12,), "rad/s", "joint", 0.02),
-                "stock_previous_raw_action": SensorSpec(
-                    (12,), "unitless", "joint", 0.02
-                ),
-            },
-            raw_action_meaning="stock unscaled action; q_target = default_q + 0.25 * raw_action; no clip",
-            configuration={
-                "default_position_rad": default_position_rad.tolist(),
-                "action_scale": 0.25,
-                "action_clip": None,
-                "actor": "45 -> GRU(128,1) -> ELU MLP(128,128,128) -> 12",
-                "input_order": [name for name, _ in FRAME_TERMS],
-                "reset": "zero GRU state; previous delivered raw action must be zero",
-                "privileged_critic_exported": False,
-            },
         )
 
-    @torch.inference_mode()
-    def reset(self, mask):
-        if (
-            mask.ndim != 1
-            or mask.dtype != torch.bool
-            or mask.device != self.default_position_rad.device
+
+@torch.inference_mode()
+def export_recurrent_actor(checkpoint, output):
+    """CPU-only, checked extraction; atomically publish a new file without clobbering."""
+    policy, metadata, checkpoint_sha = load_recurrent_checkpoint(checkpoint, "cpu")
+    manifest = metadata["controller_manifest"]
+    original = RecurrentOperatorAdapter(
+        policy,
+        joint_names=tuple(manifest["joint_names"]),
+        default_position_rad=torch.tensor(
+            manifest["configuration"]["default_position_rad"]
+        ),
+        artifact_sha256=manifest["artifact_sha256"],
+        actuator_profile=manifest["actuator_profile"],
+    )
+    payload = actor_bundle(
+        original,
+        source_checkpoint_sha256=checkpoint_sha,
+        learning_updates=metadata["learning_updates"],
+    )
+    buffer = io.BytesIO()
+    torch.save(payload, buffer)
+    encoded = buffer.getvalue()
+    restored, _, bundle_sha = _load_actor_bytes(encoded)
+    generator = torch.Generator().manual_seed(47)
+    hidden = restored.initial_state(3)
+    previous = torch.zeros(3, 12)
+    # Compare against native RSL, not merely two instances of the shared wrapper.
+    for step in range(64):
+        reset = torch.full((3,), step == 0, dtype=torch.bool)
+        if step in (21, 42):
+            reset[step // 21 - 1] = True
+        hidden[:, reset] = 0
+        previous[reset] = 0
+        frame = torch.randn(3, FRAME_DIM, generator=generator)
+        frame[:, -12:] = previous
+        policy.reset(reset)
+        expected = policy.act_inference({"proprio": frame})
+        actual, hidden = restored.infer(frame, hidden)
+        if not torch.equal(actual, expected) or not torch.equal(
+            hidden, policy.memory_a.hidden_state
         ):
-            raise ValueError("Require a matching boolean reset mask")
-        if self.hidden_state is None:
-            if not len(mask) or not mask.all():
-                raise ValueError("First recurrent frame must reset every environment")
-        else:
-            _check_tensor(self.hidden_state, (1, len(mask), 128), "GRU state")
-            self.hidden_state[:, mask] = 0
-        self.reset_mask = mask.clone()
-
-    @torch.inference_mode()
-    def act(self, inputs):
-        from parkour_lab.learning.controller import JointTargets
-
-        sensors = inputs.sensors
-        previous = sensors["stock_previous_raw_action"].value
-        if self.reset_mask is None or torch.any(previous[self.reset_mask] != 0):
-            raise ValueError("Previous delivered action must be zero after reset")
-        frame = torch.cat(
-            (
-                sensors["base_ang_vel"].value,
-                sensors["projected_gravity"].value,
-                inputs.command,
-                sensors["joint_position_relative_default"].value,
-                sensors["joint_velocity"].value,
-                previous,
-            ),
-            dim=-1,
-        )
-        _check_tensor(frame, (len(self.reset_mask), FRAME_DIM), "proprioceptive frame")
-        memory, hidden = self.memory(frame.unsqueeze(0), self.hidden_state)
-        action = self.actor(memory.squeeze(0))
-        _check_tensor(action, (len(frame), 12), "recurrent raw action")
-        _check_tensor(hidden, (1, len(frame), 128), "GRU state")
-        self.hidden_state = hidden.detach()
-        return JointTargets(
-            self.spec.joint_names, self.default_position_rad + 0.25 * action, action
-        )
+            raise RuntimeError(
+                "Actor export differs from native CPU recurrent inference"
+            )
+        previous = actual
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=output.parent, prefix=".operator_actor_", suffix=".tmp"
+    ) as stream:
+        stream.write(encoded)
+        stream.flush()
+        os.fsync(stream.fileno())
+        # Hard-link publication is exclusive even if another writer wins a race.
+        os.link(stream.name, output)
+    return {
+        "status": "ACTOR_EXPORTED_CPU_PARITY_VERIFIED_NOT_DEPLOYED",
+        "path": str(output.resolve()),
+        "sha256": bundle_sha,
+        "source_checkpoint_sha256": checkpoint_sha,
+        "actor_tensor_sha256": manifest["artifact_sha256"],
+        "source_learning_updates": metadata["learning_updates"],
+        "bytes": len(encoded),
+        "parity_steps": 64,
+        "parity_batch": 3,
+        "interface": restored.spec.manifest(),
+        "exit_allowed": False,
+    }
