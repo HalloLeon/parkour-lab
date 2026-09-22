@@ -20,8 +20,10 @@ from torch import nn
 
 try:
     from .operator_benchmark_core import PROPRIO_EVALUATION_SEEDS
+    from .operator_runtime import NativeActorSession, _runtime_motor_binding
 except ImportError:
     from operator_benchmark_core import PROPRIO_EVALUATION_SEEDS
+    from operator_runtime import NativeActorSession, _runtime_motor_binding
 
 # Compatibility exports for existing training, audit and evaluation callers.
 from parkour_lab.learning.recurrent_operator import (
@@ -1011,85 +1013,6 @@ def controller_preflight(checkpoint):
         "learning_updates": 0,
         "exit_allowed": False,
     }
-
-
-def _runtime_motor_binding(env):
-    """Bind the resolved native stock motor, not merely an action tensor width."""
-    robot = env.scene["robot"]
-    term = env.action_manager.get_term("joint_pos")
-    cfg, descriptor = term.cfg, term.IO_descriptor
-    joints = tuple(robot.joint_names)
-    default = robot.data.default_joint_pos
-    _check_tensor(default, (env.num_envs, 12), "runtime default joint position")
-    _check_tensor(
-        robot.data.default_joint_vel, default.shape, "runtime default joint velocity"
-    )
-    if (
-        tuple(env.action_manager.active_terms) != ("joint_pos",)
-        or env.action_manager.total_action_dim != 12
-        or len(joints) != 12
-        or len(set(joints)) != 12
-        or tuple(descriptor.joint_names) != joints
-        or cfg.asset_name != "robot"
-        or cfg.joint_names != [".*"]
-        or cfg.preserve_order
-        or not cfg.use_default_offset
-        or cfg.scale != 0.25
-        or descriptor.scale != 0.25
-        or cfg.clip is not None
-        or descriptor.clip is not None
-        or cfg.class_type.__name__ != "JointPositionAction"
-        or cfg.class_type.__module__ != "isaaclab.envs.mdp.actions.joint_actions"
-        or not torch.equal(default, default[0].expand_as(default))
-        or torch.any(robot.data.default_joint_vel != 0)
-        or not torch.equal(
-            torch.as_tensor(
-                descriptor.offset, device=default.device, dtype=default.dtype
-            ),
-            default[0],
-        )
-    ):
-        raise ValueError(
-            "Native stock joint order, default pose/velocity or action transform differs"
-        )
-    actuators = {}
-    covered = []
-    for name, actuator in robot.actuators.items():
-        covered.extend(actuator.joint_names)
-        parameters = {}
-        for parameter in (
-            "stiffness",
-            "damping",
-            "effort_limit",
-            "velocity_limit",
-            "effort_limit_sim",
-            "velocity_limit_sim",
-            "armature",
-            "friction",
-        ):
-            value = getattr(actuator, parameter)
-            _check_tensor(value, (env.num_envs, len(actuator.joint_names)), parameter)
-            parameters[parameter] = value.detach().cpu().tolist()
-        actuators[name] = {
-            "joint_names": list(actuator.joint_names),
-            "configuration": actuator.cfg.to_dict(),
-            "resolved_parameters": parameters,
-        }
-    if sorted(covered) != sorted(joints):
-        raise ValueError("Native actuators must cover each motor joint exactly once")
-    binding = {
-        "joint_names": list(joints),
-        "default_position_rad": default[0].cpu().tolist(),
-        "action": cfg.to_dict(),
-        "actuators": actuators,
-        "step_dt_s": env.step_dt,
-        "physics_dt_s": env.physics_dt,
-        "decimation": env.cfg.decimation,
-    }
-    digest = hashlib.sha256(
-        json.dumps(binding, sort_keys=True, allow_nan=False).encode()
-    ).hexdigest()
-    return binding, digest
 
 
 def _check_pivot_planar_precision_stage(env, change, resume_from):
@@ -2644,11 +2567,14 @@ def evaluate_recurrent_operator(
     out_and_back=False,
     command_source=False,
     seed=43,
+    actor_bundle=None,
 ):
     """Replay one clean deterministic first attempt; only the actor drives motors."""
     import numpy as np
     from parkour_lab.learning.controller import ControllerSession, Sample
 
+    if actor_bundle is not None and not command_source:
+        raise ValueError("Actor-bundle integration requires the command-source probe")
     native = difficulty_range is not None
     protocol = recurrent_evaluation_protocol(
         difficulty_range=difficulty_range,
@@ -2798,18 +2724,30 @@ def evaluate_recurrent_operator(
             "Evaluation requires sixteen initial trials per terrain profile"
         )
     flat = profile_ids < 2
-    adapter = RecurrentOperatorAdapter(
-        policy,
-        joint_names=tuple(binding["joint_names"]),
-        default_position_rad=robot.default_joint_pos[0],
-        artifact_sha256=checkpoint_sha,
-        actuator_profile="native_motor_sha256:" + motor_hash,
-    )
-    session = ControllerSession(
-        adapter,
-        joint_names=adapter.spec.joint_names,
-        actuator_profile=adapter.spec.actuator_profile,
-    )
+    host = None
+    if actor_bundle is not None:
+        host = NativeActorSession(
+            env,
+            actor_bundle["path"],
+            artifact_sha256=actor_bundle["sha256"],
+            checkpoint_sha256=checkpoint_sha,
+            source_manifest=metadata["controller_manifest"],
+            learning_updates=metadata["learning_updates"],
+        )
+        adapter, session = host.controller, host.session
+    else:
+        adapter = RecurrentOperatorAdapter(
+            policy,
+            joint_names=tuple(binding["joint_names"]),
+            default_position_rad=robot.default_joint_pos[0],
+            artifact_sha256=checkpoint_sha,
+            actuator_profile="native_motor_sha256:" + motor_hash,
+        )
+        session = ControllerSession(
+            adapter,
+            joint_names=adapter.spec.joint_names,
+            actuator_profile=adapter.spec.actuator_profile,
+        )
     phase_ids = np.repeat(
         np.arange(len(protocol["phases"])),
         [round(p["duration_s"] / env.step_dt) for p in protocol["phases"]],
@@ -2850,45 +2788,50 @@ def evaluate_recurrent_operator(
                     )
                     source_samples.append(source_record)
                 desired[finished] = 0  # Housekeeping packets, never replacement trials.
-                command.time_left.fill_(float("inf"))
-                command.is_standing_env.fill_(False)
-                command.is_heading_env.fill_(False)
-                command.vel_command_b.copy_(desired)
-                frame = env.observation_manager.compute()["proprio"]
-                values = (
-                    robot.root_ang_vel_b,
-                    robot.projected_gravity_b,
-                    robot.joint_pos - robot.default_joint_pos,
-                    robot.joint_vel,
-                    env.action_manager.action,
-                )
-                independent = torch.cat((*values[:2], desired, *values[2:]), dim=-1)
-                if not torch.equal(frame, independent) or torch.any(
-                    values[-1][reset] != 0
-                ):
-                    raise RuntimeError(
-                        "Clean causal frame or previous-action reset differs from native sensors"
-                    )
                 now = step * env.step_dt
-                samples = {
-                    name: Sample(
-                        value, now, torch.ones_like(reset), spec.units, spec.frame
+                if host is not None:
+                    result = host.act(desired, time_s=now, reset_mask=reset)
+                    frame = host.frame
+                else:
+                    command.time_left.fill_(float("inf"))
+                    command.is_standing_env.fill_(False)
+                    command.is_heading_env.fill_(False)
+                    command.vel_command_b.copy_(desired)
+                    frame = env.observation_manager.compute()["proprio"]
+                    values = (
+                        robot.root_ang_vel_b,
+                        robot.projected_gravity_b,
+                        robot.joint_pos - robot.default_joint_pos,
+                        robot.joint_vel,
+                        env.action_manager.action,
                     )
-                    for (name, spec), value in zip(
-                        adapter.spec.sensors.items(), values, strict=True
+                    independent = torch.cat((*values[:2], desired, *values[2:]), dim=-1)
+                    if not torch.equal(frame, independent) or torch.any(
+                        values[-1][reset] != 0
+                    ):
+                        raise RuntimeError(
+                            "Clean causal frame or previous-action reset differs from native sensors"
+                        )
+                    now = step * env.step_dt
+                    samples = {
+                        name: Sample(
+                            value, now, torch.ones_like(reset), spec.units, spec.frame
+                        )
+                        for (name, spec), value in zip(
+                            adapter.spec.sensors.items(), values, strict=True
+                        )
+                    }
+                    result = session.step(
+                        time_s=now,
+                        command=desired,
+                        command_time_s=(
+                            float(source_record["command_source_decision_time_s"][0])
+                            if source_probe is not None
+                            else now
+                        ),
+                        sensors=samples,
+                        reset_mask=reset,
                     )
-                }
-                result = session.step(
-                    time_s=now,
-                    command=desired,
-                    command_time_s=(
-                        float(source_record["command_source_decision_time_s"][0])
-                        if source_probe is not None
-                        else now
-                    ),
-                    sensors=samples,
-                    reset_mask=reset,
-                )
                 policy.reset(reset)
                 shadow = policy.act_inference({"proprio": frame})
                 if not torch.allclose(result.raw_action, shadow, atol=1e-6, rtol=0):
@@ -2959,6 +2902,14 @@ def evaluate_recurrent_operator(
         "motor_binding": binding,
         "motor_binding_sha256": motor_hash,
         "training_motor_binding_sha256": metadata["motor_binding_sha256"],
+        **(
+            {
+                "actor_bundle": dict(actor_bundle),
+                "motor_verification": host.motor_verification,
+            }
+            if host is not None
+            else {}
+        ),
         **(
             {"foot_geometry_binding": capture.foot_diagnostics_manifest}
             if out_and_back

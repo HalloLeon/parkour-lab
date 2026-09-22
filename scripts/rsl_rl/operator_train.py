@@ -3285,6 +3285,7 @@ def recurrent_evaluation_configs(saved, agent, args, training_protocol, metadata
 def recurrent_training_main(args, parser):
     """Shared supervised acquisition/evaluation lifecycle; never implicit promotion."""
     evaluation = args.procedural_evaluate_checkpoint is not None
+    actor_bundle = None
     refinement = args.procedural_refine_checkpoint is not None
     resuming = args.procedural_resume_checkpoint is not None
     learned_source = (
@@ -3393,6 +3394,16 @@ def recurrent_training_main(args, parser):
                     learned_source, identity["physical_reference"]
                 )
             )
+            if getattr(args, "evaluation_actor_bundle", None) is not None:
+                try:
+                    from .operator_runtime import actor_bundle_source
+                except ImportError:
+                    from operator_runtime import actor_bundle_source
+                actor_bundle = actor_bundle_source(
+                    args.evaluation_actor_bundle,
+                    evaluation_files["checkpoint"],
+                    metadata,
+                )
             if (args.restart_coverage or args.pivot_planar_precision) and (
                 archived_protocol["version"] != PROPRIO_HIGHER_TERRAIN_VERSION
                 or archived_protocol.get("restart_coverage_change") is not None
@@ -3671,6 +3682,7 @@ def recurrent_training_main(args, parser):
             "training_producer_identity": archived_protocol["source_identity"],
             "evaluation_sources": evaluation_files,
             "checkpoint_learning_updates": metadata["learning_updates"],
+            **({"actor_bundle": actor_bundle} if actor_bundle is not None else {}),
             "policy_version": RECURRENT_OPERATOR_VERSION,
             "learning_updates": 0,
             "configuration_check": "reconstruct and compare full archived training config before evaluation-only overrides in native worker",
@@ -3778,6 +3790,11 @@ def recurrent_training_main(args, parser):
                             if getattr(args, "evaluation_command_source", False)
                             else []
                         ),
+                        *(
+                            ["--evaluation-actor-bundle", actor_bundle["path"]]
+                            if actor_bundle is not None
+                            else []
+                        ),
                     ]
                     if evaluation
                     else [
@@ -3832,6 +3849,41 @@ def recurrent_training_main(args, parser):
             ):
                 raise ValueError("Frozen evaluation source changed during execution")
             if result.get("status") == success:
+                if actor_bundle is not None:
+                    from parkour_lab.learning.motor_contract import verify_runtime_motor
+                    from parkour_lab.learning.recurrent_runtime import load_actor_bundle
+
+                    controller, bundle_metadata, _ = load_actor_bundle(
+                        actor_bundle["path"], expected_sha256=actor_bundle["sha256"]
+                    )
+                    verification = verify_runtime_motor(
+                        bundle_metadata["motor_contract"],
+                        controller.spec.manifest(),
+                        result["motor_binding"],
+                    )
+                    manifest_json = json.dumps(
+                        controller.spec.manifest(), sort_keys=True, allow_nan=False
+                    )
+                    if (
+                        result.get("actor_bundle") != actor_bundle
+                        or result.get("motor_verification") != verification
+                        or verification["runtime_num_envs"] != args.num_envs
+                        or result.get("motor_binding_sha256")
+                        != verification["runtime_motor_binding_sha256"]
+                        or result.get("training_motor_binding_sha256")
+                        != verification["source_motor_binding_sha256"]
+                        or json.dumps(
+                            result.get("controller_manifest"),
+                            sort_keys=True,
+                            allow_nan=False,
+                        )
+                        != manifest_json
+                        or result.get("interface_sha256")
+                        != hashlib.sha256(manifest_json.encode()).hexdigest()
+                    ):
+                        raise ValueError(
+                            "Actor-bundle identity or native motor verification receipt differs"
+                        )
                 if not evaluation and _requires_root_point_check(protocol):
                     _check_root_point_receipt(
                         result.get("root_point_check"), args.num_envs
@@ -4050,6 +4102,7 @@ def recurrent_training_main(args, parser):
                 reward_capture=getattr(args, "evaluation_reward_capture", False),
                 out_and_back=getattr(args, "evaluation_out_and_back", False),
                 command_source=getattr(args, "evaluation_command_source", False),
+                **({"actor_bundle": actor_bundle} if actor_bundle is not None else {}),
                 seed=args.seed,
             )
             np.savez_compressed(output / "trace.npz", **trace)
@@ -4232,6 +4285,11 @@ def main(argv=None):
         help="With explicit difficulty and no other tape/reward options: integrate the recurrent controller with leased body-twist sources; inject release, disconnect, silence and replay. No learning, network/hardware certification or acceptance",
     )
     parser.add_argument(
+        "--evaluation-actor-bundle",
+        type=Path,
+        help="With --evaluation-command-source: drive the same frozen probe with a V2 exported actor and verified native motors; original checkpoint is the parity shadow only",
+    )
+    parser.add_argument(
         "--evaluation-reward-capture",
         action="store_true",
         help="Frozen evaluation with explicit difficulty only: record native reward contributions in the existing trace; no reward, policy or scoring changes",
@@ -4363,6 +4421,12 @@ def main(argv=None):
     refinement = args.procedural_refine_checkpoint is not None
     resuming = args.procedural_resume_checkpoint is not None
     learning = args.procedural_train or refinement or resuming
+    if args.evaluation_actor_bundle is not None and (
+        not evaluation or not args.evaluation_command_source
+    ):
+        parser.error(
+            "--evaluation-actor-bundle requires --procedural-evaluate-checkpoint and --evaluation-command-source"
+        )
     if args.restart_coverage and not resuming:
         parser.error("--restart-coverage requires --procedural-resume-checkpoint")
     if args.pivot_planar_precision and not resuming:

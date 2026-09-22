@@ -301,10 +301,23 @@ class RecurrentOperatorAdapter(ActorOnlyController):
 
 
 @torch.inference_mode()
-def export_recurrent_actor(checkpoint, output):
+def export_recurrent_actor(checkpoint, output, *, motor_report=None):
     """CPU-only, checked extraction; atomically publish a new file without clobbering."""
     policy, metadata, checkpoint_sha = load_recurrent_checkpoint(checkpoint, "cpu")
     manifest = metadata["controller_manifest"]
+    motor_report = (
+        Path(motor_report)
+        if motor_report is not None
+        else Path(checkpoint).parent / "report.json"
+    )
+    try:
+        binding = json.loads(motor_report.read_text())["motor_binding"]
+        if type(binding) is not dict:
+            raise ValueError("Missing source motor binding")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise ValueError(
+            f"Require a source motor-binding report: {motor_report}; use --motor-report if stored elsewhere"
+        ) from error
     original = RecurrentOperatorAdapter(
         policy,
         joint_names=tuple(manifest["joint_names"]),
@@ -318,6 +331,7 @@ def export_recurrent_actor(checkpoint, output):
         original,
         source_checkpoint_sha256=checkpoint_sha,
         learning_updates=metadata["learning_updates"],
+        motor_binding=binding,
     )
     buffer = io.BytesIO()
     torch.save(payload, buffer)
@@ -363,6 +377,8 @@ def export_recurrent_actor(checkpoint, output):
         "actor_tensor_sha256": manifest["artifact_sha256"],
         "source_learning_updates": metadata["learning_updates"],
         "bytes": len(encoded),
+        "format": payload["format"],
+        "motor_contract": payload["motor_contract"],
         "parity_steps": 64,
         "parity_batch": 3,
         "interface": restored.spec.manifest(),

@@ -20,9 +20,11 @@ import torch
 from torch import nn
 
 from .controller import ControllerSpec, JointTargets, SensorSpec
+from .motor_contract import make_motor_contract, validate_motor_contract
 
 RECURRENT_OPERATOR_VERSION = "go2_operator_proprio_gru_v1"
 ACTOR_BUNDLE_VERSION = "go2_operator_actor_bundle_v1"
+BOUND_ACTOR_BUNDLE_VERSION = "go2_operator_actor_bundle_v2"
 FRAME_DIM = 45
 FRAME_TERMS = (
     ("base_ang_vel", 3),
@@ -232,7 +234,9 @@ class ActorOnlyController:
         )
 
 
-def actor_bundle(controller, *, source_checkpoint_sha256, learning_updates):
+def actor_bundle(
+    controller, *, source_checkpoint_sha256, learning_updates, motor_binding=None
+):
     """Take only actor weights and the exact inference interface, never live state."""
     if (
         not _sha256_string(source_checkpoint_sha256)
@@ -247,8 +251,9 @@ def actor_bundle(controller, *, source_checkpoint_sha256, learning_updates):
         != controller.spec.artifact_sha256
     ):
         raise ValueError("Controller actor identity differs from its tensor weights")
+    bound = motor_binding is not None
     return {
-        "format": ACTOR_BUNDLE_VERSION,
+        "format": BOUND_ACTOR_BUNDLE_VERSION if bound else ACTOR_BUNDLE_VERSION,
         "source_checkpoint_sha256": source_checkpoint_sha256,
         "source_learning_updates": learning_updates,
         "controller_manifest": copy.deepcopy(controller.spec.manifest()),
@@ -260,12 +265,24 @@ def actor_bundle(controller, *, source_checkpoint_sha256, learning_updates):
             )
         },
         "exit_allowed": False,
+        **(
+            {
+                "motor_contract": make_motor_contract(
+                    motor_binding, controller.spec.actuator_profile
+                )
+            }
+            if bound
+            else {}
+        ),
     }
 
 
 def _load_actor_bytes(encoded, device="cpu"):
     saved = torch.load(io.BytesIO(encoded), map_location="cpu", weights_only=True)
     try:
+        bound = (
+            type(saved) is dict and saved.get("format") == BOUND_ACTOR_BUNDLE_VERSION
+        )
         if (
             type(saved) is not dict
             or set(saved)
@@ -277,7 +294,8 @@ def _load_actor_bytes(encoded, device="cpu"):
                 "state_dicts",
                 "exit_allowed",
             }
-            or saved["format"] != ACTOR_BUNDLE_VERSION
+            | ({"motor_contract"} if bound else set())
+            or saved["format"] not in (ACTOR_BUNDLE_VERSION, BOUND_ACTOR_BUNDLE_VERSION)
             or not _sha256_string(saved["source_checkpoint_sha256"])
             or type(saved["source_learning_updates"]) is not int
             or saved["source_learning_updates"] < 1
@@ -335,6 +353,8 @@ def _load_actor_bytes(encoded, device="cpu"):
             raise ValueError(
                 "Actor-only controller manifest differs from the fixed interface"
             )
+        if bound:
+            validate_motor_contract(saved["motor_contract"], manifest)
     except (KeyError, TypeError, AttributeError, RuntimeError) as error:
         raise ValueError("Incomplete or malformed actor-only artifact") from error
     metadata = {k: copy.deepcopy(v) for k, v in saved.items() if k != "state_dicts"}
