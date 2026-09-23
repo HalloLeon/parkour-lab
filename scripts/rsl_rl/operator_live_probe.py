@@ -32,7 +32,7 @@ PHASES = (
 
 def smoke_protocol():
     return {
-        "version": "operator_native_live_smoke_v1",
+        "version": "operator_native_live_smoke_v2",
         "control_steps": STEPS,
         "simulated_seconds": STEPS * 0.02,
         "loop_wall_timeout_s": WALL_SECONDS,
@@ -42,6 +42,8 @@ def smoke_protocol():
             for start, end, name in PHASES
         ],
         "source": "synthetic key events; no Kit keyboard, focus or network transport",
+        "repeat_schedule": "one explicit synthetic repeat per intended-active poll; none during silence",
+        "host_stall_timeout_s": 0.25,
         "silence_oracle": "strict local decision time > last scripted repeat receipt + 0.25s",
         "scope": "one-plane native scene, causal actor, input lease, reset masks and motor delivery only",
         "gui_validation": "UNRUN",
@@ -68,6 +70,8 @@ class HeadlessSmoke:
         self.max_abs_raw_action = 0.0
         self.max_abs_joint_speed_rad_s = 0.0
         self.max_root_com_planar_speed_m_s = 0.0
+        self.timings = {}
+        self.last_input_check = None
 
     def _event(self, key, kind):
         now = self.clock()
@@ -88,13 +92,15 @@ class HeadlessSmoke:
             key = {100: "W", 250: "Q", 500: "Z"}[step]
             self._event("R", "press")
             self._event(key, "press")
-        if step % 5 == 0:
-            if 100 <= step < 200:
-                self._event("W", "repeat")
-            elif 250 <= step < 350 or 400 <= step < 450:
-                self._event("Q", "repeat")
-            elif 500 <= step < 550 or 575 <= step < STEPS:
-                self._event("Z", "repeat")
+        # Simulation ticks need not take 20ms of wall time. These are explicit
+        # test-source receipts, not a keyboard heartbeat or automatic rearming.
+        # The unchanged host-gap/expiry checks still reject a real >250ms stall.
+        if 100 <= step < 200:
+            self._event("W", "repeat")
+        elif 250 <= step < 350 or 400 <= step < 450:
+            self._event("Q", "repeat")
+        elif 500 <= step < 550 or 575 <= step < STEPS:
+            self._event("Z", "repeat")
         if step == 200:
             self._event("W", "release")
         if step == RESET_STEP:
@@ -134,8 +140,26 @@ class HeadlessSmoke:
         if step != self.verified_steps:
             raise RuntimeError("Smoke observer skipped or duplicated a physical step")
         expected = self._expected_command(step, decision.decision_time_s)
+        self.last_input_check = {
+            "step": step,
+            "status": decision.status,
+            "expected_command": list(expected),
+            "actual_command": list(decision.command),
+            "generation": decision.generation,
+            "poll_gap_s": self.control.last_poll_gap_s,
+            "source_receipt_age_s": (
+                None
+                if decision.source_time_s is None
+                else decision.decision_time_s - decision.source_time_s
+            ),
+        }
         if decision.command != expected:
-            raise RuntimeError(f"Synthetic input command mismatch at smoke step {step}")
+            raise RuntimeError(
+                f"Synthetic input command mismatch at smoke step {step}: "
+                f"status={decision.status}, poll_gap_s={self.control.last_poll_gap_s:.6f}, "
+                f"expected={expected}, actual={decision.command}. "
+                "The 0.25s watchdog remains enforced; see smoke_progress timings."
+            )
         expected_generation = (
             0 if step < 100 else 1 if step < 250 else 2 if step < 500 else 3
         )
@@ -206,6 +230,12 @@ class HeadlessSmoke:
             "max_abs_raw_action": self.max_abs_raw_action,
             "max_abs_joint_speed_rad_s": self.max_abs_joint_speed_rad_s,
             "max_root_com_body_xy_speed_m_s": self.max_root_com_planar_speed_m_s,
+            "last_input_check": self.last_input_check,
+            "max_poll_gap_s": self.control.max_poll_gap_s,
+            "host_call_timings": {
+                name: dict(entry) for name, entry in self.timings.items()
+            },
+            "timing_scope": "host elapsed durations; GPU work may be charged at its next synchronization, not kernel profiling",
             "metrics_scope": "descriptive post-control-step maxima, not substep extrema or behavioral thresholds",
             "gui_validation": "UNRUN",
         }
@@ -224,6 +254,7 @@ class HeadlessSmoke:
                 max_wall_seconds=WALL_SECONDS,
                 before_poll=self.prepare,
                 after_step=self.observe,
+                timings=self.timings,
             )
             if (
                 result["control_steps"] != STEPS

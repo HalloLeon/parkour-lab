@@ -41,6 +41,8 @@ class KeyboardTwist:
         self.quit_requested = False
         self._key = None
         self._last_poll = None
+        self.last_poll_gap_s = 0.0
+        self.max_poll_gap_s = 0.0
         self._sequence = 0
 
     def stop(self, now, *, disconnected=False):
@@ -60,9 +62,9 @@ class KeyboardTwist:
 
     def poll(self, now, *, available):
         decision = self.resolve(now)  # Validate clock before touching cached state.
-        if not available or (
-            self._last_poll is not None and now - self._last_poll > self.lease.timeout_s
-        ):
+        self.last_poll_gap_s = 0.0 if self._last_poll is None else now - self._last_poll
+        self.max_poll_gap_s = max(self.max_poll_gap_s, self.last_poll_gap_s)
+        if not available or self.last_poll_gap_s > self.lease.timeout_s:
             self.stop(now, disconnected=True)
         self.available = bool(available)
         self._last_poll = decision.decision_time_s
@@ -127,6 +129,7 @@ def run_live_loop(
     max_wall_seconds=None,
     before_poll=None,
     after_step=None,
+    timings=None,
 ):
     """Serialize input decisions, physical resets and fixed-clock actor delivery.
 
@@ -136,6 +139,8 @@ def run_live_loop(
     Optional bounded-probe hooks inject synthetic events BEFORE the poll clock
     is sampled, and inspect each completed native step with its original reset
     mask. Ordinary keyboard operation supplies neither hook nor a step limit.
+    Optional timings hold bounded host-call durations, including failed calls;
+    no extra CUDA synchronization or change to the lease clock is introduced.
     """
     import torch
 
@@ -158,6 +163,28 @@ def run_live_loop(
         raise ValueError("Wall-time limit must be finite and positive")
     started = clock()
     step_index = episode_ends = manual_resets = 0
+    if timings is not None:
+        timings.clear()
+
+    def measured(name, operation, *args, **kwargs):
+        if timings is None:
+            return operation(*args, **kwargs)
+        before = clock()
+        try:
+            return operation(*args, **kwargs)
+        finally:
+            elapsed = clock() - before
+            entry = timings.setdefault(name, {"calls": 0, "max_s": 0.0})
+            entry.update(
+                calls=entry["calls"] + 1,
+                previous_step=entry.get("last_step"),
+                previous_s=entry.get("last_s"),
+                last_step=step_index,
+                last_s=elapsed,
+                max_step=step_index if elapsed >= entry["max_s"] else entry["max_step"],
+                max_s=max(entry["max_s"], elapsed),
+            )
+
     last_status = None
     reset_mask = torch.ones(1, dtype=torch.bool, device=env.device)
     with torch.inference_mode():
@@ -169,7 +196,7 @@ def run_live_loop(
             if max_wall_seconds is not None and clock() - started > max_wall_seconds:
                 raise TimeoutError("Live loop exceeded its wall-time budget")
             if before_poll is not None:
-                before_poll(step_index)
+                measured("source_events", before_poll, step_index)
             tick = clock()
             if not env.sim.is_playing():
                 control.poll(tick, available=False)
@@ -181,10 +208,12 @@ def run_live_loop(
                 control.stop(clock(), disconnected=True)
                 sleep(env.step_dt)
                 continue
-            decision = control.poll(tick, available=is_available())
+            decision = measured(
+                "input_poll", control.poll, tick, available=is_available()
+            )
             if control.reset_requested:
                 control.stop(clock(), disconnected=True)
-                env.reset()
+                measured("physical_reset", env.reset)
                 reset_mask.fill_(True)
                 manual_resets += 1
                 # env.reset may render and dispatch callbacks; discard them too.
@@ -196,18 +225,31 @@ def run_live_loop(
                 print(f"[OPERATOR] {decision.status}", flush=True)
                 last_status = decision.status
             command = env.scene["robot"].data.joint_pos.new_tensor([decision.command])
-            result = host.act(
-                command, time_s=step_index * env.step_dt, reset_mask=reset_mask
+            result = measured(
+                "actor",
+                host.act,
+                command,
+                time_s=step_index * env.step_dt,
+                reset_mask=reset_mask,
             )
             # Inference itself can stall. Never deliver its now-stale moving
             # action, or step the GRU twice to try to repair the same frame.
             latest = control.resolve(clock())
             if latest.command != decision.command:
                 raise RuntimeError("Input expired during inference; delivery aborted")
-            _, _, terminated, timed_out, _ = env.step(result.raw_action)
+            _, _, terminated, timed_out, _ = measured(
+                "native_step", env.step, result.raw_action
+            )
             if after_step is not None:
-                after_step(
-                    step_index, decision, reset_mask, result, terminated, timed_out
+                measured(
+                    "observer",
+                    after_step,
+                    step_index,
+                    decision,
+                    reset_mask,
+                    result,
+                    terminated,
+                    timed_out,
                 )
             step_index += 1
             reset_mask = (terminated | timed_out).clone()

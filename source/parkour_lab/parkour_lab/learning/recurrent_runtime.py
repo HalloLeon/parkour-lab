@@ -132,6 +132,8 @@ class ActorOnlyController:
             )
         self.memory = copy.deepcopy(memory).eval().requires_grad_(False)
         self.actor = copy.deepcopy(actor).eval().requires_grad_(False)
+        # Deepcopy splits cuDNN's packed GRU storage; repack the private copy once.
+        self.memory.flatten_parameters()
         self.default_position_rad = default_position_rad.detach().clone()
         self.hidden_state = None
         self.reset_mask = None
