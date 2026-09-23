@@ -19,6 +19,83 @@ import traceback
 
 
 TERRAINS = ("plane", "rough_flat", "hills", "step_hills", "tilted_ramps")
+KIT_THREAD_SETTINGS = (
+    "/plugins/carb.tasking.plugin/threadCount",
+    "/plugins/omni.tbb.globalcontrol/maxThreadCount",
+    "/persistent/physics/numThreads",
+)
+
+
+def configure_live_execution(cpu_threads):
+    """Bound host worker pools before source readers or Kit initialize them.
+
+    This standalone one-robot process is latency-sensitive, unlike batched PPO.
+    These are scheduling limits, not changed physics or input-lease parameters.
+    """
+    if type(cpu_threads) is not int or cpu_threads < 1:
+        raise ValueError("Live CPU thread budget must be a positive integer")
+    logical_count = os.cpu_count()
+    try:
+        affinity_count = (
+            len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None
+        )
+    except OSError:
+        affinity_count = None
+    limit = min(cpu_threads, affinity_count or logical_count or 1)
+    environment = {
+        "OMP_NUM_THREADS": "1",
+        "MKL_NUM_THREADS": "1",
+        "OPENBLAS_NUM_THREADS": "1",
+        "PXR_WORK_THREAD_LIMIT": str(limit),
+    }
+    os.environ.update(environment)
+    import torch
+
+    torch.set_num_threads(1)
+    # Interop can only be configured before its first work. Do not silently
+    # continue with an unconstrained pool if this entry point was called late.
+    if torch.get_num_interop_threads() != 1:
+        torch.set_num_interop_threads(1)
+    if torch.get_num_threads() != 1 or torch.get_num_interop_threads() != 1:
+        raise RuntimeError("Cannot establish single-threaded live Torch execution")
+    return {
+        "version": "operator_single_robot_execution_v1",
+        "requested_cpu_threads": cpu_threads,
+        "cpu_threads": limit,
+        "logical_cpu_count": logical_count,
+        "affinity_cpu_count": affinity_count,
+        "torch_intraop_threads": torch.get_num_threads(),
+        "torch_interop_threads": torch.get_num_interop_threads(),
+        "environment": environment,
+        "kit_args": " ".join(f"--{key}={limit}" for key in KIT_THREAD_SETTINGS),
+        "scope": "process-local scheduling limits; no real-time guarantee; USD/BLAS environment requests, not worker-count measurements",
+    }
+
+
+def verify_live_execution(execution):
+    """Read back Kit/Torch settings after launcher initialization, before motion."""
+    import carb
+    import torch
+
+    settings = carb.settings.get_settings()
+    actual = {key: settings.get(key) for key in KIT_THREAD_SETTINGS}
+    if any(
+        type(value) is not int or not 1 <= value <= execution["cpu_threads"]
+        for value in actual.values()
+    ):
+        raise RuntimeError(f"Kit did not retain the live CPU thread budget: {actual}")
+    if torch.get_num_threads() != 1 or torch.get_num_interop_threads() != 1:
+        raise RuntimeError("Live Torch thread budget changed during simulator startup")
+    return {
+        "kit_settings": actual,
+        "torch_intraop_threads": torch.get_num_threads(),
+        "torch_interop_threads": torch.get_num_interop_threads(),
+        # SimulationApp versions may overwrite USD/BLAS environment variables.
+        # Report that honestly; env values are not observed native pool sizes.
+        "environment_after_launcher": {
+            key: os.environ.get(key) for key in execution["environment"]
+        },
+    }
 
 
 def _write_live_report(path, report):
@@ -52,6 +129,12 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=47)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=4,
+        help="Per-pool Kit/TBB/PhysX thread cap for one-robot play (default 4, capped by CPU affinity); Torch uses one",
+    )
+    parser.add_argument(
         "--headless-smoke",
         action="store_true",
         help="Fixed 600-step one-robot plane integration with synthetic input; no GUI or training",
@@ -76,6 +159,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.seed < 0:
         parser.error("--seed must be nonnegative")
+    if args.cpu_threads < 1:
+        parser.error("--cpu-threads must be positive")
     if args.headless_smoke:
         if args.terrain != "plane" or args.livestream not in (None, 0):
             parser.error("--headless-smoke requires plane terrain and no livestream")
@@ -138,6 +223,11 @@ def apply_live_overrides(cfg, args, *, command_class, recorders):
 
 def main(argv=None):
     args = parse_args(argv)
+    try:
+        execution = configure_live_execution(args.cpu_threads)
+    except Exception as error:
+        print(f"Live execution setup failed: {error}", flush=True)
+        return 2
     # Source readers import RSL-RL for strict archive verification, but the live
     # NativeActorSession uses only the extracted actor, never a training runner.
     from . import operator_train as training
@@ -190,6 +280,7 @@ def main(argv=None):
         "episode_length_s": 300.0,
         "livestream": args.livestream,
         "device": args.device,
+        "execution": execution,
         "mode": "headless_smoke" if args.headless_smoke else "interactive",
         "headless": args.headless_smoke or args.livestream != 0,
         "motion_keys_body_twist": MOTION_KEYS,
@@ -224,6 +315,12 @@ def main(argv=None):
         tempfile.mkdtemp(prefix="operator_live_", dir=args.output_parent)
     ).resolve()
     print(f"Live session: {output}", flush=True)
+    print(
+        f"Live host budget: per-pool Kit/TBB/PhysX thread cap {execution['cpu_threads']}; "
+        "Torch intra/inter-op = 1/1; simulation device unchanged: "
+        f"{args.device}",
+        flush=True,
+    )
     app = env = probe = None
     report = {"status": "ERROR", "learning_updates": 0, "exit_allowed": False}
     code = 2
@@ -239,7 +336,9 @@ def main(argv=None):
             headless=protocol["headless"],
             livestream=args.livestream,
             device=args.device,
+            kit_args=execution["kit_args"],
         ).app
+        report["execution"] = verify_live_execution(execution)
         from isaaclab.envs import ManagerBasedRLEnv
         from isaaclab.envs.mdp import UniformVelocityCommand
         from isaaclab.managers import RecorderManagerBaseCfg
