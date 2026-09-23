@@ -134,10 +134,16 @@ def parse_args(argv=None):
         default=4,
         help="Per-pool Kit/TBB/PhysX thread cap for one-robot play (default 4, capped by CPU affinity); Torch uses one",
     )
-    parser.add_argument(
+    smoke_modes = parser.add_mutually_exclusive_group()
+    smoke_modes.add_argument(
         "--headless-smoke",
         action="store_true",
-        help="Fixed 600-step one-robot plane integration with synthetic input; no GUI or training",
+        help="Fixed 600-step one-robot plane integration with synthetic input and wall-clock watchdog; no GUI or training",
+    )
+    smoke_modes.add_argument(
+        "--headless-functional-smoke",
+        action="store_true",
+        help="Fixed 600-step plane functional integration with controlled synthetic command time; permits slow hosts, does not validate live timing",
     )
     parser.add_argument(
         "--livestream",
@@ -161,9 +167,9 @@ def parse_args(argv=None):
         parser.error("--seed must be nonnegative")
     if args.cpu_threads < 1:
         parser.error("--cpu-threads must be positive")
-    if args.headless_smoke:
+    if args.headless_smoke or args.headless_functional_smoke:
         if args.terrain != "plane" or args.livestream not in (None, 0):
-            parser.error("--headless-smoke requires plane terrain and no livestream")
+            parser.error("Headless smoke modes require plane terrain and no livestream")
         args.livestream = 0
     elif args.livestream is None:
         args.livestream = 2
@@ -223,6 +229,7 @@ def apply_live_overrides(cfg, args, *, command_class, recorders):
 
 def main(argv=None):
     args = parse_args(argv)
+    headless_smoke = args.headless_smoke or args.headless_functional_smoke
     try:
         execution = configure_live_execution(args.cpu_threads)
     except Exception as error:
@@ -245,7 +252,7 @@ def main(argv=None):
                 raise ValueError(
                     "Live output must be outside immutable source run directories"
                 )
-        if not args.headless_smoke:
+        if not headless_smoke:
             validate_operator_display(
                 headless=args.livestream != 0, livestream=args.livestream
             )
@@ -281,8 +288,12 @@ def main(argv=None):
         "livestream": args.livestream,
         "device": args.device,
         "execution": execution,
-        "mode": "headless_smoke" if args.headless_smoke else "interactive",
-        "headless": args.headless_smoke or args.livestream != 0,
+        "mode": (
+            "headless_functional_smoke"
+            if args.headless_functional_smoke
+            else "headless_smoke" if args.headless_smoke else "interactive"
+        ),
+        "headless": headless_smoke or args.livestream != 0,
         "motion_keys_body_twist": MOTION_KEYS,
         "lease_s": 0.25,
         "command_clock": "local monotonic receipt time; real key repeats only",
@@ -292,7 +303,17 @@ def main(argv=None):
         "learning_updates": 0,
         "exit_allowed": False,
     }
-    if args.headless_smoke:
+    if args.headless_functional_smoke:
+        protocol["smoke"] = smoke_protocol(functional=True)
+        protocol["command_clock"] = (
+            "controlled synthetic command time advanced by native control steps; "
+            "not wall-clock input freshness"
+        )
+        protocol["wall_clock"] = (
+            "local monotonic time for measured host durations and administrative timeout"
+        )
+        protocol["live_timing_validation"] = "UNRUN"
+    elif args.headless_smoke:
         protocol["smoke"] = smoke_protocol()
         protocol["command_clock"] = (
             "local monotonic receipt time; explicitly synthetic scripted key events"
@@ -323,6 +344,8 @@ def main(argv=None):
     )
     app = env = probe = None
     report = {"status": "ERROR", "learning_updates": 0, "exit_allowed": False}
+    if args.headless_functional_smoke:
+        report["live_timing_validation"] = "UNRUN"
     code = 2
     try:
         training.write_run_provenance(output, __file__)
@@ -369,8 +392,12 @@ def main(argv=None):
             artifact_sha256=bundle["sha256"],
         )
         report["motor_verification"] = host.motor_verification
-        if args.headless_smoke:
-            probe = HeadlessSmoke(env)
+        if headless_smoke:
+            probe = (
+                HeadlessSmoke(env, functional=True)
+                if args.headless_functional_smoke
+                else HeadlessSmoke(env)
+            )
             report.update(probe.run(host, app))
         else:
             report.update(run_keyboard_actor(env, host, app))
@@ -381,9 +408,13 @@ def main(argv=None):
         ):
             raise ValueError("Source files or runtime changed during the live session")
         report["status"] = (
-            "HEADLESS_SMOKE_PASSED_NOT_ACCEPTED"
-            if args.headless_smoke
-            else "INTERACTIVE_SESSION_FINISHED_NOT_ACCEPTED"
+            "HEADLESS_FUNCTIONAL_SMOKE_PASSED_NOT_ACCEPTED"
+            if args.headless_functional_smoke
+            else (
+                "HEADLESS_SMOKE_PASSED_NOT_ACCEPTED"
+                if args.headless_smoke
+                else "INTERACTIVE_SESSION_FINISHED_NOT_ACCEPTED"
+            )
         )
         code = 0
     except KeyboardInterrupt:

@@ -124,7 +124,9 @@ def run_live_loop(
     *,
     is_available,
     clock=time.monotonic,
+    command_clock=None,
     sleep=time.sleep,
+    pace=True,
     max_steps=None,
     max_wall_seconds=None,
     before_poll=None,
@@ -140,7 +142,10 @@ def run_live_loop(
     is sampled, and inspect each completed native step with its original reset
     mask. Ordinary keyboard operation supplies neither hook nor a step limit.
     Optional timings hold bounded host-call durations, including failed calls;
-    no extra CUDA synchronization or change to the lease clock is introduced.
+    no extra CUDA synchronization is introduced. ``clock`` always measures host
+    time (durations, administrative timeout and pacing). Only an explicit offline
+    probe supplies a separate ``command_clock`` and disables pacing; live input
+    defaults to the host clock for every receipt, poll and delivery check.
     """
     import torch
 
@@ -161,6 +166,10 @@ def run_live_loop(
         or max_wall_seconds <= 0
     ):
         raise ValueError("Wall-time limit must be finite and positive")
+    if type(pace) is not bool:
+        raise ValueError("Pacing must be a boolean")
+    if command_clock is None:
+        command_clock = clock
     started = clock()
     step_index = episode_ends = manual_resets = 0
     if timings is not None:
@@ -198,26 +207,27 @@ def run_live_loop(
             if before_poll is not None:
                 measured("source_events", before_poll, step_index)
             tick = clock()
+            command_tick = command_clock()
             if not env.sim.is_playing():
-                control.poll(tick, available=False)
+                control.poll(command_tick, available=False)
                 # Pinned SimulationContext.render suppresses physics during UI
                 # updates, including the one that resumes play. app.update does
                 # not, and could advance physics outside our policy clock.
                 env.sim.render()
                 # Includes the update that resumes play: R/N during it are lost.
-                control.stop(clock(), disconnected=True)
+                control.stop(command_clock(), disconnected=True)
                 sleep(env.step_dt)
                 continue
             decision = measured(
-                "input_poll", control.poll, tick, available=is_available()
+                "input_poll", control.poll, command_tick, available=is_available()
             )
             if control.reset_requested:
-                control.stop(clock(), disconnected=True)
+                control.stop(command_clock(), disconnected=True)
                 measured("physical_reset", env.reset)
                 reset_mask.fill_(True)
                 manual_resets += 1
                 # env.reset may render and dispatch callbacks; discard them too.
-                control.stop(clock(), disconnected=True)
+                control.stop(command_clock(), disconnected=True)
                 # Recheck quit/play/focus and callback faults before inference.
                 # A reset is not a policy step and never advances its clock.
                 continue
@@ -234,7 +244,7 @@ def run_live_loop(
             )
             # Inference itself can stall. Never deliver its now-stale moving
             # action, or step the GRU twice to try to repair the same frame.
-            latest = control.resolve(clock())
+            latest = control.resolve(command_clock())
             if latest.command != decision.command:
                 raise RuntimeError("Input expired during inference; delivery aborted")
             _, _, terminated, timed_out, _ = measured(
@@ -255,12 +265,13 @@ def run_live_loop(
             reset_mask = (terminated | timed_out).clone()
             if reset_mask.any():
                 episode_ends += 1
-                control.stop(clock(), disconnected=True)
+                control.stop(command_clock(), disconnected=True)
                 print(
                     "[OPERATOR] Episode reset; press R, then fresh motion keys.",
                     flush=True,
                 )
-            sleep(max(0.0, env.step_dt - (clock() - tick)))
+            if pace:
+                sleep(max(0.0, env.step_dt - (clock() - tick)))
     if max_wall_seconds is not None and clock() - started > max_wall_seconds:
         raise TimeoutError("Live loop exceeded its wall-time budget")
     return {

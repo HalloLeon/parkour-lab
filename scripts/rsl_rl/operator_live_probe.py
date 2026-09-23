@@ -1,9 +1,10 @@
 """Fixed headless native-loop integration, not keyboard or behavioral acceptance.
 
 Synthetic key events exercise the SAME lease, policy loop, physical reset and
-motor delivery used by live play. The receipt clock is real monotonic time;
-the independent silence oracle uses actual scripted receipt times, not physics
-ticks. Only bounded aggregates are retained, including the final native frame.
+motor delivery used by live play. By default the receipt clock is real monotonic
+time. Explicit offline functional mode uses controlled command-test time instead
+and cannot validate live responsiveness. Host timings and administrative timeout
+always use real elapsed time. Only bounded aggregates are retained.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ from .operator_live import KeyboardTwist, MOTION_KEYS, run_live_loop
 
 STEPS = 600
 WALL_SECONDS = 120.0
+FUNCTIONAL_WALL_SECONDS = 600.0
 RESET_STEP = 450
 PHASES = (
     (0, 100, "initial_zero"),
@@ -30,12 +32,16 @@ PHASES = (
 )
 
 
-def smoke_protocol():
+def smoke_protocol(*, functional=False):
     return {
-        "version": "operator_native_live_smoke_v2",
+        "version": (
+            "operator_native_functional_smoke_v1"
+            if functional
+            else "operator_native_live_smoke_v2"
+        ),
         "control_steps": STEPS,
         "simulated_seconds": STEPS * 0.02,
-        "loop_wall_timeout_s": WALL_SECONDS,
+        "loop_wall_timeout_s": FUNCTIONAL_WALL_SECONDS if functional else WALL_SECONDS,
         "manual_reset_step": RESET_STEP,
         "phases": [
             {"start_step": start, "end_step_exclusive": end, "name": name}
@@ -43,8 +49,19 @@ def smoke_protocol():
         ],
         "source": "synthetic key events; no Kit keyboard, focus or network transport",
         "repeat_schedule": "one explicit synthetic repeat per intended-active poll; none during silence",
-        "host_stall_timeout_s": 0.25,
-        "silence_oracle": "strict local decision time > last scripted repeat receipt + 0.25s",
+        "command_clock": (
+            "controlled synthetic time: control-step index times 0.02 seconds; unchanged during host work or physical reset"
+            if functional
+            else "local monotonic receipt time"
+        ),
+        "command_lease_s": 0.25,
+        "host_stall_timeout_s": None if functional else 0.25,
+        "wall_clock_watchdog_validation": (
+            "UNRUN" if functional else "IN_SCOPE_NOT_CERTIFIED"
+        ),
+        "real_time_validation": "UNRUN",
+        "wall_pacing": not functional,
+        "silence_oracle": "strict command decision time > last scripted repeat receipt + 0.25s",
         "scope": "one-plane native scene, causal actor, input lease, reset masks and motor delivery only",
         "gui_validation": "UNRUN",
         "behavioral_acceptance": False,
@@ -55,8 +72,13 @@ def smoke_protocol():
 class HeadlessSmoke:
     """Consume one-shot events once, even when a physical reset repeats a tick."""
 
-    def __init__(self, env, *, clock=time.monotonic, sleep=time.sleep):
+    def __init__(
+        self, env, *, functional=False, clock=time.monotonic, sleep=time.sleep
+    ):
+        if type(functional) is not bool:
+            raise ValueError("Functional smoke selection must be a boolean")
         self.env = env
+        self.functional = functional
         self.clock, self.sleep = clock, sleep
         self.control = KeyboardTwist()
         self.last_prepared_step = -1
@@ -73,8 +95,11 @@ class HeadlessSmoke:
         self.timings = {}
         self.last_input_check = None
 
+    def command_time(self):
+        return self.current_step * 0.02 if self.functional else self.clock()
+
     def _event(self, key, kind):
-        now = self.clock()
+        now = self.command_time()
         self.control.key_event(key, kind, now, shift_held=True)
         if kind == "repeat" and key == "Q" and 250 <= self.current_step < 350:
             self.last_pivot_repeat_receipt = now
@@ -82,11 +107,11 @@ class HeadlessSmoke:
     def prepare(self, step):
         if not self.env.sim.is_playing():
             raise RuntimeError("Headless smoke cannot wait for an interactive resume")
-        self.current_step = step
         if step == self.last_prepared_step:
             return  # N resets without advancing the policy clock; never replay N.
         if step != self.last_prepared_step + 1:
             raise RuntimeError("Smoke source skipped a control step")
+        self.current_step = step
         self.last_prepared_step = step
         if step in (100, 250, 500):
             key = {100: "W", 250: "Q", 500: "Z"}[step]
@@ -94,7 +119,8 @@ class HeadlessSmoke:
             self._event(key, "press")
         # Simulation ticks need not take 20ms of wall time. These are explicit
         # test-source receipts, not a keyboard heartbeat or automatic rearming.
-        # The unchanged host-gap/expiry checks still reject a real >250ms stall.
+        # Strict mode rejects real >250ms stalls. Functional mode advances only
+        # explicit test time; it is never a fallback for live keyboard input.
         if 100 <= step < 200:
             self._event("W", "repeat")
         elif 250 <= step < 350 or 400 <= step < 450:
@@ -158,7 +184,8 @@ class HeadlessSmoke:
                 f"Synthetic input command mismatch at smoke step {step}: "
                 f"status={decision.status}, poll_gap_s={self.control.last_poll_gap_s:.6f}, "
                 f"expected={expected}, actual={decision.command}. "
-                "The 0.25s watchdog remains enforced; see smoke_progress timings."
+                "The 0.25s lease remains enforced in the declared command clock; "
+                "see smoke_progress timing scopes."
             )
         expected_generation = (
             0 if step < 100 else 1 if step < 250 else 2 if step < 500 else 3
@@ -221,7 +248,15 @@ class HeadlessSmoke:
         self.verified_steps += 1
 
     def progress(self):
+        protocol = smoke_protocol(functional=self.functional)
         return {
+            "version": protocol["version"],
+            "command_clock": protocol["command_clock"],
+            "input_timing_scope": "poll gaps and receipt ages use the declared command clock, not necessarily wall time",
+            "wall_clock_watchdog_validation": protocol[
+                "wall_clock_watchdog_validation"
+            ],
+            "real_time_validation": "UNRUN",
             "verified_control_steps": self.verified_steps,
             "last_attempted_step": self.last_attempted_step,
             "phase_counts": dict(self.phase_counts),
@@ -249,9 +284,13 @@ class HeadlessSmoke:
                 self.control,
                 is_available=self.available,
                 clock=self.clock,
+                command_clock=self.command_time,
                 sleep=self.sleep,
+                pace=not self.functional,
                 max_steps=STEPS,
-                max_wall_seconds=WALL_SECONDS,
+                max_wall_seconds=(
+                    FUNCTIONAL_WALL_SECONDS if self.functional else WALL_SECONDS
+                ),
                 before_poll=self.prepare,
                 after_step=self.observe,
                 timings=self.timings,
@@ -271,4 +310,4 @@ class HeadlessSmoke:
                 )
             return result
         finally:
-            self.control.stop(self.clock(), disconnected=True)
+            self.control.stop(self.command_time(), disconnected=True)
