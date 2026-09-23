@@ -123,12 +123,19 @@ def run_live_loop(
     is_available,
     clock=time.monotonic,
     sleep=time.sleep,
+    max_steps=None,
+    max_wall_seconds=None,
+    before_poll=None,
+    after_step=None,
 ):
     """Serialize input decisions, physical resets and fixed-clock actor delivery.
 
     Paused app updates do not advance actor time. An episode auto-reset or an N
     reset is the only reason to reset GRU rows; the simulation clock never rewinds.
     No per-frame files or unbounded trace buffers are created.
+    Optional bounded-probe hooks inject synthetic events BEFORE the poll clock
+    is sampled, and inspect each completed native step with its original reset
+    mask. Ordinary keyboard operation supplies neither hook nor a step limit.
     """
     import torch
 
@@ -141,12 +148,28 @@ def run_live_loop(
         raise ValueError(
             "Interactive actor requires one 50 Hz environment with end-of-frame rendering"
         )
+    if max_steps is not None and (type(max_steps) is not int or max_steps < 1):
+        raise ValueError("Control-step limit must be a positive integer")
+    if max_wall_seconds is not None and (
+        isinstance(max_wall_seconds, bool)
+        or not math.isfinite(max_wall_seconds)
+        or max_wall_seconds <= 0
+    ):
+        raise ValueError("Wall-time limit must be finite and positive")
     started = clock()
     step_index = episode_ends = manual_resets = 0
     last_status = None
     reset_mask = torch.ones(1, dtype=torch.bool, device=env.device)
     with torch.inference_mode():
-        while app.is_running() and not control.quit_requested:
+        while (
+            app.is_running()
+            and not control.quit_requested
+            and (max_steps is None or step_index < max_steps)
+        ):
+            if max_wall_seconds is not None and clock() - started > max_wall_seconds:
+                raise TimeoutError("Live loop exceeded its wall-time budget")
+            if before_poll is not None:
+                before_poll(step_index)
             tick = clock()
             if not env.sim.is_playing():
                 control.poll(tick, available=False)
@@ -182,6 +205,10 @@ def run_live_loop(
             if latest.command != decision.command:
                 raise RuntimeError("Input expired during inference; delivery aborted")
             _, _, terminated, timed_out, _ = env.step(result.raw_action)
+            if after_step is not None:
+                after_step(
+                    step_index, decision, reset_mask, result, terminated, timed_out
+                )
             step_index += 1
             reset_mask = (terminated | timed_out).clone()
             if reset_mask.any():
@@ -192,6 +219,8 @@ def run_live_loop(
                     flush=True,
                 )
             sleep(max(0.0, env.step_dt - (clock() - tick)))
+    if max_wall_seconds is not None and clock() - started > max_wall_seconds:
+        raise TimeoutError("Live loop exceeded its wall-time budget")
     return {
         "control_steps": step_index,
         "simulated_seconds": step_index * env.step_dt,

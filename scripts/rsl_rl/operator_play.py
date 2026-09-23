@@ -1,4 +1,4 @@
-"""Attended, simulation-only play of a verified actor artifact (no PPO).
+"""Simulation-only play or bounded headless smoke of a verified actor (no PPO).
 
 The physical reference and learned archive are validated before launch. After
 the complete training configuration matches its archive, explicit live-scene
@@ -33,10 +33,15 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=47)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
+        "--headless-smoke",
+        action="store_true",
+        help="Fixed 600-step one-robot plane integration with synthetic input; no GUI or training",
+    )
+    parser.add_argument(
         "--livestream",
         type=int,
         choices=(0, 2),
-        default=2,
+        default=None,
         help="2: server stream; 0: local window",
     )
     parser.add_argument(
@@ -52,6 +57,12 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.seed < 0:
         parser.error("--seed must be nonnegative")
+    if args.headless_smoke:
+        if args.terrain != "plane" or args.livestream not in (None, 0):
+            parser.error("--headless-smoke requires plane terrain and no livestream")
+        args.livestream = 0
+    elif args.livestream is None:
+        args.livestream = 2
     return args
 
 
@@ -108,6 +119,7 @@ def main(argv=None):
     from . import operator_train as training
     from .operator_live import MOTION_KEYS, run_keyboard_actor
     from .operator_runtime import NativeActorSession, actor_bundle_source
+    from .operator_live_probe import HeadlessSmoke, smoke_protocol
     from .teleoperation import validate_operator_display
 
     try:
@@ -119,9 +131,10 @@ def main(argv=None):
                 raise ValueError(
                     "Live output must be outside immutable source run directories"
                 )
-        validate_operator_display(
-            headless=args.livestream != 0, livestream=args.livestream
-        )
+        if not args.headless_smoke:
+            validate_operator_display(
+                headless=args.livestream != 0, livestream=args.livestream
+            )
         if importlib.metadata.version("rsl-rl-lib") != "3.1.2":
             raise ValueError("Archive preflight requires RSL-RL 3.1.2")
         agent = training.read_yaml_data(args.reference.parent / "params/agent.yaml")
@@ -153,6 +166,8 @@ def main(argv=None):
         "episode_length_s": 300.0,
         "livestream": args.livestream,
         "device": args.device,
+        "mode": "headless_smoke" if args.headless_smoke else "interactive",
+        "headless": args.headless_smoke or args.livestream != 0,
         "motion_keys_body_twist": MOTION_KEYS,
         "lease_s": 0.25,
         "command_clock": "local monotonic receipt time; real key repeats only",
@@ -161,6 +176,11 @@ def main(argv=None):
         "learning_updates": 0,
         "exit_allowed": False,
     }
+    if args.headless_smoke:
+        protocol["smoke"] = smoke_protocol()
+        protocol["command_clock"] = (
+            "local monotonic receipt time; explicitly synthetic scripted key events"
+        )
     if args.validate_only:
         print(
             json.dumps(
@@ -179,7 +199,7 @@ def main(argv=None):
         tempfile.mkdtemp(prefix="operator_live_", dir=args.output_parent)
     ).resolve()
     print(f"Live session: {output}", flush=True)
-    app = env = None
+    app = env = probe = None
     report = {"status": "ERROR", "learning_updates": 0, "exit_allowed": False}
     code = 2
     try:
@@ -191,7 +211,7 @@ def main(argv=None):
         from isaaclab.app import AppLauncher
 
         app = AppLauncher(
-            headless=args.livestream != 0,
+            headless=protocol["headless"],
             livestream=args.livestream,
             device=args.device,
         ).app
@@ -225,14 +245,22 @@ def main(argv=None):
             artifact_sha256=bundle["sha256"],
         )
         report["motor_verification"] = host.motor_verification
-        report.update(run_keyboard_actor(env, host, app))
+        if args.headless_smoke:
+            probe = HeadlessSmoke(env)
+            report.update(probe.run(host, app))
+        else:
+            report.update(run_keyboard_actor(env, host, app))
         if (
             training.recurrent_evaluation_files(args.checkpoint) != sources
             or training.recurrent_training_identity(args.reference) != identity
             or training.file_sha256(args.actor_bundle) != bundle["sha256"]
         ):
             raise ValueError("Source files or runtime changed during the live session")
-        report["status"] = "INTERACTIVE_SESSION_FINISHED_NOT_ACCEPTED"
+        report["status"] = (
+            "HEADLESS_SMOKE_PASSED_NOT_ACCEPTED"
+            if args.headless_smoke
+            else "INTERACTIVE_SESSION_FINISHED_NOT_ACCEPTED"
+        )
         code = 0
     except KeyboardInterrupt:
         report["status"] = "INTERRUPTED_NOT_ACCEPTED"
@@ -243,6 +271,8 @@ def main(argv=None):
         )
         print(report["traceback"], flush=True)
     finally:
+        if probe is not None:
+            report["smoke_progress"] = probe.progress()
         for label, resource in (("environment", env), ("application", app)):
             if resource is not None:
                 try:
