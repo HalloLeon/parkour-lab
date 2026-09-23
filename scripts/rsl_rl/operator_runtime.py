@@ -202,7 +202,12 @@ class NativeActorSession:
             command.is_standing_env.fill_(False)
             command.is_heading_env.fill_(False)
             command.vel_command_b.copy_(applied_command)
-            frame = env.observation_manager.compute()["proprio"]
+            # Pinned Isaac Lab's compute() recomputes every observation group.
+            # The frozen actor needs only fresh proprioception here; the native
+            # env.step still owns ordinary all-group observation computation.
+            frame = env.observation_manager.compute_group(
+                "proprio", update_history=False
+            )
             values = (
                 robot.root_ang_vel_b,
                 robot.projected_gravity_b,

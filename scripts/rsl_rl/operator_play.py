@@ -12,12 +12,31 @@ import argparse
 import copy
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import tempfile
 import traceback
 
 
 TERRAINS = ("plane", "rough_flat", "hills", "step_hills", "tilted_ramps")
+
+
+def _write_live_report(path, report):
+    """Replace only a fully written snapshot; preserve the last one on failure."""
+    payload = json.dumps(report, indent=2, allow_nan=False) + "\n"
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=".report-", delete=False
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def parse_args(argv=None):
@@ -89,6 +108,11 @@ def apply_live_overrides(cfg, args, *, command_class, recorders):
     cfg.scene.num_envs = 1
     cfg.sim.device = args.device
     cfg.observations.proprio.enable_corruption = False
+    # The actor has no teacher/value/terrain input. Do not compute these unused
+    # groups again on every native step. Keep sensors and physical failure terms
+    # intact (notably the single center ray used for terrain-relative clearance).
+    cfg.observations.policy = None
+    cfg.observations.terrain = None
     cfg.episode_length_s = 300.0
     # A single tile cannot use the procedural sampler's fixed profile layout.
     # This stock term samples only zero; NativeActorSession owns every command
@@ -173,6 +197,7 @@ def main(argv=None):
         "command_clock": "local monotonic receipt time; real key repeats only",
         "policy_clock": "completed native control steps times 0.02 seconds",
         "configuration_check": "full archived recipe before one-tile live overrides",
+        "observation_groups": ["proprio"],
         "learning_updates": 0,
         "exit_allowed": False,
     }
@@ -272,16 +297,53 @@ def main(argv=None):
         print(report["traceback"], flush=True)
     finally:
         if probe is not None:
-            report["smoke_progress"] = probe.progress()
-        for label, resource in (("environment", env), ("application", app)):
+            try:
+                report["smoke_progress"] = probe.progress()
+            except Exception as error:
+                report["progress_error"] = str(error)
+                report["status"] = "ERROR"
+                code = 2
+        report["session_status"] = report["status"]
+        resources = (("environment", env), ("application", app))
+        report["cleanup"] = {
+            label: "pending" if resource is not None else "not_created"
+            for label, resource in resources
+        }
+        if code == 0:
+            report["status"] = "SESSION_COMPLETED_CLEANUP_PENDING"
+        report_path = output / "report.json"
+
+        def persist_report():
+            nonlocal code
+            try:
+                _write_live_report(report_path, report)
+            except (OSError, ValueError, TypeError) as error:
+                report["report_write_error"] = str(error)
+                report["status"] = "ERROR"
+                code = 2
+                print(f"Cannot save live report {report_path}: {error}", flush=True)
+
+        # Native cleanup can terminate the process without returning to Python.
+        # Publish diagnostics first, and never publish a pass while close is pending.
+        print(f"Live report (before cleanup): {report_path}", flush=True)
+        if probe is not None:
+            print(f"Smoke progress: {report.get('smoke_progress', {})}", flush=True)
+        persist_report()
+        for label, resource in resources:
             if resource is not None:
                 try:
                     resource.close()
                 except Exception as error:
+                    report["cleanup"][label] = "error"
                     report[f"{label}_cleanup_error"] = str(error)
                     report["status"] = "ERROR"
                     code = 2
-        training.write_json(output / "report.json", report)
+                else:
+                    report["cleanup"][label] = "complete"
+                persist_report()
+        if code == 0:
+            report["status"] = report["session_status"]
+        persist_report()
     print(f"{report['status']}: {output / 'report.json'}", flush=True)
     return code
 
