@@ -8,6 +8,7 @@ This is not a certified remote disconnect detector or a hardware controller.
 from __future__ import annotations
 
 import math
+import sys
 import time
 
 from parkour_lab.learning.command_source import BodyTwistLease
@@ -297,6 +298,24 @@ def run_keyboard_actor(env, host, app):
     control = KeyboardTwist()
     callback_errors = []
 
+    def note_failure(error, detail):
+        if hasattr(error, "add_note"):
+            error.add_note(detail)
+        else:  # Python 3.10 has no exception notes.
+            print(f"[OPERATOR] {detail}", file=sys.stderr, flush=True)
+
+    def callback_failed(error):
+        first_failure = not callback_errors
+        if first_failure:
+            callback_errors.append(error)
+        try:
+            control.stop(time.monotonic(), disconnected=True)
+        except Exception as stop_error:
+            # A secondary disarm failure must not escape the Kit callback or
+            # replace the first fault. The latch prevents subsequent inference.
+            if first_failure:
+                note_failure(error, f"Callback disarm also failed: {stop_error!r}")
+
     def is_available():
         if callback_errors:
             raise RuntimeError("Keyboard callback failed") from callback_errors[0]
@@ -323,16 +342,18 @@ def run_keyboard_actor(env, host, app):
                 shift_held=bool(getattr(event, "modifiers", 0) & 1),
             )
         except Exception as error:
-            if not callback_errors:
-                callback_errors.append(error)
-            control.stop(time.monotonic(), disconnected=True)
+            callback_failed(error)
         return True
 
     def on_focus_change(_event):
-        control.stop(time.monotonic(), disconnected=True)
+        try:
+            control.stop(time.monotonic(), disconnected=True)
+        except Exception as error:
+            callback_failed(error)
 
     subscription = inputs.subscribe_to_keyboard_events(keyboard, on_key)
     focus_subscription = None
+    primary_error = None
     try:
         focus_subscription = (
             window.get_window_focus_event_stream().create_subscription_to_pop(
@@ -357,7 +378,27 @@ def run_keyboard_actor(env, host, app):
         if callback_errors:
             raise RuntimeError("Keyboard callback failed") from callback_errors[0]
         return result
+    except BaseException as error:
+        primary_error = error
+        raise
     finally:
-        control.stop(time.monotonic(), disconnected=True)
-        inputs.unsubscribe_to_keyboard_events(keyboard, subscription)
-        del focus_subscription
+        cleanup_errors = []
+        try:
+            control.stop(time.monotonic(), disconnected=True)
+        except Exception as error:
+            cleanup_errors.append(("disarm", error))
+        try:
+            inputs.unsubscribe_to_keyboard_events(keyboard, subscription)
+        except Exception as error:
+            cleanup_errors.append(("keyboard unsubscribe", error))
+        finally:
+            # Kit's focus event subscription is retained/released by its handle.
+            del focus_subscription
+        if cleanup_errors:
+            details = "; ".join(f"{name}: {error!r}" for name, error in cleanup_errors)
+            if primary_error is not None:
+                note_failure(primary_error, f"Keyboard cleanup failed: {details}")
+            else:
+                raise RuntimeError(f"Keyboard cleanup failed: {details}") from (
+                    cleanup_errors[0][1]
+                )
