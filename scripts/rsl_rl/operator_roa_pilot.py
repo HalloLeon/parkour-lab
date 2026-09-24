@@ -1,4 +1,4 @@
-"""Bounded native ROA learning pilot, not a trained/deployable policy or exit gate.
+"""Native ROA mechanism pilot and bounded incremental-learning comparison.
 
 Alternate privileged PPO with reverse latent regularization and history-owned
 adaptation blocks, sharing one motor. Both paths use causal estimated velocity.
@@ -10,17 +10,22 @@ from __future__ import annotations
 import argparse
 import copy
 import importlib.metadata
+import json
 from pathlib import Path
 import tempfile
+import time
 import traceback
 
-VERSION = "operator_roa_learning_pilot_v2"
+VERSION = "operator_roa_learning_pilot_v3"
 REGULARIZATION_COEFFICIENTS = (0.1, 0.55, 1.0)
 ROLLOUT_STEPS = 24
 HISTORY_STEPS = 64
 ADAPTATION_EPOCHS = 4
 ADAPTATION_BATCHES = 4
 FROZEN_STEPS = 32
+LEARNING_UPDATES = 100
+HISTORY_INTERVAL = 20
+EVALUATION_SEED = 1042
 DYNAMICS_NAMES = (
     "base_mass_relative_to_nominal_minus_one",
     "base_local_com_x_m",
@@ -49,6 +54,17 @@ def parse_args(argv=None):
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--cpu-threads", type=int, default=4)
     parser.add_argument(
+        "--learning-checkpoint",
+        type=Path,
+        help="Completed v2 pilot.pt: initialize a bounded learning experiment; fresh optimizers",
+    )
+    parser.add_argument(
+        "--regularization",
+        choices=("ramp", "off"),
+        help="Additional regularization only: zero for 20 updates then ramp to 0.1, or remain zero",
+    )
+    parser.add_argument("--learning-updates", type=int, choices=(100, 500, 1000))
+    parser.add_argument(
         "--output-parent",
         type=Path,
         default=Path("logs/rsl_rl/go2_operator_refinement"),
@@ -56,7 +72,80 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.seed < 0 or args.cpu_threads < 1:
         parser.error("seed must be nonnegative and cpu-threads positive")
+    if (args.learning_checkpoint is None) != (args.regularization is None):
+        parser.error("--learning-checkpoint and --regularization must be used together")
+    if args.learning_updates is not None and args.learning_checkpoint is None:
+        parser.error("--learning-updates requires --learning-checkpoint")
+    if args.learning_checkpoint is not None and args.learning_updates is None:
+        args.learning_updates = LEARNING_UPDATES
     return args
+
+
+def learning_coefficients(regularization, updates=LEARNING_UPDATES):
+    """A predeclared short experiment, not the paper's convergence schedule."""
+    if regularization not in ("ramp", "off") or type(updates) is not int or updates < 1:
+        raise ValueError("Unknown additional-regularization experiment")
+    return tuple(
+        0.1 * min(1, max(0, update - 20) / 80) if regularization == "ramp" else 0.0
+        for update in range(1, updates + 1)
+    )
+
+
+def load_learning_source(path, physical_reference):
+    """Admit only completed v2 mechanism evidence, never a deployment artifact."""
+    import torch
+    from parkour_lab.learning.motor_contract import validate_motor_contract
+    from .operator_train import file_sha256
+
+    path = path.resolve(strict=True)
+    files = (path, path.parent / "training_protocol.json", path.parent / "report.json")
+    identity = {str(item): file_sha256(item) for item in files}
+    protocol, report = (json.loads(item.read_text()) for item in files[1:])
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    motor = report["motor_delivery"]
+    if (
+        protocol["version"] != "operator_roa_learning_pilot_v2"
+        or checkpoint["version"] != protocol["version"]
+        or protocol["source_identity"]["physical_reference"] != physical_reference
+        or report.get("session_status", report["status"])
+        != "ROA_LEARNING_PILOT_COMPLETED_NOT_QUALIFIED"
+        or report["status"]
+        not in (
+            "ROA_LEARNING_PILOT_COMPLETED_NOT_QUALIFIED",
+            "SESSION_COMPLETED_CLEANUP_PENDING",
+        )
+        or report["checkpoint_sha256"] != identity[str(path)]
+        or checkpoint["readiness_only"] is not True
+        or checkpoint["deployment_allowed"] is not False
+        or checkpoint["completed_cycles"] != 3
+        or tuple(checkpoint["regularization_coefficients"])
+        != REGULARIZATION_COEFFICIENTS
+        or report["ppo_updates_completed"] != 3
+        or report["adaptation_optimizer_steps"] != 48
+        or report["exit_allowed"] is not False
+        or report["behavior_validated"] is not False
+        or motor["faulted"] is not False
+        or motor["pending_delivery"] is not False
+        or any(
+            motor[name] != 296
+            for name in (
+                "encoded_steps",
+                "verified_delivery_steps",
+                "native_step_returns",
+            )
+        )
+        or report["environment_transitions"] != 296 * protocol["num_envs"]
+    ):
+        raise ValueError("Require a completed, source-bound v2 ROA pilot")
+    validate_motor_contract(checkpoint["motor_contract"], checkpoint["motor_manifest"])
+    if any(file_sha256(item) != identity[str(item)] for item in files):
+        raise ValueError("Learning source changed while loading")
+    return checkpoint, {
+        "files": identity,
+        "policy_state_sha256": report["policy_state_sha256"],
+        "optimizer": "fresh PPO and adaptation Adam; weights-only warm start, NOT exact resume",
+        "comparison": "Effect of ADDITIONAL regularization from a common already-ROA-initialized policy; not ROA versus no ROA",
+    }
 
 
 def validate_events(cfg):
@@ -145,11 +234,32 @@ class PilotEnvironment:
                 "ROA pilot must retain native 50Hz control / 200Hz physics"
             )
 
-    def observations(self, native, reset):
+    def observations(self, native, reset, command=None):
         import torch
         from tensordict import TensorDict
 
         frame, clean = native["proprio"], native["policy"]
+        if command is not None:
+            # The frozen screen owns just the command component. Keep the one
+            # native noisy sensor draw and push history exactly once per tick.
+            term = self.env.command_manager.get_term("base_velocity")
+            desired = frame.new_tensor(command)
+            if (
+                desired.shape != (3,)
+                or not torch.isfinite(desired).all()
+                or not torch.equal(frame[:, 6:9], term.vel_command_b)
+                or not torch.equal(clean[:, 9:12], term.vel_command_b)
+            ):
+                raise ValueError(
+                    "Invalid command or native command observation binding"
+                )
+            desired = desired.expand(self.env.num_envs, 3)
+            term.time_left.fill_(float("inf"))
+            term.is_standing_env.fill_(False)
+            term.is_heading_env.fill_(False)
+            term.vel_command_b.copy_(desired)
+            frame, clean = frame.clone(), clean.clone()
+            frame[:, 6:9], clean[:, 9:12] = desired, desired
         expected = self.previous.clone()
         expected[reset] = 0
         command = self.env.command_manager.get_command("base_velocity")
@@ -178,17 +288,17 @@ class PilotEnvironment:
             batch_size=[self.env.num_envs],
         )
 
-    def reset(self):
+    def reset(self, *, seed=None, command=None):
         import torch
 
-        native, _ = self.env.reset()
+        native, _ = self.env.reset(**({"seed": seed} if seed is not None else {}))
         if not torch.equal(read_dynamics(self.env), self.dynamics):
             raise ValueError("Persistent dynamics changed on reset")
         self.previous.zero_()
         reset = torch.ones(self.env.num_envs, dtype=torch.bool, device=self.env.device)
-        return self.observations(native, reset), reset
+        return self.observations(native, reset, command), reset
 
-    def step(self, raw, stage):
+    def step(self, raw, stage, *, next_command=None):
         import torch
         from parkour_lab.learning.controller import JointTargets
 
@@ -214,22 +324,28 @@ class PilotEnvironment:
         counts["terminated_rows"] += int(terminated.sum())
         counts["timeout_rows"] += int(timed_out.sum())
         return (
-            self.observations(native, done),
+            self.observations(native, done, next_command),
             reward,
             done,
             {**extras, "time_outs": timed_out & ~terminated},
         )
 
 
-def run_pilot(env, app, source_state, runner_cfg, output, report, publish):
+def run_pilot(
+    env, app, source_state, runner_cfg, output, report, publish, *, learning=None
+):
+    started = time.perf_counter()
     host = PilotEnvironment(env, app)
     report["stage_counts"] = host.stage_counts
     report["dynamics_std"] = host.dynamics.std(dim=0, unbiased=False).cpu().tolist()
     try:
-        _learn_pilot(host, source_state, runner_cfg, output, report, publish)
+        _learn_pilot(
+            host, source_state, runner_cfg, output, report, publish, learning=learning
+        )
     finally:
         motor_progress = host.bridge.progress()
         report.update(
+            runner_wall_seconds=time.perf_counter() - started,
             environment_transitions=motor_progress["native_step_returns"]
             * env.num_envs,
             resets=host.resets,
@@ -238,7 +354,105 @@ def run_pilot(env, app, source_state, runner_cfg, output, report, publish):
         )
 
 
-def _learn_pilot(host, source_state, runner_cfg, output, report, publish):
+def _adapt_history(host, policy, optimizer, obs, record, report, *, require_change):
+    """Collect with fixed causal weights, then fit only the history estimator."""
+    import torch
+    from parkour_lab.learning.operator_roa import (
+        FRAME_DIM,
+        HISTORY_LENGTH,
+        set_phase,
+        state_sha256,
+    )
+
+    actor, env = policy.actor, host.env
+
+    def frames(observations):
+        return observations["history"].reshape(-1, HISTORY_LENGTH, FRAME_DIM)
+
+    def privileged_hashes():
+        return {
+            name: state_sha256(module)
+            for name, module in (
+                ("motor", actor.motor),
+                ("encoder", actor.encoder),
+                ("critic", policy.critic),
+            )
+        }
+
+    # Collect the whole history-owned block with fixed weights. Fit only
+    # afterwards, so no action can incorporate its own privileged label.
+    set_phase(policy, "frozen")
+    fixed_hashes = privileged_hashes()
+    fixed_std = policy.std.detach().clone()
+    fixed_estimator = state_sha256(actor.estimator)
+    samples = []
+    with torch.no_grad():
+        for _ in range(HISTORY_STEPS):
+            samples.append(
+                (
+                    frames(obs).clone(),
+                    obs["dynamics"].clone(),
+                    obs["critic_state"][:, :3].clone(),
+                )
+            )
+            action = actor.history_action(obs["policy"], frames(obs))
+            obs, _, _, _ = host.step(action, "history_adaptation")
+    record["estimator_unchanged_during_history_collection"] = (
+        state_sha256(actor.estimator) == fixed_estimator
+    )
+    if not record["estimator_unchanged_during_history_collection"]:
+        raise RuntimeError("History estimator changed before block collection ended")
+    histories, dynamics, velocities = (
+        torch.cat(values, dim=0) for values in zip(*samples)
+    )
+    del samples
+    with torch.no_grad():
+        before = actor.adaptation_losses(histories, dynamics, velocities)
+    record["adaptation_before"] = {name: float(value) for name, value in before.items()}
+    set_phase(policy, "history")
+    for _ in range(ADAPTATION_EPOCHS):
+        for indices in torch.randperm(len(histories), device=env.device).chunk(
+            ADAPTATION_BATCHES
+        ):
+            optimizer.zero_grad(set_to_none=True)
+            losses = actor.adaptation_losses(
+                histories[indices], dynamics[indices], velocities[indices]
+            )
+            loss = losses["latent"] + losses["velocity"]
+            if not torch.isfinite(loss):
+                raise RuntimeError("Nonfinite ROA adaptation loss")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                actor.estimator.parameters(), 1.0, error_if_nonfinite=True
+            )
+            optimizer.step()
+            report["adaptation_optimizer_steps"] += 1
+    with torch.no_grad():
+        after = actor.adaptation_losses(histories, dynamics, velocities)
+    record["adaptation_after"] = {name: float(value) for name, value in after.items()}
+    record["privileged_modules_unchanged_during_adaptation"] = (
+        fixed_hashes == privileged_hashes() and torch.equal(fixed_std, policy.std)
+    )
+    record["estimator_changed_during_adaptation"] = (
+        state_sha256(actor.estimator) != fixed_estimator
+    )
+    if not record["privileged_modules_unchanged_during_adaptation"] or (
+        require_change and not record["estimator_changed_during_adaptation"]
+    ):
+        raise RuntimeError(
+            "ROA adaptation violated optimizer ownership or did not learn"
+        )
+    if (
+        not all(torch.isfinite(p).all() for p in policy.parameters())
+        or (policy.std <= 0).any()
+    ):
+        raise RuntimeError("Invalid ROA parameters")
+    return obs
+
+
+def _learn_pilot(
+    host, source_state, runner_cfg, output, report, publish, *, learning=None
+):
     import torch
     from parkour_lab.learning.operator_roa import (
         build_policy,
@@ -271,6 +485,38 @@ def _learn_pilot(host, source_state, runner_cfg, output, report, publish):
         parity_scope="Identical estimated-velocity inputs; NOT equivalence to the true-velocity stock controller",
         motor_verification=host.bridge.motor_verification,
     )
+    coefficients = REGULARIZATION_COEFFICIENTS
+    history_interval = 1
+    if learning is not None:
+        from .operator_roa_evaluation import evaluate_history
+        from parkour_lab.learning.motor_contract import binding_sha256
+
+        checkpoint, metadata, regularization, seed, updates = learning
+        if updates % HISTORY_INTERVAL:
+            raise ValueError("Learning budget must end on a complete adaptation block")
+        if binding_sha256(checkpoint["motor_contract"]["binding"]) != binding_sha256(
+            host.motor_contract["binding"]
+        ):
+            raise ValueError("Learning checkpoint motor differs from native motor")
+        policy.load_state_dict(checkpoint["policy_state"], strict=True)
+        if (
+            state_sha256(policy) != metadata["policy_state_sha256"]
+            or not all(torch.isfinite(p).all() for p in policy.parameters())
+            or (policy.std <= 0).any()
+        ):
+            raise ValueError(
+                "Learning checkpoint state is invalid or differs from report"
+            )
+        report["evaluation_before"] = evaluate_history(
+            host, policy, seed=EVALUATION_SEED
+        )
+        publish()
+        # Reset the training RNG and physical episodes after the diagnostic.
+        # This is a fresh seeded run, not simulator/RNG continuation of the pilot.
+        obs, _ = host.reset(seed=seed)
+        policy.train()
+        coefficients = learning_coefficients(regularization, updates)
+        history_interval = HISTORY_INTERVAL
     options = copy.deepcopy(runner_cfg["algorithm"])
     options.pop("class_name")
     options.update(
@@ -288,17 +534,37 @@ def _learn_pilot(host, source_state, runner_cfg, output, report, publish):
     report["ppo_updates_completed"] = 0
     report["adaptation_optimizer_steps"] = 0
 
-    def privileged_hashes():
-        return {
-            name: state_sha256(module)
-            for name, module in (
-                ("motor", actor.motor),
-                ("encoder", actor.encoder),
-                ("critic", policy.critic),
-            )
-        }
+    def save_checkpoint(update):
+        from .operator_train import file_sha256
 
-    for cycle, coefficient in enumerate(REGULARIZATION_COEFFICIENTS, 1):
+        path = output / ("pilot.pt" if learning is None else f"learning_{update}.pt")
+        pending = path.with_suffix(".pt.pending")
+        torch.save(
+            {
+                "version": VERSION,
+                "readiness_only": True,
+                "deployment_allowed": False,
+                "policy_state": policy.state_dict(),
+                "ppo_optimizer": algorithm.optimizer.state_dict(),
+                "adaptation_optimizer": optimizer.state_dict(),
+                "motor_contract": host.motor_contract,
+                "motor_manifest": host.manifest,
+                "completed_cycles": update,
+                "regularization_coefficients": coefficients[:update],
+                "history_interval": history_interval,
+                "learning_source": None if learning is None else metadata,
+            },
+            pending,
+        )
+        pending.replace(path)
+        receipt = {
+            "path": path.name,
+            "sha256": file_sha256(path),
+            "ppo_updates": update,
+        }
+        report.setdefault("checkpoints", []).append(receipt)
+
+    for cycle, coefficient in enumerate(coefficients, 1):
         record = {"cycle": cycle, "regularization_coefficient": coefficient}
         report["cycles"].append(record)
         set_phase(policy, "privileged")
@@ -313,7 +579,7 @@ def _learn_pilot(host, source_state, runner_cfg, output, report, publish):
             algorithm.compute_returns(obs)
         record["ppo_losses"] = algorithm.update()
         report["ppo_updates_completed"] += 1
-        if (
+        if learning is None and (
             min(
                 record["ppo_losses"]["encoder_gradient_l2_max"],
                 record["ppo_losses"]["projection_gradient_l2_max"],
@@ -330,128 +596,81 @@ def _learn_pilot(host, source_state, runner_cfg, output, report, publish):
         record["latent_branch"] = branch_diagnostics(actor, obs)
         if not record["estimator_unchanged_during_ppo"]:
             raise RuntimeError("ROA PPO changed the frozen history/velocity estimator")
-        if not record["encoder_changed_during_ppo"]:
+        if learning is None and not record["encoder_changed_during_ppo"]:
             raise RuntimeError("ROA privileged encoder did not update")
-        if (
+        if learning is None and (
             record["latent_branch"]["latent_batch_std_max"] <= 0
             or record["latent_branch"]["latent_permutation_action_abs_max"] <= 0
         ):
             raise RuntimeError("ROA latent branch is constant or unused")
         print(
-            f"ROA cycle {cycle}/3: privileged PPO complete; lambda={coefficient}",
+            f"ROA update {cycle}/{len(coefficients)}: privileged PPO complete; lambda={coefficient}",
             flush=True,
         )
         publish()
+        if cycle % history_interval:
+            continue
 
-        # Collect the whole history-owned block with fixed weights. Fit only
-        # afterwards, so no action can incorporate its own privileged label.
-        set_phase(policy, "frozen")
-        fixed_hashes = privileged_hashes()
-        fixed_std = policy.std.detach().clone()
-        fixed_estimator = state_sha256(actor.estimator)
-        samples = []
-        with torch.no_grad():
-            for _ in range(HISTORY_STEPS):
-                samples.append(
-                    (
-                        frames(obs).clone(),
-                        obs["dynamics"].clone(),
-                        obs["critic_state"][:, :3].clone(),
-                    )
-                )
-                action = actor.history_action(obs["policy"], frames(obs))
-                obs, _, _, _ = host.step(action, "history_adaptation")
-        record["estimator_unchanged_during_history_collection"] = (
-            state_sha256(actor.estimator) == fixed_estimator
+        obs = _adapt_history(
+            host,
+            policy,
+            optimizer,
+            obs,
+            record,
+            report,
+            require_change=learning is None,
         )
-        if not record["estimator_unchanged_during_history_collection"]:
-            raise RuntimeError(
-                "History estimator changed before block collection ended"
-            )
-        histories, dynamics, velocities = (
-            torch.cat(values, dim=0) for values in zip(*samples)
+        print(
+            f"ROA update {cycle}/{len(coefficients)}: history adaptation complete",
+            flush=True,
         )
-        del samples
-        with torch.no_grad():
-            before = actor.adaptation_losses(histories, dynamics, velocities)
-        record["adaptation_before"] = {
-            name: float(value) for name, value in before.items()
-        }
-        set_phase(policy, "history")
-        for _ in range(ADAPTATION_EPOCHS):
-            for indices in torch.randperm(len(histories), device=env.device).chunk(
-                ADAPTATION_BATCHES
-            ):
-                optimizer.zero_grad(set_to_none=True)
-                losses = actor.adaptation_losses(
-                    histories[indices], dynamics[indices], velocities[indices]
-                )
-                loss = losses["latent"] + losses["velocity"]
-                if not torch.isfinite(loss):
-                    raise RuntimeError("Nonfinite ROA adaptation loss")
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    actor.estimator.parameters(), 1.0, error_if_nonfinite=True
-                )
-                optimizer.step()
-                report["adaptation_optimizer_steps"] += 1
-        with torch.no_grad():
-            after = actor.adaptation_losses(histories, dynamics, velocities)
-        record["adaptation_after"] = {
-            name: float(value) for name, value in after.items()
-        }
-        record["privileged_modules_unchanged_during_adaptation"] = (
-            fixed_hashes == privileged_hashes() and torch.equal(fixed_std, policy.std)
-        )
-        record["estimator_changed_during_adaptation"] = (
-            state_sha256(actor.estimator) != estimator_before
-        )
-        if not (
-            record["privileged_modules_unchanged_during_adaptation"]
-            and record["estimator_changed_during_adaptation"]
-        ):
-            raise RuntimeError(
-                "ROA adaptation violated optimizer ownership or did not learn"
-            )
-        if (
-            not all(torch.isfinite(p).all() for p in policy.parameters())
-            or (policy.std <= 0).any()
-        ):
-            raise RuntimeError("Invalid ROA parameters")
-        print(f"ROA cycle {cycle}/3: history adaptation complete", flush=True)
+        if learning is not None and (cycle % 100 == 0 or cycle == len(coefficients)):
+            save_checkpoint(cycle)
         publish()
 
     policy.eval()
     set_phase(policy, "frozen")
     frozen_hash = state_sha256(policy)
-    obs, _ = host.reset()
-    with torch.no_grad():
-        for _ in range(FROZEN_STEPS):
-            action = actor.history_action(obs["policy"], frames(obs))
-            obs, _, _, _ = host.step(action, "frozen_history_integration")
+    if learning is None:
+        obs, _ = host.reset()
+        with torch.no_grad():
+            for _ in range(FROZEN_STEPS):
+                action = actor.history_action(obs["policy"], frames(obs))
+                obs, _, _, _ = host.step(action, "frozen_history_integration")
+    else:
+        report["evaluation_after"] = evaluate_history(
+            host, policy, seed=EVALUATION_SEED
+        )
+        report["evaluation_initial_conditions_match"] = {
+            name: (
+                report["evaluation_before"].get(name)
+                == report["evaluation_after"].get(name)
+                if report["evaluation_before"].get(name) is not None
+                and report["evaluation_after"].get(name) is not None
+                else None
+            )
+            for name in (
+                "initial_observation_sha256",
+                "initial_dynamics_sha256",
+                "initial_root_state_sha256",
+                "terrain_assignment",
+                "command_tape_sha256",
+            )
+        }
     if state_sha256(policy) != frozen_hash or not torch.equal(
         read_dynamics(env), host.dynamics
     ):
         raise RuntimeError("Frozen policy or persistent dynamics changed")
-    torch.save(
-        {
-            "version": VERSION,
-            "readiness_only": True,
-            "deployment_allowed": False,
-            "policy_state": policy.state_dict(),
-            "ppo_optimizer": algorithm.optimizer.state_dict(),
-            "adaptation_optimizer": optimizer.state_dict(),
-            "motor_contract": host.motor_contract,
-            "motor_manifest": host.manifest,
-            "completed_cycles": len(REGULARIZATION_COEFFICIENTS),
-            "regularization_coefficients": REGULARIZATION_COEFFICIENTS,
-        },
-        output / "pilot.pt",
-    )
+    if learning is None:
+        save_checkpoint(len(coefficients))
     report.update(
-        status="ROA_LEARNING_PILOT_COMPLETED_NOT_QUALIFIED",
+        status=(
+            "ROA_LEARNING_PILOT_COMPLETED_NOT_QUALIFIED"
+            if learning is None
+            else "ROA_INCREMENTAL_EXPERIMENT_COMPLETED_NOT_QUALIFIED"
+        ),
         policy_state_sha256=frozen_hash,
-        frozen_rollout_scope="Same training seed/scene, integration only; not heldout behavior or adaptation benefit",
+        frozen_rollout_scope="Same training scene/dynamics; no heldout terrain or deployment qualification",
     )
 
 
@@ -513,6 +732,21 @@ def main(argv=None):
     source = training.load_reference_checkpoint(args.reference, agent)
     if training.recurrent_training_identity(args.reference) != identity:
         raise ValueError("Source or runtime changed during preflight")
+    learning = None
+    if args.learning_checkpoint is not None:
+        args.learning_checkpoint = args.learning_checkpoint.resolve(strict=True)
+        if args.output_parent.resolve().is_relative_to(args.learning_checkpoint.parent):
+            raise ValueError("Output must be outside the immutable learning source")
+        checkpoint, metadata = load_learning_source(
+            args.learning_checkpoint, identity["physical_reference"]
+        )
+        learning = (
+            checkpoint,
+            metadata,
+            args.regularization,
+            args.seed,
+            args.learning_updates,
+        )
     args.output_parent.mkdir(parents=True, exist_ok=True)
     output = Path(
         tempfile.mkdtemp(prefix="operator_roa_pilot_", dir=args.output_parent)
@@ -566,8 +800,43 @@ def main(argv=None):
         "learning_scope": "mechanism readiness only; new unqualified teacher and student; not a continuation of LINK20k",
         "exit_allowed": False,
     }
+    if learning is not None:
+        from .operator_roa_evaluation import (
+            COMMAND_TAPE,
+            COMMAND_TAPE_SHA256,
+            EVALUATION_STEPS,
+        )
+
+        protocol.update(
+            learning_source=metadata,
+            cycles=args.learning_updates,
+            regularization_coefficients=learning_coefficients(
+                args.regularization, args.learning_updates
+            ),
+            history_interval=HISTORY_INTERVAL,
+            history_blocks=args.learning_updates // HISTORY_INTERVAL,
+            checkpoint_interval=100,
+            frozen_history_steps=2 * EVALUATION_STEPS,
+            evaluation={
+                "seed": EVALUATION_SEED,
+                "steps_each": EVALUATION_STEPS,
+                "command_tape": COMMAND_TAPE,
+                "command_tape_sha256": COMMAND_TAPE_SHA256,
+                "scope": "Seeded before/after causal screen in the SAME training geometry and dynamics; not heldout terrain",
+                "training_rng": "Native reset(seed=training_seed) after the pre-screen; fresh episode/history",
+            },
+            planned_environment_transitions=args.num_envs
+            * (
+                args.learning_updates * ROLLOUT_STEPS
+                + args.learning_updates // HISTORY_INTERVAL * HISTORY_STEPS
+                + 2 * EVALUATION_STEPS
+            ),
+            adaptation_collection="64 fixed-weight history-owned steps after each 20 PPO updates; then estimator-only fitting",
+            schedule_scope="Bounded incremental experiment; warmup20 then lambda ramp to0.1 at100 and hold versus0 control, NOT original paper schedule or convergence",
+            learning_scope=metadata["comparison"],
+        )
     report = {
-        "status": "ERROR",
+        "status": "RUNNING_NOT_QUALIFIED",
         "exit_allowed": False,
         "behavior_validated": False,
         "sim_to_real": "UNRUN",
@@ -595,7 +864,7 @@ def main(argv=None):
         from isaaclab.envs import ManagerBasedRLEnv
         import yaml
 
-        args.iterations = len(REGULARIZATION_COEFFICIENTS)
+        args.iterations = protocol["cycles"]
         cfg, runner_cfg = training.proprioceptive_procedural_configs(saved, agent, args)
         validate_events(cfg)
         cfg.validate()
@@ -604,11 +873,30 @@ def main(argv=None):
         )
         env = ManagerBasedRLEnv(cfg=cfg)
         run_pilot(
-            env, app, source["model_state_dict"], runner_cfg, output, report, publish
+            env,
+            app,
+            source["model_state_dict"],
+            runner_cfg,
+            output,
+            report,
+            publish,
+            learning=learning,
         )
         if training.recurrent_training_identity(args.reference) != identity:
             raise RuntimeError("Source or runtime changed during learning pilot")
-        report["checkpoint_sha256"] = training.file_sha256(output / "pilot.pt")
+        if learning is not None and any(
+            training.file_sha256(Path(path)) != digest
+            for path, digest in metadata["files"].items()
+        ):
+            raise RuntimeError("Learning source changed during experiment")
+        report["checkpoint_sha256"] = training.file_sha256(
+            output
+            / (
+                "pilot.pt"
+                if learning is None
+                else f"learning_{args.learning_updates}.pt"
+            )
+        )
         code = 0
     except Exception as error:
         report.update(
