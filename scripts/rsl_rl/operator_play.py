@@ -12,6 +12,7 @@ import argparse
 import copy
 import importlib.metadata
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -19,6 +20,12 @@ import traceback
 
 
 TERRAINS = ("plane", "rough_flat", "hills", "step_hills", "tilted_ramps")
+DEFAULT_DIFFICULTY = (0.15, 0.35)
+NONPLANE_DEMO_POSE_RANGE = {
+    "x": (0.0, 0.0),
+    "y": (0.0, 0.0),
+    "yaw": (math.pi / 2, math.pi / 2),
+}
 KIT_THREAD_SETTINGS = (
     "/plugins/carb.tasking.plugin/threadCount",
     "/plugins/omni.tbb.globalcontrol/maxThreadCount",
@@ -126,6 +133,14 @@ def parse_args(argv=None):
         "--actor-bundle", type=Path, required=True, help="Motor-bound actor V2"
     )
     parser.add_argument("--terrain", choices=TERRAINS, default="plane")
+    parser.add_argument(
+        "--difficulty",
+        type=float,
+        nargs=2,
+        metavar=("LOW", "HIGH"),
+        default=DEFAULT_DIFFICULTY,
+        help="Ordered terrain difficulty bounds in [0, 1] (default 0.15 0.35); headless smokes retain the default",
+    )
     parser.add_argument("--seed", type=int, default=47)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
@@ -148,7 +163,7 @@ def parse_args(argv=None):
     smoke_modes.add_argument(
         "--scripted-demo",
         action="store_true",
-        help="Bounded plane body-twist sequence for streamed or local viewing; no keyboard input or live-timing validation",
+        help="Bounded terrain-specific body-twist sequence for streamed or local viewing; no keyboard input or live-timing validation",
     )
     parser.add_argument(
         "--livestream",
@@ -178,11 +193,20 @@ def parse_args(argv=None):
         parser.error("--seed must be nonnegative")
     if args.cpu_threads < 1:
         parser.error("--cpu-threads must be positive")
-    if args.scripted_demo and args.terrain != "plane":
-        parser.error("--scripted-demo requires plane terrain")
+    if not all(math.isfinite(value) for value in args.difficulty) or not (
+        0.0 <= args.difficulty[0] <= args.difficulty[1] <= 1.0
+    ):
+        parser.error(
+            "--difficulty requires finite ordered bounds: 0 <= LOW <= HIGH <= 1"
+        )
+    args.difficulty = tuple(args.difficulty)
     if args.headless_smoke or args.headless_functional_smoke:
         if args.terrain != "plane" or args.livestream not in (None, 0):
             parser.error("Headless smoke modes require plane terrain and no livestream")
+        if args.difficulty != DEFAULT_DIFFICULTY:
+            parser.error(
+                "Headless smoke modes require the default --difficulty 0.15 0.35"
+            )
         args.livestream = 0
     elif args.livestream is None:
         args.livestream = 2
@@ -206,7 +230,9 @@ def apply_live_overrides(cfg, args, *, command_class, recorders):
     generator.sub_terrains = {args.terrain: tile}
     generator.seed = cfg.seed = args.seed
     generator.num_rows = generator.num_cols = 1
-    generator.difficulty_range = (0.15, 0.35)
+    generator.difficulty_range = tuple(getattr(args, "difficulty", DEFAULT_DIFFICULTY))
+    if getattr(args, "scripted_demo", False) and args.terrain != "plane":
+        cfg.events.reset_base.params["pose_range"].update(NONPLANE_DEMO_POSE_RANGE)
     cfg.scene.terrain.max_init_terrain_level = 0
     cfg.curriculum.terrain_levels = None
     cfg.scene.num_envs = 1
@@ -300,7 +326,7 @@ def main(argv=None):
         "seed": args.seed,
         "num_envs": 1,
         "terrain": args.terrain,
-        "difficulty_range": [0.15, 0.35],
+        "difficulty_range": list(args.difficulty),
         "episode_length_s": 300.0,
         "livestream": args.livestream,
         "device": args.device,
@@ -328,8 +354,13 @@ def main(argv=None):
             command_source="predefined body-twist sequence; no keyboard or network input",
             keyboard_controls="unused",
             live_timing_validation="UNRUN",
-            demo=demo_protocol(),
+            demo=demo_protocol(terrain=args.terrain),
         )
+        if args.terrain != "plane":
+            protocol["spawn_override"] = {
+                "reset_base_pose_range": copy.deepcopy(NONPLANE_DEMO_POSE_RANGE),
+                "scope": "scripted non-plane demo only; fixed initial pose, not feedback steering",
+            }
         protocol.pop("motion_keys_body_twist")
         protocol.pop("lease_s")
     elif not headless_smoke and args.keyboard_controls == "single-key":
@@ -418,7 +449,7 @@ def main(argv=None):
         cfg, _ = training.recurrent_source_configs(
             saved, agent, args, archived_protocol, metadata, args.checkpoint
         )
-        training._configure_recurrent_terrain(cfg, (0.15, 0.35))
+        training._configure_recurrent_terrain(cfg, args.difficulty)
         apply_live_overrides(
             cfg,
             args,
@@ -441,7 +472,7 @@ def main(argv=None):
         )
         report["motor_verification"] = host.motor_verification
         if args.scripted_demo:
-            demo = ScriptedDemo(env)
+            demo = ScriptedDemo(env, terrain=args.terrain)
             report.update(demo.run(host, app))
         elif headless_smoke:
             probe = (
