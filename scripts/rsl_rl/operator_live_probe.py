@@ -204,8 +204,6 @@ class HeadlessSmoke:
         applied = self.env.command_manager.get_term("base_velocity").command
         if not torch.equal(applied, applied.new_tensor([expected])):
             raise RuntimeError("Native command buffer differs from the lease decision")
-        if not torch.equal(self.env.action_manager.action, result.raw_action):
-            raise RuntimeError("Native action delivery differs from actor output")
         if not all(
             torch.equal(value, result.position_rad)
             for value in (term.processed_actions, robot.joint_pos_target)
@@ -221,7 +219,7 @@ class HeadlessSmoke:
             ("joint position", robot.joint_pos, (1, 12)),
             ("joint velocity", robot.joint_vel, (1, 12)),
             ("motor target", robot.joint_pos_target, (1, 12)),
-            ("raw action", result.raw_action, (1, 12)),
+            ("raw action", self.env.action_manager.action, (1, 12)),
         ):
             if value.shape != shape or not torch.isfinite(value).all():
                 raise RuntimeError(f"Invalid post-step {name} at smoke step {step}")
@@ -236,7 +234,7 @@ class HeadlessSmoke:
         if reset:
             self.reset_mask_steps.append(step)
         self.max_abs_raw_action = max(
-            self.max_abs_raw_action, float(result.raw_action.abs().max())
+            self.max_abs_raw_action, float(self.env.action_manager.action.abs().max())
         )
         self.max_abs_joint_speed_rad_s = max(
             self.max_abs_joint_speed_rad_s, float(robot.joint_vel.abs().max())
@@ -258,6 +256,7 @@ class HeadlessSmoke:
             ],
             "real_time_validation": "UNRUN",
             "verified_control_steps": self.verified_steps,
+            "verification_scope": "observer-local input/reset/state/target checks; full native delivery equality is motor_delivery.verified_delivery_steps",
             "last_attempted_step": self.last_attempted_step,
             "phase_counts": dict(self.phase_counts),
             "actor_reset_mask_steps": list(self.reset_mask_steps),

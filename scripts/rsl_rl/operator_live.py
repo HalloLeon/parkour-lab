@@ -256,6 +256,9 @@ def run_live_loop(
                 time_s=step_index * env.step_dt,
                 reset_mask=reset_mask,
             )
+            # Encoding may synchronize tensors; it belongs BEFORE the last
+            # authority/stall check. Adapter-private raw vectors are not motors.
+            native_action = measured("motor_encode", host.motor.encode, result)
             # Inference itself can stall. Never deliver its now-stale moving
             # action, or step the GRU twice to try to repair the same frame.
             latest = control.resolve(command_clock())
@@ -272,7 +275,7 @@ def run_live_loop(
             if latest.command != decision.command:
                 raise RuntimeError("Input expired during inference; delivery aborted")
             _, _, terminated, timed_out, _ = measured(
-                "native_step", env.step, result.raw_action
+                "native_step", env.step, native_action
             )
             try:
                 if after_step is not None:
@@ -287,13 +290,26 @@ def run_live_loop(
                         timed_out,
                     )
             finally:
-                # Preserve every completed delivery, including a terminal
-                # return or a failed diagnostic, without starving observers
-                # of the final native event. Neither path may continue past it.
-                if recording is not None:
-                    recording.after_step(
-                        step_index, decision, reset_mask, result, terminated, timed_out
+                # Every observer sees the completed native event. Verification
+                # still runs if a diagnostic fails; recording still retains the
+                # completed prefix if either observer or verification fails.
+                try:
+                    measured(
+                        "motor_verify",
+                        host.motor.verify_delivery,
+                        terminated,
+                        timed_out,
                     )
+                finally:
+                    if recording is not None:
+                        recording.after_step(
+                            step_index,
+                            decision,
+                            reset_mask,
+                            result,
+                            terminated,
+                            timed_out,
+                        )
             step_index += 1
             reset_mask = (terminated | timed_out).clone()
             if reset_mask.any():
@@ -319,6 +335,7 @@ def run_live_loop(
         "episode_resets": episode_ends,
         "manual_resets": manual_resets,
         "learning_updates": 0,
+        "motor_delivery": host.motor.progress(),
     }
 
 

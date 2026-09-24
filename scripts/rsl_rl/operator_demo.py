@@ -222,13 +222,11 @@ class ScriptedDemo:
             raise RuntimeError("Unexpected actor-memory reset during scripted demo")
         if reset:
             self.reset_mask_steps.append(step)
-        # The shared host still binds/validates the stock motor contract. Verify
-        # command and raw-action delivery, without collecting full traces/video.
+        # The shared motor bridge verifies native actions/targets independently
+        # of adapter-private raw diagnostics. Check command ownership here.
         applied = self.env.command_manager.get_term("base_velocity").command
         if not torch.equal(applied, applied.new_tensor([decision.command])):
             raise RuntimeError("Scripted command differs from native command buffer")
-        if not torch.equal(self.env.action_manager.action, result.raw_action):
-            raise RuntimeError("Scripted action delivery differs from actor output")
         if self.terrain != "plane" and step % MOTION_SAMPLE_STEPS == 0:
             self.measure_motion(decision)
 

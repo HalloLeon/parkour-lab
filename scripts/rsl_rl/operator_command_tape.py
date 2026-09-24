@@ -112,10 +112,6 @@ class CommandReplay:
         applied = self.env.command_manager.get_term("base_velocity").command
         if not torch.equal(applied, applied.new_tensor([decision.command])):
             raise RuntimeError("Replay command differs from native command buffer")
-        if not torch.equal(self.env.action_manager.action, result.raw_action):
-            raise RuntimeError(
-                "Replay motor delivery differs from current actor output"
-            )
 
     def progress(self):
         return {

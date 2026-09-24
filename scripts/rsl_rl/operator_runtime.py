@@ -1,21 +1,19 @@
 """Native simulator input binding for a frozen, motor-bound actor artifact.
 
 No RSL-RL, training policy, command sampler, GUI or hardware driver. The caller
-owns source leases and resolves them before act(), then delivers raw_action via
-the native environment. time_s is the exact physics-frame clock, not a remote
+owns source leases and resolves them before act(), then uses the verified motor
+bridge to deliver absolute joint targets. time_s is the physics-frame clock, not a remote
 packet timestamp or wall clock. Scene/motor configuration must remain frozen.
 """
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
 import torch
 
-from parkour_lab.learning.controller import ControllerSession, Sample
-from parkour_lab.learning.motor_contract import verify_runtime_motor
+from parkour_lab.learning.controller import ControllerSession, Sample, finite_tensor
 from parkour_lab.learning.recurrent_runtime import (
     BOUND_ACTOR_BUNDLE_VERSION,
     FRAME_DIM,
@@ -25,83 +23,22 @@ from parkour_lab.learning.recurrent_runtime import (
 )
 
 
-def _runtime_motor_binding(env):
-    """Bind the resolved native stock motor, not merely an action tensor width."""
-    robot = env.scene["robot"]
-    term = env.action_manager.get_term("joint_pos")
-    cfg, descriptor = term.cfg, term.IO_descriptor
-    joints = tuple(robot.joint_names)
-    default = robot.data.default_joint_pos
-    _check_tensor(default, (env.num_envs, 12), "runtime default joint position")
-    _check_tensor(
-        robot.data.default_joint_vel, default.shape, "runtime default joint velocity"
-    )
-    if (
-        tuple(env.action_manager.active_terms) != ("joint_pos",)
-        or env.action_manager.total_action_dim != 12
-        or len(joints) != 12
-        or len(set(joints)) != 12
-        or tuple(descriptor.joint_names) != joints
-        or cfg.asset_name != "robot"
-        or cfg.joint_names != [".*"]
-        or cfg.preserve_order
-        or not cfg.use_default_offset
-        or cfg.scale != 0.25
-        or descriptor.scale != 0.25
-        or cfg.clip is not None
-        or descriptor.clip is not None
-        or cfg.class_type.__name__ != "JointPositionAction"
-        or cfg.class_type.__module__ != "isaaclab.envs.mdp.actions.joint_actions"
-        or not torch.equal(default, default[0].expand_as(default))
-        or torch.any(robot.data.default_joint_vel != 0)
-        or not torch.equal(
-            torch.as_tensor(
-                descriptor.offset, device=default.device, dtype=default.dtype
-            ),
-            default[0],
-        )
-    ):
-        raise ValueError(
-            "Native stock joint order, default pose/velocity or action transform differs"
-        )
-    actuators = {}
-    covered = []
-    for name, actuator in robot.actuators.items():
-        covered.extend(actuator.joint_names)
-        parameters = {}
-        for parameter in (
-            "stiffness",
-            "damping",
-            "effort_limit",
-            "velocity_limit",
-            "effort_limit_sim",
-            "velocity_limit_sim",
-            "armature",
-            "friction",
-        ):
-            value = getattr(actuator, parameter)
-            _check_tensor(value, (env.num_envs, len(actuator.joint_names)), parameter)
-            parameters[parameter] = value.detach().cpu().tolist()
-        actuators[name] = {
-            "joint_names": list(actuator.joint_names),
-            "configuration": actuator.cfg.to_dict(),
-            "resolved_parameters": parameters,
-        }
-    if sorted(covered) != sorted(joints):
-        raise ValueError("Native actuators must cover each motor joint exactly once")
-    binding = {
-        "joint_names": list(joints),
-        "default_position_rad": default[0].cpu().tolist(),
-        "action": cfg.to_dict(),
-        "actuators": actuators,
-        "step_dt_s": env.step_dt,
-        "physics_dt_s": env.physics_dt,
-        "decimation": env.cfg.decimation,
-    }
-    digest = hashlib.sha256(
-        json.dumps(binding, sort_keys=True, allow_nan=False).encode()
-    ).hexdigest()
-    return binding, digest
+if __package__:
+    from .operator_motor_bridge import NativeJointTargetBridge, _runtime_motor_binding
+else:
+    from operator_motor_bridge import NativeJointTargetBridge, _runtime_motor_binding
+
+
+# Trusted native sensor semantics, not metadata supplied by a backbone. No
+# simulator velocity, terrain, privileged latent or adapter-order assumptions.
+NATIVE_SENSORS = {
+    "base_ang_vel": ((3,), "rad/s", "body"),
+    "projected_gravity": ((3,), "unitless", "body"),
+    "joint_position_relative_default": ((12,), "rad", "joint"),
+    "joint_position": ((12,), "rad", "joint"),
+    "joint_velocity": ((12,), "rad/s", "joint"),
+    "stock_previous_raw_action": ((12,), "unitless", "joint"),
+}
 
 
 def _check_bundle_source(
@@ -133,8 +70,117 @@ def actor_bundle_source(path, checkpoint_sha256, metadata):
     return {"path": str(path), "sha256": digest}
 
 
-class NativeActorSession:
-    """Verify actual motors before inference; preserve archived actor identity."""
+class NativeControllerSession:
+    """Native sensing/motor binding for an already-loaded causal Controller.
+
+    Artifact loaders/adapters own weights, normalization, history and provenance;
+    this host owns named sensing, command delivery and the native motor contract.
+    No dynamic imports, policy hot-swaps or backend-specific latent assumptions.
+    """
+
+    def __init__(
+        self,
+        env,
+        controller,
+        motor_contract,
+        *,
+        preserve_native_raw=False,
+    ):
+        self.env = env
+        self.failed = False
+        self.controller = controller
+        self.motor = NativeJointTargetBridge(
+            env,
+            motor_contract,
+            controller.spec.manifest(),
+            preserve_native_raw=preserve_native_raw,
+        )
+        self.motor_verification = self.motor.motor_verification
+        for name, spec in controller.spec.sensors.items():
+            trusted = NATIVE_SENSORS.get(name)
+            if spec.privileged or (trusted is None and spec.required):
+                raise ValueError(f"Unsupported native deployment sensor: {name}")
+            if trusted is not None and (spec.shape, spec.units, spec.frame) != trusted:
+                raise ValueError(f"Native sensor semantics differ: {name}")
+        command = env.command_manager.get_term("base_velocity")
+        if (
+            command.cfg.heading_command
+            or command.cfg.rel_heading_envs
+            or command.cfg.rel_standing_envs
+        ):
+            raise ValueError("Native controller requires direct body twist")
+        # The profile is not rebound to the current batch hash. Exact normalized
+        # equality above establishes compatibility with this original profile.
+        self.session = ControllerSession(
+            self.controller,
+            joint_names=tuple(self.motor.binding["joint_names"]),
+            actuator_profile=self.controller.spec.actuator_profile,
+        )
+
+    def _check_sensing(self, applied_command, values):
+        """A source-specific subclass may additionally audit native observations."""
+
+    @torch.inference_mode()
+    def act(self, applied_command, *, time_s, reset_mask):
+        """Pack fresh simulator sensors; source events never create a reset mask."""
+        if self.failed or self.motor.faulted:
+            raise RuntimeError("Native actor session is faulted")
+        try:
+            env = self.env
+            robot = env.scene["robot"].data
+            finite_tensor(applied_command, (env.num_envs, 3), robot.joint_pos)
+            command = env.command_manager.get_term("base_velocity")
+            command.time_left.fill_(float("inf"))
+            command.is_standing_env.fill_(False)
+            command.is_heading_env.fill_(False)
+            command.vel_command_b.copy_(applied_command)
+            values = {
+                "base_ang_vel": robot.root_ang_vel_b,
+                "projected_gravity": robot.projected_gravity_b,
+                "joint_position_relative_default": robot.joint_pos
+                - robot.default_joint_pos,
+                "joint_position": robot.joint_pos,
+                "joint_velocity": robot.joint_vel,
+                "stock_previous_raw_action": env.action_manager.action,
+            }
+            self._check_sensing(applied_command, values)
+            if (
+                not isinstance(reset_mask, torch.Tensor)
+                or reset_mask.shape != (env.num_envs,)
+                or reset_mask.dtype != torch.bool
+                or reset_mask.device != applied_command.device
+            ):
+                raise ValueError("Native reset mask must match the sensor batch")
+            if torch.any(values["stock_previous_raw_action"][reset_mask] != 0):
+                raise ValueError("Native previous action must be zero after reset")
+            samples = {
+                name: (
+                    Sample(
+                        values[name],
+                        time_s,
+                        torch.ones(env.num_envs, dtype=torch.bool, device=env.device),
+                        NATIVE_SENSORS[name][1],
+                        NATIVE_SENSORS[name][2],
+                    )
+                    if name in values
+                    else None
+                )
+                for name in self.controller.spec.sensors
+            }
+            return self.session.step(
+                time_s=time_s,
+                command=applied_command,
+                command_time_s=time_s,
+                sensors=samples,
+                reset_mask=reset_mask,
+            )
+        except Exception:
+            self.failed = True
+            raise
+
+
+class NativeActorSession(NativeControllerSession):
+    """Compatibility loader for the exact archived GRU; no shared GRU host API."""
 
     def __init__(
         self,
@@ -146,111 +192,45 @@ class NativeActorSession:
         learning_updates,
         artifact_sha256=None,
     ):
-        self.env = env
-        self.failed = False
-        self.controller, self.metadata, self.artifact_sha256 = load_actor_bundle(
+        controller, self.metadata, self.artifact_sha256 = load_actor_bundle(
             artifact, env.device, expected_sha256=artifact_sha256
         )
         _check_bundle_source(
-            self.controller,
+            controller,
             self.metadata,
             checkpoint_sha256,
             source_manifest,
             learning_updates,
         )
-        binding, _ = _runtime_motor_binding(env)
-        self.motor_verification = verify_runtime_motor(
-            self.metadata["motor_contract"], self.controller.spec.manifest(), binding
-        )
-        command = env.command_manager.get_term("base_velocity")
-        if (
-            env.cfg.observations.proprio.enable_corruption
-            or tuple(env.observation_manager.active_terms["proprio"])
-            != tuple(name for name, _ in FRAME_TERMS)
-            or command.cfg.heading_command
-            or command.cfg.rel_heading_envs
-            or command.cfg.rel_standing_envs
-        ):
-            raise ValueError(
-                "Native actor requires clean proprioception and direct body twist"
-            )
-        # The profile is not rebound to the current batch hash. Exact normalized
-        # equality above establishes compatibility with this original profile.
-        self.session = ControllerSession(
-            self.controller,
-            joint_names=tuple(binding["joint_names"]),
-            actuator_profile=self.controller.spec.actuator_profile,
+        if env.cfg.observations.proprio.enable_corruption or tuple(
+            env.observation_manager.active_terms["proprio"]
+        ) != tuple(name for name, _ in FRAME_TERMS):
+            raise ValueError("Native actor requires clean proprioception")
+        super().__init__(
+            env, controller, self.metadata["motor_contract"], preserve_native_raw=True
         )
         self.frame = None
 
-    @torch.inference_mode()
-    def act(self, applied_command, *, time_s, reset_mask):
-        """Pack fresh simulator sensors; source events never create a reset mask."""
-        if self.failed:
-            raise RuntimeError("Native actor session is faulted")
-        try:
-            env = self.env
-            robot = env.scene["robot"].data
-            _check_tensor(applied_command, (env.num_envs, 3), "applied body twist")
-            if (
-                applied_command.device != robot.joint_pos.device
-                or applied_command.dtype != robot.joint_pos.dtype
-            ):
-                raise ValueError("Body twist must match native sensor device/dtype")
-            command = env.command_manager.get_term("base_velocity")
-            command.time_left.fill_(float("inf"))
-            command.is_standing_env.fill_(False)
-            command.is_heading_env.fill_(False)
-            command.vel_command_b.copy_(applied_command)
-            # Pinned Isaac Lab's compute() recomputes every observation group.
-            # The frozen actor needs only fresh proprioception here; the native
-            # env.step still owns ordinary all-group observation computation.
-            frame = env.observation_manager.compute_group(
-                "proprio", update_history=False
+    def _check_sensing(self, applied_command, values):
+        # The archived actor's 45-D packing is an additional parity audit, not
+        # an input format imposed on other backbones by the generic host.
+        frame = self.env.observation_manager.compute_group(
+            "proprio", update_history=False
+        )
+        independent = torch.cat(
+            (
+                values["base_ang_vel"],
+                values["projected_gravity"],
+                applied_command,
+                values["joint_position_relative_default"],
+                values["joint_velocity"],
+                values["stock_previous_raw_action"],
+            ),
+            dim=-1,
+        )
+        _check_tensor(frame, (self.env.num_envs, FRAME_DIM), "native proprioception")
+        if not torch.equal(frame, independent):
+            raise ValueError(
+                "Native proprioception differs from the causal sensor contract"
             )
-            values = (
-                robot.root_ang_vel_b,
-                robot.projected_gravity_b,
-                robot.joint_pos - robot.default_joint_pos,
-                robot.joint_vel,
-                env.action_manager.action,
-            )
-            independent = torch.cat((*values[:2], applied_command, *values[2:]), dim=-1)
-            _check_tensor(frame, (env.num_envs, FRAME_DIM), "native proprioception")
-            if not torch.equal(frame, independent):
-                raise ValueError(
-                    "Native proprioception differs from the causal sensor contract"
-                )
-            if (
-                not isinstance(reset_mask, torch.Tensor)
-                or reset_mask.shape != (env.num_envs,)
-                or reset_mask.dtype != torch.bool
-                or reset_mask.device != frame.device
-            ):
-                raise ValueError("Native reset mask must match the sensor batch")
-            if torch.any(values[-1][reset_mask] != 0):
-                raise ValueError("Native previous action must be zero after reset")
-            samples = {
-                name: Sample(
-                    value,
-                    time_s,
-                    torch.ones(env.num_envs, dtype=torch.bool, device=env.device),
-                    spec.units,
-                    spec.frame,
-                )
-                for (name, spec), value in zip(
-                    self.controller.spec.sensors.items(), values, strict=True
-                )
-            }
-            result = self.session.step(
-                time_s=time_s,
-                command=applied_command,
-                command_time_s=time_s,
-                sensors=samples,
-                reset_mask=reset_mask,
-            )
-            self.frame = frame.detach().clone()
-            return result
-        except Exception:
-            self.failed = True
-            raise
+        self.frame = frame.detach().clone()

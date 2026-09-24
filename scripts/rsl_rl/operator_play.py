@@ -699,7 +699,7 @@ def main(argv=None):
         f"{args.device}",
         flush=True,
     )
-    app = env = probe = demo = replay = recording = None
+    app = env = host = probe = demo = replay = recording = None
     report = {"status": "ERROR", "learning_updates": 0, "exit_allowed": False}
     if args.headless_functional_smoke or args.scripted_demo or args.replay_commands:
         report["live_timing_validation"] = "UNRUN"
@@ -857,6 +857,13 @@ def main(argv=None):
         )
         print(report["traceback"], flush=True)
     finally:
+        if host is not None:
+            try:
+                report["motor_delivery"] = host.motor.progress()
+            except Exception as error:
+                report["motor_delivery_error"] = str(error)
+                report["status"] = "ERROR"
+                code = 2
         if replay is not None:
             try:
                 report["replay_progress"] = replay.progress()
