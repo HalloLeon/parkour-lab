@@ -1,7 +1,8 @@
 """Simulation-only keyboard ingress for the frozen recurrent operator.
 
-Kit callbacks and the policy loop must run serially on the simulator host. Only
-real motion-key repeats renew the wall-clock lease; polling held keys never does.
+Kit callbacks and the policy loop must run serially on the simulator host. A
+fresh press can start single-key motion; only real repeats extend its deadline.
+Polling held keys never renews input authority.
 This is not a certified remote disconnect detector or a hardware controller.
 """
 
@@ -12,6 +13,11 @@ import sys
 import time
 
 from parkour_lab.learning.command_source import BodyTwistLease
+from scripts.rsl_rl.operator_simple_input import (
+    SINGLE_KEY_MOTION_KEYS,
+    SPEED_LEVELS,
+    SingleKeyTwist,
+)
 
 
 MOTION_KEYS = {
@@ -246,6 +252,16 @@ def run_live_loop(
             # Inference itself can stall. Never deliver its now-stale moving
             # action, or step the GRU twice to try to repair the same frame.
             latest = control.resolve(command_clock())
+            host_limit = getattr(control, "host_stall_timeout_s", None)
+            if (
+                host_limit is not None
+                and any(decision.command)
+                and clock() - tick > host_limit
+            ):
+                # The initial key-repeat grace must not also permit slow/stale
+                # inference delivery. Offline legacy probes do not use this guard.
+                control.stop(command_clock(), disconnected=True)
+                raise RuntimeError("Host stalled during inference; delivery aborted")
             if latest.command != decision.command:
                 raise RuntimeError("Input expired during inference; delivery aborted")
             _, _, terminated, timed_out, _ = measured(
@@ -268,7 +284,12 @@ def run_live_loop(
                 episode_ends += 1
                 control.stop(command_clock(), disconnected=True)
                 print(
-                    "[OPERATOR] Episode reset; press R, then fresh motion keys.",
+                    "[OPERATOR] Episode reset; "
+                    + (
+                        "release all motion keys, then press a fresh direction key."
+                        if isinstance(control, SingleKeyTwist)
+                        else "press R, then fresh motion keys."
+                    ),
                     flush=True,
                 )
             if pace:
@@ -285,17 +306,25 @@ def run_live_loop(
     }
 
 
-def run_keyboard_actor(env, host, app):
+def run_keyboard_actor(env, host, app, *, controls="single-key"):
     """Attach the local/streamed Kit window; never fall back to synthetic repeats."""
     import carb
     import omni.appwindow
 
+    if controls not in ("single-key", "legacy"):
+        raise ValueError("Unknown keyboard controls profile")
+    simple = controls == "single-key"
     window = omni.appwindow.get_default_app_window()
     if window is None or window.get_keyboard() is None:
         raise RuntimeError("A local or streamed Isaac Sim keyboard window is required")
     keyboard = window.get_keyboard()
+    mouse = window.get_mouse() if simple else None
+    if simple and mouse is None:
+        raise RuntimeError(
+            "Single-key controls require a mouse for the navigation guard"
+        )
     inputs = carb.input.acquire_input_interface()
-    control = KeyboardTwist()
+    control = SingleKeyTwist() if simple else KeyboardTwist()
     callback_errors = []
 
     def note_failure(error, detail):
@@ -323,12 +352,24 @@ def run_keyboard_actor(env, host, app):
             env.sim.is_playing()
             and window.is_focused()
             and not window.get_input_blocking_state(carb.input.DeviceType.KEYBOARD)
+            and (
+                not simple
+                or not any(
+                    inputs.get_mouse_value(mouse, button)
+                    for button in (
+                        carb.input.MouseInput.LEFT_BUTTON,
+                        carb.input.MouseInput.MIDDLE_BUTTON,
+                        carb.input.MouseInput.RIGHT_BUTTON,
+                    )
+                )
+            )
         )
 
     def on_key(event, *_):
         try:
             now = time.monotonic()
-            if not is_available():
+            available = is_available()
+            if not available:
                 control.stop(now, disconnected=True)
             event_type = {
                 carb.input.KeyboardEventType.KEY_PRESS: "press",
@@ -347,12 +388,29 @@ def run_keyboard_actor(env, host, app):
             )
             if not isinstance(key, str) or not key:
                 raise ValueError("Keyboard key event requires a nonempty key name")
-            control.key_event(
-                key,
-                event_type,
-                now,
-                shift_held=bool(getattr(event, "modifiers", 0) & 1),
-            )
+            modifiers = getattr(event, "modifiers", 0)
+            if simple:
+                previous_speed = control.speed_scale
+                control.key_event(key, event_type, now, modifiers=modifiers)
+                if control.speed_scale != previous_speed:
+                    print(
+                        f"[OPERATOR] Speed {control.speed_scale:.0%}; "
+                        "applies on next fresh direction press.",
+                        flush=True,
+                    )
+                # False prevents subsequent subscribers handling owned plain
+                # keys. It cannot undo a shortcut handled by an earlier one.
+                if (
+                    available
+                    and type(modifiers) is int
+                    and modifiers >= 0
+                    and modifiers & ~48 == 0  # Caps/NumLock are not navigation.
+                    and key
+                    in {*SINGLE_KEY_MOTION_KEYS, *SPEED_LEVELS, "X", "N", "ESCAPE"}
+                ):
+                    return False
+            else:
+                control.key_event(key, event_type, now, shift_held=bool(modifiers & 1))
         except Exception as error:
             callback_failed(error)
         return True
@@ -372,20 +430,38 @@ def run_keyboard_actor(env, host, app):
                 on_focus_change
             )
         )
-        print(
-            "[OPERATOR] SIMULATION ONLY. R: arm (no reset); Shift + ONE key: "
-            "W/S forward/back, A/D lateral, Q/E pivot, Z/C forward arcs. "
-            "Release stops and requires R. N: physical reset, X: stop, Esc: exit.",
-            flush=True,
-        )
-        print(
-            "[OPERATOR] Motion starts on the first real key repeat. Missing repeats, "
-            "Shift release, conflicting keys, focus loss, pause, >0.25s host stalls "
-            "or episode ends latch zero body twist. Re-arm with R and fresh keys. "
-            "A client that fabricates repeats after disconnect cannot certify presence; "
-            "test the stream while attended. Zero twist is NOT zero motor action.",
-            flush=True,
-        )
+        if simple:
+            print(
+                "[OPERATOR] SIMULATION ONLY. Hold ONE key: arrows move forward/back/"
+                "left/right; J/L pivot; U/O forward arcs. No R or Shift. "
+                "Release requests stop. 1/2/3: 25/50/100% speed (default 50%, "
+                "next fresh direction press). X: stop, N: physical reset, Esc: exit.",
+                flush=True,
+            )
+            print(
+                "[OPERATOR] Click viewport, then release mouse buttons. Fresh press "
+                "starts immediately; 0.75s first-repeat grace, then 0.25s repeat lease. "
+                "Focus loss, pause, mouse navigation, modifiers, conflicting keys, "
+                "expiry or >0.25s host stalls stop commands. Release all motion keys "
+                "before a fresh press. Zero twist is NOT zero motor action; "
+                "client-fabricated repeats cannot certify remote presence.",
+                flush=True,
+            )
+        else:
+            print(
+                "[OPERATOR] SIMULATION ONLY. R: arm (no reset); Shift + ONE key: "
+                "W/S forward/back, A/D lateral, Q/E pivot, Z/C forward arcs. "
+                "Release stops and requires R. N: physical reset, X: stop, Esc: exit.",
+                flush=True,
+            )
+            print(
+                "[OPERATOR] Motion starts on the first real key repeat. Missing repeats, "
+                "Shift release, conflicting keys, focus loss, pause, >0.25s host stalls "
+                "or episode ends latch zero body twist. Re-arm with R and fresh keys. "
+                "A client that fabricates repeats after disconnect cannot certify presence; "
+                "test the stream while attended. Zero twist is NOT zero motor action.",
+                flush=True,
+            )
         result = run_live_loop(env, host, app, control, is_available=is_available)
         if callback_errors:
             raise RuntimeError("Keyboard callback failed") from callback_errors[0]

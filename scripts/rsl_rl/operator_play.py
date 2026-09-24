@@ -153,6 +153,12 @@ def parse_args(argv=None):
         help="2: server stream; 0: local window",
     )
     parser.add_argument(
+        "--keyboard-controls",
+        choices=("single-key", "legacy"),
+        default="single-key",
+        help="Interactive controller (default single-key); headless smokes always exercise legacy synthetic input",
+    )
+    parser.add_argument(
         "--validate-only",
         action="store_true",
         help="CPU source checks only; no simulator/window",
@@ -241,6 +247,7 @@ def main(argv=None):
     from .operator_live import MOTION_KEYS, run_keyboard_actor
     from .operator_runtime import NativeActorSession, actor_bundle_source
     from .operator_live_probe import HeadlessSmoke, smoke_protocol
+    from .operator_simple_input import SINGLE_KEY_MOTION_KEYS, simple_keyboard_protocol
     from .teleoperation import validate_operator_display
 
     try:
@@ -294,6 +301,7 @@ def main(argv=None):
             else "headless_smoke" if args.headless_smoke else "interactive"
         ),
         "headless": headless_smoke or args.livestream != 0,
+        "keyboard_controls": "legacy" if headless_smoke else args.keyboard_controls,
         "motion_keys_body_twist": MOTION_KEYS,
         "lease_s": 0.25,
         "command_clock": "local monotonic receipt time; real key repeats only",
@@ -303,6 +311,17 @@ def main(argv=None):
         "learning_updates": 0,
         "exit_allowed": False,
     }
+    if not headless_smoke and args.keyboard_controls == "single-key":
+        protocol["keyboard"] = simple_keyboard_protocol()
+        protocol["motion_keys_body_twist"] = SINGLE_KEY_MOTION_KEYS
+        protocol["motion_keys_body_twist_scale"] = (
+            "Base twists multiplied by selected speed; scale captured on fresh press"
+        )
+        protocol.pop("lease_s")
+        protocol["command_clock"] = (
+            "local monotonic receipt time; fresh press starts bounded initial grace, "
+            "real key repeats renew the shorter lease"
+        )
     if args.headless_functional_smoke:
         protocol["smoke"] = smoke_protocol(functional=True)
         protocol["command_clock"] = (
@@ -317,6 +336,12 @@ def main(argv=None):
         protocol["smoke"] = smoke_protocol()
         protocol["command_clock"] = (
             "local monotonic receipt time; explicitly synthetic scripted key events"
+        )
+    if headless_smoke:
+        protocol["smoke"].update(
+            keyboard_controls="legacy",
+            input_coverage="legacy synthetic input only; not the interactive single-key default",
+            single_key_controls_validation="UNRUN",
         )
     if args.validate_only:
         print(
@@ -400,7 +425,9 @@ def main(argv=None):
             )
             report.update(probe.run(host, app))
         else:
-            report.update(run_keyboard_actor(env, host, app))
+            report.update(
+                run_keyboard_actor(env, host, app, controls=args.keyboard_controls)
+            )
         if (
             training.recurrent_evaluation_files(args.checkpoint) != sources
             or training.recurrent_training_identity(args.reference) != identity
