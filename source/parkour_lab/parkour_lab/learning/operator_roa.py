@@ -171,9 +171,6 @@ class ROAActor(nn.Module):
             self.encode(observations["dynamics"]) - predicted[:, 3:].detach(), dim=-1
         ).mean()
 
-    def adaptation_parameters(self):
-        return self.estimator.parameters()
-
     def adaptation_losses(self, history, dynamics, velocity):
         predicted = self.estimate(history)
         finite_tensor(velocity, (len(history), 3), predicted)

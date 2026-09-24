@@ -14,7 +14,7 @@ from pathlib import Path
 import tempfile
 import traceback
 
-VERSION = "operator_roa_learning_pilot_v1"
+VERSION = "operator_roa_learning_pilot_v2"
 REGULARIZATION_COEFFICIENTS = (0.1, 0.55, 1.0)
 ROLLOUT_STEPS = 24
 HISTORY_STEPS = 64
@@ -33,7 +33,12 @@ DYNAMICS_NAMES = (
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"{VERSION}\n{Path(__file__).resolve()}"
+    )
     parser.add_argument(
         "reference",
         type=Path,
@@ -434,10 +439,6 @@ def _learn_pilot(host, source_state, runner_cfg, output, report, publish):
             "readiness_only": True,
             "deployment_allowed": False,
             "policy_state": policy.state_dict(),
-            "causal_state": {
-                "motor": actor.motor.state_dict(),
-                "estimator": actor.estimator.state_dict(),
-            },
             "ppo_optimizer": algorithm.optimizer.state_dict(),
             "adaptation_optimizer": optimizer.state_dict(),
             "motor_contract": host.motor_contract,
@@ -454,8 +455,48 @@ def _learn_pilot(host, source_state, runner_cfg, output, report, publish):
     )
 
 
+def finish_session(env, app, report, publish, code):
+    """Close in order; preserve the last durable receipt if Kit exits in close()."""
+    resources = (("environment", env), ("application", app))
+    report["session_status"] = report["status"]
+    if code == 0:
+        report["status"] = "SESSION_COMPLETED_CLEANUP_PENDING"
+    report["cleanup"] = {
+        name: "pending" if resource is not None else "not_created"
+        for name, resource in resources
+    }
+
+    def save():
+        nonlocal code
+        try:
+            publish()
+        except Exception as error:
+            code = 2
+            report.update(status="ERROR", report_write_error=str(error))
+            try:
+                print(f"Could not publish ROA report: {error}", flush=True)
+            except OSError:
+                pass  # A broken logging pipe must not prevent resource cleanup.
+
+    save()
+    for name, resource in resources:
+        if resource is None:
+            continue
+        try:
+            resource.close()
+            report["cleanup"][name] = "complete"
+        except Exception as error:
+            report["cleanup"][name] = f"ERROR: {error}"
+            code = 2
+        save()
+    report["status"] = report["session_status"] if code == 0 else "ERROR"
+    save()
+    return code
+
+
 def main(argv=None):
     args = parse_args(argv)
+    print(f"ROA entry point: {Path(__file__).resolve()} ({VERSION})", flush=True)
     from .operator_play import configure_live_execution, verify_live_execution
 
     execution = configure_live_execution(args.cpu_threads)
@@ -487,7 +528,7 @@ def main(argv=None):
         "regularization_coefficients": REGULARIZATION_COEFFICIENTS,
         "rollout_steps_per_update": ROLLOUT_STEPS,
         "history_steps_per_cycle": HISTORY_STEPS,
-        "frozen_student_steps": FROZEN_STEPS,
+        "frozen_history_steps": FROZEN_STEPS,
         "dynamics": list(DYNAMICS_NAMES),
         "dynamics_sampling": "post-startup; persistent physics checked on phase resets and completion",
         "velocity": "root_lin_vel_b: root COM linear velocity expressed in root body frame, m/s",
@@ -575,41 +616,10 @@ def main(argv=None):
         )
         traceback.print_exc()
     finally:
-        report["session_status"] = report["status"]
-        if code == 0:
-            report["status"] = "SESSION_COMPLETED_CLEANUP_PENDING"
-        report["cleanup"] = {
-            "environment": "pending" if env else "not_created",
-            "application": "pending" if app else "not_created",
-        }
-
-        def cleanup_publish():
-            nonlocal code
-            try:
-                publish()
-            except Exception as error:
-                print(f"Could not publish ROA report: {error}", flush=True)
-                code = 2
-
-        cleanup_publish()
-        if env is not None:
-            try:
-                env.close()
-                report["cleanup"]["environment"] = "complete"
-            except Exception as error:
-                report["cleanup"]["environment"] = f"ERROR: {error}"
-                code = 2
-            cleanup_publish()
-        print(f"ROA pilot report: {output / 'report.json'}", flush=True)
-        if app is not None:
-            try:
-                app.close()
-                report["cleanup"]["application"] = "complete"
-            except Exception as error:
-                report["cleanup"]["application"] = f"ERROR: {error}"
-                code = 2
-        report["status"] = report["session_status"] if code == 0 else "ERROR"
-        cleanup_publish()
+        try:
+            print(f"ROA pilot report: {output / 'report.json'}", flush=True)
+        finally:
+            code = finish_session(env, app, report, publish, code)
     return code
 
 
