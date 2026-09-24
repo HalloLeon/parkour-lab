@@ -4287,7 +4287,7 @@ def main(argv=None):
     parser.add_argument(
         "--evaluation-actor-bundle",
         type=Path,
-        help="With --evaluation-command-source: drive the same frozen probe with a V2 exported actor and verified native motors; original checkpoint is the parity shadow only",
+        help="With explicit difficulty and canonical --evaluation-command-coverage, --evaluation-out-and-back or --evaluation-command-source: drive the unchanged frozen probe with a V2 exported actor and verified native motors; no long-stop, negative-pivot-first or reward-capture variants; original checkpoint is the parity shadow only",
     )
     parser.add_argument(
         "--evaluation-reward-capture",
@@ -4422,10 +4422,25 @@ def main(argv=None):
     resuming = args.procedural_resume_checkpoint is not None
     learning = args.procedural_train or refinement or resuming
     if args.evaluation_actor_bundle is not None and (
-        not evaluation or not args.evaluation_command_source
+        not evaluation
+        or args.evaluation_difficulty is None
+        or sum(
+            (
+                args.evaluation_command_source,
+                args.evaluation_out_and_back,
+                args.evaluation_command_coverage,
+            )
+        )
+        != 1
+        or args.evaluation_long_stops
+        or args.evaluation_negative_pivot_first
+        or args.evaluation_reward_capture
     ):
         parser.error(
-            "--evaluation-actor-bundle requires --procedural-evaluate-checkpoint and --evaluation-command-source"
+            "--evaluation-actor-bundle requires --procedural-evaluate-checkpoint, "
+            "explicit --evaluation-difficulty and exactly one canonical "
+            "command-coverage, out-and-back or command-source probe; "
+            "long-stop, negative-pivot-first and reward-capture variants are unsupported"
         )
     if args.restart_coverage and not resuming:
         parser.error("--restart-coverage requires --procedural-resume-checkpoint")

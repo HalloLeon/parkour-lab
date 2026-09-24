@@ -2573,8 +2573,18 @@ def evaluate_recurrent_operator(
     import numpy as np
     from parkour_lab.learning.controller import ControllerSession, Sample
 
-    if actor_bundle is not None and not command_source:
-        raise ValueError("Actor-bundle integration requires the command-source probe")
+    if actor_bundle is not None and (
+        difficulty_range is None
+        or sum((command_source, out_and_back, command_coverage)) != 1
+        or long_stops
+        or negative_pivot_first
+        or reward_capture
+    ):
+        raise ValueError(
+            "Actor-bundle integration requires explicit native difficulty and one "
+            "canonical command-coverage, out-and-back or command-source probe; "
+            "long-stop, negative-pivot-first and reward-capture variants are unsupported"
+        )
     native = difficulty_range is not None
     protocol = recurrent_evaluation_protocol(
         difficulty_range=difficulty_range,
