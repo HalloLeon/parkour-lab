@@ -16,28 +16,32 @@ from .operator_live import run_live_loop
 
 STEP_SECONDS = 0.02
 WALL_SECONDS = 1800.0
+DEMO_VERSION = "operator_scripted_demo_v2"
 ZERO = (0.0, 0.0, 0.0)
 # Native steps, phase name, body-relative (vx m/s, vy m/s, yaw rad/s).
 # Ten simulated seconds initially allow time to connect the viewer; this does
 # not detect a connected viewer and is not a network-readiness handshake.
 SEGMENTS = (
     (500, "initial_stand", ZERO),
-    (150, "forward", (0.2, 0.0, 0.0)),
-    (100, "stop_after_forward", ZERO),
-    (150, "backward", (-0.15, 0.0, 0.0)),
-    (100, "stop_after_backward", ZERO),
-    (150, "left", (0.0, 0.1, 0.0)),
-    (100, "stop_after_left", ZERO),
-    (150, "right", (0.0, -0.1, 0.0)),
-    (100, "stop_after_right", ZERO),
-    (150, "pivot_left", (0.0, 0.0, 0.25)),
-    (100, "stop_after_pivot_left", ZERO),
-    (150, "pivot_right", (0.0, 0.0, -0.25)),
-    (100, "stop_after_pivot_right", ZERO),
-    (150, "arc_left", (0.2, 0.0, 0.2)),
-    (100, "stop_after_arc_left", ZERO),
-    (150, "arc_right", (0.2, 0.0, -0.2)),
-    (100, "final_stand", ZERO),
+    # Full existing command limits, not increased joint/motor action scales.
+    (300, "forward", (0.4, 0.0, 0.0)),  # 6 s: nominal 2.4 m outward.
+    (50, "stop_after_forward", ZERO),
+    (400, "backward", (-0.3, 0.0, 0.0)),  # 8 s: nominal 2.4 m return.
+    (50, "stop_after_backward", ZERO),
+    (250, "left", (0.0, 0.2, 0.0)),  # 5 s: nominal 1 m sideways.
+    (50, "stop_after_left", ZERO),
+    (250, "right", (0.0, -0.2, 0.0)),
+    (50, "stop_after_right", ZERO),
+    (314, "pivot_left", (0.0, 0.0, 0.5)),  # 6.28 s: about 180 degrees.
+    (50, "stop_after_pivot_left", ZERO),
+    (314, "pivot_right", (0.0, 0.0, -0.5)),
+    (50, "stop_after_pivot_right", ZERO),
+    # Opposite ~360-degree loops, separated by a stop, trace a figure-eight
+    # only under ideal tracking. Radius v/w = 1 m; no position-feedback steering.
+    (786, "arc_left", (0.4, 0.0, 0.4)),
+    (50, "stop_after_arc_left", ZERO),
+    (786, "arc_right", (0.4, 0.0, -0.4)),
+    (150, "final_stand", ZERO),
 )
 STEPS = sum(length for length, _, _ in SEGMENTS)
 
@@ -56,7 +60,9 @@ def demo_protocol():
         )
         start += length
     return {
-        "version": "operator_scripted_demo_v1",
+        "version": DEMO_VERSION,
+        "presentation": "full-speed long legs, half-turns and two opposing circles",
+        "geometry_scope": "nominal command integrals only; no measured path closure or tracking guarantee",
         "control_steps": STEPS,
         "simulated_seconds": STEPS * STEP_SECONDS,
         "phases": phases,
@@ -166,7 +172,7 @@ class ScriptedDemo:
 
     def progress(self):
         return {
-            "version": "operator_scripted_demo_v1",
+            "version": DEMO_VERSION,
             "completed": self.completed,
             "executed_control_steps": self.executed_steps,
             "simulated_seconds": self.executed_steps * STEP_SECONDS,
@@ -185,7 +191,8 @@ class ScriptedDemo:
 
     def run(self, host, app):
         print(
-            "[DEMO] SIMULATION ONLY: automatic one-shot 50s simulation-time sequence. "
+            f"[DEMO] SIMULATION ONLY: automatic one-shot {STEPS * STEP_SECONDS:g}s "
+            "simulation-time showcase at existing full command speeds. "
             "No keyboard input; does not wait for viewer connection. "
             "Slow hosts take longer. Ctrl+C in the launch terminal stops the process.",
             flush=True,
