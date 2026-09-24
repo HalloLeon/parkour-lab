@@ -353,7 +353,7 @@ class ScriptedDemo:
             "behavioral_acceptance": False,
         }
 
-    def run(self, host, app):
+    def run(self, host, app, *, recording=None):
         print(
             f"[DEMO] SIMULATION ONLY: automatic one-shot {self.steps * STEP_SECONDS:g}s "
             f"simulation-time {self.terrain} showcase. "
@@ -378,6 +378,7 @@ class ScriptedDemo:
                 before_poll=self.prepare,
                 after_step=self.observe,
                 timings=self.timings,
+                **({"recording": recording} if recording is not None else {}),
             )
             if (
                 result["control_steps"] != self.steps

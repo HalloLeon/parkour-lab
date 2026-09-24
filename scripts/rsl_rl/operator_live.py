@@ -139,6 +139,7 @@ def run_live_loop(
     before_poll=None,
     after_step=None,
     timings=None,
+    recording=None,
 ):
     """Serialize input decisions, physical resets and fixed-clock actor delivery.
 
@@ -177,6 +178,8 @@ def run_live_loop(
         raise ValueError("Wall-time limit must be finite and positive")
     if type(pace) is not bool:
         raise ValueError("Pacing must be a boolean")
+    if recording is not None:
+        max_steps = min(max_steps or recording.max_steps, recording.max_steps)
     if command_clock is None:
         command_clock = clock
     started = clock()
@@ -231,6 +234,8 @@ def run_live_loop(
                 "input_poll", control.poll, command_tick, available=is_available()
             )
             if control.reset_requested:
+                if recording is not None:
+                    recording.before_reset()
                 control.stop(command_clock(), disconnected=True)
                 measured("physical_reset", env.reset)
                 reset_mask.fill_(True)
@@ -269,17 +274,26 @@ def run_live_loop(
             _, _, terminated, timed_out, _ = measured(
                 "native_step", env.step, result.raw_action
             )
-            if after_step is not None:
-                measured(
-                    "observer",
-                    after_step,
-                    step_index,
-                    decision,
-                    reset_mask,
-                    result,
-                    terminated,
-                    timed_out,
-                )
+            try:
+                if after_step is not None:
+                    measured(
+                        "observer",
+                        after_step,
+                        step_index,
+                        decision,
+                        reset_mask,
+                        result,
+                        terminated,
+                        timed_out,
+                    )
+            finally:
+                # Preserve every completed delivery, including a terminal
+                # return or a failed diagnostic, without starving observers
+                # of the final native event. Neither path may continue past it.
+                if recording is not None:
+                    recording.after_step(
+                        step_index, decision, reset_mask, result, terminated, timed_out
+                    )
             step_index += 1
             reset_mask = (terminated | timed_out).clone()
             if reset_mask.any():
@@ -308,7 +322,7 @@ def run_live_loop(
     }
 
 
-def run_keyboard_actor(env, host, app, *, controls="single-key"):
+def run_keyboard_actor(env, host, app, *, controls="single-key", recording=None):
     """Attach the local/streamed Kit window; never fall back to synthetic repeats."""
     import carb
     import omni.appwindow
@@ -464,7 +478,20 @@ def run_keyboard_actor(env, host, app, *, controls="single-key"):
                 "test the stream while attended. Zero twist is NOT zero motor action.",
                 flush=True,
             )
-        result = run_live_loop(env, host, app, control, is_available=is_available)
+        if recording is not None:
+            print(
+                "[RECORD] Release motion, allow zero commands to run, then Esc. "
+                "N/reset, native episode end or errors invalidate the recording.",
+                flush=True,
+            )
+        result = run_live_loop(
+            env,
+            host,
+            app,
+            control,
+            is_available=is_available,
+            **({"recording": recording} if recording is not None else {}),
+        )
         if callback_errors:
             raise RuntimeError("Keyboard callback failed") from callback_errors[0]
         return result

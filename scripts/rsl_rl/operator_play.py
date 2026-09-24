@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import importlib.metadata
 import json
 import math
@@ -172,6 +173,21 @@ def parse_args(argv=None):
         action="store_true",
         help="Bounded terrain-specific body-twist sequence for streamed or local viewing; no keyboard input or live-timing validation",
     )
+    smoke_modes.add_argument(
+        "--replay-commands",
+        type=Path,
+        help="Replay a complete validated simulation command tape by control-step index; no keyboard or training",
+    )
+    parser.add_argument(
+        "--record-commands",
+        action="store_true",
+        help="Record completed applied body-twist commands into this run's command_tape.json; manual reset and native termination invalidate the tape",
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Run scripted demo or command replay without a window or stream; not interactive keyboard control",
+    )
     parser.add_argument(
         "--livestream",
         type=int,
@@ -207,9 +223,17 @@ def parse_args(argv=None):
             "--difficulty requires finite ordered bounds: 0 <= LOW <= HIGH <= 1"
         )
     args.difficulty = tuple(args.difficulty)
+    if args.headless and not (args.scripted_demo or args.replay_commands):
+        parser.error("--headless requires --scripted-demo or --replay-commands")
+    if args.headless and args.livestream == 2:
+        parser.error("--headless cannot be combined with --livestream 2")
+    if args.record_commands and (args.headless_smoke or args.headless_functional_smoke):
+        parser.error("--record-commands does not support headless smoke reset tapes")
     if args.terrain == "rough_stress":
-        if not args.scripted_demo:
-            parser.error("rough_stress is evaluation-only and requires --scripted-demo")
+        if not (args.scripted_demo or args.replay_commands):
+            parser.error(
+                "rough_stress is evaluation-only and requires --scripted-demo or --replay-commands"
+            )
         if args.difficulty[0] <= 0.0 or args.difficulty[0] != args.difficulty[1]:
             parser.error(
                 "rough_stress requires fixed positive --difficulty LOW HIGH with LOW == HIGH"
@@ -222,9 +246,117 @@ def parse_args(argv=None):
                 "Headless smoke modes require the default --difficulty 0.15 0.35"
             )
         args.livestream = 0
+    elif args.headless:
+        args.livestream = 0
     elif args.livestream is None:
         args.livestream = 2
     return args
+
+
+def _validate_replay_scene(args, tape):
+    """Keep declared recording context fixed; only one known spawn override exists."""
+    metadata = tape["metadata"]
+    required = {
+        "terrain",
+        "seed",
+        "difficulty_range",
+        "spawn_override",
+        "resolved_scene_configuration_sha256",
+        "runtime_source_sha256",
+        "portable_motor_sha256",
+        "checkpoint_sha256",
+        "controller_interface_sha256",
+        "actor_bundle",
+        "source_mode",
+    }
+    if not required <= metadata.keys():
+        raise ValueError(
+            "Replay requires the recorded scene and runtime identity metadata"
+        )
+    bundle = metadata["actor_bundle"]
+    if (
+        type(bundle) is not dict
+        or set(bundle) != {"path", "sha256"}
+        or type(bundle["path"]) is not str
+        or not bundle["path"]
+        or type(metadata["source_mode"]) is not str
+        or metadata["source_mode"]
+        not in ("interactive", "scripted_demo", "command_replay")
+    ):
+        raise ValueError(
+            "Replay requires a recorded actor bundle and simulation source mode"
+        )
+    identities = {
+        key: metadata[key]
+        for key in (
+            "resolved_scene_configuration_sha256",
+            "runtime_source_sha256",
+            "portable_motor_sha256",
+            "checkpoint_sha256",
+            "controller_interface_sha256",
+        )
+    }
+    identities["actor_bundle.sha256"] = bundle["sha256"]
+    for key, value in identities.items():
+        if (
+            type(value) is not str
+            or len(value) != 64
+            or any(c not in "0123456789abcdef" for c in value)
+        ):
+            raise ValueError(f"Replay requires a recorded SHA256 identity: {key}")
+    if metadata["terrain"] != args.terrain:
+        raise ValueError("Replay terrain differs from the recorded command tape")
+    if type(metadata["seed"]) is not int or metadata["seed"] != args.seed:
+        raise ValueError("Replay seed differs from the recorded command tape")
+    bounds = metadata["difficulty_range"]
+    if (
+        type(bounds) is not list
+        or len(bounds) != 2
+        or any(type(value) not in (int, float) for value in bounds)
+        or tuple(bounds) != args.difficulty
+    ):
+        raise ValueError("Replay difficulty differs from the recorded command tape")
+    override = metadata["spawn_override"]
+    if override is not None:
+        if (
+            args.terrain == "plane"
+            or type(override) is not dict
+            or set(override) != {"reset_base_pose_range", "scope"}
+            or type(override["scope"]) is not str
+            or json.dumps(override["reset_base_pose_range"], sort_keys=True)
+            != json.dumps(NONPLANE_DEMO_POSE_RANGE, sort_keys=True)
+        ):
+            raise ValueError("Unknown or incompatible command replay spawn override")
+        args._command_replay_spawn = copy.deepcopy(NONPLANE_DEMO_POSE_RANGE)
+    if args.terrain == "rough_stress" and override is None:
+        raise ValueError(
+            "rough_stress replay requires the recorded supported demo spawn"
+        )
+
+
+def _scene_configuration_sha256(resolved):
+    """Bind resolved scene/physics while excluding only administrative/view settings."""
+    import yaml
+
+    normalized = copy.deepcopy(resolved)
+    for key in (
+        "episode_length_s",
+        "log_dir",
+        "recorders",
+        "viewer",
+        "ui_window_class_type",
+    ):
+        normalized.pop(key, None)
+    if "sim" in normalized:
+        for key in ("log_dir", "logging_level", "save_logs_to_file", "render"):
+            normalized["sim"].pop(key, None)
+    return hashlib.sha256(yaml.dump(normalized, sort_keys=True).encode()).hexdigest()
+
+
+def _runtime_source_sha256(identity):
+    return hashlib.sha256(
+        json.dumps(identity["runtime"], sort_keys=True, allow_nan=False).encode()
+    ).hexdigest()
 
 
 def _rough_stress_geometry(args, *, size=(16.0, 16.0)):
@@ -237,13 +369,16 @@ def _rough_stress_geometry(args, *, size=(16.0, 16.0)):
 
     difficulty = tuple(args.difficulty)
     if (
-        not getattr(args, "scripted_demo", False)
+        not (
+            getattr(args, "scripted_demo", False)
+            or getattr(args, "_command_replay_spawn", None)
+        )
         or len(difficulty) != 2
         or not all(math.isfinite(value) for value in difficulty)
         or not 0.0 < difficulty[0] == difficulty[1] <= 1.0
     ):
         raise ValueError(
-            "rough_stress requires scripted demo and fixed positive difficulty"
+            "rough_stress requires scripted demo or its recorded replay spawn and fixed positive difficulty"
         )
     surface = build_stress_surface(difficulty[0], seed=args.seed, size=size)
     return {
@@ -315,6 +450,8 @@ def apply_live_overrides(cfg, args, *, command_class, recorders):
     generator.difficulty_range = tuple(getattr(args, "difficulty", DEFAULT_DIFFICULTY))
     if getattr(args, "scripted_demo", False) and args.terrain != "plane":
         cfg.events.reset_base.params["pose_range"].update(NONPLANE_DEMO_POSE_RANGE)
+    if getattr(args, "_command_replay_spawn", None) is not None:
+        cfg.events.reset_base.params["pose_range"].update(args._command_replay_spawn)
     cfg.scene.terrain.max_init_terrain_level = 0
     cfg.curriculum.terrain_levels = None
     cfg.scene.num_envs = 1
@@ -325,7 +462,9 @@ def apply_live_overrides(cfg, args, *, command_class, recorders):
     # intact (notably the single center ray used for terrain-relative clearance).
     cfg.observations.policy = None
     cfg.observations.terrain = None
-    cfg.episode_length_s = 300.0
+    cfg.episode_length_s = max(
+        300.0, getattr(args, "_command_replay_steps", 0) * 0.02 + 1.0
+    )
     # A single tile cannot use the procedural sampler's fixed profile layout.
     # This stock term samples only zero; NativeActorSession owns every command
     # consumed by inference and prevents resampling during active delivery.
@@ -351,6 +490,7 @@ def apply_live_overrides(cfg, args, *, command_class, recorders):
 def main(argv=None):
     args = parse_args(argv)
     headless_smoke = args.headless_smoke or args.headless_functional_smoke
+    replay_tape = replay_file_sha256 = None
     try:
         execution = configure_live_execution(args.cpu_threads)
     except Exception as error:
@@ -367,17 +507,31 @@ def main(argv=None):
 
     if args.scripted_demo:
         from .operator_demo import ScriptedDemo, demo_protocol
+    if args.record_commands or args.replay_commands:
+        from .operator_command_tape import CommandRecording, CommandReplay
 
     try:
         args.reference = args.reference.resolve(strict=True)
         args.checkpoint = args.checkpoint.resolve(strict=True)
         args.actor_bundle = args.actor_bundle.resolve(strict=True)
-        for source in (args.reference, args.checkpoint):
+        immutable_sources = [args.reference, args.checkpoint]
+        if args.replay_commands:
+            from parkour_lab.learning.command_tape import load_tape
+
+            args.replay_commands = args.replay_commands.resolve(strict=True)
+            replay_file_sha256 = training.file_sha256(args.replay_commands)
+            replay_tape = load_tape(args.replay_commands)
+            if training.file_sha256(args.replay_commands) != replay_file_sha256:
+                raise ValueError("Command tape changed during source preflight")
+            args._command_replay_steps = replay_tape["steps"]
+            _validate_replay_scene(args, replay_tape)
+            immutable_sources.append(args.replay_commands)
+        for source in immutable_sources:
             if args.output_parent.resolve().is_relative_to(source.parent):
                 raise ValueError(
                     "Live output must be outside immutable source run directories"
                 )
-        if not headless_smoke:
+        if not headless_smoke and not args.headless:
             validate_operator_display(
                 headless=args.livestream != 0, livestream=args.livestream
             )
@@ -388,6 +542,15 @@ def main(argv=None):
         training.load_reference_checkpoint(args.reference, agent)
         training.select_profile(saved, agent, "source")
         identity = training.recurrent_training_identity(args.reference)
+        runtime_source_sha256 = _runtime_source_sha256(identity)
+        if (
+            replay_tape
+            and replay_tape["metadata"]["runtime_source_sha256"]
+            != runtime_source_sha256
+        ):
+            raise ValueError(
+                "Replay runtime source differs from the recorded command tape"
+            )
         policy, metadata, archived_protocol, sources = (
             training.recurrent_evaluation_source(
                 args.checkpoint, identity["physical_reference"]
@@ -411,7 +574,9 @@ def main(argv=None):
         "num_envs": 1,
         "terrain": args.terrain,
         "difficulty_range": list(args.difficulty),
-        "episode_length_s": 300.0,
+        "episode_length_s": max(
+            300.0, getattr(args, "_command_replay_steps", 0) * 0.02 + 1.0
+        ),
         "livestream": args.livestream,
         "device": args.device,
         "execution": execution,
@@ -420,7 +585,7 @@ def main(argv=None):
             if args.headless_functional_smoke
             else "headless_smoke" if args.headless_smoke else "interactive"
         ),
-        "headless": headless_smoke or args.livestream != 0,
+        "headless": headless_smoke or args.headless or args.livestream != 0,
         "keyboard_controls": "legacy" if headless_smoke else args.keyboard_controls,
         "motion_keys_body_twist": MOTION_KEYS,
         "lease_s": 0.25,
@@ -449,6 +614,29 @@ def main(argv=None):
             }
         protocol.pop("motion_keys_body_twist")
         protocol.pop("lease_s")
+    elif args.replay_commands:
+        protocol.update(
+            mode="command_replay",
+            command_clock="completed native control steps times 0.02 seconds",
+            command_source="recorded applied body-twist sequence; no keyboard or network input",
+            keyboard_controls="unused",
+            live_timing_validation="UNRUN",
+            command_replay={
+                "path": str(args.replay_commands),
+                "file_sha256": replay_file_sha256,
+                "tape_sha256": replay_tape["sha256"],
+                "steps": replay_tape["steps"],
+                "source_metadata": replay_tape["metadata"],
+                "scope": "Command-only simulation replay; current actor and scene are recorded separately, not a physical trajectory reproduction or acceptance test.",
+            },
+        )
+        protocol.pop("motion_keys_body_twist")
+        protocol.pop("lease_s")
+        if getattr(args, "_command_replay_spawn", None) is not None:
+            protocol["spawn_override"] = {
+                "reset_base_pose_range": copy.deepcopy(args._command_replay_spawn),
+                "scope": "Supported fixed spawn inherited from the recorded scripted demo; not feedback steering or physical trajectory reproduction",
+            }
     elif not headless_smoke and args.keyboard_controls == "single-key":
         protocol["keyboard"] = simple_keyboard_protocol()
         protocol["motion_keys_body_twist"] = SINGLE_KEY_MOTION_KEYS
@@ -481,6 +669,12 @@ def main(argv=None):
             input_coverage="legacy synthetic input only; not the interactive single-key default",
             single_key_controls_validation="UNRUN",
         )
+    if args.record_commands:
+        protocol["command_recording"] = {
+            "filename": "command_tape.json",
+            "maximum_steps": 30000,
+            "scope": "Completed applied body twists only; no raw key/network events, observations, actions, recurrent state or PPO. Manual reset/native termination invalidates the tape.",
+        }
     if args.validate_only:
         print(
             json.dumps(
@@ -505,12 +699,14 @@ def main(argv=None):
         f"{args.device}",
         flush=True,
     )
-    app = env = probe = demo = None
+    app = env = probe = demo = replay = recording = None
     report = {"status": "ERROR", "learning_updates": 0, "exit_allowed": False}
-    if args.headless_functional_smoke or args.scripted_demo:
+    if args.headless_functional_smoke or args.scripted_demo or args.replay_commands:
         report["live_timing_validation"] = "UNRUN"
     if args.scripted_demo:
         report["demo_progress"] = {"status": "NOT_STARTED"}
+    if args.replay_commands:
+        report["replay_progress"] = {"status": "NOT_STARTED"}
     code = 2
     try:
         training.write_run_provenance(output, __file__)
@@ -543,8 +739,19 @@ def main(argv=None):
             recorders=RecorderManagerBaseCfg(),
         )
         cfg.validate()
+        resolved_configuration = cfg.to_dict()
+        scene_configuration_sha256 = _scene_configuration_sha256(resolved_configuration)
+        if (
+            replay_tape
+            and replay_tape["metadata"]["resolved_scene_configuration_sha256"]
+            != scene_configuration_sha256
+        ):
+            raise ValueError(
+                "Replay resolved scene configuration differs from the recorded command tape"
+            )
+        report["resolved_scene_configuration_sha256"] = scene_configuration_sha256
         (output / "resolved_env.yaml").write_text(
-            yaml.dump(cfg.to_dict(), sort_keys=False)
+            yaml.dump(resolved_configuration, sort_keys=False)
         )
         if args.terrain == "rough_stress":
             from .operator_stress_terrain import (
@@ -581,9 +788,32 @@ def main(argv=None):
             artifact_sha256=bundle["sha256"],
         )
         report["motor_verification"] = host.motor_verification
+        if args.record_commands:
+            recording = CommandRecording(
+                {
+                    "actor_bundle": copy.deepcopy(bundle),
+                    "checkpoint_sha256": sources["checkpoint"],
+                    "controller_interface_sha256": host.session.interface_sha256,
+                    "portable_motor_sha256": host.motor_verification[
+                        "portable_motor_sha256"
+                    ],
+                    "source_mode": protocol["mode"],
+                    "terrain": args.terrain,
+                    "difficulty_range": list(args.difficulty),
+                    "seed": args.seed,
+                    "spawn_override": copy.deepcopy(protocol.get("spawn_override")),
+                    "resolved_scene_configuration_sha256": scene_configuration_sha256,
+                    "runtime_source_sha256": runtime_source_sha256,
+                }
+            )
+        recording_options = {"recording": recording} if recording is not None else {}
         if args.scripted_demo:
             demo = ScriptedDemo(env, terrain=args.terrain)
-            report.update(demo.run(host, app))
+            report.update(demo.run(host, app, **recording_options))
+        elif args.replay_commands:
+            replay = CommandReplay(env, replay_tape)
+            report["command_replay"] = replay.protocol
+            report.update(replay.run(host, app, **recording_options))
         elif headless_smoke:
             probe = (
                 HeadlessSmoke(env, functional=True)
@@ -593,16 +823,24 @@ def main(argv=None):
             report.update(probe.run(host, app))
         else:
             report.update(
-                run_keyboard_actor(env, host, app, controls=args.keyboard_controls)
+                run_keyboard_actor(
+                    env, host, app, controls=args.keyboard_controls, **recording_options
+                )
             )
         if (
             training.recurrent_evaluation_files(args.checkpoint) != sources
             or training.recurrent_training_identity(args.reference) != identity
             or training.file_sha256(args.actor_bundle) != bundle["sha256"]
+            or (
+                args.replay_commands
+                and training.file_sha256(args.replay_commands) != replay_file_sha256
+            )
         ):
             raise ValueError("Source files or runtime changed during the live session")
         if args.scripted_demo:
             report["status"] = "SCRIPTED_DEMO_COMPLETED_NOT_ACCEPTED"
+        elif args.replay_commands:
+            report["status"] = "COMMAND_REPLAY_COMPLETED_NOT_ACCEPTED"
         elif args.headless_functional_smoke:
             report["status"] = "HEADLESS_FUNCTIONAL_SMOKE_PASSED_NOT_ACCEPTED"
         elif args.headless_smoke:
@@ -619,6 +857,13 @@ def main(argv=None):
         )
         print(report["traceback"], flush=True)
     finally:
+        if replay is not None:
+            try:
+                report["replay_progress"] = replay.progress()
+            except Exception as error:
+                report["replay_progress_error"] = str(error)
+                report["status"] = "ERROR"
+                code = 2
         if demo is not None:
             try:
                 report["demo_progress"] = demo.progress()
@@ -631,6 +876,23 @@ def main(argv=None):
                 report["smoke_progress"] = probe.progress()
             except Exception as error:
                 report["progress_error"] = str(error)
+                report["status"] = "ERROR"
+                code = 2
+        if recording is not None:
+            try:
+                report["command_recording"] = recording.finish(
+                    output / "command_tape.json",
+                    completed=code == 0,
+                    error=(
+                        None if code == 0 else report.get("error", report["status"])
+                    ),
+                )
+                if code == 0 and not report["command_recording"]["complete"]:
+                    raise RuntimeError(
+                        "Command recording did not produce a complete tape"
+                    )
+            except Exception as error:
+                report["command_recording_error"] = str(error)
                 report["status"] = "ERROR"
                 code = 2
         report["session_status"] = report["status"]
