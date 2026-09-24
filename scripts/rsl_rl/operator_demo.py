@@ -45,8 +45,15 @@ SEGMENTS = (
     (150, "final_stand", ZERO),
 )
 STEPS = sum(length for length, _, _ in SEGMENTS)
-TERRAIN_VERSION = "operator_scripted_terrain_demo_v1"
-NONPLANE_TERRAINS = ("rough_flat", "hills", "step_hills", "tilted_ramps")
+TERRAIN_VERSION = "operator_scripted_terrain_demo_v2"
+MOTION_SAMPLE_STEPS = 2
+NONPLANE_TERRAINS = (
+    "rough_flat",
+    "hills",
+    "step_hills",
+    "tilted_ramps",
+    "rough_stress",
+)
 # Initial yaw pi/2 is set by the demo-only scene override, not feedback steering.
 # Forward commands cross the flat central strip to both sides. No reverse or
 # lateral motion on slopes; these were not trained there. Magnitudes are inside
@@ -114,8 +121,11 @@ def demo_protocol(*, terrain="plane"):
         "completion": "full command sequence delivered, not behavioral acceptance",
         "behavioral_acceptance": False,
         "learning_updates": 0,
+        "motion_sample_interval_steps": (
+            None if terrain == "plane" else MOTION_SAMPLE_STEPS
+        ),
         "motion_measurement": (
-            "terrain demo only: every tenth nonterminal native return; root-link body velocity, sampled XY path and center-ray height; diagnostic only, never actor inputs"
+            "terrain demo only: every second nonterminal native return, identically for control and stress; root-link body velocity, sampled XY path and center-ray height; sampled observations, not complete extrema or under-foot support; diagnostic only, never actor inputs"
         ),
     }
 
@@ -219,7 +229,7 @@ class ScriptedDemo:
             raise RuntimeError("Scripted command differs from native command buffer")
         if not torch.equal(self.env.action_manager.action, result.raw_action):
             raise RuntimeError("Scripted action delivery differs from actor output")
-        if self.terrain != "plane" and step % 10 == 0:
+        if self.terrain != "plane" and step % MOTION_SAMPLE_STEPS == 0:
             self.measure_motion(decision)
 
     def measure_motion(self, decision):
@@ -327,7 +337,10 @@ class ScriptedDemo:
                 self.executed_steps * STEP_SECONDS / wall if wall else None
             ),
             "motion_by_phase": motion,
-            "motion_scope": "every tenth nonterminal return, not extrema or acceptance; sampled path chords include previous phase boundary; terminal replacement scene and unsampled tail excluded; center-ray height is not foot contact or slope",
+            "motion_sample_interval_steps": (
+                None if self.terrain == "plane" else MOTION_SAMPLE_STEPS
+            ),
+            "motion_scope": "every second nonterminal return, not extrema or acceptance; sampled path chords include previous phase boundary; terminal replacement scene and unsampled tail excluded; center-ray height is not foot contact or slope",
             "phase_counts": dict(self.phase_counts),
             "actor_reset_mask_steps": list(self.reset_mask_steps),
             "terminal_event": self.terminal_event,

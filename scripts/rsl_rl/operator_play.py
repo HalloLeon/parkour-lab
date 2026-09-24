@@ -19,7 +19,14 @@ import tempfile
 import traceback
 
 
-TERRAINS = ("plane", "rough_flat", "hills", "step_hills", "tilted_ramps")
+TERRAINS = (
+    "plane",
+    "rough_flat",
+    "hills",
+    "step_hills",
+    "tilted_ramps",
+    "rough_stress",
+)
 DEFAULT_DIFFICULTY = (0.15, 0.35)
 NONPLANE_DEMO_POSE_RANGE = {
     "x": (0.0, 0.0),
@@ -200,6 +207,13 @@ def parse_args(argv=None):
             "--difficulty requires finite ordered bounds: 0 <= LOW <= HIGH <= 1"
         )
     args.difficulty = tuple(args.difficulty)
+    if args.terrain == "rough_stress":
+        if not args.scripted_demo:
+            parser.error("rough_stress is evaluation-only and requires --scripted-demo")
+        if args.difficulty[0] <= 0.0 or args.difficulty[0] != args.difficulty[1]:
+            parser.error(
+                "rough_stress requires fixed positive --difficulty LOW HIGH with LOW == HIGH"
+            )
     if args.headless_smoke or args.headless_functional_smoke:
         if args.terrain != "plane" or args.livestream not in (None, 0):
             parser.error("Headless smoke modes require plane terrain and no livestream")
@@ -213,13 +227,45 @@ def parse_args(argv=None):
     return args
 
 
+def _rough_stress_geometry(args, *, size=(16.0, 16.0)):
+    """Build deterministic evaluation geometry without simulator initialization."""
+    from .operator_stress_terrain import (
+        FULL_HEIGHT_BOUND,
+        build_stress_surface,
+        stress_terrain_envelope,
+    )
+
+    difficulty = tuple(args.difficulty)
+    if (
+        not getattr(args, "scripted_demo", False)
+        or len(difficulty) != 2
+        or not all(math.isfinite(value) for value in difficulty)
+        or not 0.0 < difficulty[0] == difficulty[1] <= 1.0
+    ):
+        raise ValueError(
+            "rough_stress requires scripted demo and fixed positive difficulty"
+        )
+    surface = build_stress_surface(difficulty[0], seed=args.seed, size=size)
+    return {
+        "envelope": stress_terrain_envelope(),
+        "realized": surface["metadata"],
+        "fallback_floor_bound": {
+            "minimum_surface_z_m": -FULL_HEIGHT_BOUND * difficulty[0],
+            "scope": "Geometry-derived fallback floor only; minimum clearance, fall margin and tilt limit unchanged",
+        },
+    }
+
+
 def apply_live_overrides(cfg, args, *, command_class, recorders):
     """Call only after archive reconstruction; keep motors/actions/physics intact."""
     if cfg.decimation != 4 or cfg.sim.render_interval != 4 or cfg.sim.dt != 0.005:
         raise ValueError("Live input requires stock physics and end-of-frame rendering")
     generator = cfg.scene.terrain.terrain_generator
+    template_profile = "rough_flat" if args.terrain == "rough_stress" else args.terrain
     selected = [
-        sub for sub in generator.sub_terrains.values() if sub.profile == args.terrain
+        sub
+        for sub in generator.sub_terrains.values()
+        if sub.profile == template_profile
     ]
     if not selected or args.terrain not in TERRAINS:
         raise ValueError(
@@ -227,6 +273,42 @@ def apply_live_overrides(cfg, args, *, command_class, recorders):
         )
     tile = copy.deepcopy(selected[0])
     tile.proportion = 1.0
+    if args.terrain == "rough_stress":
+        from dataclasses import fields
+
+        from isaaclab.utils import configclass
+        from .operator_stress_terrain import RESOLUTION, stress_terrain
+
+        geometry = _rough_stress_geometry(args, size=tuple(generator.size))
+        preflight_geometry = getattr(args, "_rough_stress_geometry", None)
+        if preflight_geometry is not None and geometry != preflight_geometry:
+            raise ValueError(
+                "Native rough_stress geometry differs from the CPU preflight manifest"
+            )
+
+        @configclass
+        class StressTerrainCfg(type(tile)):
+            # Native cfg.copy() uses dataclasses.replace, so this must be a
+            # declared field rather than a dynamically attached attribute.
+            expected_height_sha256: str = ""
+
+        tile = StressTerrainCfg(
+            **{
+                field.name: copy.deepcopy(getattr(tile, field.name))
+                for field in fields(tile)
+                if field.init
+            },
+            expected_height_sha256=geometry["realized"]["height_float64_sha256"],
+        )
+        tile.function = stress_terrain
+        tile.profile = "rough_stress"
+        tile.variant = 0
+        tile.seed = args.seed
+        generator.horizontal_scale = RESOLUTION
+        generator.use_cache = False
+        cfg.terminations.procedural_physical_failure.params["minimum_surface_z_m"] = (
+            geometry["fallback_floor_bound"]["minimum_surface_z_m"]
+        )
     generator.sub_terrains = {args.terrain: tile}
     generator.seed = cfg.seed = args.seed
     generator.num_rows = generator.num_cols = 1
@@ -313,6 +395,8 @@ def main(argv=None):
         )
         del policy
         bundle = actor_bundle_source(args.actor_bundle, sources["checkpoint"], metadata)
+        if args.terrain == "rough_stress":
+            args._rough_stress_geometry = _rough_stress_geometry(args)
     except Exception as error:
         print(f"Live source preflight failed: {error}", flush=True)
         return 2
@@ -347,6 +431,8 @@ def main(argv=None):
         "learning_updates": 0,
         "exit_allowed": False,
     }
+    if args.terrain == "rough_stress":
+        protocol["rough_stress_geometry"] = args._rough_stress_geometry
     if args.scripted_demo:
         protocol.update(
             mode="scripted_demo",
@@ -460,7 +546,31 @@ def main(argv=None):
         (output / "resolved_env.yaml").write_text(
             yaml.dump(cfg.to_dict(), sort_keys=False)
         )
+        if args.terrain == "rough_stress":
+            from .operator_stress_terrain import (
+                clear_stress_terrain_receipt,
+                stress_terrain_receipt,
+            )
+
+            clear_stress_terrain_receipt()
         env = ManagerBasedRLEnv(cfg=cfg)
+        if args.terrain == "rough_stress":
+            receipt = stress_terrain_receipt()
+            report["rough_stress_native_geometry"] = receipt
+            if (
+                not isinstance(receipt, dict)
+                or type(receipt.get("calls")) is not int
+                or receipt["calls"] != 1
+                or receipt.get("seed") != args.seed
+                or receipt.get("difficulty") != args.difficulty[0]
+                or receipt.get("height_float64_sha256")
+                != protocol["rough_stress_geometry"]["realized"][
+                    "height_float64_sha256"
+                ]
+            ):
+                raise ValueError(
+                    "Native rough_stress geometry callback receipt is missing or mismatched"
+                )
         env.reset(seed=args.seed)
         host = NativeActorSession(
             env,
