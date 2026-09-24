@@ -93,11 +93,30 @@ def recurrent_evaluation_protocol(
     reward_capture=False,
     out_and_back=False,
     command_source=False,
+    support_capture=False,
     seed=43,
 ):
     """Predeclared clean-sensor first-attempt screen, not an acceptance gate."""
     if type(seed) is not int or seed not in PROPRIO_EVALUATION_SEEDS:
         raise ValueError("Recurrent development evaluation requires a seed in 43–48")
+    if type(support_capture) is not bool or (
+        support_capture
+        and (
+            difficulty_range is None
+            or type(command_coverage) is not bool
+            or type(command_source) is not bool
+            or sum((command_coverage, command_source)) != 1
+            or long_stops
+            or negative_pivot_first
+            or reward_capture
+            or out_and_back
+        )
+    ):
+        raise ValueError(
+            "Support capture requires explicit difficulty and exactly one canonical "
+            "command-coverage or command-source probe; long-stop, negative-pivot-first, "
+            "reward-capture and out-and-back variants are unsupported"
+        )
     if type(root_point_diagnostics) is not bool:
         raise ValueError("Root-point diagnostics flag must be boolean")
     if root_point_diagnostics and difficulty_range is None:
@@ -346,6 +365,15 @@ def recurrent_evaluation_protocol(
         except ImportError:
             from operator_command_source import command_source_protocol
         protocol.update(command_source_protocol())
+    if support_capture:
+        try:
+            from .operator_support_capture import SUPPORT_CAPTURE_MANIFEST
+        except ImportError:
+            from operator_support_capture import SUPPORT_CAPTURE_MANIFEST
+        protocol.update(
+            foot_telemetry="post_physics_pre_reset_foot_regions_v1",
+            support_capture=copy.deepcopy(SUPPORT_CAPTURE_MANIFEST),
+        )
     return protocol
 
 
@@ -1943,15 +1971,18 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
     )
     out_and_back = protocol.get("version") == "go2_operator_proprio_out_and_back_v1"
     command_source = protocol.get("version") == "go2_operator_proprio_command_source_v1"
+    support_capture = "support_capture" in protocol
     if not command_source and (
         "source_lease" in protocol
         or any(name.startswith("command_source_") for name in trace)
     ):
         raise ValueError("Undeclared command-source telemetry")
-    if not out_and_back and (
+    if not (out_and_back or support_capture) and (
         "foot_telemetry" in protocol or any(name.startswith("foot_") for name in trace)
     ):
         raise ValueError("Undeclared out-and-back foot telemetry")
+    if not support_capture and "sample_index" in trace:
+        raise ValueError("Undeclared support-capture sample index")
     coverage = (
         out_and_back
         or negative_pivot_first
@@ -1966,6 +1997,7 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
             out_and_back=out_and_back,
             root_point_diagnostics="root_point_telemetry" in protocol,
             reward_capture="reward_telemetry" in protocol,
+            support_capture=support_capture,
         )
         if any(protocol.get(key) != value for key, value in expected.items()):
             raise ValueError("Command coverage tape or development limits differ")
@@ -1979,9 +2011,16 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
             seed=protocol.get("seed"),
             root_point_diagnostics="root_point_telemetry" in protocol,
             command_source=True,
+            support_capture=support_capture,
         )
         if any(protocol.get(key) != value for key, value in expected.items()):
             raise ValueError("Command-source integration protocol differs")
+    if support_capture:
+        try:
+            from .operator_support_capture import validate_support_capture
+        except ImportError:
+            from operator_support_capture import validate_support_capture
+        support_summary = validate_support_capture(trace, protocol)
     if native and version != 3:
         raise ValueError("Native terrain probes require summary version 3")
     names = ("plane", "rough_flat", "hills", "step_hills", "tilted_ramps")
@@ -2060,7 +2099,19 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
             from .operator_command_source import validate_command_source_trace
         except ImportError:
             from operator_command_source import validate_command_source_trace
-        source_summary = validate_command_source_trace(trace, protocol)
+        # The additive capture contract was validated above. Replay the exact
+        # unchanged source contract independently; the legacy source scorer
+        # deliberately rejects any foot telemetry declaration of its own.
+        source_protocol = (
+            {
+                key: value
+                for key, value in protocol.items()
+                if key not in ("support_capture", "foot_telemetry")
+            }
+            if support_capture
+            else protocol
+        )
+        source_summary = validate_command_source_trace(trace, source_protocol)
     elif not np.array_equal(trace["command"], expected_command):
         raise ValueError(
             "Recorded command differs from the first-attempt operator tape"
@@ -2549,6 +2600,8 @@ def summarize_recurrent_evaluation(trace, protocol=None, *, version=3):
         summary["out_and_back"] = summarize_out_and_back_coverage(trace, protocol)
     if command_source:
         summary["command_source"] = source_summary
+    if support_capture:
+        summary["support_capture"] = support_summary
     return summary
 
 
@@ -2566,6 +2619,7 @@ def evaluate_recurrent_operator(
     reward_capture=False,
     out_and_back=False,
     command_source=False,
+    support_capture=False,
     seed=43,
     actor_bundle=None,
 ):
@@ -2595,6 +2649,7 @@ def evaluate_recurrent_operator(
         reward_capture=reward_capture,
         out_and_back=out_and_back,
         command_source=command_source,
+        support_capture=support_capture,
         seed=seed,
     )
     generator = env.cfg.scene.terrain.terrain_generator
@@ -2772,8 +2827,21 @@ def evaluate_recurrent_operator(
         capture.reward_terms = (reward_names, reward_weights)
     capture.motor_parity = capture.enabled = True
     try:
-        if out_and_back:
+        if out_and_back or support_capture:
             native_trace.update(capture.configure_foot_diagnostics())
+            if support_capture:
+                native_trace.update(
+                    sample_index=np.arange(protocol["steps"], dtype=np.int64),
+                    foot_geometry_binding_sha256=np.asarray(
+                        hashlib.sha256(
+                            json.dumps(
+                                capture.foot_diagnostics_manifest,
+                                sort_keys=True,
+                                allow_nan=False,
+                            ).encode()
+                        ).hexdigest()
+                    ),
+                )
         with torch.inference_mode():
             for step, phase_id in enumerate(phase_ids):
                 if not is_running():
@@ -2892,6 +2960,12 @@ def evaluate_recurrent_operator(
         env_origins=env.scene.env_origins.detach().cpu().numpy().copy(),
         soft_joint_pos_limits=limits.cpu().numpy().copy(),
     )
+    if support_capture:
+        try:
+            from .operator_support_capture import validate_support_geometry_binding
+        except ImportError:
+            from operator_support_capture import validate_support_geometry_binding
+        validate_support_geometry_binding(capture.foot_diagnostics_manifest, trace)
     if native and not torch.equal(hard_limits, robot.joint_pos_limits):
         raise RuntimeError("Native joint bounds changed during evaluation")
     if (
@@ -2922,7 +2996,7 @@ def evaluate_recurrent_operator(
         ),
         **(
             {"foot_geometry_binding": capture.foot_diagnostics_manifest}
-            if out_and_back
+            if out_and_back or support_capture
             else {}
         ),
         "controller_manifest": session.manifest,
