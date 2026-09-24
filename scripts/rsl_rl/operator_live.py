@@ -335,8 +335,20 @@ def run_keyboard_actor(env, host, app):
                 carb.input.KeyboardEventType.KEY_REPEAT: "repeat",
                 carb.input.KeyboardEventType.KEY_RELEASE: "release",
             }.get(event.type)
+            if event_type is None:
+                # CHAR carries text, not a KeyboardInput enum. Do not inspect
+                # its payload or treat text entry as a motion/arm/lease event.
+                return True
+            key_input = event.input
+            key = (
+                key_input
+                if isinstance(key_input, str)
+                else getattr(key_input, "name", None)
+            )
+            if not isinstance(key, str) or not key:
+                raise ValueError("Keyboard key event requires a nonempty key name")
             control.key_event(
-                event.input.name,
+                key,
                 event_type,
                 now,
                 shift_held=bool(getattr(event, "modifiers", 0) & 1),
