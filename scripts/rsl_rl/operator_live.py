@@ -150,9 +150,11 @@ def run_live_loop(
     mask. Ordinary keyboard operation supplies neither hook nor a step limit.
     Optional timings hold bounded host-call durations, including failed calls;
     no extra CUDA synchronization is introduced. ``clock`` always measures host
-    time (durations, administrative timeout and pacing). Only an explicit offline
-    probe supplies a separate ``command_clock`` and disables pacing; live input
-    defaults to the host clock for every receipt, poll and delivery check.
+    time (durations, administrative timeout and pacing). Explicit functional
+    probes and scripted demonstrations can supply a separate ``command_clock``;
+    a streamed demo retains pacing, while offline functional probes disable it.
+    Live keyboard input always defaults to the host clock for every receipt,
+    poll and delivery check.
     """
     import torch
 

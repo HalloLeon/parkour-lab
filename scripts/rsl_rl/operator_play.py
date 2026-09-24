@@ -1,8 +1,8 @@
-"""Simulation-only play or bounded headless smoke of a verified actor (no PPO).
+"""Simulation-only play, scripted demo or headless smoke of an actor (no PPO).
 
 The physical reference and learned archive are validated before launch. After
 the complete training configuration matches its archive, explicit live-scene
-overrides select one tile and direct keyboard twist. No legacy RMA teleoperator,
+overrides select one tile and direct body-twist commands. No legacy RMA teleoperator,
 privileged steering, hardware driver or per-frame disk capture is used.
 """
 
@@ -145,6 +145,11 @@ def parse_args(argv=None):
         action="store_true",
         help="Fixed 600-step plane functional integration with controlled synthetic command time; permits slow hosts, does not validate live timing",
     )
+    smoke_modes.add_argument(
+        "--scripted-demo",
+        action="store_true",
+        help="Bounded plane body-twist sequence for streamed or local viewing; no keyboard input or live-timing validation",
+    )
     parser.add_argument(
         "--livestream",
         type=int,
@@ -156,7 +161,7 @@ def parse_args(argv=None):
         "--keyboard-controls",
         choices=("single-key", "legacy"),
         default="single-key",
-        help="Interactive controller (default single-key); headless smokes always exercise legacy synthetic input",
+        help="Interactive controller (default single-key); ignored for scripted demo, headless smokes use legacy synthetic input",
     )
     parser.add_argument(
         "--validate-only",
@@ -173,6 +178,8 @@ def parse_args(argv=None):
         parser.error("--seed must be nonnegative")
     if args.cpu_threads < 1:
         parser.error("--cpu-threads must be positive")
+    if args.scripted_demo and args.terrain != "plane":
+        parser.error("--scripted-demo requires plane terrain")
     if args.headless_smoke or args.headless_functional_smoke:
         if args.terrain != "plane" or args.livestream not in (None, 0):
             parser.error("Headless smoke modes require plane terrain and no livestream")
@@ -250,6 +257,9 @@ def main(argv=None):
     from .operator_simple_input import SINGLE_KEY_MOTION_KEYS, simple_keyboard_protocol
     from .teleoperation import validate_operator_display
 
+    if args.scripted_demo:
+        from .operator_demo import ScriptedDemo, demo_protocol
+
     try:
         args.reference = args.reference.resolve(strict=True)
         args.checkpoint = args.checkpoint.resolve(strict=True)
@@ -311,7 +321,18 @@ def main(argv=None):
         "learning_updates": 0,
         "exit_allowed": False,
     }
-    if not headless_smoke and args.keyboard_controls == "single-key":
+    if args.scripted_demo:
+        protocol.update(
+            mode="scripted_demo",
+            command_clock="completed native control steps times 0.02 seconds",
+            command_source="predefined body-twist sequence; no keyboard or network input",
+            keyboard_controls="unused",
+            live_timing_validation="UNRUN",
+            demo=demo_protocol(),
+        )
+        protocol.pop("motion_keys_body_twist")
+        protocol.pop("lease_s")
+    elif not headless_smoke and args.keyboard_controls == "single-key":
         protocol["keyboard"] = simple_keyboard_protocol()
         protocol["motion_keys_body_twist"] = SINGLE_KEY_MOTION_KEYS
         protocol["motion_keys_body_twist_scale"] = (
@@ -367,10 +388,12 @@ def main(argv=None):
         f"{args.device}",
         flush=True,
     )
-    app = env = probe = None
+    app = env = probe = demo = None
     report = {"status": "ERROR", "learning_updates": 0, "exit_allowed": False}
-    if args.headless_functional_smoke:
+    if args.headless_functional_smoke or args.scripted_demo:
         report["live_timing_validation"] = "UNRUN"
+    if args.scripted_demo:
+        report["demo_progress"] = {"status": "NOT_STARTED"}
     code = 2
     try:
         training.write_run_provenance(output, __file__)
@@ -417,7 +440,10 @@ def main(argv=None):
             artifact_sha256=bundle["sha256"],
         )
         report["motor_verification"] = host.motor_verification
-        if headless_smoke:
+        if args.scripted_demo:
+            demo = ScriptedDemo(env)
+            report.update(demo.run(host, app))
+        elif headless_smoke:
             probe = (
                 HeadlessSmoke(env, functional=True)
                 if args.headless_functional_smoke
@@ -434,15 +460,14 @@ def main(argv=None):
             or training.file_sha256(args.actor_bundle) != bundle["sha256"]
         ):
             raise ValueError("Source files or runtime changed during the live session")
-        report["status"] = (
-            "HEADLESS_FUNCTIONAL_SMOKE_PASSED_NOT_ACCEPTED"
-            if args.headless_functional_smoke
-            else (
-                "HEADLESS_SMOKE_PASSED_NOT_ACCEPTED"
-                if args.headless_smoke
-                else "INTERACTIVE_SESSION_FINISHED_NOT_ACCEPTED"
-            )
-        )
+        if args.scripted_demo:
+            report["status"] = "SCRIPTED_DEMO_COMPLETED_NOT_ACCEPTED"
+        elif args.headless_functional_smoke:
+            report["status"] = "HEADLESS_FUNCTIONAL_SMOKE_PASSED_NOT_ACCEPTED"
+        elif args.headless_smoke:
+            report["status"] = "HEADLESS_SMOKE_PASSED_NOT_ACCEPTED"
+        else:
+            report["status"] = "INTERACTIVE_SESSION_FINISHED_NOT_ACCEPTED"
         code = 0
     except KeyboardInterrupt:
         report["status"] = "INTERRUPTED_NOT_ACCEPTED"
@@ -453,6 +478,13 @@ def main(argv=None):
         )
         print(report["traceback"], flush=True)
     finally:
+        if demo is not None:
+            try:
+                report["demo_progress"] = demo.progress()
+            except Exception as error:
+                report["demo_progress_error"] = str(error)
+                report["status"] = "ERROR"
+                code = 2
         if probe is not None:
             try:
                 report["smoke_progress"] = probe.progress()
@@ -485,6 +517,8 @@ def main(argv=None):
         print(f"Live report (before cleanup): {report_path}", flush=True)
         if probe is not None:
             print(f"Smoke progress: {report.get('smoke_progress', {})}", flush=True)
+        if args.scripted_demo:
+            print(f"Demo progress: {report['demo_progress']}", flush=True)
         persist_report()
         for label, resource in resources:
             if resource is not None:
