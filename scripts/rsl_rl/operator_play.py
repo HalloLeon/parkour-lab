@@ -135,10 +135,28 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("reference", type=Path, help="Physical reference checkpoint")
     parser.add_argument(
-        "--checkpoint", type=Path, required=True, help="Learned recurrent checkpoint"
+        "--checkpoint",
+        type=Path,
+        required=True,
+        help="Archived recurrent scene recipe; also the policy source with --actor-bundle",
     )
+    controllers = parser.add_mutually_exclusive_group(required=True)
+    controllers.add_argument(
+        "--actor-bundle",
+        type=Path,
+        help="Legacy motor-bound actor V2 of the exact --checkpoint",
+    )
+    controllers.add_argument(
+        "--controller-artifact",
+        type=Path,
+        help="Explicit inference artifact independent of scene weights; must match the scene motor contract",
+    )
+    from .operator_backend import BACKENDS
+
     parser.add_argument(
-        "--actor-bundle", type=Path, required=True, help="Motor-bound actor V2"
+        "--controller-backend",
+        choices=tuple(BACKENDS),
+        help="Trusted in-code artifact adapter; required with --controller-artifact",
     )
     parser.add_argument("--terrain", choices=TERRAINS, default="plane")
     parser.add_argument(
@@ -212,6 +230,10 @@ def parse_args(argv=None):
         default=Path("logs/rsl_rl/go2_operator_refinement"),
     )
     args = parser.parse_args(argv)
+    if bool(args.controller_artifact) != bool(args.controller_backend):
+        parser.error(
+            "--controller-artifact and --controller-backend require each other"
+        )
     if args.seed < 0:
         parser.error("--seed must be nonnegative")
     if args.cpu_threads < 1:
@@ -253,6 +275,13 @@ def parse_args(argv=None):
     return args
 
 
+def _same_controller_receipt(recorded, current):
+    """Exact JSON identity, without Python's True == 1 or 1 == 1.0 coercion."""
+    return json.dumps(recorded, sort_keys=True, allow_nan=False) == json.dumps(
+        current, sort_keys=True, allow_nan=False
+    )
+
+
 def _validate_replay_scene(args, tape):
     """Keep declared recording context fixed; only one known spawn override exists."""
     metadata = tape["metadata"]
@@ -264,16 +293,20 @@ def _validate_replay_scene(args, tape):
         "resolved_scene_configuration_sha256",
         "runtime_source_sha256",
         "portable_motor_sha256",
-        "checkpoint_sha256",
         "controller_interface_sha256",
-        "actor_bundle",
         "source_mode",
     }
+    generic = args.controller_artifact is not None
+    if generic != ("controller" in metadata):
+        raise ValueError("Replay controller selection mode differs from the recording")
+    checkpoint_key = "scene_checkpoint_sha256" if generic else "checkpoint_sha256"
+    artifact_key = "controller_artifact" if generic else "actor_bundle"
+    required |= {checkpoint_key, artifact_key}
     if not required <= metadata.keys():
         raise ValueError(
             "Replay requires the recorded scene and runtime identity metadata"
         )
-    bundle = metadata["actor_bundle"]
+    bundle = metadata[artifact_key]
     if (
         type(bundle) is not dict
         or set(bundle) != {"path", "sha256"}
@@ -292,11 +325,11 @@ def _validate_replay_scene(args, tape):
             "resolved_scene_configuration_sha256",
             "runtime_source_sha256",
             "portable_motor_sha256",
-            "checkpoint_sha256",
+            checkpoint_key,
             "controller_interface_sha256",
         )
     }
-    identities["actor_bundle.sha256"] = bundle["sha256"]
+    identities[f"{artifact_key}.sha256"] = bundle["sha256"]
     for key, value in identities.items():
         if (
             type(value) is not str
@@ -491,6 +524,7 @@ def main(argv=None):
     args = parse_args(argv)
     headless_smoke = args.headless_smoke or args.headless_functional_smoke
     replay_tape = replay_file_sha256 = None
+    controller_receipt = archived_controller_motor_check = None
     try:
         execution = configure_live_execution(args.cpu_threads)
     except Exception as error:
@@ -501,6 +535,10 @@ def main(argv=None):
     from . import operator_train as training
     from .operator_live import MOTION_KEYS, run_keyboard_actor
     from .operator_runtime import NativeActorSession, actor_bundle_source
+
+    if args.controller_artifact:
+        from .operator_backend import load_controller_artifact
+        from .operator_runtime import NativeControllerSession, validate_controller_scene
     from .operator_live_probe import HeadlessSmoke, smoke_protocol
     from .operator_simple_input import SINGLE_KEY_MOTION_KEYS, simple_keyboard_protocol
     from .teleoperation import validate_operator_display
@@ -513,8 +551,10 @@ def main(argv=None):
     try:
         args.reference = args.reference.resolve(strict=True)
         args.checkpoint = args.checkpoint.resolve(strict=True)
-        args.actor_bundle = args.actor_bundle.resolve(strict=True)
-        immutable_sources = [args.reference, args.checkpoint]
+        artifact_path = (args.controller_artifact or args.actor_bundle).resolve(
+            strict=True
+        )
+        immutable_sources = [args.reference, args.checkpoint, artifact_path]
         if args.replay_commands:
             from parkour_lab.learning.command_tape import load_tape
 
@@ -557,7 +597,32 @@ def main(argv=None):
             )
         )
         del policy
-        bundle = actor_bundle_source(args.actor_bundle, sources["checkpoint"], metadata)
+        if args.controller_artifact:
+            loaded = load_controller_artifact(
+                artifact_path, backend=args.controller_backend, device="cpu"
+            )
+            archived_controller_motor_check = validate_controller_scene(
+                loaded, metadata
+            )
+            controller_receipt = loaded.receipt()
+            bundle = {"path": str(artifact_path), "sha256": loaded.artifact_sha256}
+            if replay_tape:
+                recorded = replay_tape["metadata"]
+                if (
+                    recorded["scene_checkpoint_sha256"] != sources["checkpoint"]
+                    or recorded["controller_artifact"]["sha256"] != bundle["sha256"]
+                    or not _same_controller_receipt(
+                        recorded["controller"], controller_receipt
+                    )
+                    or recorded["controller_interface_sha256"]
+                    != controller_receipt["controller_interface_sha256"]
+                ):
+                    raise ValueError(
+                        "Replay selected controller or scene source differs from recording"
+                    )
+            del loaded
+        else:
+            bundle = actor_bundle_source(artifact_path, sources["checkpoint"], metadata)
         if args.terrain == "rough_stress":
             args._rough_stress_geometry = _rough_stress_geometry(args)
     except Exception as error:
@@ -596,6 +661,12 @@ def main(argv=None):
         "learning_updates": 0,
         "exit_allowed": False,
     }
+    if controller_receipt is not None:
+        for key in ("checkpoint", "checkpoint_sources", "checkpoint_learning_updates"):
+            protocol[f"scene_{key}"] = protocol.pop(key)
+        protocol["controller_artifact"] = protocol.pop("actor_bundle")
+        protocol["controller"] = controller_receipt
+        protocol["archived_controller_motor_check"] = archived_controller_motor_check
     if args.terrain == "rough_stress":
         protocol["rough_stress_geometry"] = args._rough_stress_geometry
     if args.scripted_demo:
@@ -779,20 +850,54 @@ def main(argv=None):
                     "Native rough_stress geometry callback receipt is missing or mismatched"
                 )
         env.reset(seed=args.seed)
-        host = NativeActorSession(
-            env,
-            args.actor_bundle,
-            checkpoint_sha256=sources["checkpoint"],
-            source_manifest=metadata["controller_manifest"],
-            learning_updates=metadata["learning_updates"],
-            artifact_sha256=bundle["sha256"],
-        )
+        if args.controller_artifact:
+            loaded = load_controller_artifact(
+                artifact_path,
+                backend=args.controller_backend,
+                device=args.device,
+                expected_sha256=bundle["sha256"],
+            )
+            if not _same_controller_receipt(loaded.receipt(), controller_receipt):
+                raise ValueError("Controller identity changed after source preflight")
+            host = NativeControllerSession(
+                env,
+                loaded.controller,
+                loaded.motor_contract,
+                preserve_native_raw=loaded.preserve_native_raw,
+            )
+            if (
+                host.session.interface_sha256
+                != controller_receipt["controller_interface_sha256"]
+            ):
+                raise ValueError(
+                    "Native controller interface differs from the preflight receipt"
+                )
+        else:
+            host = NativeActorSession(
+                env,
+                artifact_path,
+                checkpoint_sha256=sources["checkpoint"],
+                source_manifest=metadata["controller_manifest"],
+                learning_updates=metadata["learning_updates"],
+                artifact_sha256=bundle["sha256"],
+            )
         report["motor_verification"] = host.motor_verification
         if args.record_commands:
-            recording = CommandRecording(
+            controller_source = (
                 {
+                    "controller_artifact": copy.deepcopy(bundle),
+                    "controller": copy.deepcopy(controller_receipt),
+                    "scene_checkpoint_sha256": sources["checkpoint"],
+                }
+                if controller_receipt is not None
+                else {
                     "actor_bundle": copy.deepcopy(bundle),
                     "checkpoint_sha256": sources["checkpoint"],
+                }
+            )
+            recording = CommandRecording(
+                {
+                    **controller_source,
                     "controller_interface_sha256": host.session.interface_sha256,
                     "portable_motor_sha256": host.motor_verification[
                         "portable_motor_sha256"
@@ -830,7 +935,7 @@ def main(argv=None):
         if (
             training.recurrent_evaluation_files(args.checkpoint) != sources
             or training.recurrent_training_identity(args.reference) != identity
-            or training.file_sha256(args.actor_bundle) != bundle["sha256"]
+            or training.file_sha256(artifact_path) != bundle["sha256"]
             or (
                 args.replay_commands
                 and training.file_sha256(args.replay_commands) != replay_file_sha256

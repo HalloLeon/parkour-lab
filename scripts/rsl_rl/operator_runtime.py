@@ -8,12 +8,14 @@ packet timestamp or wall clock. Scene/motor configuration must remain frozen.
 
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
 
 import torch
 
 from parkour_lab.learning.controller import ControllerSession, Sample, finite_tensor
+from parkour_lab.learning.motor_contract import validate_motor_contract
 from parkour_lab.learning.recurrent_runtime import (
     BOUND_ACTOR_BUNDLE_VERSION,
     FRAME_DIM,
@@ -39,6 +41,50 @@ NATIVE_SENSORS = {
     "joint_velocity": ((12,), "rad/s", "joint"),
     "stock_previous_raw_action": ((12,), "unitless", "joint"),
 }
+
+
+def validate_native_controller_spec(spec):
+    """Check trusted deployment sensor semantics without starting a simulator."""
+    for name, sensor in spec.sensors.items():
+        trusted = NATIVE_SENSORS.get(name)
+        if sensor.privileged or (trusted is None and sensor.required):
+            raise ValueError(f"Unsupported native deployment sensor: {name}")
+        if (
+            trusted is not None
+            and (sensor.shape, sensor.units, sensor.frame) != trusted
+        ):
+            raise ValueError(f"Native sensor semantics differ: {name}")
+
+
+def validate_controller_scene(loaded, scene_metadata):
+    """Match archived motors, not inference weights, before launching the scene.
+
+    Re-expand the candidate's lossless motor receipt to the scene's recorded
+    batch count. Its hash must reproduce the independently loaded scene archive.
+    Resolved native motors are checked again by NativeControllerSession.
+    """
+    validate_native_controller_spec(loaded.controller.spec)
+    validate_motor_contract(loaded.motor_contract, loaded.controller.spec.manifest())
+    transitions, steps = (
+        scene_metadata["environment_transitions"],
+        scene_metadata["control_steps"],
+    )
+    if (
+        type(transitions) is not int
+        or type(steps) is not int
+        or steps < 1
+        or transitions < steps
+        or transitions % steps
+    ):
+        raise ValueError("Invalid archived scene batch accounting")
+    contract = copy.deepcopy(loaded.motor_contract)
+    contract["source_num_envs"] = transitions // steps
+    validate_motor_contract(contract, scene_metadata["controller_manifest"])
+    return {
+        "status": "ARCHIVED_MOTOR_COMPATIBLE_NOT_SIMULATED",
+        "native_motor_verification": "UNRUN",
+        "scope": "Exact archived motor compatibility after lossless batch normalization; no policy equality or behavioral acceptance",
+    }
 
 
 def _check_bundle_source(
@@ -96,12 +142,7 @@ class NativeControllerSession:
             preserve_native_raw=preserve_native_raw,
         )
         self.motor_verification = self.motor.motor_verification
-        for name, spec in controller.spec.sensors.items():
-            trusted = NATIVE_SENSORS.get(name)
-            if spec.privileged or (trusted is None and spec.required):
-                raise ValueError(f"Unsupported native deployment sensor: {name}")
-            if trusted is not None and (spec.shape, spec.units, spec.frame) != trusted:
-                raise ValueError(f"Native sensor semantics differ: {name}")
+        validate_native_controller_spec(controller.spec)
         command = env.command_manager.get_term("base_velocity")
         if (
             command.cfg.heading_command
