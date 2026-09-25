@@ -28,7 +28,7 @@ def parse_args(argv=None):
         "--checkpoint",
         type=Path,
         required=True,
-        help="Completed final v3 ROA checkpoint",
+        help="Completed ROA learning or estimator-refinement checkpoint",
     )
     parser.add_argument("--controller-artifact", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=1043)

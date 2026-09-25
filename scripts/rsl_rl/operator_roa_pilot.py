@@ -354,7 +354,9 @@ def run_pilot(
         )
 
 
-def _adapt_history(host, policy, optimizer, obs, record, report, *, require_change):
+def _adapt_history(
+    host, policy, optimizer, obs, record, report, *, require_change, observe=None
+):
     """Collect with fixed causal weights, then fit only the history estimator."""
     import torch
     from parkour_lab.learning.operator_roa import (
@@ -388,6 +390,8 @@ def _adapt_history(host, policy, optimizer, obs, record, report, *, require_chan
     samples = []
     with torch.no_grad():
         for _ in range(HISTORY_STEPS):
+            if observe is not None:
+                observe()
             samples.append(
                 (
                     frames(obs).clone(),
