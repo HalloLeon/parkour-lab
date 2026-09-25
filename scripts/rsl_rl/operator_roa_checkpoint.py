@@ -180,26 +180,16 @@ def _load_refinement(path, hashes, saved, protocol, report):
         != source["physical_reference"]
     ):
         raise ValueError("ROA refinement differs from its completed v3 source receipt")
-    _validate_refinement_exposure(report["training_exposure"], count)
+    _validate_training_exposure(
+        report["training_exposure"],
+        count,
+        steps=SCHEDULE["blocks"] * SCHEDULE["history_block_steps"],
+    )
     for key, digest in (
         ("evaluations_before", source["policy_state_sha256"]),
         ("evaluations_after", report["policy_state_sha256"]),
     ):
-        evaluation = report[key]
-        if (
-            evaluation["version"] != "operator_roa_history_evaluation_v1"
-            or evaluation["seed"] != seed + 1000
-            or evaluation["control_steps"] != 900
-            or evaluation["num_envs"] != count
-            or evaluation["environment_transitions"] != 900 * count
-            or evaluation["complete_tape"] is not True
-            or evaluation["policy_state_sha256_before"] != digest
-            or evaluation["policy_state_sha256_after"] != digest
-            or evaluation.get("diagnostic_input") is not None
-        ):
-            raise ValueError(
-                "ROA refinement requires complete frozen causal evaluations"
-            )
+        _validate_frozen_evaluation(report[key], count, seed + 1000, digest)
     _validate_native_motor(saved, report, count)
     if binding_sha256(saved["motor_contract"]["binding"]) != binding_sha256(
         source_contract["binding"]
@@ -236,11 +226,23 @@ def _load_refinement(path, hashes, saved, protocol, report):
     return policy, saved["motor_contract"], saved["motor_manifest"], receipt
 
 
-def _validate_refinement_exposure(exposure, count):
-    """Accounting only: no minimum motion, support, or success is inferred."""
-    from .operator_roa_adapt import SCHEDULE
+def _validate_frozen_evaluation(evaluation, count, seed, digest):
+    if (
+        evaluation["version"] != "operator_roa_history_evaluation_v1"
+        or evaluation["seed"] != seed
+        or evaluation["control_steps"] != 900
+        or evaluation["num_envs"] != count
+        or evaluation["environment_transitions"] != 900 * count
+        or evaluation["complete_tape"] is not True
+        or evaluation["policy_state_sha256_before"] != digest
+        or evaluation["policy_state_sha256_after"] != digest
+        or evaluation.get("diagnostic_input") is not None
+    ):
+        raise ValueError("ROA stage requires complete frozen causal evaluations")
 
-    steps = SCHEDULE["blocks"] * SCHEDULE["history_block_steps"]
+
+def _validate_training_exposure(exposure, count, *, steps):
+    """Accounting only: no minimum motion, support, or success is inferred."""
     profiles = ("plane", "rough_flat", "hills", "step_hills", "tilted_ramps")
     columns, levels = exposure["column_ids"], exposure["level_ids"]
     if (
@@ -250,7 +252,7 @@ def _validate_refinement_exposure(exposure, count):
         or any(type(value) is not int or not 0 <= value < 20 for value in columns)
         or any(type(value) is not int or not 0 <= value < 3 for value in levels)
     ):
-        raise ValueError("Invalid ROA refinement exposure rows or collection budget")
+        raise ValueError("Invalid ROA training exposure rows or collection budget")
     expected = {(profile, level): 0 for profile in profiles for level in range(3)}
     for column, level in zip(columns, levels, strict=True):
         expected[(profiles[column // 4], level)] += steps
@@ -277,15 +279,60 @@ def _validate_refinement_exposure(exposure, count):
             )
             or not group[names[3]] <= group[names[2]] <= group[names[1]]
         ):
-            raise ValueError("Invalid ROA refinement exposure sample accounting")
+            raise ValueError("Invalid ROA training exposure sample accounting")
         observed.add(key)
     if observed != set(expected):
-        raise ValueError("Incomplete ROA refinement exposure groups")
+        raise ValueError("Incomplete ROA training exposure groups")
 
 
-def load_completed_checkpoint(path, *, allow_refinement=True):
-    """Completed final v3 or its single estimator-only stage; no partial selection."""
-    from .operator_roa_pilot import learning_coefficients
+def _environment_source(saved, protocol, report):
+    """Validate the one allowed joint stage over estimator-refinement ancestry."""
+    source_path = protocol["environment_checkpoint"]
+    seed, count = protocol["seed"], protocol["num_envs"]
+    if (
+        type(source_path) is not str
+        or not Path(source_path).is_absolute()
+        or type(seed) is not int
+        or seed < 0
+        or saved["completed_cycles"] != 1000
+        or any(saved["regularization_coefficients"])
+        or protocol["terrain_rows"] != 3
+        or protocol["difficulty_range"] != [0.15, 0.55]
+        or protocol["evaluation"]["seed"] != seed + 1000
+        or protocol["planned_environment_transitions"] != 29000 * count
+        or protocol["adaptation_optimizer"]["learning_rate"] != 1e-4
+        or report["ppo_options"]["learning_rate"] != 1e-4
+        or report["ppo_options"]["schedule"] != "fixed"
+    ):
+        raise ValueError("Require the bounded 1000-update free-environment ROA stage")
+    _, contract, _, source = load_completed_checkpoint(
+        source_path, allow_environment=False
+    )
+    if (
+        source.get("stage") != "estimator_refinement"
+        or source["learning_updates"] != 1000
+        or saved["learning_source"] != source
+        or source["physical_reference"]
+        != protocol["source_identity"]["physical_reference"]
+        or source["training_seed"] == seed
+        or binding_sha256(contract["binding"])
+        != binding_sha256(saved["motor_contract"]["binding"])
+    ):
+        raise ValueError(
+            "Environment stage differs from its estimator-refinement source"
+        )
+    _validate_training_exposure(report["training_exposure"], count, steps=27200)
+    for key, digest in (
+        ("evaluation_before", source["policy_state_sha256"]),
+        ("evaluation_after", report["policy_state_sha256"]),
+    ):
+        _validate_frozen_evaluation(report[key], count, seed + 1000, digest)
+    return source
+
+
+def load_completed_checkpoint(path, *, allow_refinement=True, allow_environment=True):
+    """Completed bounded stages with finite ancestry; no partial/resume selection."""
+    from .operator_roa_pilot import ENVIRONMENT_VERSION, learning_coefficients
 
     path = Path(path).resolve(strict=True)
     paths = (path, path.parent / "training_protocol.json", path.parent / "report.json")
@@ -296,6 +343,11 @@ def load_completed_checkpoint(path, *, allow_refinement=True):
             io.BytesIO(encoded[str(path)]), map_location="cpu", weights_only=True
         )
         protocol, report = (json.loads(encoded[str(item)]) for item in paths[1:])
+        environment = saved["version"] == ENVIRONMENT_VERSION
+        if environment and (not allow_refinement or not allow_environment):
+            raise ValueError(
+                "Require original v3/refinement ancestry, not an environment stage"
+            )
         if saved["version"] == "operator_roa_estimator_refinement_v1":
             if not allow_refinement:
                 raise ValueError(
@@ -303,7 +355,11 @@ def load_completed_checkpoint(path, *, allow_refinement=True):
                 )
             return _load_refinement(path, hashes, saved, protocol, report)
         updates, count = saved["completed_cycles"], protocol["num_envs"]
-        status = "ROA_INCREMENTAL_EXPERIMENT_COMPLETED_NOT_QUALIFIED"
+        status = (
+            "ROA_ENVIRONMENT_LEARNING_COMPLETED_NOT_QUALIFIED"
+            if environment
+            else "ROA_INCREMENTAL_EXPERIMENT_COMPLETED_NOT_QUALIFIED"
+        )
         expected_steps = updates * 24 + updates // 20 * 64 + 1800
         motor = report["motor_delivery"]
         physical = protocol["source_identity"]["physical_reference"]
@@ -323,7 +379,8 @@ def load_completed_checkpoint(path, *, allow_refinement=True):
                 "history_interval",
                 "learning_source",
             }
-            or saved["version"] != "operator_roa_learning_pilot_v3"
+            or saved["version"]
+            not in ("operator_roa_learning_pilot_v3", ENVIRONMENT_VERSION)
             or protocol["version"] != saved["version"]
             or type(updates) is not int
             or updates not in (100, 500, 1000)
@@ -388,9 +445,14 @@ def load_completed_checkpoint(path, *, allow_refinement=True):
                 for digest in physical.values()
             )
         ):
-            raise ValueError("Require a source-bound completed final v3 ROA experiment")
+            raise ValueError(
+                "Require a source-bound completed final environment ROA experiment"
+                if environment
+                else "Require a source-bound completed final v3 ROA experiment"
+            )
         _validate_native_motor(saved, report, count)
         policy = _validated_policy(saved, report)
+        source = _environment_source(saved, protocol, report) if environment else None
     except (KeyError, TypeError, AttributeError, RuntimeError, OverflowError) as error:
         raise ValueError("Malformed or incomplete ROA experiment") from error
     receipt = {
@@ -404,6 +466,23 @@ def load_completed_checkpoint(path, *, allow_refinement=True):
         "source_cleanup": report.get("cleanup"),
         "scope": "Completed final v3 experiment; simulator-development only, not hardware qualification",
     }
+    if source is not None:
+        inherited_adaptation = (
+            source["learning_updates"] // 20 * 16
+            + source["additional_adaptation_optimizer_steps"]
+        )
+        receipt.update(
+            files={**source["files"], **hashes},
+            learning_updates=source["learning_updates"] + updates,
+            stage_learning_updates=updates,
+            stage_adaptation_optimizer_steps=report["adaptation_optimizer_steps"],
+            inherited_adaptation_optimizer_steps=inherited_adaptation,
+            total_adaptation_optimizer_steps=inherited_adaptation
+            + report["adaptation_optimizer_steps"],
+            counting_scope="Selected v3 experiment and descendant stages only; excludes the v2 initialization pilot and stock pretraining",
+            stage="environment_learning",
+            scope="Bounded free-environment joint ROA stage; simulator-development only, not terrain or hardware qualification",
+        )
     verify_source_files(receipt)
     return policy, saved["motor_contract"], saved["motor_manifest"], receipt
 

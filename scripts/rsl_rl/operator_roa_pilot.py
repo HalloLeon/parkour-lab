@@ -17,6 +17,7 @@ import time
 import traceback
 
 VERSION = "operator_roa_learning_pilot_v3"
+ENVIRONMENT_VERSION = "operator_roa_environment_learning_v1"
 REGULARIZATION_COEFFICIENTS = (0.1, 0.55, 1.0)
 ROLLOUT_STEPS = 24
 HISTORY_STEPS = 64
@@ -53,10 +54,16 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--cpu-threads", type=int, default=4)
-    parser.add_argument(
+    sources = parser.add_mutually_exclusive_group()
+    sources.add_argument(
         "--learning-checkpoint",
         type=Path,
         help="Completed v2 pilot.pt: initialize a bounded learning experiment; fresh optimizers",
+    )
+    sources.add_argument(
+        "--environment-checkpoint",
+        type=Path,
+        help="Completed estimator-refined adapted.pt: 1000 new joint updates in free terrain environments",
     )
     parser.add_argument(
         "--regularization",
@@ -72,12 +79,21 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.seed < 0 or args.cpu_threads < 1:
         parser.error("seed must be nonnegative and cpu-threads positive")
-    if (args.learning_checkpoint is None) != (args.regularization is None):
-        parser.error("--learning-checkpoint and --regularization must be used together")
-    if args.learning_updates is not None and args.learning_checkpoint is None:
-        parser.error("--learning-updates requires --learning-checkpoint")
-    if args.learning_checkpoint is not None and args.learning_updates is None:
-        args.learning_updates = LEARNING_UPDATES
+    learning = args.learning_checkpoint or args.environment_checkpoint
+    if (learning is None) != (args.regularization is None):
+        parser.error("A learning checkpoint and --regularization must be used together")
+    if args.learning_updates is not None and learning is None:
+        parser.error("--learning-updates requires a learning checkpoint")
+    if learning is not None and args.learning_updates is None:
+        args.learning_updates = (
+            1000 if args.environment_checkpoint else LEARNING_UPDATES
+        )
+    if args.environment_checkpoint and (
+        args.regularization != "off" or args.learning_updates != 1000
+    ):
+        parser.error(
+            "Environment learning requires --regularization off and 1000 new updates"
+        )
     return args
 
 
@@ -146,6 +162,23 @@ def load_learning_source(path, physical_reference):
         "optimizer": "fresh PPO and adaptation Adam; weights-only warm start, NOT exact resume",
         "comparison": "Effect of ADDITIONAL regularization from a common already-ROA-initialized policy; not ROA versus no ROA",
     }
+
+
+def load_environment_source(path, physical_reference, seed):
+    """Only the completed, source-linked estimator repair can seed this stage."""
+    from .operator_roa_checkpoint import load_completed_checkpoint
+
+    policy, contract, _, receipt = load_completed_checkpoint(path)
+    if (
+        receipt.get("stage") != "estimator_refinement"
+        or receipt["physical_reference"] != physical_reference
+        or receipt["learning_updates"] != 1000
+        or receipt["training_seed"] == seed
+    ):
+        raise ValueError(
+            "Require the completed 1000-update estimator-refined source and a fresh seed"
+        )
+    return {"policy_state": policy.state_dict(), "motor_contract": contract}, receipt
 
 
 def validate_events(cfg):
@@ -332,7 +365,16 @@ class PilotEnvironment:
 
 
 def run_pilot(
-    env, app, source_state, runner_cfg, output, report, publish, *, learning=None
+    env,
+    app,
+    source_state,
+    runner_cfg,
+    output,
+    report,
+    publish,
+    *,
+    learning=None,
+    environment=False,
 ):
     started = time.perf_counter()
     host = PilotEnvironment(env, app)
@@ -340,7 +382,14 @@ def run_pilot(
     report["dynamics_std"] = host.dynamics.std(dim=0, unbiased=False).cpu().tolist()
     try:
         _learn_pilot(
-            host, source_state, runner_cfg, output, report, publish, learning=learning
+            host,
+            source_state,
+            runner_cfg,
+            output,
+            report,
+            publish,
+            learning=learning,
+            environment=environment,
         )
     finally:
         motor_progress = host.bridge.progress()
@@ -455,7 +504,15 @@ def _adapt_history(
 
 
 def _learn_pilot(
-    host, source_state, runner_cfg, output, report, publish, *, learning=None
+    host,
+    source_state,
+    runner_cfg,
+    output,
+    report,
+    publish,
+    *,
+    learning=None,
+    environment=False,
 ):
     import torch
     from parkour_lab.learning.operator_roa import (
@@ -469,6 +526,10 @@ def _learn_pilot(
     from parkour_lab.learning.operator_roa_training import ROAPPO
 
     env = host.env
+    if environment and learning is None:
+        raise ValueError("Environment learning requires a validated warm start")
+    evaluation_seed = learning[3] + 1000 if environment else EVALUATION_SEED
+    exposure = None
     obs, _ = host.reset()
     policy, reference = build_policy(obs, source_state)
     actor = policy.actor
@@ -512,7 +573,7 @@ def _learn_pilot(
                 "Learning checkpoint state is invalid or differs from report"
             )
         report["evaluation_before"] = evaluate_history(
-            host, policy, seed=EVALUATION_SEED
+            host, policy, seed=evaluation_seed
         )
         publish()
         # Reset the training RNG and physical episodes after the diagnostic.
@@ -521,6 +582,15 @@ def _learn_pilot(
         policy.train()
         coefficients = learning_coefficients(regularization, updates)
         history_interval = HISTORY_INTERVAL
+        if environment:
+            from .operator_roa_adapt import TerrainExposure
+
+            exposure = TerrainExposure(env)
+            report.update(
+                inherited_ppo_updates=metadata["learning_updates"],
+                optimizer_initialization="Fresh PPO and history Adam; full-policy warm start, NOT exact resume",
+                update_counting_scope="Counts from the selected v3 experiment onward; excludes the ancestor's three-update mechanism pilot",
+            )
     options = copy.deepcopy(runner_cfg["algorithm"])
     options.pop("class_name")
     options.update(
@@ -533,7 +603,9 @@ def _learn_pilot(
     report["ppo_options"] = options
     algorithm = ROAPPO(policy, device=env.device, **options)
     algorithm.init_storage("rl", env.num_envs, ROLLOUT_STEPS, obs, [12])
-    optimizer = torch.optim.Adam(actor.estimator.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(
+        actor.estimator.parameters(), lr=1e-4 if environment else 1e-3
+    )
     report["cycles"] = []
     report["ppo_updates_completed"] = 0
     report["adaptation_optimizer_steps"] = 0
@@ -545,7 +617,7 @@ def _learn_pilot(
         pending = path.with_suffix(".pt.pending")
         torch.save(
             {
-                "version": VERSION,
+                "version": ENVIRONMENT_VERSION if environment else VERSION,
                 "readiness_only": True,
                 "deployment_allowed": False,
                 "policy_state": policy.state_dict(),
@@ -577,6 +649,8 @@ def _learn_pilot(
         algorithm.regularization_coef = coefficient
         with torch.no_grad():
             for _ in range(ROLLOUT_STEPS):
+                if exposure is not None:
+                    exposure.sample()
                 action = algorithm.act(obs)
                 obs, reward, done, extras = host.step(action, "privileged_ppo")
                 algorithm.process_env_step(obs, reward, done.long(), extras)
@@ -611,6 +685,8 @@ def _learn_pilot(
             f"ROA update {cycle}/{len(coefficients)}: privileged PPO complete; lambda={coefficient}",
             flush=True,
         )
+        if exposure is not None:
+            report["training_exposure"] = exposure.report()
         publish()
         if cycle % history_interval:
             continue
@@ -623,13 +699,19 @@ def _learn_pilot(
             record,
             report,
             require_change=learning is None,
+            observe=None if exposure is None else exposure.sample,
         )
         print(
             f"ROA update {cycle}/{len(coefficients)}: history adaptation complete",
             flush=True,
         )
-        if learning is not None and (cycle % 100 == 0 or cycle == len(coefficients)):
+        checkpoint_interval = len(coefficients) if environment else 100
+        if learning is not None and (
+            cycle % checkpoint_interval == 0 or cycle == len(coefficients)
+        ):
             save_checkpoint(cycle)
+        if exposure is not None:
+            report["training_exposure"] = exposure.report()
         publish()
 
     policy.eval()
@@ -643,7 +725,7 @@ def _learn_pilot(
                 obs, _, _, _ = host.step(action, "frozen_history_integration")
     else:
         report["evaluation_after"] = evaluate_history(
-            host, policy, seed=EVALUATION_SEED
+            host, policy, seed=evaluation_seed
         )
         report["evaluation_initial_conditions_match"] = {
             name: (
@@ -669,13 +751,21 @@ def _learn_pilot(
         save_checkpoint(len(coefficients))
     report.update(
         status=(
-            "ROA_LEARNING_PILOT_COMPLETED_NOT_QUALIFIED"
-            if learning is None
-            else "ROA_INCREMENTAL_EXPERIMENT_COMPLETED_NOT_QUALIFIED"
+            "ROA_ENVIRONMENT_LEARNING_COMPLETED_NOT_QUALIFIED"
+            if environment
+            else (
+                "ROA_LEARNING_PILOT_COMPLETED_NOT_QUALIFIED"
+                if learning is None
+                else "ROA_INCREMENTAL_EXPERIMENT_COMPLETED_NOT_QUALIFIED"
+            )
         ),
         policy_state_sha256=frozen_hash,
         frozen_rollout_scope="Same training scene/dynamics; no heldout terrain or deployment qualification",
     )
+    if environment:
+        report["cumulative_ppo_updates"] = metadata["learning_updates"] + len(
+            coefficients
+        )
 
 
 def finish_session(env, app, report, publish, code):
@@ -719,7 +809,9 @@ def finish_session(env, app, report, publish, code):
 
 def main(argv=None):
     args = parse_args(argv)
-    print(f"ROA entry point: {Path(__file__).resolve()} ({VERSION})", flush=True)
+    environment = args.environment_checkpoint is not None
+    version = ENVIRONMENT_VERSION if environment else VERSION
+    print(f"ROA entry point: {Path(__file__).resolve()} ({version})", flush=True)
     from .operator_play import configure_live_execution, verify_live_execution
 
     execution = configure_live_execution(args.cpu_threads)
@@ -737,13 +829,22 @@ def main(argv=None):
     if training.recurrent_training_identity(args.reference) != identity:
         raise ValueError("Source or runtime changed during preflight")
     learning = None
-    if args.learning_checkpoint is not None:
-        args.learning_checkpoint = args.learning_checkpoint.resolve(strict=True)
-        if args.output_parent.resolve().is_relative_to(args.learning_checkpoint.parent):
-            raise ValueError("Output must be outside the immutable learning source")
-        checkpoint, metadata = load_learning_source(
-            args.learning_checkpoint, identity["physical_reference"]
-        )
+    learning_path = args.environment_checkpoint or args.learning_checkpoint
+    if learning_path is not None:
+        learning_path = learning_path.resolve(strict=True)
+        if environment:
+            checkpoint, metadata = load_environment_source(
+                learning_path, identity["physical_reference"], args.seed
+            )
+        else:
+            checkpoint, metadata = load_learning_source(
+                learning_path, identity["physical_reference"]
+            )
+        if any(
+            args.output_parent.resolve().is_relative_to(Path(path).parent)
+            for path in metadata["files"]
+        ):
+            raise ValueError("Output must be outside every immutable source run")
         learning = (
             checkpoint,
             metadata,
@@ -757,7 +858,7 @@ def main(argv=None):
     ).resolve()
     print(f"ROA learning pilot: {output}", flush=True)
     protocol = {
-        "version": VERSION,
+        "version": version,
         "source_identity": identity,
         "seed": args.seed,
         "stock_motor_source": str(args.reference),
@@ -837,8 +938,25 @@ def main(argv=None):
             ),
             adaptation_collection="64 fixed-weight history-owned steps after each 20 PPO updates; then estimator-only fitting",
             schedule_scope="Bounded incremental experiment; warmup20 then lambda ramp to0.1 at100 and hold versus0 control, NOT original paper schedule or convergence",
-            learning_scope=metadata["comparison"],
+            learning_scope=(
+                "Joint hill/rough-environment motor acquisition from estimator-refined policy; NOT true vertical-step training or qualification"
+                if environment
+                else metadata["comparison"]
+            ),
         )
+    if environment:
+        from .operator_roa_adapt import DIFFICULTY
+
+        protocol.update(
+            environment_checkpoint=str(learning_path),
+            terrain_rows=3,
+            difficulty_range=DIFFICULTY,
+            checkpoint_interval=args.learning_updates,
+            terrain="Existing five-profile free-command environments, three static rows; slanted step_hills are NOT vertical stairs; no courses, waypoints or success resets",
+            schedule_scope="1000 new PPO updates, H block every20; zero ADDITIONAL regularization from the already-ROA-initialized source; fresh optimizers, not resume",
+        )
+        protocol["evaluation"]["seed"] = args.seed + 1000
+        protocol["adaptation_optimizer"]["learning_rate"] = 1e-4
     report = {
         "status": "RUNNING_NOT_QUALIFIED",
         "exit_allowed": False,
@@ -854,6 +972,12 @@ def main(argv=None):
     try:
         training.write_run_provenance(output, __file__)
         training.write_json(output / "training_protocol.json", protocol)
+        if learning is not None:
+            from .operator_roa_checkpoint import verify_source_files
+
+            verify_source_files(metadata)
+        if training.recurrent_training_identity(args.reference) != identity:
+            raise ValueError("Source or runtime changed before simulator launch")
         if (
             importlib.metadata.version("isaaclab")
             not in training.PROCEDURAL_ISAACLAB_DISTRIBUTIONS
@@ -870,6 +994,8 @@ def main(argv=None):
 
         args.iterations = protocol["cycles"]
         cfg, runner_cfg = training.proprioceptive_procedural_configs(saved, agent, args)
+        if environment:
+            training._configure_recurrent_terrain(cfg, DIFFICULTY, num_rows=3)
         validate_events(cfg)
         cfg.validate()
         (output / "resolved_env.yaml").write_text(
@@ -885,6 +1011,7 @@ def main(argv=None):
             report,
             publish,
             learning=learning,
+            environment=environment,
         )
         if training.recurrent_training_identity(args.reference) != identity:
             raise RuntimeError("Source or runtime changed during learning pilot")
