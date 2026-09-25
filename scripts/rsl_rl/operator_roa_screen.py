@@ -1,8 +1,9 @@
 """Frozen exported ROA controller on newly seeded native procedural terrain.
 
 This development screen uses the training sensor-noise model. A separate frozen
-training actor is a parity oracle only, never an action fallback. No PPO, keyboard
-input, online weight updates, hardware commands or qualification pass is possible.
+training actor is a parity oracle, never an action fallback. Explicit input
+diagnostics instead drive the frozen motor with one privileged input replacement;
+they are not deployable-controller evaluations. No learning or qualification pass.
 """
 
 from __future__ import annotations
@@ -45,6 +46,11 @@ def parse_args(argv=None):
         metavar=("LOW", "HIGH"),
     )
     parser.add_argument("--num-envs", type=int, choices=(80, 160, 320), default=80)
+    parser.add_argument(
+        "--diagnostic-input",
+        choices=("true_velocity", "privileged_latent"),
+        help="Traversal only: frozen privileged input intervention, NOT deployable or qualifying",
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--cpu-threads", type=int, default=4)
     parser.add_argument("--validate-only", action="store_true")
@@ -54,6 +60,8 @@ def parse_args(argv=None):
         default=Path("logs/rsl_rl/go2_operator_refinement"),
     )
     args = parser.parse_args(argv)
+    if args.diagnostic_input and args.terrain_suite != "traversal":
+        parser.error("Input diagnostics require --terrain-suite traversal")
     if args.terrain_suite == "traversal" and args.difficulty is not None:
         parser.error("Traversal has fixed SI geometry; do not supply --difficulty")
     if args.terrain_suite == "procedural" and args.difficulty is None:
@@ -163,12 +171,25 @@ def main(argv=None):
         "learning_updates": 0,
         "exit_allowed": False,
     }
+    if args.diagnostic_input:
+        protocol.update(
+            diagnostic_input=args.diagnostic_input,
+            action_source="PRIVILEGED_SIMULATION_DIAGNOSTIC_NOT_DEPLOYABLE",
+            sensing="Unchanged noisy45 frames/history; replace only motor velocity with true native body-COM velocity OR history latent with privileged dynamics latent, as selected",
+            scope=protocol["scope"]
+            + "; simulator-input intervention, NOT a causal controller test or an oracle upper bound",
+        )
     training.write_json(output / "evaluation_protocol.json", protocol)
     report = {
         "status": "SOURCE_VALIDATED_NOT_SIMULATED",
         "learning_updates": 0,
         "exit_allowed": False,
     }
+    if args.diagnostic_input:
+        report.update(
+            diagnostic_input=args.diagnostic_input,
+            action_source=protocol["action_source"],
+        )
 
     def publish():
         training.write_json(output / "report.json", report)
@@ -242,6 +263,10 @@ def main(argv=None):
             controller=loaded.controller,
             command_tape=command_tape,
             observer=probe,
+            diagnostic_input=args.diagnostic_input,
+            diagnostic_output=(
+                output / "input_diagnostic_trace.npz" if args.diagnostic_input else None
+            ),
         )
         if probe is not None:
             report["traversal"] = probe.report()
@@ -251,7 +276,11 @@ def main(argv=None):
             raise RuntimeError("Physical source or runtime changed during screen")
         if training.file_sha256(args.controller_artifact) != loaded.artifact_sha256:
             raise RuntimeError("Controller artifact changed during screen")
-        report["status"] = "ROA_EXPORTED_SCREEN_COMPLETED_NOT_QUALIFIED"
+        report["status"] = (
+            "ROA_INPUT_DIAGNOSTIC_COMPLETED_NOT_DEPLOYABLE"
+            if args.diagnostic_input
+            else "ROA_EXPORTED_SCREEN_COMPLETED_NOT_QUALIFIED"
+        )
         code = 0
     except Exception as error:
         report.update(

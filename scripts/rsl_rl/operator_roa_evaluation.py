@@ -1,4 +1,4 @@
-"""Frozen causal ROA diagnostics on the training geometry, never a behavior gate."""
+"""Frozen ROA evaluation and explicit simulator-input diagnostics, never a gate."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from copy import deepcopy
+from pathlib import Path
 
 import torch
 
@@ -167,6 +168,77 @@ def _summary(totals):
     }
 
 
+def _input_diagnostic_report(records, mode, terrain, output):
+    """Archive pre-action interventions separately from deployable-controller evidence."""
+    import numpy as np
+
+    arrays = {
+        name: np.stack([record[name] for record in records]) for name in records[0]
+    }
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Never overwrite prior evidence, even when called outside the screen CLI.
+    with output.open("xb") as stream:
+        np.savez_compressed(stream, **arrays)
+    profiles = (
+        [terrain["profile_by_column"][column] for column in terrain["column_ids"]]
+        if terrain["profile_by_column"] is not None
+        else ["unmapped"] * arrays["first_attempt_valid"].shape[1]
+    )
+    moving = np.any(arrays["command_b"][..., :2] != 0, axis=-1)
+    groups = {}
+    for profile in dict.fromkeys(profiles):
+        selected = np.array([name == profile for name in profiles])[None, :]
+        first = arrays["first_attempt_valid"] & selected
+        groups[profile] = {}
+        for population, mask in (
+            ("first_episode", first),
+            ("moving_first_episode", first & moving),
+        ):
+            predicted = arrays["estimated_velocity_b_m_s"][mask].astype(np.float64)
+            actual = arrays["true_velocity_b_m_s"][mask].astype(np.float64)
+            delta = arrays["applied_raw_action"][mask].astype(np.float64) - arrays[
+                "history_raw_action"
+            ][mask].astype(np.float64)
+            count = len(predicted)
+            groups[profile][population] = {
+                "sample_count": count,
+                "estimated_velocity_mean_b_m_s": (
+                    predicted.mean(0).tolist() if count else None
+                ),
+                "true_velocity_mean_b_m_s": actual.mean(0).tolist() if count else None,
+                "velocity_component_rmse_m_s": (
+                    float(np.sqrt(np.square(predicted - actual).mean()))
+                    if count
+                    else None
+                ),
+                "raw_action_delta_abs_mean": (
+                    float(np.abs(delta).mean()) if count else None
+                ),
+                "raw_action_delta_abs_max": (
+                    float(np.abs(delta).max()) if count else None
+                ),
+            }
+    return {
+        "version": "operator_roa_input_diagnostic_v1",
+        "mode": mode,
+        "deployable": False,
+        "scope": "Frozen simulator-only input intervention; not an oracle upper bound or acceptance evidence",
+        "sampling": "Pre-action decision index times 0.02s; first_attempt_valid includes the decision causing first termination, excludes all later episodes",
+        "comparison": "History actions are shadows on the INTERVENED trajectory, not an independent baseline rollout",
+        "replaced": (
+            "Only motor code[:3]: native current body-COM velocity in m/s"
+            if mode == "true_velocity"
+            else "Only motor code[3:]: privileged dynamics encoder latent"
+        ),
+        "by_profile": groups,
+        "trace": {
+            "path": str(output.resolve()),
+            "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+        },
+    }
+
+
 def evaluate_history(
     host,
     policy,
@@ -176,6 +248,8 @@ def evaluate_history(
     controller=None,
     command_tape=COMMAND_TAPE,
     observer=None,
+    diagnostic_input=None,
+    diagnostic_output=None,
 ):
     """Evaluate a fixed tape without updates; shorter prefixes are diagnostic only.
 
@@ -186,7 +260,20 @@ def evaluate_history(
     If supplied, the exported controller drives the existing host motor bridge;
     the full policy is only a frozen parity/diagnostic reference. The caller must
     first validate the exported portable motor contract against the native host.
+    An explicit diagnostic replaces one motor-code slice after shadow export
+    parity checking. It never supplies privilege to the exported controller or
+    changes history frames. Applied diagnostic actions feed the next frame.
     """
+    if (
+        diagnostic_input not in (None, "true_velocity", "privileged_latent")
+        or ((diagnostic_input is None) != (diagnostic_output is None))
+        or (diagnostic_input is not None and controller is None)
+    ):
+        raise ValueError(
+            "Input diagnostic requires a known mode, trace path and shadow controller"
+        )
+    if diagnostic_output is not None and Path(diagnostic_output).exists():
+        raise FileExistsError(f"Diagnostic trace already exists: {diagnostic_output}")
     if type(seed) is not int or seed < 0:
         raise ValueError("Evaluation seed must be a nonnegative integer")
     if type(steps) is not int or not 1 <= steps <= EVALUATION_STEPS:
@@ -216,6 +303,7 @@ def evaluate_history(
     before = state_sha256(policy)
     controller_session = None
     controller_hash = None
+    diagnostic_records = []
     if controller is not None:
         from parkour_lab.learning.controller import ControllerSession, Sample
         from parkour_lab.learning.operator_roa_runtime import roa_tensor_sha256
@@ -359,6 +447,30 @@ def evaluate_history(
                         "Exported causal controller differs from frozen reference"
                     )
                 raw = output.raw_action.detach().clone()
+            if diagnostic_input is not None:
+                code = estimate.clone()
+                if diagnostic_input == "true_velocity":
+                    code[:, :3] = clean[:, :3]
+                else:
+                    code[:, 3:] = policy.actor.encode(observations["dynamics"])
+                applied = policy.actor.motor(frame, code)
+                _finite(applied, (count, 12), "diagnostic action")
+                diagnostic_records.append(
+                    {
+                        name: value.detach().cpu().numpy().copy()
+                        for name, value in {
+                            "estimated_velocity_b_m_s": estimate[:, :3],
+                            "true_velocity_b_m_s": clean[:, :3],
+                            "history_latent": estimate[:, 3:],
+                            "applied_latent": code[:, 3:],
+                            "history_raw_action": raw,
+                            "applied_raw_action": applied,
+                            "first_attempt_valid": alive,
+                            "command_b": expected_command,
+                        }.items()
+                    }
+                )
+                raw = applied
             # Own the metrics before native buffers can change in step().
             xy = clean[:, :2].double() - expected_command[:, :2].double()
             yaw = clean[:, 5].double() - expected_command[:, 2].double()
@@ -382,7 +494,13 @@ def evaluate_history(
             all_values, first_values = values.sum(0), values[alive].sum(0)
             next_command = tape[index + 1][1] if index + 1 < len(tape) else command
             next_observations, reward, done, extras = host.step(
-                raw, "frozen_history_evaluation", next_command=next_command
+                raw,
+                (
+                    f"diagnostic_{diagnostic_input}"
+                    if diagnostic_input
+                    else "frozen_history_evaluation"
+                ),
+                next_command=next_command,
             )
             _finite(reward, (count,), "reward")
             _mask(done, count, device, "done")
@@ -494,7 +612,11 @@ def evaluate_history(
             {"status": "REFERENCE_HISTORY_ACTOR_ONLY"}
             if controller_session is None
             else {
-                "status": "EXACT_ON_EXECUTED_DECISIONS",
+                "status": (
+                    "EXACT_SHADOW_NOT_APPLIED"
+                    if diagnostic_input
+                    else "EXACT_ON_EXECUTED_DECISIONS"
+                ),
                 "decision_count": steps,
                 "interface_sha256": controller_session.interface_sha256,
                 "state_sha256_before": controller_hash,
@@ -529,5 +651,13 @@ def evaluate_history(
         "regimes": "Exact commands: stopped xyz=0; moving xy!=0; pivot xy=0,yaw!=0. Empty groups have null metrics, not success.",
         "tracking": tracking,
     }
+    if diagnostic_input is not None:
+        report.update(
+            diagnostic_input=diagnostic_input,
+            action_source="PRIVILEGED_SIMULATION_DIAGNOSTIC_NOT_DEPLOYABLE",
+            input_diagnostic=_input_diagnostic_report(
+                diagnostic_records, diagnostic_input, terrain, diagnostic_output
+            ),
+        )
     json.dumps(report, allow_nan=False)  # Reject overflow as well as nonfinite inputs.
     return report
