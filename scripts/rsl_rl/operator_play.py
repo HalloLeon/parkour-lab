@@ -498,20 +498,10 @@ def apply_live_overrides(cfg, args, *, command_class, recorders):
     cfg.episode_length_s = max(
         300.0, getattr(args, "_command_replay_steps", 0) * 0.02 + 1.0
     )
-    # A single tile cannot use the procedural sampler's fixed profile layout.
-    # This stock term samples only zero; NativeActorSession owns every command
-    # consumed by inference and prevents resampling during active delivery.
-    command = cfg.commands.base_velocity
-    command.class_type = command_class
-    command.heading_command = False
-    command.rel_heading_envs = command.rel_standing_envs = 0.0
-    command.ranges.heading = None
-    command.ranges.lin_vel_x = command.ranges.lin_vel_y = command.ranges.ang_vel_z = (
-        0.0,
-        0.0,
-    )
-    command.resampling_time_range = (1.0e9, 1.0e9)
-    command.debug_vis = False
+    # NativeControllerSession owns every command, independent of terrain layout.
+    from .operator_runtime import configure_external_command
+
+    configure_external_command(cfg.commands.base_velocity, command_class=command_class)
     cfg.recorders = recorders
     cfg.viewer.origin_type = "asset_root"
     cfg.viewer.asset_name = "robot"

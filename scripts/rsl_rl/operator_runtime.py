@@ -1,6 +1,6 @@
 """Native simulator input binding for a frozen, motor-bound actor artifact.
 
-No RSL-RL, training policy, command sampler, GUI or hardware driver. The caller
+No RSL-RL, training policy, training command sampler, GUI or hardware driver. The caller
 owns source leases and resolves them before act(), then uses the verified motor
 bridge to deliver absolute joint targets. time_s is the physics-frame clock, not a remote
 packet timestamp or wall clock. Scene/motor configuration must remain frozen.
@@ -41,6 +41,29 @@ NATIVE_SENSORS = {
     "joint_velocity": ((12,), "rad/s", "joint"),
     "stock_previous_raw_action": ((12,), "unitless", "joint"),
 }
+
+
+def configure_external_command(command, *, command_class=None):
+    """Zero on native reset; the host owns every applied body-twist command.
+
+    Call after AppLauncher when using the default native class. No terrain
+    sampler, heading assistance or standing override may compete with the host.
+    The host still freezes the timer and clears mode flags on each delivery.
+    """
+    if command_class is None:
+        from isaaclab.envs.mdp.commands import UniformVelocityCommand
+
+        command_class = UniformVelocityCommand
+    command.class_type = command_class
+    command.heading_command = False
+    command.rel_heading_envs = command.rel_standing_envs = 0.0
+    command.ranges.heading = None
+    command.ranges.lin_vel_x = command.ranges.lin_vel_y = command.ranges.ang_vel_z = (
+        0.0,
+        0.0,
+    )
+    command.resampling_time_range = (1.0e9, 1.0e9)
+    command.debug_vis = False
 
 
 def validate_native_controller_spec(spec):

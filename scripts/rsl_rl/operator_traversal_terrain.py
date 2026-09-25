@@ -155,9 +155,10 @@ def traversal_terrain(difficulty, cfg):
 
 
 def configure(cfg, seed, expected):
-    """Replace geometry/reset pose only; preserve the archived sensor/motor recipe."""
+    """Install the fixed fixture and external commands; preserve sensors/motors."""
     from isaaclab.terrains import SubTerrainBaseCfg, TerrainGeneratorCfg
     from isaaclab.utils import configclass
+    from .operator_runtime import configure_external_command
 
     @configclass
     class TraversalCfg(SubTerrainBaseCfg):
@@ -195,3 +196,6 @@ def configure(cfg, seed, expected):
     cfg.terminations.procedural_physical_failure.params["minimum_surface_z_m"] = (
         -ROUGHNESS_BOUND
     )
+    # The archived training sampler requires its 20-column profile layout.
+    # This four-column evaluation instead uses PilotEnvironment's fixed tape.
+    configure_external_command(cfg.commands.base_velocity)
