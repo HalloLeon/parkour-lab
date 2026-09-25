@@ -492,14 +492,23 @@ def verify_native_geometry(env):
         )
         directions.extend((probe["ray_direction"], [0, 0, -1]))
         origins.append(origin.tolist())
+    # Isaac Lab 2.3.2 restores distance/face IDs as (batch, rays), so keep an
+    # explicit batch even though these probes all target one terrain mesh.
     hits, distances, normals, ids = raycast_mesh(
-        torch.tensor(np.asarray(starts), dtype=torch.float32, device=env.device),
-        torch.tensor(np.asarray(directions), dtype=torch.float32, device=env.device),
+        torch.tensor(
+            np.asarray(starts), dtype=torch.float32, device=env.device
+        ).unsqueeze(0),
+        torch.tensor(
+            np.asarray(directions), dtype=torch.float32, device=env.device
+        ).unsqueeze(0),
         sensor.meshes[paths[0]],
         max_dist=2.0,
         return_distance=True,
         return_normal=True,
         return_face_id=True,
+    )
+    hits, distances, normals, ids = (
+        value.squeeze(0) for value in (hits, distances, normals, ids)
     )
     # Compare directions, without depending on Warp's face-normal magnitude.
     normals = normals / torch.linalg.vector_norm(normals, dim=-1, keepdim=True)
