@@ -15,7 +15,14 @@ def main(argv=None):
         help="Report containing the exact source motor binding (default: checkpoint sibling report.json)",
     )
     parser.add_argument(
-        "checkpoint", type=Path, help="Native recurrent training checkpoint"
+        "checkpoint",
+        type=Path,
+        help="Native recurrent checkpoint or completed final ROA learning checkpoint",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=("recurrent_actor_v2", "roa_history_v1"),
+        default="recurrent_actor_v2",
     )
     parser.add_argument(
         "--output",
@@ -24,12 +31,21 @@ def main(argv=None):
         help="New actor-only .pt file; never overwrite",
     )
     args = parser.parse_args(argv)
-    from parkour_lab.learning.recurrent_operator import export_recurrent_actor
-
     try:
-        report = export_recurrent_actor(
-            args.checkpoint, args.output, motor_report=args.motor_report
-        )
+        if args.backend == "roa_history_v1":
+            if args.motor_report is not None:
+                parser.error(
+                    "ROA uses its completed sibling report; omit --motor-report"
+                )
+            from .operator_roa_checkpoint import export_roa_actor
+
+            report = export_roa_actor(args.checkpoint, args.output)
+        else:
+            from parkour_lab.learning.recurrent_operator import export_recurrent_actor
+
+            report = export_recurrent_actor(
+                args.checkpoint, args.output, motor_report=args.motor_report
+            )
     except (ValueError, OSError, RuntimeError) as error:
         parser.exit(1, f"Actor export failed: {error}\n")
     print(json.dumps(report, indent=2, allow_nan=False))

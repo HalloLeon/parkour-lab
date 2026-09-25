@@ -121,8 +121,28 @@ def _recurrent_actor_v2(encoded, device):
     )
 
 
+def _roa_history_v1(encoded, device):
+    from parkour_lab.learning.operator_roa_runtime import _load_actor_bytes
+
+    controller, metadata, _ = _load_actor_bytes(encoded, device)
+    return (
+        controller,
+        metadata["motor_contract"],
+        {
+            "checkpoint_sha256": metadata["source_checkpoint_sha256"],
+            "learning_updates": metadata["source_learning_updates"],
+            "physical_reference": metadata["source_physical_reference"],
+            "verification": "artifact_recorded_not_checkpoint_reloaded",
+            "deployment_allowed": False,
+        },
+    )
+
+
 BACKENDS = MappingProxyType(
-    {"recurrent_actor_v2": Backend(_recurrent_actor_v2, preserve_native_raw=True)}
+    {
+        "recurrent_actor_v2": Backend(_recurrent_actor_v2, preserve_native_raw=True),
+        "roa_history_v1": Backend(_roa_history_v1, preserve_native_raw=True),
+    }
 )
 
 

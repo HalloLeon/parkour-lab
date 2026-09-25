@@ -101,7 +101,7 @@ def _terrain_receipt(env):
     return {"status": "RECORDED_NATIVE_ASSIGNMENTS", **result}
 
 
-def _root_state_hash(env):
+def _native_state_hash(env, name, width):
     scene = getattr(env, "scene", None)
     robot = getattr(scene, "robot", None)
     if robot is None and scene is not None:
@@ -109,11 +109,42 @@ def _root_state_hash(env):
             robot = scene["robot"]
         except (KeyError, TypeError):
             pass
-    state = getattr(getattr(robot, "data", None), "root_state_w", None)
+    state = getattr(getattr(robot, "data", None), name, None)
     if state is None:
         return None  # Explicitly unavailable in a generic CPU host, never inferred.
-    _finite(state, (env.num_envs, 13), "initial root_state_w")
-    return _hash_tensors({"root_state_w": state})
+    _finite(state, (env.num_envs, width), "initial " + name)
+    return _hash_tensors({name: state})
+
+
+def _profile_summary(rows, terrain, period):
+    if terrain["profile_by_column"] is None:
+        return None
+    result = {}
+    for name in dict.fromkeys(terrain["profile_by_column"]):
+        selected = [row for row in rows if row["terrain_profile"] == name]
+        decisions = sum(row["decision_count"] for row in selected)
+        exposure, start = {}, 0
+        for phase in COMMAND_TAPE:
+            exposure[phase["name"]] = sum(
+                min(max(row["decision_count"] - start, 0), phase["steps"])
+                for row in selected
+            )
+            start += phase["steps"]
+        result[name] = {
+            "row_count": len(selected),
+            "terminated": sum(row["end_kind"] == "terminated" for row in selected),
+            "timeouts": sum(row["end_kind"] == "timeout" for row in selected),
+            "right_censored": sum(
+                row["end_kind"] == "right_censored" for row in selected
+            ),
+            "exposure_decisions": decisions,
+            "exposure_seconds": decisions * period,
+            "exposure_decisions_by_phase": exposure,
+            "restricted_observed_duration_mean_s": (
+                decisions * period / len(selected) if selected else None
+            ),
+        }
+    return result
 
 
 def _summary(totals):
@@ -130,13 +161,18 @@ def _summary(totals):
     }
 
 
-def evaluate_history(host, policy, *, seed: int, steps: int = EVALUATION_STEPS):
+def evaluate_history(
+    host, policy, *, seed: int, steps: int = EVALUATION_STEPS, controller=None
+):
     """Evaluate a fixed tape without updates; shorter prefixes are diagnostic only.
 
     Samples are pre-action, not auto-reset observations attributed to a terminal
     state. First-episode totals include the decision causing the first end and no
     later decisions for that row. Timeouts are host-filtered to exclude physical
     terminations. There is no survivor-only mean or zero-sample success claim.
+    If supplied, the exported controller drives the existing host motor bridge;
+    the full policy is only a frozen parity/diagnostic reference. The caller must
+    first validate the exported portable motor contract against the native host.
     """
     if type(seed) is not int or seed < 0:
         raise ValueError("Evaluation seed must be a nonnegative integer")
@@ -149,6 +185,48 @@ def evaluate_history(host, policy, *, seed: int, steps: int = EVALUATION_STEPS):
     policy.eval()
     set_phase(policy, "frozen")
     before = state_sha256(policy)
+    controller_session = None
+    controller_hash = None
+    if controller is not None:
+        from parkour_lab.learning.controller import ControllerSession, Sample
+        from parkour_lab.learning.operator_roa_runtime import roa_tensor_sha256
+
+        sensor_fields = {
+            "base_ang_vel": (slice(0, 3), "rad/s", "body"),
+            "projected_gravity": (slice(3, 6), "unitless", "body"),
+            "joint_position_relative_default": (slice(9, 21), "rad", "joint"),
+            "joint_velocity": (slice(21, 33), "rad/s", "joint"),
+            "stock_previous_raw_action": (slice(33, 45), "unitless", "joint"),
+        }
+        if (
+            set(controller.spec.sensors) != set(sensor_fields)
+            or controller.spec.period_s != period
+        ):
+            raise ValueError("Evaluation controller must declare the causal ROA frame")
+        for name, (indices, units, frame_name) in sensor_fields.items():
+            spec = controller.spec.sensors[name]
+            if (spec.shape, spec.units, spec.frame, spec.required, spec.privileged) != (
+                (indices.stop - indices.start,),
+                units,
+                frame_name,
+                True,
+                False,
+            ):
+                raise ValueError("Evaluation controller sensor semantics differ")
+        controller_session = ControllerSession(
+            controller,
+            joint_names=tuple(host.bridge.joint_names),
+            # The caller validates the portable motor contract against the native
+            # bridge. Full archived profiles may differ only by source batch size.
+            actuator_profile=controller.spec.actuator_profile,
+            allow_privileged=False,
+        )
+        controller_hash = roa_tensor_sha256(controller.motor, controller.estimator)
+        if any(
+            module.training or any(p.requires_grad for p in module.parameters())
+            for module in (controller.motor, controller.estimator)
+        ):
+            raise ValueError("Evaluation requires a frozen exported controller")
     tape = [
         (phase_index, phase["command"])
         for phase_index, phase in enumerate(COMMAND_TAPE)
@@ -169,9 +247,15 @@ def evaluate_history(host, policy, *, seed: int, steps: int = EVALUATION_STEPS):
         ):
             _finite(observations[name], (count, width), name)
         initial_hash = _hash_tensors(observations)
+        initial_group_hashes = {
+            name: _hash_tensors({name: observations[name]})
+            for name in sorted(observations.keys())
+        }
         dynamics_hash = _hash_tensors({"dynamics": observations["dynamics"]})
         terrain = _terrain_receipt(host.env)
-        root_state_hash = _root_state_hash(host.env)
+        root_state_hash = _native_state_hash(host.env, "root_state_w", 13)
+        joint_pos_hash = _native_state_hash(host.env, "joint_pos", 12)
+        joint_vel_hash = _native_state_hash(host.env, "joint_vel", 12)
         alive = torch.ones(count, dtype=torch.bool, device=device)
         durations = torch.zeros(count, dtype=torch.int64, device=device)
         first_end = torch.full((count,), -1, dtype=torch.int64, device=device)
@@ -208,6 +292,42 @@ def evaluate_history(host, policy, *, seed: int, steps: int = EVALUATION_STEPS):
             _finite(estimate, (count, 11), "velocity/latent estimate")
             raw = policy.actor.history_action(frame, history)
             _finite(raw, (count, 12), "action")
+            if controller_session is not None:
+                time_s = index * period
+                sensors = {
+                    name: Sample(
+                        frame[:, indices],
+                        time_s,
+                        torch.ones_like(reset),
+                        units,
+                        frame_name,
+                    )
+                    for name, (indices, units, frame_name) in sensor_fields.items()
+                }
+                output = controller_session.step(
+                    time_s=time_s,
+                    command=frame[:, 6:9],
+                    command_time_s=time_s,
+                    sensors=sensors,
+                    reset_mask=reset,
+                )
+                _finite(output.raw_action, (count, 12), "controller raw action")
+                controller_estimate = controller.last_estimate
+                controller_history = controller.history_frames
+                _finite(controller_estimate, (count, 11), "controller estimate")
+                _finite(controller_history, (count, 25, 45), "controller history")
+                if not (
+                    torch.equal(output.raw_action, raw)
+                    and torch.equal(
+                        output.position_rad, host.bridge.default + 0.25 * raw
+                    )
+                    and torch.equal(controller_estimate, estimate)
+                    and torch.equal(controller_history, history)
+                ):
+                    raise RuntimeError(
+                        "Exported causal controller differs from frozen reference"
+                    )
+                raw = output.raw_action.detach().clone()
             # Own the metrics before native buffers can change in step().
             xy = clean[:, :2].double() - expected_command[:, :2].double()
             yaw = clean[:, 5].double() - expected_command[:, 2].double()
@@ -253,6 +373,7 @@ def evaluate_history(host, policy, *, seed: int, steps: int = EVALUATION_STEPS):
             alive &= ~done
             end_counts += torch.stack((done.sum(), terminated.sum(), timeout.sum()))
             observations = next_observations
+            reset = done.detach().clone()
     after = state_sha256(policy)
     if (
         after != before
@@ -260,6 +381,13 @@ def evaluate_history(host, policy, *, seed: int, steps: int = EVALUATION_STEPS):
         or policy.training
     ):
         raise RuntimeError("Frozen evaluation changed the policy or its frozen mode")
+    if controller is not None:
+        controller_after = roa_tensor_sha256(controller.motor, controller.estimator)
+        if controller_after != controller_hash or any(
+            module.training or any(p.requires_grad for p in module.parameters())
+            for module in (controller.motor, controller.estimator)
+        ):
+            raise RuntimeError("Frozen evaluation changed the exported controller")
     regimes = ("stopped", "moving", "pivot")
     tracking = {}
     for population, values in zip(
@@ -318,7 +446,10 @@ def evaluate_history(host, policy, *, seed: int, steps: int = EVALUATION_STEPS):
         "full_tape_steps": EVALUATION_STEPS,
         "complete_tape": steps == EVALUATION_STEPS,
         "initial_observation_sha256": initial_hash,
+        "initial_observation_group_sha256": initial_group_hashes,
         "initial_dynamics_sha256": dynamics_hash,
+        "initial_joint_pos_sha256": joint_pos_hash,
+        "initial_joint_vel_sha256": joint_vel_hash,
         "initial_root_state_sha256": root_state_hash,
         "initial_root_state_status": (
             "RECORDED_ROOT_STATE_W" if root_state_hash else "UNAVAILABLE_NOT_INFERRED"
@@ -326,6 +457,24 @@ def evaluate_history(host, policy, *, seed: int, steps: int = EVALUATION_STEPS):
         "terrain_assignment": terrain,
         "policy_state_sha256_before": before,
         "policy_state_sha256_after": after,
+        "controller_parity": (
+            {"status": "REFERENCE_HISTORY_ACTOR_ONLY"}
+            if controller_session is None
+            else {
+                "status": "EXACT_ON_EXECUTED_DECISIONS",
+                "decision_count": steps,
+                "interface_sha256": controller_session.interface_sha256,
+                "state_sha256_before": controller_hash,
+                "state_sha256_after": controller_after,
+                "compared": [
+                    "raw_action",
+                    "absolute_joint_targets",
+                    "estimated_velocity_and_latent",
+                    "causal_history",
+                ],
+                "inputs": "Only noisy frame sensors and current command; no true velocity, dynamics or terrain",
+            }
+        ),
         "all_transition_counts": dict(
             zip(("resets", "terminated", "timeouts"), end_counts.tolist(), strict=True)
         ),
@@ -338,6 +487,10 @@ def evaluate_history(host, policy, *, seed: int, steps: int = EVALUATION_STEPS):
             "restricted_observed_duration_mean_s": float(durations.double().mean())
             * period,
             "includes_first_end_transition": True,
+            "by_profile": _profile_summary(rows, terrain, period),
+            "unmapped_profile_row_count": (
+                count if terrain["profile_by_column"] is None else 0
+            ),
         },
         "sampling": "Pre-action true COM xy velocity, yaw rate and current command; returned auto-reset states are not terminal tracking samples",
         "regimes": "Exact commands: stopped xyz=0; moving xy!=0; pivot xy=0,yaw!=0. Empty groups have null metrics, not success.",
