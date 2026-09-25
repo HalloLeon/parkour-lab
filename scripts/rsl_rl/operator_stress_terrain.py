@@ -81,6 +81,28 @@ def _maximum_triangle_grade(heights):
     return float(max(first.max(), second.max()))
 
 
+def multiscale_field(axes, seed):
+    """Independent 2-D lattices; shared by bounded evaluation-only surfaces."""
+    rng = np.random.default_rng(seed)
+    field = np.zeros(tuple(len(axis) for axis in axes), dtype=np.float64)
+    for octave, spacing in enumerate(LATTICE_SPACINGS):
+        coarse_axes = [
+            np.linspace(0.0, side, round(side / spacing) + 1) for side in TILE_SIZE
+        ]
+        lattice = rng.uniform(-1.0, 1.0, tuple(len(axis) for axis in coarse_axes))
+        along_x = np.column_stack(
+            [
+                np.interp(axes[0], coarse_axes[0], lattice[:, column])
+                for column in range(lattice.shape[1])
+            ]
+        )
+        bilinear = np.stack(
+            [np.interp(axes[1], coarse_axes[1], row) for row in along_x]
+        )
+        field += 2.0 ** (-0.7 * octave) * bilinear
+    return field
+
+
 def _nominal_route_geometry(heights, centered_axes):
     """Describe the demo centerline, without asserting any robot reached it."""
     x, y = centered_axes
@@ -135,29 +157,13 @@ def build_stress_surface(difficulty, *, seed, size=TILE_SIZE):
         raise ValueError("Stress terrain requires exactly a 16 m by 16 m tile")
 
     difficulty = float(difficulty)
-    rng = np.random.default_rng(seed)
     axes = [
         np.round(np.arange(round(side / RESOLUTION) + 1) * RESOLUTION, 12)
         for side in TILE_SIZE
     ]
     centered_axes = [np.round(axis - side / 2, 12) for axis, side in zip(axes, size)]
     x, y = np.meshgrid(*centered_axes, indexing="ij")
-    field = np.zeros_like(x)
-    for octave, spacing in enumerate(LATTICE_SPACINGS):
-        coarse_axes = [
-            np.linspace(0.0, side, round(side / spacing) + 1) for side in TILE_SIZE
-        ]
-        lattice = rng.uniform(-1.0, 1.0, tuple(len(axis) for axis in coarse_axes))
-        along_x = np.column_stack(
-            [
-                np.interp(axes[0], coarse_axes[0], lattice[:, column])
-                for column in range(lattice.shape[1])
-            ]
-        )
-        bilinear = np.stack(
-            [np.interp(axes[1], coarse_axes[1], row) for row in along_x]
-        )
-        field += 2.0 ** (-0.7 * octave) * bilinear
+    field = multiscale_field(axes, seed)
 
     edge_distance = np.minimum(TILE_SIZE[0] / 2 - np.abs(x), 8.0 - np.abs(y))
     envelope = _smoothstep((edge_distance - BORDER_WIDTH) / TRANSITION_WIDTH)

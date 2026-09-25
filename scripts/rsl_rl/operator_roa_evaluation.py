@@ -22,9 +22,15 @@ COMMAND_TAPE = (
     {"name": "final_stop", "steps": 150, "command": (0.0, 0.0, 0.0)},
 )
 EVALUATION_STEPS = sum(phase["steps"] for phase in COMMAND_TAPE)
-COMMAND_TAPE_SHA256 = hashlib.sha256(
-    json.dumps(COMMAND_TAPE, sort_keys=True, allow_nan=False).encode()
-).hexdigest()
+
+
+def command_tape_sha256(tape):
+    return hashlib.sha256(
+        json.dumps(tape, sort_keys=True, allow_nan=False).encode()
+    ).hexdigest()
+
+
+COMMAND_TAPE_SHA256 = command_tape_sha256(COMMAND_TAPE)
 
 
 def _finite(value, shape, name):
@@ -116,7 +122,7 @@ def _native_state_hash(env, name, width):
     return _hash_tensors({name: state})
 
 
-def _profile_summary(rows, terrain, period):
+def _profile_summary(rows, terrain, period, command_tape):
     if terrain["profile_by_column"] is None:
         return None
     result = {}
@@ -124,7 +130,7 @@ def _profile_summary(rows, terrain, period):
         selected = [row for row in rows if row["terrain_profile"] == name]
         decisions = sum(row["decision_count"] for row in selected)
         exposure, start = {}, 0
-        for phase in COMMAND_TAPE:
+        for phase in command_tape:
             exposure[phase["name"]] = sum(
                 min(max(row["decision_count"] - start, 0), phase["steps"])
                 for row in selected
@@ -162,7 +168,14 @@ def _summary(totals):
 
 
 def evaluate_history(
-    host, policy, *, seed: int, steps: int = EVALUATION_STEPS, controller=None
+    host,
+    policy,
+    *,
+    seed: int,
+    steps: int = EVALUATION_STEPS,
+    controller=None,
+    command_tape=COMMAND_TAPE,
+    observer=None,
 ):
     """Evaluate a fixed tape without updates; shorter prefixes are diagnostic only.
 
@@ -178,6 +191,22 @@ def evaluate_history(
         raise ValueError("Evaluation seed must be a nonnegative integer")
     if type(steps) is not int or not 1 <= steps <= EVALUATION_STEPS:
         raise ValueError("Evaluation steps must be a positive fixed-tape prefix")
+    command_tape = deepcopy(command_tape)
+    if (
+        not command_tape
+        or sum(p["steps"] for p in command_tape) != EVALUATION_STEPS
+        or len({p["name"] for p in command_tape}) != len(command_tape)
+        or any(
+            type(p["steps"]) is not int
+            or p["steps"] < 1
+            or not isinstance(p["name"], str)
+            or not p["name"]
+            or len(p["command"]) != 3
+            or any(not math.isfinite(v) or abs(v) > 1 for v in p["command"])
+            for p in command_tape
+        )
+    ):
+        raise ValueError("Require a finite named 900-step development command tape")
     period = host.env.step_dt
     count = host.env.num_envs
     if type(count) is not int or count < 1 or period != 0.02:
@@ -229,7 +258,7 @@ def evaluate_history(
             raise ValueError("Evaluation requires a frozen exported controller")
     tape = [
         (phase_index, phase["command"])
-        for phase_index, phase in enumerate(COMMAND_TAPE)
+        for phase_index, phase in enumerate(command_tape)
         for _ in range(phase["steps"])
     ]
     with torch.no_grad():
@@ -257,13 +286,15 @@ def evaluate_history(
         joint_pos_hash = _native_state_hash(host.env, "joint_pos", 12)
         joint_vel_hash = _native_state_hash(host.env, "joint_vel", 12)
         alive = torch.ones(count, dtype=torch.bool, device=device)
+        if observer is not None:
+            observer.observe(0, alive)
         durations = torch.zeros(count, dtype=torch.int64, device=device)
         first_end = torch.full((count,), -1, dtype=torch.int64, device=device)
         first_terminated = torch.zeros_like(alive)
         first_timeout = torch.zeros_like(alive)
         # Populations: all decisions / first episode. Groups: regimes then phases.
         totals = torch.zeros(
-            (2, 3 + len(COMMAND_TAPE), 6), dtype=torch.float64, device=device
+            (2, 3 + len(command_tape), 6), dtype=torch.float64, device=device
         )
         end_counts = torch.zeros(3, dtype=torch.int64, device=device)
         for index, (phase, command) in enumerate(tape[:steps]):
@@ -371,6 +402,8 @@ def evaluate_history(
             first_terminated |= alive & terminated
             first_timeout |= alive & timeout
             alive &= ~done
+            if observer is not None:
+                observer.observe(index + 1, alive)
             end_counts += torch.stack((done.sum(), terminated.sum(), timeout.sum()))
             observations = next_observations
             reset = done.detach().clone()
@@ -397,7 +430,7 @@ def evaluate_history(
             "by_regime": {name: _summary(values[i]) for i, name in enumerate(regimes)},
             "by_phase": {
                 phase["name"]: _summary(values[3 + i])
-                for i, phase in enumerate(COMMAND_TAPE)
+                for i, phase in enumerate(command_tape)
             },
         }
     rows = [
@@ -441,8 +474,8 @@ def evaluate_history(
         "num_envs": count,
         "environment_transitions": steps * count,
         "period_s": period,
-        "command_tape": deepcopy(COMMAND_TAPE),
-        "command_tape_sha256": COMMAND_TAPE_SHA256,
+        "command_tape": command_tape,
+        "command_tape_sha256": command_tape_sha256(command_tape),
         "full_tape_steps": EVALUATION_STEPS,
         "complete_tape": steps == EVALUATION_STEPS,
         "initial_observation_sha256": initial_hash,
@@ -487,7 +520,7 @@ def evaluate_history(
             "restricted_observed_duration_mean_s": float(durations.double().mean())
             * period,
             "includes_first_end_transition": True,
-            "by_profile": _profile_summary(rows, terrain, period),
+            "by_profile": _profile_summary(rows, terrain, period, command_tape),
             "unmapped_profile_row_count": (
                 count if terrain["profile_by_column"] is None else 0
             ),

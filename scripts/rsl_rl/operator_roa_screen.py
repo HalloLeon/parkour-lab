@@ -32,10 +32,16 @@ def parse_args(argv=None):
     parser.add_argument("--controller-artifact", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=1043)
     parser.add_argument(
+        "--terrain-suite",
+        choices=("procedural", "traversal"),
+        default="procedural",
+        help="Traversal uses four fixed rough ramp/vertical-step fixtures and a straight approach tape",
+    )
+    parser.add_argument(
         "--difficulty",
         type=float,
         nargs=2,
-        default=(0.05, 0.15),
+        default=None,
         metavar=("LOW", "HIGH"),
     )
     parser.add_argument("--num-envs", type=int, choices=(80, 160, 320), default=80)
@@ -48,12 +54,19 @@ def parse_args(argv=None):
         default=Path("logs/rsl_rl/go2_operator_refinement"),
     )
     args = parser.parse_args(argv)
+    if args.terrain_suite == "traversal" and args.difficulty is not None:
+        parser.error("Traversal has fixed SI geometry; do not supply --difficulty")
+    if args.terrain_suite == "procedural" and args.difficulty is None:
+        args.difficulty = (0.05, 0.15)
     if (
         args.seed < 0
         or args.cpu_threads < 1
-        or not (
-            all(math.isfinite(value) for value in args.difficulty)
-            and 0 <= args.difficulty[0] <= args.difficulty[1] <= 1
+        or (
+            args.difficulty is not None
+            and not (
+                all(math.isfinite(value) for value in args.difficulty)
+                and 0 <= args.difficulty[0] <= args.difficulty[1] <= 1
+            )
         )
     ):
         parser.error(
@@ -74,11 +87,22 @@ def main(argv=None):
     from .operator_roa_evaluation import (
         evaluate_history,
         COMMAND_TAPE,
-        COMMAND_TAPE_SHA256,
+        command_tape_sha256,
     )
     from parkour_lab.learning.motor_contract import binding_sha256, verify_runtime_motor
     from parkour_lab.learning.operator_roa import state_sha256
 
+    command_tape = COMMAND_TAPE
+    fixtures = None
+    if args.terrain_suite == "traversal":
+        from . import operator_traversal_terrain as traversal
+        from .operator_traversal_probe import (
+            TraversalProbe,
+            COMMAND_TAPE as TRAVERSAL_TAPE,
+        )
+
+        command_tape = TRAVERSAL_TAPE
+        fixtures = traversal.preflight(args.seed)
     args.reference = args.reference.resolve(strict=True)
     args.checkpoint = args.checkpoint.resolve(strict=True)
     args.controller_artifact = args.controller_artifact.resolve(strict=True)
@@ -125,11 +149,17 @@ def main(argv=None):
         "seed": args.seed,
         "terrain_generator_seed": args.seed,
         "num_envs": args.num_envs,
-        "difficulty_range": list(args.difficulty),
-        "command_tape": COMMAND_TAPE,
-        "command_tape_sha256": COMMAND_TAPE_SHA256,
+        "terrain_suite": args.terrain_suite,
+        "difficulty_range": list(args.difficulty) if args.difficulty else None,
+        "traversal_geometry": fixtures,
+        "command_tape": command_tape,
+        "command_tape_sha256": command_tape_sha256(command_tape),
         "sensing": "Original noisy45 proprioceptive frame, unchanged scales; controller receives no true velocity, dynamics or scan",
-        "scope": "Newly generated five-profile terrain, frozen causal development screen; not high-step/stair, sim-to-real or exit qualification",
+        "scope": (
+            "Four fixed full-width rough ramp/vertical-step layouts; yaw-zero fixed approach, no feedback steering. Root/foot/contact diagnostics, not supported completion, sim-to-real or exit qualification"
+            if fixtures
+            else "Newly generated five-profile terrain, frozen causal development screen; not high-step/stair, sim-to-real or exit qualification"
+        ),
         "learning_updates": 0,
         "exit_allowed": False,
     }
@@ -168,7 +198,10 @@ def main(argv=None):
 
         args.iterations = 0
         cfg, _ = training.proprioceptive_procedural_configs(saved, agent, args)
-        training._configure_recurrent_terrain(cfg, args.difficulty)
+        if fixtures:
+            traversal.configure(cfg, args.seed, fixtures)
+        else:
+            training._configure_recurrent_terrain(cfg, args.difficulty)
         cfg.seed = cfg.scene.terrain.terrain_generator.seed = args.seed
         validate_events(cfg)
         cfg.validate()
@@ -176,6 +209,10 @@ def main(argv=None):
             yaml.dump(cfg.to_dict(), sort_keys=False)
         )
         env = ManagerBasedRLEnv(cfg=cfg)
+        if fixtures:
+            report["native_geometry"] = traversal.native_receipts()
+            if report["native_geometry"] != fixtures:
+                raise ValueError("Require all four constructed traversal mesh receipts")
         host = PilotEnvironment(env, app)
         if binding_sha256(contract["binding"]) != binding_sha256(
             host.motor_contract["binding"]
@@ -195,9 +232,19 @@ def main(argv=None):
             raise ValueError("Frozen reference weights changed")
         report["status"] = "RUNNING_NOT_QUALIFIED"
         publish()
-        report["evaluation"] = evaluate_history(
-            host, policy, seed=args.seed, controller=loaded.controller
+        probe = (
+            TraversalProbe(env, output / "traversal_trace.npz") if fixtures else None
         )
+        report["evaluation"] = evaluate_history(
+            host,
+            policy,
+            seed=args.seed,
+            controller=loaded.controller,
+            command_tape=command_tape,
+            observer=probe,
+        )
+        if probe is not None:
+            report["traversal"] = probe.report()
         report["evaluation"]["scope"] = protocol["scope"]
         verify_source_files(source)
         if training.recurrent_training_identity(args.reference) != identity:
