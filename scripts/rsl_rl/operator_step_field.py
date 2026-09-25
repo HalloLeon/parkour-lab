@@ -255,7 +255,7 @@ def _native_key(difficulty, cfg):
         or tuple(cfg.size) != TILE_SIZE
         or cfg.profile != "step_hills"
         or cfg.variant not in (12, 13, 14, 15)
-        or getattr(cfg, "step_field_version", None) != VERSION
+        or cfg.function is not step_field_terrain
         or isinstance(difficulty, (bool, np.bool_))
         or not math.isfinite(float(difficulty))
         or not DIFFICULTY[0] <= difficulty < DIFFICULTY[1]
@@ -285,7 +285,7 @@ def step_field_terrain(difficulty, cfg):
 
 
 def configure(cfg):
-    """Opt in only four callbacks; preserve native commands, resets and other16tiles."""
+    """Opt in four declared callbacks; preserve commands, resets and other columns."""
     global _CONFIGURATION
     generator = cfg.scene.terrain.terrain_generator
     terrains = list(generator.sub_terrains.values())
@@ -314,8 +314,9 @@ def configure(cfg):
             "Require unchanged20-column/3-row procedural acquisition layout"
         )
     for item in terrains[12:16]:
+        # configclass.copy() retains declared dataclass fields only. The callback
+        # identifies this opt-in; geometry versioning lives in protocol/receipts.
         item.function = step_field_terrain
-        item.step_field_version = VERSION
     _CONFIGURATION = {"seed": generator.seed}
     _RECEIPTS.clear()
 
