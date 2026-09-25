@@ -168,13 +168,46 @@ def _summary(totals):
     }
 
 
-def _input_diagnostic_report(records, mode, terrain, output):
-    """Archive pre-action interventions separately from deployable-controller evidence."""
+def _input_diagnostic_report(
+    records, mode, terrain, output, command_tape, spatial=None
+):
+    """Compare predictions and actions on this rollout, never a shadow counterfactual."""
     import numpy as np
 
     arrays = {
         name: np.stack([record[name] for record in records]) for name in records[0]
     }
+    steps, count = arrays["first_attempt_valid"].shape
+    phase_index = np.repeat(
+        np.arange(len(command_tape)), [phase["steps"] for phase in command_tape]
+    )[:steps]
+    arrays["phase_index"] = phase_index
+    near_entry = None
+    if spatial is not None:
+        root, entry = spatial["root_local_m"], spatial["entry_x_m"]
+        width = spatial["corridor_half_width_m"]
+        if not (
+            root.shape == (steps, count, 3)
+            and entry.shape == (count,)
+            and np.isfinite(root).all()
+            and np.isfinite(entry).all()
+            and np.ndim(width) == 0
+            and np.isfinite(width)
+            and width > 0
+            and spatial["first_attempt_valid"].dtype == np.bool_
+            and np.array_equal(
+                spatial["first_attempt_valid"], arrays["first_attempt_valid"]
+            )
+        ):
+            raise ValueError("Input telemetry and spatial pre-action samples differ")
+        arrays.update(
+            root_local_m=root, entry_x_m=entry, corridor_half_width_m=np.asarray(width)
+        )
+        near_entry = (
+            (root[..., 0] >= entry - 0.5)
+            & (root[..., 0] < entry)
+            & (np.abs(root[..., 1]) <= width)
+        )
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     # Never overwrite prior evidence, even when called outside the screen CLI.
@@ -186,51 +219,103 @@ def _input_diagnostic_report(records, mode, terrain, output):
         else ["unmapped"] * arrays["first_attempt_valid"].shape[1]
     )
     moving = np.any(arrays["command_b"][..., :2] != 0, axis=-1)
+    forward = (
+        moving
+        & np.array([p["name"] == "forward" for p in command_tape])[phase_index, None]
+    )
+    low_speed = np.linalg.norm(arrays["true_velocity_b_m_s"][..., :2], axis=-1) < 0.05
+
+    def summarize(mask):
+        predicted = arrays["estimated_velocity_b_m_s"][mask].astype(np.float64)
+        actual = arrays["true_velocity_b_m_s"][mask].astype(np.float64)
+        command = arrays["command_b"][mask].astype(np.float64)
+        delta = arrays["applied_raw_action"][mask].astype(np.float64) - arrays[
+            "history_raw_action"
+        ][mask].astype(np.float64)
+        error = predicted - actual
+        means = {
+            "estimated_velocity_mean_b_m_s": predicted,
+            "true_velocity_mean_b_m_s": actual,
+            "command_mean_b": command,
+            "estimated_minus_true_velocity_bias_b_m_s": error,
+            "command_minus_estimated_xy_mean_m_s": command[:, :2] - predicted[:, :2],
+            "command_minus_true_xy_mean_m_s": command[:, :2] - actual[:, :2],
+        }
+        return {
+            "sample_count": len(predicted),
+            **{
+                name: value.mean(0).tolist() if len(predicted) else None
+                for name, value in means.items()
+            },
+            "estimated_minus_true_velocity_rmse_b_m_s": (
+                np.sqrt(np.square(error).mean(0)).tolist() if len(predicted) else None
+            ),
+            "velocity_component_rmse_m_s": (
+                float(np.sqrt(np.square(error).mean())) if len(predicted) else None
+            ),
+            "raw_action_delta_abs_mean": (
+                float(np.abs(delta).mean()) if len(predicted) else None
+            ),
+            "raw_action_delta_abs_max": (
+                float(np.abs(delta).max()) if len(predicted) else None
+            ),
+        }
+
     groups = {}
     for profile in dict.fromkeys(profiles):
         selected = np.array([name == profile for name in profiles])[None, :]
         first = arrays["first_attempt_valid"] & selected
-        groups[profile] = {}
-        for population, mask in (
-            ("first_episode", first),
-            ("moving_first_episode", first & moving),
-        ):
-            predicted = arrays["estimated_velocity_b_m_s"][mask].astype(np.float64)
-            actual = arrays["true_velocity_b_m_s"][mask].astype(np.float64)
-            delta = arrays["applied_raw_action"][mask].astype(np.float64) - arrays[
-                "history_raw_action"
-            ][mask].astype(np.float64)
-            count = len(predicted)
-            groups[profile][population] = {
-                "sample_count": count,
-                "estimated_velocity_mean_b_m_s": (
-                    predicted.mean(0).tolist() if count else None
-                ),
-                "true_velocity_mean_b_m_s": actual.mean(0).tolist() if count else None,
-                "velocity_component_rmse_m_s": (
-                    float(np.sqrt(np.square(predicted - actual).mean()))
-                    if count
+        groups[profile] = {
+            "first_episode": summarize(first),
+            "moving_first_episode": summarize(first & moving),
+            "by_phase": {
+                phase["name"]: summarize(first & (phase_index[:, None] == i))
+                for i, phase in enumerate(command_tape)
+            },
+            "by_condition": {
+                "forward_low_speed": summarize(first & forward & low_speed),
+                "forward_moving": summarize(first & forward & ~low_speed),
+                "forward_near_entry": (
+                    summarize(first & forward & near_entry)
+                    if near_entry is not None
                     else None
                 ),
-                "raw_action_delta_abs_mean": (
-                    float(np.abs(delta).mean()) if count else None
+                "forward_near_entry_low_speed": (
+                    summarize(first & forward & near_entry & low_speed)
+                    if near_entry is not None
+                    else None
                 ),
-                "raw_action_delta_abs_max": (
-                    float(np.abs(delta).max()) if count else None
-                ),
-            }
+            },
+        }
     return {
-        "version": "operator_roa_input_diagnostic_v1",
-        "mode": mode,
+        "version": "operator_roa_input_diagnostic_v2",
+        "mode": mode or "causal_history",
         "deployable": False,
-        "scope": "Frozen simulator-only input intervention; not an oracle upper bound or acceptance evidence",
+        "causal_actor_inputs_only": mode is None,
+        "scope": "Frozen input telemetry, not an oracle upper bound, deployment validation or acceptance evidence",
         "sampling": "Pre-action decision index times 0.02s; first_attempt_valid includes the decision causing first termination, excludes all later episodes",
-        "comparison": "History actions are shadows on the INTERVENED trajectory, not an independent baseline rollout",
+        "comparison": (
+            "History actions are shadows on the INTERVENED trajectory, not an independent baseline rollout"
+            if mode
+            else "Executed causal history actions; no input replacement or privileged actor inputs"
+        ),
         "replaced": (
             "Only motor code[:3]: native current body-COM velocity in m/s"
             if mode == "true_velocity"
-            else "Only motor code[3:]: privileged dynamics encoder latent"
+            else (
+                "Only motor code[3:]: privileged dynamics encoder latent"
+                if mode
+                else None
+            )
         ),
+        "conditions": {
+            "forward": "Tape phase named forward with nonzero XY command; all conditions use first-episode decisions",
+            "low_speed": "Native body-COM XY speed < 0.05 m/s at this instant, not a sustained stall diagnosis",
+            "near_entry": "entry_x - 0.5 <= root_local_x < entry_x; abs(root_local_y) <= corridor_half_width; no foot contact or support inference",
+            "spatial_available": spatial is not None,
+            "interpretation": "Conditional populations differ after intervention; compare matched full-rollout outcomes, not conditional means as causal effects",
+            "command_units": "Body [vx m/s, vy m/s, yaw rad/s]; velocity bias is estimated minus true [x,y,z] m/s",
+        },
         "by_profile": groups,
         "trace": {
             "path": str(output.resolve()),
@@ -260,14 +345,15 @@ def evaluate_history(
     If supplied, the exported controller drives the existing host motor bridge;
     the full policy is only a frozen parity/diagnostic reference. The caller must
     first validate the exported portable motor contract against the native host.
-    An explicit diagnostic replaces one motor-code slice after shadow export
+    A diagnostic_output alone records observer-only telemetry on the causal
+    rollout. An explicit diagnostic replaces one motor-code slice after shadow export
     parity checking. It never supplies privilege to the exported controller or
     changes history frames. Applied diagnostic actions feed the next frame.
     """
     if (
         diagnostic_input not in (None, "true_velocity", "privileged_latent")
-        or ((diagnostic_input is None) != (diagnostic_output is None))
-        or (diagnostic_input is not None and controller is None)
+        or (diagnostic_input is not None and diagnostic_output is None)
+        or (diagnostic_output is not None and controller is None)
     ):
         raise ValueError(
             "Input diagnostic requires a known mode, trace path and shadow controller"
@@ -447,6 +533,7 @@ def evaluate_history(
                         "Exported causal controller differs from frozen reference"
                     )
                 raw = output.raw_action.detach().clone()
+            code, applied = estimate, raw
             if diagnostic_input is not None:
                 code = estimate.clone()
                 if diagnostic_input == "true_velocity":
@@ -455,6 +542,7 @@ def evaluate_history(
                     code[:, 3:] = policy.actor.encode(observations["dynamics"])
                 applied = policy.actor.motor(frame, code)
                 _finite(applied, (count, 12), "diagnostic action")
+            if diagnostic_output is not None:
                 diagnostic_records.append(
                     {
                         name: value.detach().cpu().numpy().copy()
@@ -470,7 +558,7 @@ def evaluate_history(
                         }.items()
                     }
                 )
-                raw = applied
+            raw = applied
             # Own the metrics before native buffers can change in step().
             xy = clean[:, :2].double() - expected_command[:, :2].double()
             yaw = clean[:, 5].double() - expected_command[:, 2].double()
@@ -655,9 +743,16 @@ def evaluate_history(
         report.update(
             diagnostic_input=diagnostic_input,
             action_source="PRIVILEGED_SIMULATION_DIAGNOSTIC_NOT_DEPLOYABLE",
-            input_diagnostic=_input_diagnostic_report(
-                diagnostic_records, diagnostic_input, terrain, diagnostic_output
-            ),
+        )
+    if diagnostic_output is not None:
+        spatial_samples = getattr(observer, "input_diagnostic_samples", None)
+        report["input_diagnostic"] = _input_diagnostic_report(
+            diagnostic_records,
+            diagnostic_input,
+            terrain,
+            diagnostic_output,
+            command_tape,
+            spatial_samples(steps) if spatial_samples is not None else None,
         )
     json.dumps(report, allow_nan=False)  # Reject overflow as well as nonfinite inputs.
     return report

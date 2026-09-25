@@ -171,6 +171,13 @@ def main(argv=None):
         "learning_updates": 0,
         "exit_allowed": False,
     }
+    if fixtures:
+        protocol["input_telemetry"] = {
+            "version": "operator_roa_input_diagnostic_v2",
+            "scope": "Observer-only pre-action estimates, true velocity and root position; no change to actor inputs except an explicitly selected diagnostic-input intervention",
+            "trace": "input_diagnostic_trace.npz",
+            "conditions": "First-episode profile/phase; instantaneous XY speed <0.05m/s; root within0.5m before entry and inside corridor",
+        }
     if args.diagnostic_input:
         protocol.update(
             diagnostic_input=args.diagnostic_input,
@@ -265,7 +272,7 @@ def main(argv=None):
             observer=probe,
             diagnostic_input=args.diagnostic_input,
             diagnostic_output=(
-                output / "input_diagnostic_trace.npz" if args.diagnostic_input else None
+                output / "input_diagnostic_trace.npz" if fixtures else None
             ),
         )
         if probe is not None:

@@ -84,6 +84,19 @@ class TraversalProbe:
                 )
         self.records.append((root.copy(), feet.copy(), forces.copy(), valid))
 
+    def input_diagnostic_samples(self, steps):
+        """Align observer states with pre-action decisions, excluding the final state."""
+        if type(steps) is not int or steps < 1 or len(self.records) != steps + 1:
+            raise ValueError("Input telemetry requires every initial/post-step sample")
+        return {
+            "root_local_m": np.stack([record[0] for record in self.records[:steps]]),
+            "first_attempt_valid": np.stack(
+                [record[3] for record in self.records[:steps]]
+            ),
+            "entry_x_m": np.array([spec["entry_x_m"] for spec in self.specs]),
+            "corridor_half_width_m": CORRIDOR_HALF_WIDTH,
+        }
+
     def report(self):
         if len(self.records) != 901:
             raise ValueError("Traversal report requires the complete 900-step tape")
