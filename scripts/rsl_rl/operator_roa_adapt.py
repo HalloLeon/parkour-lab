@@ -56,14 +56,18 @@ def parse_args(argv=None):
 class TerrainExposure:
     """Pre-action training-state counts; no contact/support or success inference."""
 
-    def __init__(self, env, *, step_fields=False):
+    def __init__(self, env, *, geometry_version=None):
         import torch
         from parkour_lab.tasks.manager_based.parkour_lab.mdp.terrain.operator_terrain import (
             PROFILE_BY_COLUMN,
         )
 
         self.env = env
-        self.step_fields = step_fields
+        if geometry_version is not None:
+            from .operator_step_field import envelope
+
+            envelope(geometry_version)
+        self.geometry_version = geometry_version
         terrain = env.scene.terrain
         self.columns = terrain.terrain_types.clone()
         self.levels = terrain.terrain_levels.clone()
@@ -98,7 +102,7 @@ class TerrainExposure:
         command = env.command_manager.get_command("base_velocity")
         # Geometry taper is exactly zero in these pads, bands and borders.
         outside_band = local[:, 1].abs() > 0.6
-        if self.step_fields:
+        if self.geometry_version:
             outside_band |= (self.columns >= 12) & (self.columns < 16)
         off_flat = (local[:, :2].abs().amax(1) > 1.0) & outside_band
         off_flat &= (local[:, :2].abs() < 7.0).all(1) & finite
@@ -149,10 +153,8 @@ class TerrainExposure:
             ],
             "scope": "All pre-action training states, including reset and later episodes; measured COM XY speed >0.05m/s, center-ray height magnitude >1mm. Root location only, NOT foot support, course completion or qualification.",
         }
-        if self.step_fields:
-            from .operator_step_field import VERSION
-
-            result["geometry_overrides"] = {"step_hills": VERSION}
+        if self.geometry_version:
+            result["geometry_overrides"] = {"step_hills": self.geometry_version}
         return result
 
 

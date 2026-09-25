@@ -16,6 +16,7 @@ import numpy as np
 from .operator_stress_terrain import multiscale_field
 
 VERSION = "operator_step_field_v1"
+BOOTSTRAP_VERSION = "operator_step_field_bootstrap_v1"
 TILE_SIZE = (16.0, 16.0)
 DIFFICULTY = (0.15, 0.55)
 CELL_SIZE = 0.5
@@ -24,9 +25,11 @@ _CONFIGURATION = None
 _RECEIPTS = []
 
 
-def envelope():
-    return {
-        "version": VERSION,
+def envelope(version=VERSION):
+    if version not in (VERSION, BOOTSTRAP_VERSION):
+        raise ValueError("Unknown step-field geometry version")
+    result = {
+        "version": version,
         "tile_size_m": list(TILE_SIZE),
         "replaced_columns": [12, 13, 14, 15],
         "profile_tag": "step_hills",
@@ -42,6 +45,13 @@ def envelope():
         "holes_routes_waypoints_success_resets": False,
         "scope": "Partial gentle vertical-step acquisition, not the full 4–24cm curriculum or high-step qualification; tread width is axis-aligned, not every travel direction",
     }
+    if version == BOOTSTRAP_VERSION:
+        result.update(
+            riser_formula_m="0.005 + 0.1 * difficulty",
+            acquisition_riser_range_m=[0.02, 0.06],
+            scope="2–6cm bootstrap vertical-step acquisition, not the full 4–24cm curriculum or high-step qualification; tread width is axis-aligned, not every travel direction",
+        )
+    return result
 
 
 def _levels(seed, variant):
@@ -136,7 +146,8 @@ def _audit_mesh(vertices, faces):
     }
 
 
-def build_surface(difficulty, *, seed, variant, size=TILE_SIZE):
+def build_surface(difficulty, *, seed, variant, size=TILE_SIZE, version=VERSION):
+    envelope(version)  # Validate before building or mutating any geometry.
     if (
         isinstance(difficulty, (bool, np.bool_))
         or not np.isscalar(difficulty)
@@ -149,7 +160,7 @@ def build_surface(difficulty, *, seed, variant, size=TILE_SIZE):
             "Require finite difficulty[0,1], integer seed/variant and16m tile"
         )
     difficulty = float(difficulty)
-    rise = 0.04 + 0.08 * difficulty
+    rise = 0.04 + 0.08 * difficulty if version == VERSION else 0.005 + 0.1 * difficulty
     levels = _levels(seed, variant)
     axes = [np.round(np.arange(161) * RESOLUTION, 12)] * 2
     x, y = np.meshgrid(axes[0] - 8, axes[1] - 8, indexing="ij")
@@ -218,7 +229,7 @@ def build_surface(difficulty, *, seed, variant, size=TILE_SIZE):
     faces = inverse[faces]
     audit = _audit_mesh(vertices, faces)
     receipt = {
-        "version": VERSION,
+        "version": version,
         "profile": "step_hills",
         "seed": seed,
         "variant": variant,
@@ -271,7 +282,11 @@ def step_field_terrain(difficulty, cfg):
     if any((item["variant"], item["row"]) == key for item in _RECEIPTS):
         raise ValueError("Duplicate native step-field variant/row construction")
     vertices, faces, receipt = build_surface(
-        difficulty, seed=cfg.seed, variant=cfg.variant, size=cfg.size
+        difficulty,
+        seed=cfg.seed,
+        variant=cfg.variant,
+        size=cfg.size,
+        version=_CONFIGURATION["version"],
     )
     import trimesh
 
@@ -284,9 +299,10 @@ def step_field_terrain(difficulty, cfg):
     return [mesh], np.array(receipt["origin_m"])
 
 
-def configure(cfg):
+def configure(cfg, version=VERSION):
     """Opt in four declared callbacks; preserve commands, resets and other columns."""
     global _CONFIGURATION
+    envelope(version)
     generator = cfg.scene.terrain.terrain_generator
     terrains = list(generator.sub_terrains.values())
     profiles = tuple(
@@ -317,7 +333,7 @@ def configure(cfg):
         # configclass.copy() retains declared dataclass fields only. The callback
         # identifies this opt-in; geometry versioning lives in protocol/receipts.
         item.function = step_field_terrain
-    _CONFIGURATION = {"seed": generator.seed}
+    _CONFIGURATION = {"seed": generator.seed, "version": version}
     _RECEIPTS.clear()
 
 
@@ -327,10 +343,12 @@ def verify_native_receipts(receipts=None):
     records = native_receipts() if receipts is None else deepcopy(receipts)
     try:
         seeds = {item["seed"] for item in records}
+        versions = {item["version"] for item in records}
         valid = (
             type(records) is list
             and len(records) == 12
             and len(seeds) == 1
+            and len(versions) == 1
             and {(item["variant"], item["row"]) for item in records} == expected
         )
         if receipts is None:
@@ -338,11 +356,14 @@ def verify_native_receipts(receipts=None):
                 valid
                 and _CONFIGURATION is not None
                 and seeds == {_CONFIGURATION["seed"]}
+                and versions == {_CONFIGURATION["version"]}
             )
         if not valid:
             raise ValueError(
                 "Require all12 native step-field variant/row receipts before learning"
             )
+        version = records[0]["version"]
+        envelope(version)
         for item in records:
             difficulty = item["difficulty"]
             if not DIFFICULTY[0] <= difficulty < DIFFICULTY[1]:
@@ -352,7 +373,7 @@ def verify_native_receipts(receipts=None):
                 int((difficulty - DIFFICULTY[0]) / (DIFFICULTY[1] - DIFFICULTY[0]) * 3),
             )
             _, _, built = build_surface(
-                difficulty, seed=item["seed"], variant=item["variant"]
+                difficulty, seed=item["seed"], variant=item["variant"], version=version
             )
             if item != {**built, "row": row}:
                 raise ValueError(
@@ -361,12 +382,12 @@ def verify_native_receipts(receipts=None):
     except (KeyError, TypeError, AttributeError) as error:
         raise ValueError("Malformed native step-field receipts") from error
     return {
-        "version": VERSION,
+        "version": version,
         "status": "NATIVE_GENERATED_TRIANGLES_VERIFIED_NOT_PHYSX_CONTACT",
         "seed": records[0]["seed"],
-        "envelope": envelope(),
+        "envelope": envelope(version),
         "tiles": records,
-        "scope": envelope()["scope"],
+        "scope": envelope(version)["scope"],
     }
 
 

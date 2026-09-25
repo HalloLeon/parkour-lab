@@ -79,7 +79,7 @@ def _tiles(report):
             )
             selected_levels.extend([level] * (PATCHES // 2))
         origin = np.array([16 * (tile["row"] - 1), 16 * (tile["variant"] - 9.5), 0.0])
-        rise, rough = 0.04 + 0.08 * tile["difficulty"], 0.004 * tile["difficulty"]
+        rise, rough = tile["riser_height_m"], tile["roughness_absolute_bound_m"]
         positions = (
             np.column_stack(
                 (
@@ -225,11 +225,17 @@ class SupportState:
             terrain.terrain_levels.clone(),
         )
         self.step = (self.columns >= 12) & (self.columns < 16)
-        difficulty = patches.new_zeros((3, 20))
+        rises = patches.new_ones((3, 20))
+        roughness = patches.new_zeros((3, 20))
         for tile in receipt["tiles"]:
-            difficulty[tile["row"], tile["variant"]] = tile["difficulty"]
-        self.rise = 0.04 + 0.08 * difficulty[self.rows, self.columns]
-        self.rough = 0.004 * difficulty[self.rows, self.columns]
+            # Equal roughness margin on both levels cancels; these positions
+            # already bind the source geometry's physical rise, not a formula.
+            first = tile["positions_world_m"][tile["levels"].index(1)][2]
+            second = tile["positions_world_m"][tile["levels"].index(2)][2]
+            rises[tile["row"], tile["variant"]] = second - first
+            roughness[tile["row"], tile["variant"]] = 0.004 * tile["difficulty"]
+        self.rise = rises[self.rows, self.columns]
+        self.rough = roughness[self.rows, self.columns]
         self.previous = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
         self.valid = torch.zeros_like(self.step)
         self.start_kind = torch.full_like(self.previous, -1)

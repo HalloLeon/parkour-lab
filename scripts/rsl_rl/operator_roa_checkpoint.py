@@ -310,7 +310,7 @@ def _environment_source(saved, protocol, report, layout, stage):
         )
     _, contract, _, source = load_completed_checkpoint(
         source_path,
-        allow_environment=stage.step_fields,
+        allow_environment=bool(stage.geometry_version),
         allow_step_fields=stage.support_resets,
         allow_step_support=False,
     )
@@ -331,14 +331,16 @@ def _environment_source(saved, protocol, report, layout, stage):
         count,
         steps=stage.updates * 24 + stage.updates // 20 * 64,
     )
-    if stage.step_fields:
+    if stage.geometry_version:
         from . import operator_step_field
 
         if (
             protocol["environment_layout"] != layout
-            or protocol["step_field_geometry"] != operator_step_field.envelope()
+            or protocol["step_field_geometry"]
+            != operator_step_field.envelope(stage.geometry_version)
+            or report["native_step_field_geometry"]["version"] != stage.geometry_version
             or report["training_exposure"]["geometry_overrides"]
-            != {"step_hills": operator_step_field.VERSION}
+            != {"step_hills": stage.geometry_version}
         ):
             raise ValueError("Step-field geometry or measured exposure recipe changed")
         operator_step_field.validate_geometry_report(
@@ -399,7 +401,7 @@ def load_completed_checkpoint(
             raise ValueError(
                 "Require original v3/refinement ancestry, not an environment stage"
             )
-        if stage and stage.step_fields and not allow_step_fields:
+        if stage and stage.geometry_version and not allow_step_fields:
             raise ValueError("Require earlier ancestry, not another step-field stage")
         if stage and stage.support_resets and not allow_step_support:
             raise ValueError(

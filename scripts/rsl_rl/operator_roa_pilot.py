@@ -29,7 +29,7 @@ class EnvironmentStage:
     updates: int
     status: str
     result_stage: str
-    step_fields: bool = False
+    geometry_version: str | None = None
     support_resets: bool = False
 
 
@@ -49,7 +49,7 @@ ENVIRONMENT_STAGES = {
         500,
         "ROA_STEP_FIELD_LEARNING_COMPLETED_NOT_QUALIFIED",
         "step_field_learning",
-        step_fields=True,
+        geometry_version="operator_step_field_v1",
     ),
     "step_support": EnvironmentStage(
         "operator_roa_step_support_learning_v1",
@@ -58,7 +58,17 @@ ENVIRONMENT_STAGES = {
         500,
         "ROA_STEP_SUPPORT_LEARNING_COMPLETED_NOT_QUALIFIED",
         "step_support_learning",
-        step_fields=True,
+        geometry_version="operator_step_field_v1",
+        support_resets=True,
+    ),
+    "step_bootstrap": EnvironmentStage(
+        "operator_roa_step_bootstrap_learning_v1",
+        "step_field_learning",
+        2500,
+        500,
+        "ROA_STEP_BOOTSTRAP_LEARNING_COMPLETED_NOT_QUALIFIED",
+        "step_bootstrap_learning",
+        geometry_version="operator_step_field_bootstrap_v1",
         support_resets=True,
     ),
 }
@@ -112,7 +122,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--environment-layout",
         choices=tuple(ENVIRONMENT_STAGES),
-        help="hills: refined source; step_fields: hills source; step_support: step-field source",
+        help="hills: refined source; step_fields: hills source; step_support/step_bootstrap: step-field source",
     )
     parser.add_argument(
         "--regularization",
@@ -657,7 +667,7 @@ def _learn_pilot(
         if environment:
             from .operator_roa_adapt import TerrainExposure
 
-            exposure = TerrainExposure(env, step_fields=stage.step_fields)
+            exposure = TerrainExposure(env, geometry_version=stage.geometry_version)
             report.update(
                 inherited_ppo_updates=metadata["learning_updates"],
                 optimizer_initialization="Fresh PPO and history Adam; full-policy warm start, NOT exact resume",
@@ -1044,12 +1054,12 @@ def main(argv=None):
         )
         protocol["evaluation"]["seed"] = args.seed + 1000
         protocol["adaptation_optimizer"]["learning_rate"] = 1e-4
-        if stage.step_fields:
+        if stage.geometry_version:
             from . import operator_step_field as step_field
 
             protocol.update(
                 environment_layout=args.environment_layout,
-                step_field_geometry=step_field.envelope(),
+                step_field_geometry=step_field.envelope(stage.geometry_version),
                 terrain="Free mixed environments; only step_hills columns12–15 replaced by versioned rough vertical-step fields",
                 learning_scope="Joint true-step field acquisition; no route, waypoint or success reset; not qualification",
                 schedule_scope="500 new PPO updates, H every20; zero additional regularization; fresh optimizers, not resume",
@@ -1059,7 +1069,7 @@ def main(argv=None):
 
             protocol.update(
                 support_reset_recipe=step_support.recipe(),
-                learning_scope="Mixed support-start acquisition in unchanged step fields; fixed checks retain center starts; not qualification",
+                learning_scope="Mixed support-start acquisition in the declared step-field recipe; fixed checks retain center starts; not qualification",
             )
     report = {
         "status": "RUNNING_NOT_QUALIFIED",
@@ -1100,8 +1110,8 @@ def main(argv=None):
         cfg, runner_cfg = training.proprioceptive_procedural_configs(saved, agent, args)
         if environment:
             training._configure_recurrent_terrain(cfg, DIFFICULTY, num_rows=3)
-        if stage and stage.step_fields:
-            step_field.configure(cfg)
+        if stage and stage.geometry_version:
+            step_field.configure(cfg, version=stage.geometry_version)
         if stage and stage.support_resets:
             step_support.configure(cfg)
         validate_events(cfg, support_resets=bool(stage and stage.support_resets))
@@ -1110,7 +1120,7 @@ def main(argv=None):
             yaml.dump(cfg.to_dict(), sort_keys=False)
         )
         env = ManagerBasedRLEnv(cfg=cfg)
-        if stage and stage.step_fields:
+        if stage and stage.geometry_version:
             report["native_step_field_geometry"] = step_field.verify_native_geometry(
                 env
             )
