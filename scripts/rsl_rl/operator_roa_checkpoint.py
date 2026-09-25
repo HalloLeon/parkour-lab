@@ -359,6 +359,20 @@ def _environment_source(saved, protocol, report, layout, stage):
             num_envs=count,
             steps=stage.updates * 24 + stage.updates // 20 * 64,
         )
+    if stage.step_clearance:
+        from . import operator_step_clearance
+
+        if (
+            protocol["step_clearance_recipe"] != operator_step_clearance.recipe()
+            or report["training_step_clearance"]["binding"]["columns"]
+            != report["training_exposure"]["column_ids"]
+        ):
+            raise ValueError("Step-clearance reward recipe changed")
+        operator_step_clearance.validate_training_report(
+            report["training_step_clearance"],
+            num_envs=count,
+            steps=stage.updates * 24 + stage.updates // 20 * 64,
+        )
     for key, digest in (
         ("evaluation_before", source["policy_state_sha256"]),
         ("evaluation_after", report["policy_state_sha256"]),

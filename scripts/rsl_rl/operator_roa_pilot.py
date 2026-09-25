@@ -31,6 +31,7 @@ class EnvironmentStage:
     result_stage: str
     geometry_version: str | None = None
     support_resets: bool = False
+    step_clearance: bool = False
 
 
 ENVIRONMENT_STAGES = {
@@ -70,6 +71,17 @@ ENVIRONMENT_STAGES = {
         "step_bootstrap_learning",
         geometry_version="operator_step_field_bootstrap_v1",
         support_resets=True,
+    ),
+    "step_clearance": EnvironmentStage(
+        "operator_roa_step_clearance_learning_v1",
+        "step_field_learning",
+        2500,
+        500,
+        "ROA_STEP_CLEARANCE_LEARNING_COMPLETED_NOT_QUALIFIED",
+        "step_clearance_learning",
+        geometry_version="operator_step_field_bootstrap_v1",
+        support_resets=True,
+        step_clearance=True,
     ),
 }
 REGULARIZATION_COEFFICIENTS = (0.1, 0.55, 1.0)
@@ -122,7 +134,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--environment-layout",
         choices=tuple(ENVIRONMENT_STAGES),
-        help="hills: refined source; step_fields: hills source; step_support/step_bootstrap: step-field source",
+        help="hills: refined source; step_fields: hills source; other step stages: step-field source",
     )
     parser.add_argument(
         "--regularization",
@@ -464,9 +476,7 @@ def run_pilot(
             layout=layout,
         )
     finally:
-        support = getattr(env, "_operator_step_support", None)
-        if support is not None:
-            support.active = False
+        set_training_mechanisms(env, active=False)
         motor_progress = host.bridge.progress()
         report.update(
             runner_wall_seconds=time.perf_counter() - started,
@@ -476,6 +486,14 @@ def run_pilot(
             partial_reset_steps=host.partial_reset_steps,
             motor_delivery=motor_progress,
         )
+
+
+def set_training_mechanisms(env, *, active):
+    """Keep experimental resets/rewards out of frozen screens and cleanup."""
+    for name in ("_operator_step_support", "_operator_step_clearance"):
+        state = getattr(env, name, None)
+        if state is not None:
+            state.active = active
 
 
 def _adapt_history(
@@ -610,6 +628,10 @@ def _learn_pilot(
     support = getattr(env, "_operator_step_support", None)
     if (support is not None) != bool(stage and stage.support_resets):
         raise ValueError("Support-reset admission must match the selected stage")
+    clearance = getattr(env, "_operator_step_clearance", None)
+    if (clearance is not None) != bool(stage and stage.step_clearance):
+        raise ValueError("Foot-clearance admission must match the selected stage")
+    set_training_mechanisms(env, active=False)
     obs, _ = host.reset()
     policy, reference = build_policy(obs, source_state)
     actor = policy.actor
@@ -658,8 +680,7 @@ def _learn_pilot(
         publish()
         # Reset the training RNG and physical episodes after the diagnostic.
         # This is a fresh seeded run, not simulator/RNG continuation of the pilot.
-        if support is not None:
-            support.active = True
+        set_training_mechanisms(env, active=True)
         obs, _ = host.reset(seed=seed)
         policy.train()
         coefficients = learning_coefficients(regularization, updates)
@@ -703,6 +724,8 @@ def _learn_pilot(
             report["training_exposure"] = exposure.report()
         if support is not None:
             report["training_support_resets"] = support.report()
+        if clearance is not None:
+            report["training_step_clearance"] = clearance.report()
 
     def save_checkpoint(update):
         from .operator_train import file_sha256
@@ -805,8 +828,7 @@ def _learn_pilot(
         publish_exposure()
         publish()
 
-    if support is not None:
-        support.active = False
+    set_training_mechanisms(env, active=False)
     policy.eval()
     set_phase(policy, "frozen")
     frozen_hash = state_sha256(policy)
@@ -1071,6 +1093,14 @@ def main(argv=None):
                 support_reset_recipe=step_support.recipe(),
                 learning_scope="Mixed support-start acquisition in the declared step-field recipe; fixed checks retain center starts; not qualification",
             )
+        if stage.step_clearance:
+            from . import operator_step_clearance as step_clearance
+
+            protocol.update(
+                step_clearance_recipe=step_clearance.recipe(),
+                reward="Unchanged proprio acquisition v3 plus training-only step-column low-foot-link-height cost; native dt once",
+                learning_scope="Controlled low-foot-lift cost on the bootstrap/support recipe; same 2500-update source; not qualification",
+            )
     report = {
         "status": "RUNNING_NOT_QUALIFIED",
         "exit_allowed": False,
@@ -1114,6 +1144,8 @@ def main(argv=None):
             step_field.configure(cfg, version=stage.geometry_version)
         if stage and stage.support_resets:
             step_support.configure(cfg)
+        if stage and stage.step_clearance:
+            step_clearance.configure(cfg)
         validate_events(cfg, support_resets=bool(stage and stage.support_resets))
         cfg.validate()
         (output / "resolved_env.yaml").write_text(
@@ -1130,6 +1162,8 @@ def main(argv=None):
                 env, report["native_step_field_geometry"]
             )
             publish()
+        if stage and stage.step_clearance:
+            step_clearance.install(env)
         run_pilot(
             env,
             app,
@@ -1165,9 +1199,7 @@ def main(argv=None):
         traceback.print_exc()
     finally:
         try:
-            support = getattr(env, "_operator_step_support", None)
-            if support is not None:
-                support.active = False
+            set_training_mechanisms(env, active=False)
             print(f"ROA pilot report: {output / 'report.json'}", flush=True)
         finally:
             code = finish_session(env, app, report, publish, code)
