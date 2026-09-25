@@ -309,7 +309,10 @@ def _environment_source(saved, protocol, report, layout, stage):
             f"Require the bounded {stage.updates}-update free-environment ROA stage"
         )
     _, contract, _, source = load_completed_checkpoint(
-        source_path, allow_environment=layout == "step_fields", allow_step_fields=False
+        source_path,
+        allow_environment=stage.step_fields,
+        allow_step_fields=stage.support_resets,
+        allow_step_support=False,
     )
     if (
         source.get("stage") != stage.source_stage
@@ -321,16 +324,14 @@ def _environment_source(saved, protocol, report, layout, stage):
         or binding_sha256(contract["binding"])
         != binding_sha256(saved["motor_contract"]["binding"])
     ):
-        source_label = (
-            "estimator-refinement" if layout == "hills" else "joint-environment"
-        )
+        source_label = stage.source_stage.replace("_", "-")
         raise ValueError(f"Environment stage differs from its {source_label} source")
     _validate_training_exposure(
         report["training_exposure"],
         count,
         steps=stage.updates * 24 + stage.updates // 20 * 64,
     )
-    if layout == "step_fields":
+    if stage.step_fields:
         from . import operator_step_field
 
         if (
@@ -343,6 +344,19 @@ def _environment_source(saved, protocol, report, layout, stage):
         operator_step_field.validate_geometry_report(
             report["native_step_field_geometry"], seed=seed
         )
+    if stage.support_resets:
+        from . import operator_step_support
+
+        if protocol["support_reset_recipe"] != operator_step_support.recipe():
+            raise ValueError("Support-reset recipe changed")
+        operator_step_support.validate_receipt(
+            report["native_support_patches"], report["native_step_field_geometry"]
+        )
+        operator_step_support.validate_training_report(
+            report["training_support_resets"],
+            num_envs=count,
+            steps=stage.updates * 24 + stage.updates // 20 * 64,
+        )
     for key, digest in (
         ("evaluation_before", source["policy_state_sha256"]),
         ("evaluation_after", report["policy_state_sha256"]),
@@ -352,7 +366,12 @@ def _environment_source(saved, protocol, report, layout, stage):
 
 
 def load_completed_checkpoint(
-    path, *, allow_refinement=True, allow_environment=True, allow_step_fields=True
+    path,
+    *,
+    allow_refinement=True,
+    allow_environment=True,
+    allow_step_fields=True,
+    allow_step_support=True,
 ):
     """Completed bounded stages with finite ancestry; no partial/resume selection."""
     from .operator_roa_pilot import ENVIRONMENT_STAGES, learning_coefficients
@@ -380,8 +399,12 @@ def load_completed_checkpoint(
             raise ValueError(
                 "Require original v3/refinement ancestry, not an environment stage"
             )
-        if layout == "step_fields" and not allow_step_fields:
+        if stage and stage.step_fields and not allow_step_fields:
             raise ValueError("Require earlier ancestry, not another step-field stage")
+        if stage and stage.support_resets and not allow_step_support:
+            raise ValueError(
+                "Require earlier ancestry, not another support-reset stage"
+            )
         if saved["version"] == "operator_roa_estimator_refinement_v1":
             if not allow_refinement:
                 raise ValueError(
@@ -523,9 +546,7 @@ def load_completed_checkpoint(
             total_adaptation_optimizer_steps=inherited_adaptation
             + report["adaptation_optimizer_steps"],
             counting_scope="Selected v3 experiment and descendant stages only; excludes the v2 initialization pilot and stock pretraining",
-            stage=(
-                "environment_learning" if layout == "hills" else "step_field_learning"
-            ),
+            stage=stage.result_stage,
             scope="Bounded free-environment joint ROA stage; simulator-development only, not terrain or hardware qualification",
         )
     verify_source_files(receipt)

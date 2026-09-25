@@ -28,6 +28,9 @@ class EnvironmentStage:
     source_updates: int
     updates: int
     status: str
+    result_stage: str
+    step_fields: bool = False
+    support_resets: bool = False
 
 
 ENVIRONMENT_STAGES = {
@@ -37,6 +40,7 @@ ENVIRONMENT_STAGES = {
         1000,
         1000,
         "ROA_ENVIRONMENT_LEARNING_COMPLETED_NOT_QUALIFIED",
+        "environment_learning",
     ),
     "step_fields": EnvironmentStage(
         "operator_roa_step_field_learning_v1",
@@ -44,6 +48,18 @@ ENVIRONMENT_STAGES = {
         2000,
         500,
         "ROA_STEP_FIELD_LEARNING_COMPLETED_NOT_QUALIFIED",
+        "step_field_learning",
+        step_fields=True,
+    ),
+    "step_support": EnvironmentStage(
+        "operator_roa_step_support_learning_v1",
+        "step_field_learning",
+        2500,
+        500,
+        "ROA_STEP_SUPPORT_LEARNING_COMPLETED_NOT_QUALIFIED",
+        "step_support_learning",
+        step_fields=True,
+        support_resets=True,
     ),
 }
 REGULARIZATION_COEFFICIENTS = (0.1, 0.55, 1.0)
@@ -96,7 +112,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--environment-layout",
         choices=tuple(ENVIRONMENT_STAGES),
-        help="hills (default): refined source; step_fields: completed joint hills source",
+        help="hills: refined source; step_fields: hills source; step_support: step-field source",
     )
     parser.add_argument(
         "--regularization",
@@ -219,7 +235,7 @@ def load_environment_source(path, physical_reference, seed, *, layout="hills"):
     return {"policy_state": policy.state_dict(), "motor_contract": contract}, receipt
 
 
-def validate_events(cfg):
+def validate_events(cfg, *, support_resets=False):
     """Only this reconstructed startup-persistent physics recipe can be cached."""
     expected = {
         "physics_material": ("startup", "randomize_rigid_body_material"),
@@ -239,6 +255,12 @@ def validate_events(cfg):
         )
     for name, (mode, function) in expected.items():
         term = active[name]
+        if support_resets and name == "reset_base":
+            from .operator_step_support import reset_root_state
+
+            if term.mode != mode or term.func is not reset_root_state:
+                raise ValueError("Unreviewed support-patch reset event")
+            continue
         if (
             term.mode != mode
             or term.func.__name__ != function
@@ -432,6 +454,9 @@ def run_pilot(
             layout=layout,
         )
     finally:
+        support = getattr(env, "_operator_step_support", None)
+        if support is not None:
+            support.active = False
         motor_progress = host.bridge.progress()
         report.update(
             runner_wall_seconds=time.perf_counter() - started,
@@ -572,6 +597,9 @@ def _learn_pilot(
         raise ValueError("Environment learning requires a validated warm start")
     evaluation_seed = learning[3] + 1000 if environment else EVALUATION_SEED
     exposure = None
+    support = getattr(env, "_operator_step_support", None)
+    if (support is not None) != bool(stage and stage.support_resets):
+        raise ValueError("Support-reset admission must match the selected stage")
     obs, _ = host.reset()
     policy, reference = build_policy(obs, source_state)
     actor = policy.actor
@@ -620,6 +648,8 @@ def _learn_pilot(
         publish()
         # Reset the training RNG and physical episodes after the diagnostic.
         # This is a fresh seeded run, not simulator/RNG continuation of the pilot.
+        if support is not None:
+            support.active = True
         obs, _ = host.reset(seed=seed)
         policy.train()
         coefficients = learning_coefficients(regularization, updates)
@@ -627,7 +657,7 @@ def _learn_pilot(
         if environment:
             from .operator_roa_adapt import TerrainExposure
 
-            exposure = TerrainExposure(env, step_fields=layout == "step_fields")
+            exposure = TerrainExposure(env, step_fields=stage.step_fields)
             report.update(
                 inherited_ppo_updates=metadata["learning_updates"],
                 optimizer_initialization="Fresh PPO and history Adam; full-policy warm start, NOT exact resume",
@@ -651,6 +681,18 @@ def _learn_pilot(
     report["cycles"] = []
     report["ppo_updates_completed"] = 0
     report["adaptation_optimizer_steps"] = 0
+
+    def observe():
+        if exposure is not None:
+            exposure.sample()
+        if support is not None:
+            support.sample()
+
+    def publish_exposure():
+        if exposure is not None:
+            report["training_exposure"] = exposure.report()
+        if support is not None:
+            report["training_support_resets"] = support.report()
 
     def save_checkpoint(update):
         from .operator_train import file_sha256
@@ -691,8 +733,7 @@ def _learn_pilot(
         algorithm.regularization_coef = coefficient
         with torch.no_grad():
             for _ in range(ROLLOUT_STEPS):
-                if exposure is not None:
-                    exposure.sample()
+                observe()
                 action = algorithm.act(obs)
                 obs, reward, done, extras = host.step(action, "privileged_ppo")
                 algorithm.process_env_step(obs, reward, done.long(), extras)
@@ -727,8 +768,7 @@ def _learn_pilot(
             f"ROA update {cycle}/{len(coefficients)}: privileged PPO complete; lambda={coefficient}",
             flush=True,
         )
-        if exposure is not None:
-            report["training_exposure"] = exposure.report()
+        publish_exposure()
         publish()
         if cycle % history_interval:
             continue
@@ -741,7 +781,7 @@ def _learn_pilot(
             record,
             report,
             require_change=learning is None,
-            observe=None if exposure is None else exposure.sample,
+            observe=observe,
         )
         print(
             f"ROA update {cycle}/{len(coefficients)}: history adaptation complete",
@@ -752,10 +792,11 @@ def _learn_pilot(
             cycle % checkpoint_interval == 0 or cycle == len(coefficients)
         ):
             save_checkpoint(cycle)
-        if exposure is not None:
-            report["training_exposure"] = exposure.report()
+        publish_exposure()
         publish()
 
+    if support is not None:
+        support.active = False
     policy.eval()
     set_phase(policy, "frozen")
     frozen_hash = state_sha256(policy)
@@ -1003,15 +1044,22 @@ def main(argv=None):
         )
         protocol["evaluation"]["seed"] = args.seed + 1000
         protocol["adaptation_optimizer"]["learning_rate"] = 1e-4
-        if args.environment_layout == "step_fields":
+        if stage.step_fields:
             from . import operator_step_field as step_field
 
             protocol.update(
-                environment_layout="step_fields",
+                environment_layout=args.environment_layout,
                 step_field_geometry=step_field.envelope(),
                 terrain="Free mixed environments; only step_hills columns12–15 replaced by versioned rough vertical-step fields",
                 learning_scope="Joint true-step field acquisition; no route, waypoint or success reset; not qualification",
                 schedule_scope="500 new PPO updates, H every20; zero additional regularization; fresh optimizers, not resume",
+            )
+        if stage.support_resets:
+            from . import operator_step_support as step_support
+
+            protocol.update(
+                support_reset_recipe=step_support.recipe(),
+                learning_scope="Mixed support-start acquisition in unchanged step fields; fixed checks retain center starts; not qualification",
             )
     report = {
         "status": "RUNNING_NOT_QUALIFIED",
@@ -1052,17 +1100,24 @@ def main(argv=None):
         cfg, runner_cfg = training.proprioceptive_procedural_configs(saved, agent, args)
         if environment:
             training._configure_recurrent_terrain(cfg, DIFFICULTY, num_rows=3)
-        if environment and args.environment_layout == "step_fields":
+        if stage and stage.step_fields:
             step_field.configure(cfg)
-        validate_events(cfg)
+        if stage and stage.support_resets:
+            step_support.configure(cfg)
+        validate_events(cfg, support_resets=bool(stage and stage.support_resets))
         cfg.validate()
         (output / "resolved_env.yaml").write_text(
             yaml.dump(cfg.to_dict(), sort_keys=False)
         )
         env = ManagerBasedRLEnv(cfg=cfg)
-        if environment and args.environment_layout == "step_fields":
+        if stage and stage.step_fields:
             report["native_step_field_geometry"] = step_field.verify_native_geometry(
                 env
+            )
+            publish()
+        if stage and stage.support_resets:
+            report["native_support_patches"] = step_support.install(
+                env, report["native_step_field_geometry"]
             )
             publish()
         run_pilot(
@@ -1100,6 +1155,9 @@ def main(argv=None):
         traceback.print_exc()
     finally:
         try:
+            support = getattr(env, "_operator_step_support", None)
+            if support is not None:
+                support.active = False
             print(f"ROA pilot report: {output / 'report.json'}", flush=True)
         finally:
             code = finish_session(env, app, report, publish, code)
