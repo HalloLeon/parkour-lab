@@ -18,7 +18,7 @@ from parkour_lab.learning.operator_roa import ROAActor, state_sha256
 from parkour_lab.learning.motor_contract import validate_motor_contract, binding_sha256
 
 
-def _policy_template():
+def _policy_template(*, contact_conditioned=False):
     """Fixed checkpoint schema without importing a simulator or PPO implementation."""
     from parkour_lab.learning.distillation.teacher.model import StockTerrainInput
 
@@ -36,7 +36,7 @@ def _policy_template():
     with torch.random.fork_rng(devices=[]):
         policy = nn.Module()
         policy.register_parameter("std", nn.Parameter(torch.ones(12)))
-        policy.actor = ROAActor(mlp(12))
+        policy.actor = ROAActor(mlp(12), contact_conditioned=contact_conditioned)
         policy.critic = mlp(1)
         policy.critic[0] = StockTerrainInput(policy.critic[0])
     return policy
@@ -48,8 +48,8 @@ def verify_source_files(receipt):
             raise ValueError(f"ROA source changed: {name}")
 
 
-def _validated_policy(saved, report):
-    policy = _policy_template()
+def _validated_policy(saved, report, *, contact_conditioned=False):
+    policy = _policy_template(contact_conditioned=contact_conditioned)
     expected, state = policy.state_dict(), saved["policy_state"]
     if (
         set(state) != set(expected)
@@ -308,7 +308,7 @@ def _environment_source(saved, protocol, report, layout, stage):
         raise ValueError(
             f"Require the bounded {stage.updates}-update free-environment ROA stage"
         )
-    _, contract, _, source = load_completed_checkpoint(
+    original, contract, _, source = load_completed_checkpoint(
         source_path,
         allow_environment=bool(stage.geometry_version),
         allow_step_fields=stage.support_resets,
@@ -373,8 +373,30 @@ def _environment_source(saved, protocol, report, layout, stage):
             num_envs=count,
             steps=stage.updates * 24 + stage.updates // 20 * 64,
         )
+    initial_digest = source["policy_state_sha256"]
+    if stage.contact_conditioned:
+        from . import operator_roa_contacts
+
+        if protocol["teacher_contacts"] != operator_roa_contacts.recipe():
+            raise ValueError("Teacher contact recipe changed")
+        original.actor.enable_contact_conditioning()
+        initial_digest = state_sha256(original)
+        if report["contact_initialization"] != {
+            "source_policy_state_sha256": source["policy_state_sha256"],
+            "initialized_policy_state_sha256": initial_digest,
+            "teacher_latent_exact": True,
+            "causal_action_exact": True,
+            "privileged_action_exact": True,
+            "new_projection_zero": True,
+        }:
+            raise ValueError("Teacher contact initialization differs from its source")
+        operator_roa_contacts.validate_report(
+            report["teacher_contact_observations"],
+            num_envs=count,
+            steps=stage.updates * 24 + stage.updates // 20 * 64 + 1800,
+        )
     for key, digest in (
-        ("evaluation_before", source["policy_state_sha256"]),
+        ("evaluation_before", initial_digest),
         ("evaluation_after", report["policy_state_sha256"]),
     ):
         _validate_frozen_evaluation(report[key], count, seed + 1000, digest)
@@ -486,13 +508,22 @@ def load_completed_checkpoint(
             or any(
                 protocol["model"][key] != value
                 for key, value in {
-                    "version": "operator_roa_pilot_v1",
+                    "version": (
+                        "operator_roa_contact_pilot_v1"
+                        if stage and stage.contact_conditioned
+                        else "operator_roa_pilot_v1"
+                    ),
                     "frame_dim": 45,
                     "history_frames": 25,
                     "dynamics_dim": 7,
                     "latent_dim": 8,
                     "velocity_dim": 3,
                 }.items()
+            )
+            or (
+                stage
+                and stage.contact_conditioned
+                and protocol["model"].get("contact_dim") != 12
             )
             or list(saved["regularization_coefficients"])
             != protocol["regularization_coefficients"]
@@ -527,7 +558,9 @@ def load_completed_checkpoint(
                 else "Require a source-bound completed final v3 ROA experiment"
             )
         _validate_native_motor(saved, report, count)
-        policy = _validated_policy(saved, report)
+        policy = _validated_policy(
+            saved, report, contact_conditioned=bool(stage and stage.contact_conditioned)
+        )
         source = (
             _environment_source(saved, protocol, report, layout, stage)
             if environment

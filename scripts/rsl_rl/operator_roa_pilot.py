@@ -32,6 +32,7 @@ class EnvironmentStage:
     geometry_version: str | None = None
     support_resets: bool = False
     step_clearance: bool = False
+    contact_conditioned: bool = False
 
 
 ENVIRONMENT_STAGES = {
@@ -82,6 +83,17 @@ ENVIRONMENT_STAGES = {
         geometry_version="operator_step_field_bootstrap_v1",
         support_resets=True,
         step_clearance=True,
+    ),
+    "contact_teacher": EnvironmentStage(
+        "operator_roa_contact_teacher_learning_v1",
+        "step_field_learning",
+        2500,
+        500,
+        "ROA_CONTACT_TEACHER_LEARNING_COMPLETED_NOT_QUALIFIED",
+        "contact_teacher_learning",
+        geometry_version="operator_step_field_bootstrap_v1",
+        support_resets=True,
+        contact_conditioned=True,
     ),
 }
 REGULARIZATION_COEFFICIENTS = (0.1, 0.55, 1.0)
@@ -314,7 +326,7 @@ def read_dynamics(env):
 class PilotEnvironment:
     """One native observation delivery, one verified motor delivery per control tick."""
 
-    def __init__(self, env, app):
+    def __init__(self, env, app, *, contact_conditioned=False):
         import torch
         from parkour_lab.learning.operator_roa import CausalHistory
         from parkour_lab.learning.motor_contract import make_motor_contract
@@ -341,6 +353,11 @@ class PilotEnvironment:
             env, self.motor_contract, self.manifest, preserve_native_raw=True
         )
         self.dynamics = read_dynamics(env)
+        self.contacts = None
+        if contact_conditioned:
+            from .operator_roa_contacts import ContactFeatures
+
+            self.contacts = ContactFeatures(env)
         self.previous = torch.zeros((env.num_envs, 12), device=env.device)
         self.resets = self.partial_reset_steps = self.steps = 0
         self.stage_counts = {}
@@ -390,8 +407,9 @@ class PilotEnvironment:
             raise ValueError(
                 "Pre-action sensor, command, COM-velocity or previous-action alignment failed"
             )
-        # Teacher and student see the same noisy proprioception. The critic sees
-        # clean state plus a privileged scan. No scan enters either actor path.
+        # Teacher and student share noisy proprioception; only the declared
+        # teacher extension sees contacts. The scan remains critic-only.
+        context = {"contacts": self.contacts.sample(reset)} if self.contacts else {}
         return TensorDict(
             {
                 "policy": frame.clone(),
@@ -399,6 +417,7 @@ class PilotEnvironment:
                 "critic_state": clean.clone(),
                 "terrain": native["terrain"].clone(),
                 "dynamics": self.dynamics.clone(),
+                **context,
             },
             batch_size=[self.env.num_envs],
         )
@@ -460,7 +479,10 @@ def run_pilot(
     layout="hills",
 ):
     started = time.perf_counter()
-    host = PilotEnvironment(env, app)
+    stage = ENVIRONMENT_STAGES[layout] if environment else None
+    host = PilotEnvironment(
+        env, app, contact_conditioned=bool(stage and stage.contact_conditioned)
+    )
     report["stage_counts"] = host.stage_counts
     report["dynamics_std"] = host.dynamics.std(dim=0, unbiased=False).cpu().tolist()
     try:
@@ -477,6 +499,8 @@ def run_pilot(
         )
     finally:
         set_training_mechanisms(env, active=False)
+        if host.contacts is not None:
+            report["teacher_contact_observations"] = host.contacts.report()
         motor_progress = host.bridge.progress()
         report.update(
             runner_wall_seconds=time.perf_counter() - started,
@@ -537,7 +561,7 @@ def _adapt_history(
             samples.append(
                 (
                     frames(obs).clone(),
-                    obs["dynamics"].clone(),
+                    actor.privileged_input(obs).clone(),
                     obs["critic_state"][:, :3].clone(),
                 )
             )
@@ -548,12 +572,12 @@ def _adapt_history(
     )
     if not record["estimator_unchanged_during_history_collection"]:
         raise RuntimeError("History estimator changed before block collection ended")
-    histories, dynamics, velocities = (
+    histories, privilege, velocities = (
         torch.cat(values, dim=0) for values in zip(*samples)
     )
     del samples
     with torch.no_grad():
-        before = actor.adaptation_losses(histories, dynamics, velocities)
+        before = actor.adaptation_losses(histories, privilege, velocities)
     record["adaptation_before"] = {name: float(value) for name, value in before.items()}
     set_phase(policy, "history")
     for _ in range(ADAPTATION_EPOCHS):
@@ -562,7 +586,7 @@ def _adapt_history(
         ):
             optimizer.zero_grad(set_to_none=True)
             losses = actor.adaptation_losses(
-                histories[indices], dynamics[indices], velocities[indices]
+                histories[indices], privilege[indices], velocities[indices]
             )
             loss = losses["latent"] + losses["velocity"]
             if not torch.isfinite(loss):
@@ -574,7 +598,7 @@ def _adapt_history(
             optimizer.step()
             report["adaptation_optimizer_steps"] += 1
     with torch.no_grad():
-        after = actor.adaptation_losses(histories, dynamics, velocities)
+        after = actor.adaptation_losses(histories, privilege, velocities)
     record["adaptation_after"] = {name: float(value) for name, value in after.items()}
     record["privileged_modules_unchanged_during_adaptation"] = (
         fixed_hashes == privileged_hashes() and torch.equal(fixed_std, policy.std)
@@ -674,6 +698,33 @@ def _learn_pilot(
             raise ValueError(
                 "Learning checkpoint state is invalid or differs from report"
             )
+        if stage and stage.contact_conditioned:
+            with torch.no_grad():
+                before_teacher = actor.encode(obs["dynamics"]).clone()
+                before_action = actor.history_action(obs["policy"], frames(obs)).clone()
+                before_privileged_action = policy.act_inference(obs).clone()
+                actor.enable_contact_conditioning()
+                policy.obs_groups["policy"] = actor.privileged_obs_groups
+                if not (
+                    torch.equal(
+                        before_teacher, actor.encode(actor.privileged_input(obs))
+                    )
+                    and torch.equal(
+                        before_action, actor.history_action(obs["policy"], frames(obs))
+                    )
+                    and torch.equal(before_privileged_action, policy.act_inference(obs))
+                ):
+                    raise RuntimeError(
+                        "Contact teacher initialization changed source outputs"
+                    )
+            report["contact_initialization"] = {
+                "source_policy_state_sha256": metadata["policy_state_sha256"],
+                "initialized_policy_state_sha256": state_sha256(policy),
+                "teacher_latent_exact": True,
+                "causal_action_exact": True,
+                "privileged_action_exact": True,
+                "new_projection_zero": True,
+            }
         report["evaluation_before"] = evaluate_history(
             host, policy, seed=evaluation_seed
         )
@@ -726,6 +777,8 @@ def _learn_pilot(
             report["training_support_resets"] = support.report()
         if clearance is not None:
             report["training_step_clearance"] = clearance.report()
+        if host.contacts is not None:
+            report["teacher_contact_observations"] = host.contacts.report()
 
     def save_checkpoint(update):
         from .operator_train import file_sha256
@@ -1100,6 +1153,21 @@ def main(argv=None):
                 step_clearance_recipe=step_clearance.recipe(),
                 reward="Unchanged proprio acquisition v3 plus training-only step-column low-foot-link-height cost; native dt once",
                 learning_scope="Controlled low-foot-lift cost on the bootstrap/support recipe; same 2500-update source; not qualification",
+            )
+        if stage.contact_conditioned:
+            from .operator_roa_contacts import recipe
+
+            protocol["teacher_contacts"] = recipe()
+            protocol["model"].update(
+                version="operator_roa_contact_pilot_v1",
+                contact_dim=12,
+                motor="Unchanged shared motor/history estimator; original dynamics7 GEMM plus zero-initialized contact12->64 projection before teacher ELU",
+            )
+            protocol["supervision"] = (
+                "Current body-COM velocity labels and detached dynamics/contact teacher latent; no contacts or privileged state enter the causal actor"
+            )
+            protocol["learning_scope"] = (
+                "Matched contact-teacher information ablation; unchanged bootstrap geometry, rewards, lambda-off schedule and 2500-update source; not qualification"
             )
     report = {
         "status": "RUNNING_NOT_QUALIFIED",

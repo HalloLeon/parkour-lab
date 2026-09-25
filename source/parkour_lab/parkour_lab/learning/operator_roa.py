@@ -4,6 +4,8 @@ The seven dynamics values are declared by the native provider, not inferred here
 base mass ratio minus one, local base COM xyz, and robot-shape mean static
 friction, dynamic friction and restitution. Shape means are not effective contact
 coefficients. Models and diagnostics alone are not training or acceptance evidence.
+An opt-in teacher also reads twelve current body-frame net normal contact-force
+features. These simulator labels never enter the causal history actor directly.
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ VERSION = "operator_roa_pilot_v1"
 FRAME_DIM = 45
 HISTORY_LENGTH = 25
 DYNAMICS_DIM = 7
+CONTACT_DIM = 12
 LATENT_DIM = 8
 CODE_DIM = 3 + LATENT_DIM
 
@@ -84,6 +87,28 @@ class LatentMotor(nn.Module):
         return result
 
 
+class ContactEncoderInput(nn.Module):
+    """Preserve the seven-column teacher GEMM and add a separate contact projection."""
+
+    def __init__(self, reference):
+        super().__init__()
+        self.reference = reference
+        # Initialization must not perturb the matched experiment's rollout RNG.
+        with torch.random.fork_rng(devices=[]):
+            self.contact_projection = nn.Linear(
+                CONTACT_DIM, reference.out_features, bias=False, device="cpu"
+            )
+        nn.init.zeros_(self.contact_projection.weight)
+        self.contact_projection.to(reference.weight)
+        self.contact_projection.requires_grad_(reference.weight.requires_grad)
+        self.train(reference.training)
+
+    def forward(self, privilege):
+        return self.reference(privilege[:, :DYNAMICS_DIM].contiguous()) + (
+            self.contact_projection(privilege[:, DYNAMICS_DIM:])
+        )
+
+
 class ROAActor(nn.Module):
     """Shared motor with privileged μ and causal φ; neither route reads true velocity.
 
@@ -92,8 +117,10 @@ class ROAActor(nn.Module):
     The native scheduler owns alternating blocks; forward is always privileged.
     """
 
-    def __init__(self, stock_motor):
+    def __init__(self, stock_motor, contact_conditioned=False):
         super().__init__()
+        if type(contact_conditioned) is not bool:
+            raise ValueError("Contact conditioning must be an explicit boolean")
         self.motor = LatentMotor(stock_motor)
         self.encoder = nn.Sequential(
             nn.Linear(DYNAMICS_DIM, 64, device="cpu"),
@@ -110,9 +137,41 @@ class ROAActor(nn.Module):
             nn.ELU(),
             nn.Linear(64, CODE_DIM, device="cpu"),
         ).to(self.motor.stock_first.weight)
+        if contact_conditioned:
+            self.enable_contact_conditioning()
+
+    @property
+    def contact_conditioned(self):
+        return isinstance(self.encoder[0], ContactEncoderInput)
+
+    @property
+    def privileged_dim(self):
+        return DYNAMICS_DIM + (CONTACT_DIM if self.contact_conditioned else 0)
+
+    @property
+    def privileged_obs_groups(self):
+        return (
+            ["policy", "dynamics"]
+            + (["contacts"] if self.contact_conditioned else [])
+            + ["history"]
+        )
+
+    def enable_contact_conditioning(self):
+        if self.contact_conditioned:
+            raise ValueError("Contact conditioning is already enabled")
+        self.encoder[0] = ContactEncoderInput(self.encoder[0])
+
+    def privileged_input(self, observations):
+        dynamics = observations["dynamics"]
+        _batch(dynamics, DYNAMICS_DIM, self.motor.stock_first.weight)
+        if not self.contact_conditioned:
+            return dynamics
+        contacts = observations["contacts"]
+        finite_tensor(contacts, (len(dynamics), CONTACT_DIM), dynamics)
+        return torch.cat((dynamics, contacts), dim=-1)
 
     def encode(self, dynamics):
-        _batch(dynamics, DYNAMICS_DIM, self.motor.stock_first.weight)
+        _batch(dynamics, self.privileged_dim, self.motor.stock_first.weight)
         latent = self.encoder(dynamics)
         finite_tensor(latent, (len(dynamics), LATENT_DIM), dynamics)
         return latent
@@ -120,15 +179,17 @@ class ROAActor(nn.Module):
     def forward(self, observations):
         _batch(
             observations,
-            FRAME_DIM + DYNAMICS_DIM + HISTORY_LENGTH * FRAME_DIM,
+            FRAME_DIM + self.privileged_dim + HISTORY_LENGTH * FRAME_DIM,
             self.motor.stock_first.weight,
         )
         frame = observations[:, :FRAME_DIM]
-        history = observations[:, FRAME_DIM + DYNAMICS_DIM :].reshape(
+        history = observations[:, FRAME_DIM + self.privileged_dim :].reshape(
             -1, HISTORY_LENGTH, FRAME_DIM
         )
         predicted = self._current_estimate(frame, history)
-        latent = self.encode(observations[:, FRAME_DIM : FRAME_DIM + DYNAMICS_DIM])
+        latent = self.encode(
+            observations[:, FRAME_DIM : FRAME_DIM + self.privileged_dim]
+        )
         return self.motor(frame, torch.cat((predicted[:, :3].detach(), latent), dim=-1))
 
     def estimate(self, history):
@@ -168,14 +229,16 @@ class ROAActor(nn.Module):
         history = observations["history"].reshape(-1, HISTORY_LENGTH, FRAME_DIM)
         predicted = self._current_estimate(observations["policy"], history)
         return torch.linalg.vector_norm(
-            self.encode(observations["dynamics"]) - predicted[:, 3:].detach(), dim=-1
+            self.encode(self.privileged_input(observations))
+            - predicted[:, 3:].detach(),
+            dim=-1,
         ).mean()
 
-    def adaptation_losses(self, history, dynamics, velocity):
+    def adaptation_losses(self, history, privilege, velocity):
         predicted = self.estimate(history)
         finite_tensor(velocity, (len(history), 3), predicted)
         with torch.no_grad():
-            target = self.encode(dynamics).detach().clone()
+            target = self.encode(privilege).detach().clone()
         finite_tensor(target, (len(history), LATENT_DIM), predicted)
         return {
             "latent": torch.linalg.vector_norm(
@@ -228,10 +291,15 @@ def gradient_norms(actor):
         ]
         return float(torch.stack(values).sum().sqrt()) if values else None
 
-    return {
+    result = {
         "encoder_gradient_l2": norm(actor.encoder.parameters()),
         "projection_gradient_l2": norm(actor.motor.latent_projection.parameters()),
     }
+    if actor.contact_conditioned:
+        result["contact_projection_gradient_l2"] = norm(
+            actor.encoder[0].contact_projection.parameters()
+        )
+    return result
 
 
 @torch.no_grad()
@@ -240,22 +308,41 @@ def branch_diagnostics(actor, observations):
     predicted = actor.estimate(
         observations["history"].reshape(-1, HISTORY_LENGTH, FRAME_DIM)
     )
-    code = torch.cat((predicted[:, :3], actor.encode(observations["dynamics"])), dim=-1)
+    privilege = actor.privileged_input(observations)
+    code = torch.cat((predicted[:, :3], actor.encode(privilege)), dim=-1)
     permuted = torch.cat((code[:, :3], code[:, 3:].roll(1, dims=0)), dim=-1)
     delta = actor.motor(observations["policy"], code) - actor.motor(
         observations["policy"], permuted
     )
     spread = code[:, 3:].std(dim=0, unbiased=False)
-    return {
+    result = {
         "samples": len(code),
         "latent_batch_std_mean": float(spread.mean()),
         "latent_batch_std_max": float(spread.max()),
         "latent_permutation_action_abs_max": float(delta.abs().max()),
         **gradient_norms(actor),
     }
+    if actor.contact_conditioned:
+        without_contacts = privilege.clone()
+        without_contacts[:, DYNAMICS_DIM:] = 0
+        zero_code = torch.cat((code[:, :3], actor.encode(without_contacts)), dim=-1)
+        contact_delta = (
+            actor.motor(observations["policy"], code)
+            - actor.motor(observations["policy"], zero_code)
+        ).abs()
+        result.update(
+            contact_zero_action_abs_mean=float(contact_delta.mean()),
+            contact_zero_action_abs_max=float(contact_delta.max()),
+            contact_projection_weight_l2=float(
+                actor.encoder[0].contact_projection.weight.norm()
+            ),
+            contact_feature_abs_mean=float(privilege[:, DYNAMICS_DIM:].abs().mean()),
+            contact_feature_abs_max=float(privilege[:, DYNAMICS_DIM:].abs().max()),
+        )
+    return result
 
 
-def build_policy(observations, source_state):
+def build_policy(observations, source_state, contact_conditioned=False):
     """Stock motor weights/value warm start; predicted velocity changes actor inputs."""
     from rsl_rl.modules import ActorCritic
     from .distillation.teacher.model import StockTerrainInput
@@ -271,6 +358,12 @@ def build_policy(observations, source_state):
         ("history", HISTORY_LENGTH * FRAME_DIM),
     ):
         finite_tensor(observations[name], (len(policy_obs), width), policy_obs)
+    if type(contact_conditioned) is not bool:
+        raise ValueError("Contact conditioning must be an explicit boolean")
+    if contact_conditioned:
+        finite_tensor(
+            observations["contacts"], (len(policy_obs), CONTACT_DIM), policy_obs
+        )
     if not isinstance(source_state, dict) or not source_state:
         raise ValueError("Require the verified stock ActorCritic state dictionary")
     for value in source_state.values():
@@ -291,10 +384,10 @@ def build_policy(observations, source_state):
     if (reference.std <= 0).any():
         raise ValueError("Stock action noise must be positive")
     policy = copy.deepcopy(reference)
-    policy.actor = ROAActor(policy.actor)
+    policy.actor = ROAActor(policy.actor, contact_conditioned=contact_conditioned)
     policy.critic[0] = StockTerrainInput(policy.critic[0])
     policy.obs_groups = {
-        "policy": ["policy", "dynamics", "history"],
+        "policy": policy.actor.privileged_obs_groups,
         "critic": ["critic_state", "terrain"],
     }
     return policy.to(policy_obs), reference.to(policy_obs).eval().requires_grad_(False)

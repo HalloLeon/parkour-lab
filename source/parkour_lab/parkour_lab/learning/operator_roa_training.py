@@ -36,16 +36,19 @@ class ROAPPO(PPO):
         set_phase(policy, "privileged")
 
     def _check_phase(self):
+        estimator = {id(p) for p in self.policy.actor.estimator.parameters()}
+        expected_ppo = {id(p) for p in self.policy.parameters()} - estimator
         if (
             self.policy.obs_groups
             != {
-                "policy": ["policy", "dynamics", "history"],
+                "policy": self.policy.actor.privileged_obs_groups,
                 "critic": ["critic_state", "terrain"],
             }
             or self.policy.actor_obs_normalization
             or self.policy.critic_obs_normalization
             or any(p.requires_grad for p in self.policy.actor.estimator.parameters())
             or not all(p.requires_grad for p in self.ppo_parameters)
+            or {id(p) for p in self.ppo_parameters} != expected_ppo
             or {id(p) for group in self.optimizer.param_groups for p in group["params"]}
             != {id(p) for p in self.ppo_parameters}
         ):
@@ -107,8 +110,7 @@ class ROAPPO(PPO):
             for name in ("value_function", "surrogate", "entropy", "regularization")
         }
         gradient_max = {
-            "encoder_gradient_l2_max": 0.0,
-            "projection_gradient_l2_max": 0.0,
+            name + "_max": 0.0 for name in gradient_norms(self.policy.actor)
         }
         estimator_before = state_sha256(self.policy.actor.estimator)
         count = 0

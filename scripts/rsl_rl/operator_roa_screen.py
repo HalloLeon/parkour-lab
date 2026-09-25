@@ -182,10 +182,14 @@ def main(argv=None):
         protocol.update(
             diagnostic_input=args.diagnostic_input,
             action_source="PRIVILEGED_SIMULATION_DIAGNOSTIC_NOT_DEPLOYABLE",
-            sensing="Unchanged noisy45 frames/history; replace only motor velocity with true native body-COM velocity OR history latent with privileged dynamics latent, as selected",
+            sensing="Unchanged noisy45 frames/history; replace only motor velocity with true native body-COM velocity OR history latent with the checkpoint's privileged teacher latent, as selected",
             scope=protocol["scope"]
             + "; simulator-input intervention, NOT a causal controller test or an oracle upper bound",
         )
+    if policy.actor.contact_conditioned:
+        from .operator_roa_contacts import recipe
+
+        protocol["teacher_contacts"] = recipe()
     training.write_json(output / "evaluation_protocol.json", protocol)
     report = {
         "status": "SOURCE_VALIDATED_NOT_SIMULATED",
@@ -241,7 +245,9 @@ def main(argv=None):
             report["native_geometry"] = traversal.native_receipts()
             if report["native_geometry"] != fixtures:
                 raise ValueError("Require all four constructed traversal mesh receipts")
-        host = PilotEnvironment(env, app)
+        host = PilotEnvironment(
+            env, app, contact_conditioned=policy.actor.contact_conditioned
+        )
         if binding_sha256(contract["binding"]) != binding_sha256(
             host.motor_contract["binding"]
         ):
@@ -275,6 +281,8 @@ def main(argv=None):
                 output / "input_diagnostic_trace.npz" if fixtures else None
             ),
         )
+        if host.contacts is not None:
+            report["teacher_contact_observations"] = host.contacts.report()
         if probe is not None:
             report["traversal"] = probe.report()
         report["evaluation"]["scope"] = protocol["scope"]

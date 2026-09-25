@@ -303,7 +303,7 @@ def _input_diagnostic_report(
             "Only motor code[:3]: native current body-COM velocity in m/s"
             if mode == "true_velocity"
             else (
-                "Only motor code[3:]: privileged dynamics encoder latent"
+                "Only motor code[3:]: checkpoint's privileged teacher latent"
                 if mode
                 else None
             )
@@ -539,7 +539,9 @@ def evaluate_history(
                 if diagnostic_input == "true_velocity":
                     code[:, :3] = clean[:, :3]
                 else:
-                    code[:, 3:] = policy.actor.encode(observations["dynamics"])
+                    code[:, 3:] = policy.actor.encode(
+                        policy.actor.privileged_input(observations)
+                    )
                 applied = policy.actor.motor(frame, code)
                 _finite(applied, (count, 12), "diagnostic action")
             if diagnostic_output is not None:
@@ -555,6 +557,11 @@ def evaluate_history(
                             "applied_raw_action": applied,
                             "first_attempt_valid": alive,
                             "command_b": expected_command,
+                            **(
+                                {"teacher_contact_features": observations["contacts"]}
+                                if "contacts" in observations.keys()
+                                else {}
+                            ),
                         }.items()
                     }
                 )
