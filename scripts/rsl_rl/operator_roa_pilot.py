@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from dataclasses import dataclass
 import importlib.metadata
 import json
 from pathlib import Path
@@ -18,6 +19,33 @@ import traceback
 
 VERSION = "operator_roa_learning_pilot_v3"
 ENVIRONMENT_VERSION = "operator_roa_environment_learning_v1"
+
+
+@dataclass(frozen=True)
+class EnvironmentStage:
+    version: str
+    source_stage: str
+    source_updates: int
+    updates: int
+    status: str
+
+
+ENVIRONMENT_STAGES = {
+    "hills": EnvironmentStage(
+        ENVIRONMENT_VERSION,
+        "estimator_refinement",
+        1000,
+        1000,
+        "ROA_ENVIRONMENT_LEARNING_COMPLETED_NOT_QUALIFIED",
+    ),
+    "step_fields": EnvironmentStage(
+        "operator_roa_step_field_learning_v1",
+        "environment_learning",
+        2000,
+        500,
+        "ROA_STEP_FIELD_LEARNING_COMPLETED_NOT_QUALIFIED",
+    ),
+}
 REGULARIZATION_COEFFICIENTS = (0.1, 0.55, 1.0)
 ROLLOUT_STEPS = 24
 HISTORY_STEPS = 64
@@ -63,7 +91,12 @@ def parse_args(argv=None):
     sources.add_argument(
         "--environment-checkpoint",
         type=Path,
-        help="Completed estimator-refined adapted.pt: 1000 new joint updates in free terrain environments",
+        help="Completed source for the selected bounded environment stage; fresh optimizers",
+    )
+    parser.add_argument(
+        "--environment-layout",
+        choices=tuple(ENVIRONMENT_STAGES),
+        help="hills (default): refined source; step_fields: completed joint hills source",
     )
     parser.add_argument(
         "--regularization",
@@ -80,19 +113,23 @@ def parse_args(argv=None):
     if args.seed < 0 or args.cpu_threads < 1:
         parser.error("seed must be nonnegative and cpu-threads positive")
     learning = args.learning_checkpoint or args.environment_checkpoint
+    if args.environment_layout is not None and args.environment_checkpoint is None:
+        parser.error("--environment-layout requires --environment-checkpoint")
+    args.environment_layout = args.environment_layout or "hills"
+    stage = ENVIRONMENT_STAGES[args.environment_layout]
     if (learning is None) != (args.regularization is None):
         parser.error("A learning checkpoint and --regularization must be used together")
     if args.learning_updates is not None and learning is None:
         parser.error("--learning-updates requires a learning checkpoint")
     if learning is not None and args.learning_updates is None:
         args.learning_updates = (
-            1000 if args.environment_checkpoint else LEARNING_UPDATES
+            stage.updates if args.environment_checkpoint else LEARNING_UPDATES
         )
     if args.environment_checkpoint and (
-        args.regularization != "off" or args.learning_updates != 1000
+        args.regularization != "off" or args.learning_updates != stage.updates
     ):
         parser.error(
-            "Environment learning requires --regularization off and 1000 new updates"
+            f"{args.environment_layout} requires --regularization off and {stage.updates} new updates"
         )
     return args
 
@@ -164,19 +201,20 @@ def load_learning_source(path, physical_reference):
     }
 
 
-def load_environment_source(path, physical_reference, seed):
-    """Only the completed, source-linked estimator repair can seed this stage."""
+def load_environment_source(path, physical_reference, seed, *, layout="hills"):
+    """Admit only the selected stage's completed, source-linked predecessor."""
     from .operator_roa_checkpoint import load_completed_checkpoint
 
     policy, contract, _, receipt = load_completed_checkpoint(path)
+    stage = ENVIRONMENT_STAGES[layout]
     if (
-        receipt.get("stage") != "estimator_refinement"
+        receipt.get("stage") != stage.source_stage
         or receipt["physical_reference"] != physical_reference
-        or receipt["learning_updates"] != 1000
+        or receipt["learning_updates"] != stage.source_updates
         or receipt["training_seed"] == seed
     ):
         raise ValueError(
-            "Require the completed 1000-update estimator-refined source and a fresh seed"
+            f"Require completed {stage.source_stage} with {stage.source_updates} selected-lineage updates and a fresh seed"
         )
     return {"policy_state": policy.state_dict(), "motor_contract": contract}, receipt
 
@@ -375,6 +413,7 @@ def run_pilot(
     *,
     learning=None,
     environment=False,
+    layout="hills",
 ):
     started = time.perf_counter()
     host = PilotEnvironment(env, app)
@@ -390,6 +429,7 @@ def run_pilot(
             publish,
             learning=learning,
             environment=environment,
+            layout=layout,
         )
     finally:
         motor_progress = host.bridge.progress()
@@ -513,6 +553,7 @@ def _learn_pilot(
     *,
     learning=None,
     environment=False,
+    layout="hills",
 ):
     import torch
     from parkour_lab.learning.operator_roa import (
@@ -526,6 +567,7 @@ def _learn_pilot(
     from parkour_lab.learning.operator_roa_training import ROAPPO
 
     env = host.env
+    stage = ENVIRONMENT_STAGES[layout] if environment else None
     if environment and learning is None:
         raise ValueError("Environment learning requires a validated warm start")
     evaluation_seed = learning[3] + 1000 if environment else EVALUATION_SEED
@@ -585,7 +627,7 @@ def _learn_pilot(
         if environment:
             from .operator_roa_adapt import TerrainExposure
 
-            exposure = TerrainExposure(env)
+            exposure = TerrainExposure(env, step_fields=layout == "step_fields")
             report.update(
                 inherited_ppo_updates=metadata["learning_updates"],
                 optimizer_initialization="Fresh PPO and history Adam; full-policy warm start, NOT exact resume",
@@ -617,7 +659,7 @@ def _learn_pilot(
         pending = path.with_suffix(".pt.pending")
         torch.save(
             {
-                "version": ENVIRONMENT_VERSION if environment else VERSION,
+                "version": stage.version if stage else VERSION,
                 "readiness_only": True,
                 "deployment_allowed": False,
                 "policy_state": policy.state_dict(),
@@ -751,8 +793,8 @@ def _learn_pilot(
         save_checkpoint(len(coefficients))
     report.update(
         status=(
-            "ROA_ENVIRONMENT_LEARNING_COMPLETED_NOT_QUALIFIED"
-            if environment
+            stage.status
+            if stage
             else (
                 "ROA_LEARNING_PILOT_COMPLETED_NOT_QUALIFIED"
                 if learning is None
@@ -810,7 +852,8 @@ def finish_session(env, app, report, publish, code):
 def main(argv=None):
     args = parse_args(argv)
     environment = args.environment_checkpoint is not None
-    version = ENVIRONMENT_VERSION if environment else VERSION
+    stage = ENVIRONMENT_STAGES[args.environment_layout] if environment else None
+    version = stage.version if stage else VERSION
     print(f"ROA entry point: {Path(__file__).resolve()} ({version})", flush=True)
     from .operator_play import configure_live_execution, verify_live_execution
 
@@ -834,7 +877,10 @@ def main(argv=None):
         learning_path = learning_path.resolve(strict=True)
         if environment:
             checkpoint, metadata = load_environment_source(
-                learning_path, identity["physical_reference"], args.seed
+                learning_path,
+                identity["physical_reference"],
+                args.seed,
+                layout=args.environment_layout,
             )
         else:
             checkpoint, metadata = load_learning_source(
@@ -957,6 +1003,16 @@ def main(argv=None):
         )
         protocol["evaluation"]["seed"] = args.seed + 1000
         protocol["adaptation_optimizer"]["learning_rate"] = 1e-4
+        if args.environment_layout == "step_fields":
+            from . import operator_step_field as step_field
+
+            protocol.update(
+                environment_layout="step_fields",
+                step_field_geometry=step_field.envelope(),
+                terrain="Free mixed environments; only step_hills columns12–15 replaced by versioned rough vertical-step fields",
+                learning_scope="Joint true-step field acquisition; no route, waypoint or success reset; not qualification",
+                schedule_scope="500 new PPO updates, H every20; zero additional regularization; fresh optimizers, not resume",
+            )
     report = {
         "status": "RUNNING_NOT_QUALIFIED",
         "exit_allowed": False,
@@ -996,12 +1052,19 @@ def main(argv=None):
         cfg, runner_cfg = training.proprioceptive_procedural_configs(saved, agent, args)
         if environment:
             training._configure_recurrent_terrain(cfg, DIFFICULTY, num_rows=3)
+        if environment and args.environment_layout == "step_fields":
+            step_field.configure(cfg)
         validate_events(cfg)
         cfg.validate()
         (output / "resolved_env.yaml").write_text(
             yaml.dump(cfg.to_dict(), sort_keys=False)
         )
         env = ManagerBasedRLEnv(cfg=cfg)
+        if environment and args.environment_layout == "step_fields":
+            report["native_step_field_geometry"] = step_field.verify_native_geometry(
+                env
+            )
+            publish()
         run_pilot(
             env,
             app,
@@ -1012,6 +1075,7 @@ def main(argv=None):
             publish,
             learning=learning,
             environment=environment,
+            layout=args.environment_layout,
         )
         if training.recurrent_training_identity(args.reference) != identity:
             raise RuntimeError("Source or runtime changed during learning pilot")

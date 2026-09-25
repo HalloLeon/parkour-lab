@@ -285,8 +285,8 @@ def _validate_training_exposure(exposure, count, *, steps):
         raise ValueError("Incomplete ROA training exposure groups")
 
 
-def _environment_source(saved, protocol, report):
-    """Validate the one allowed joint stage over estimator-refinement ancestry."""
+def _environment_source(saved, protocol, report, layout, stage):
+    """Validate a bounded joint stage and its strictly earlier source stage."""
     source_path = protocol["environment_checkpoint"]
     seed, count = protocol["seed"], protocol["num_envs"]
     if (
@@ -294,23 +294,26 @@ def _environment_source(saved, protocol, report):
         or not Path(source_path).is_absolute()
         or type(seed) is not int
         or seed < 0
-        or saved["completed_cycles"] != 1000
+        or saved["completed_cycles"] != stage.updates
         or any(saved["regularization_coefficients"])
         or protocol["terrain_rows"] != 3
         or protocol["difficulty_range"] != [0.15, 0.55]
         or protocol["evaluation"]["seed"] != seed + 1000
-        or protocol["planned_environment_transitions"] != 29000 * count
+        or protocol["planned_environment_transitions"]
+        != (stage.updates * 24 + stage.updates // 20 * 64 + 1800) * count
         or protocol["adaptation_optimizer"]["learning_rate"] != 1e-4
         or report["ppo_options"]["learning_rate"] != 1e-4
         or report["ppo_options"]["schedule"] != "fixed"
     ):
-        raise ValueError("Require the bounded 1000-update free-environment ROA stage")
+        raise ValueError(
+            f"Require the bounded {stage.updates}-update free-environment ROA stage"
+        )
     _, contract, _, source = load_completed_checkpoint(
-        source_path, allow_environment=False
+        source_path, allow_environment=layout == "step_fields", allow_step_fields=False
     )
     if (
-        source.get("stage") != "estimator_refinement"
-        or source["learning_updates"] != 1000
+        source.get("stage") != stage.source_stage
+        or source["learning_updates"] != stage.source_updates
         or saved["learning_source"] != source
         or source["physical_reference"]
         != protocol["source_identity"]["physical_reference"]
@@ -318,10 +321,28 @@ def _environment_source(saved, protocol, report):
         or binding_sha256(contract["binding"])
         != binding_sha256(saved["motor_contract"]["binding"])
     ):
-        raise ValueError(
-            "Environment stage differs from its estimator-refinement source"
+        source_label = (
+            "estimator-refinement" if layout == "hills" else "joint-environment"
         )
-    _validate_training_exposure(report["training_exposure"], count, steps=27200)
+        raise ValueError(f"Environment stage differs from its {source_label} source")
+    _validate_training_exposure(
+        report["training_exposure"],
+        count,
+        steps=stage.updates * 24 + stage.updates // 20 * 64,
+    )
+    if layout == "step_fields":
+        from . import operator_step_field
+
+        if (
+            protocol["environment_layout"] != layout
+            or protocol["step_field_geometry"] != operator_step_field.envelope()
+            or report["training_exposure"]["geometry_overrides"]
+            != {"step_hills": operator_step_field.VERSION}
+        ):
+            raise ValueError("Step-field geometry or measured exposure recipe changed")
+        operator_step_field.validate_geometry_report(
+            report["native_step_field_geometry"], seed=seed
+        )
     for key, digest in (
         ("evaluation_before", source["policy_state_sha256"]),
         ("evaluation_after", report["policy_state_sha256"]),
@@ -330,9 +351,11 @@ def _environment_source(saved, protocol, report):
     return source
 
 
-def load_completed_checkpoint(path, *, allow_refinement=True, allow_environment=True):
+def load_completed_checkpoint(
+    path, *, allow_refinement=True, allow_environment=True, allow_step_fields=True
+):
     """Completed bounded stages with finite ancestry; no partial/resume selection."""
-    from .operator_roa_pilot import ENVIRONMENT_VERSION, learning_coefficients
+    from .operator_roa_pilot import ENVIRONMENT_STAGES, learning_coefficients
 
     path = Path(path).resolve(strict=True)
     paths = (path, path.parent / "training_protocol.json", path.parent / "report.json")
@@ -343,11 +366,22 @@ def load_completed_checkpoint(path, *, allow_refinement=True, allow_environment=
             io.BytesIO(encoded[str(path)]), map_location="cpu", weights_only=True
         )
         protocol, report = (json.loads(encoded[str(item)]) for item in paths[1:])
-        environment = saved["version"] == ENVIRONMENT_VERSION
+        layout = next(
+            (
+                key
+                for key, stage in ENVIRONMENT_STAGES.items()
+                if saved["version"] == stage.version
+            ),
+            None,
+        )
+        environment = layout is not None
+        stage = ENVIRONMENT_STAGES[layout] if environment else None
         if environment and (not allow_refinement or not allow_environment):
             raise ValueError(
                 "Require original v3/refinement ancestry, not an environment stage"
             )
+        if layout == "step_fields" and not allow_step_fields:
+            raise ValueError("Require earlier ancestry, not another step-field stage")
         if saved["version"] == "operator_roa_estimator_refinement_v1":
             if not allow_refinement:
                 raise ValueError(
@@ -356,7 +390,7 @@ def load_completed_checkpoint(path, *, allow_refinement=True, allow_environment=
             return _load_refinement(path, hashes, saved, protocol, report)
         updates, count = saved["completed_cycles"], protocol["num_envs"]
         status = (
-            "ROA_ENVIRONMENT_LEARNING_COMPLETED_NOT_QUALIFIED"
+            stage.status
             if environment
             else "ROA_INCREMENTAL_EXPERIMENT_COMPLETED_NOT_QUALIFIED"
         )
@@ -380,7 +414,10 @@ def load_completed_checkpoint(path, *, allow_refinement=True, allow_environment=
                 "learning_source",
             }
             or saved["version"]
-            not in ("operator_roa_learning_pilot_v3", ENVIRONMENT_VERSION)
+            not in (
+                "operator_roa_learning_pilot_v3",
+                *(item.version for item in ENVIRONMENT_STAGES.values()),
+            )
             or protocol["version"] != saved["version"]
             or type(updates) is not int
             or updates not in (100, 500, 1000)
@@ -452,7 +489,11 @@ def load_completed_checkpoint(path, *, allow_refinement=True, allow_environment=
             )
         _validate_native_motor(saved, report, count)
         policy = _validated_policy(saved, report)
-        source = _environment_source(saved, protocol, report) if environment else None
+        source = (
+            _environment_source(saved, protocol, report, layout, stage)
+            if environment
+            else None
+        )
     except (KeyError, TypeError, AttributeError, RuntimeError, OverflowError) as error:
         raise ValueError("Malformed or incomplete ROA experiment") from error
     receipt = {
@@ -470,6 +511,8 @@ def load_completed_checkpoint(path, *, allow_refinement=True, allow_environment=
         inherited_adaptation = (
             source["learning_updates"] // 20 * 16
             + source["additional_adaptation_optimizer_steps"]
+            if layout == "hills"
+            else source["total_adaptation_optimizer_steps"]
         )
         receipt.update(
             files={**source["files"], **hashes},
@@ -480,7 +523,9 @@ def load_completed_checkpoint(path, *, allow_refinement=True, allow_environment=
             total_adaptation_optimizer_steps=inherited_adaptation
             + report["adaptation_optimizer_steps"],
             counting_scope="Selected v3 experiment and descendant stages only; excludes the v2 initialization pilot and stock pretraining",
-            stage="environment_learning",
+            stage=(
+                "environment_learning" if layout == "hills" else "step_field_learning"
+            ),
             scope="Bounded free-environment joint ROA stage; simulator-development only, not terrain or hardware qualification",
         )
     verify_source_files(receipt)

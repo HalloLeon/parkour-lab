@@ -56,13 +56,14 @@ def parse_args(argv=None):
 class TerrainExposure:
     """Pre-action training-state counts; no contact/support or success inference."""
 
-    def __init__(self, env):
+    def __init__(self, env, *, step_fields=False):
         import torch
         from parkour_lab.tasks.manager_based.parkour_lab.mdp.terrain.operator_terrain import (
             PROFILE_BY_COLUMN,
         )
 
         self.env = env
+        self.step_fields = step_fields
         terrain = env.scene.terrain
         self.columns = terrain.terrain_types.clone()
         self.levels = terrain.terrain_levels.clone()
@@ -96,7 +97,10 @@ class TerrainExposure:
         moving = torch.linalg.vector_norm(data.root_lin_vel_b[:, :2], dim=1) > 0.05
         command = env.command_manager.get_command("base_velocity")
         # Geometry taper is exactly zero in these pads, bands and borders.
-        off_flat = (local[:, :2].abs().amax(1) > 1.0) & (local[:, 1].abs() > 0.6)
+        outside_band = local[:, 1].abs() > 0.6
+        if self.step_fields:
+            outside_band |= (self.columns >= 12) & (self.columns < 16)
+        off_flat = (local[:, :2].abs().amax(1) > 1.0) & outside_band
         off_flat &= (local[:, :2].abs() < 7.0).all(1) & finite
         nonzero_height = (hits[:, 0, 2] - env.scene.env_origins[:, 2]).abs() > 0.001
         values = torch.stack(
@@ -130,7 +134,7 @@ class TerrainExposure:
             "invalid_ray_or_root_samples",
         )
         counts = self.counts.cpu().tolist()
-        return {
+        result = {
             "control_steps": self.steps,
             "column_ids": self.columns.cpu().tolist(),
             "level_ids": self.levels.cpu().tolist(),
@@ -145,6 +149,11 @@ class TerrainExposure:
             ],
             "scope": "All pre-action training states, including reset and later episodes; measured COM XY speed >0.05m/s, center-ray height magnitude >1mm. Root location only, NOT foot support, course completion or qualification.",
         }
+        if self.step_fields:
+            from .operator_step_field import VERSION
+
+            result["geometry_overrides"] = {"step_hills": VERSION}
+        return result
 
 
 def refine(host, policy, source, output, report, publish, *, seed, source_checkpoint):
