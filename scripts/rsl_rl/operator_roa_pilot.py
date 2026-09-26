@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import importlib.metadata
 import json
 from pathlib import Path
@@ -24,8 +24,8 @@ ENVIRONMENT_VERSION = "operator_roa_environment_learning_v1"
 @dataclass(frozen=True)
 class EnvironmentStage:
     version: str
-    source_stage: str
-    source_updates: int
+    source_stage: str | tuple[str, ...]
+    source_updates: int | None
     updates: int
     status: str
     result_stage: str
@@ -35,6 +35,20 @@ class EnvironmentStage:
     contact_conditioned: bool = False
     source_contact_conditioned: bool = False
     stumble_cost: bool = False
+
+    @property
+    def source_stages(self):
+        return (
+            (self.source_stage,)
+            if isinstance(self.source_stage, str)
+            else self.source_stage
+        )
+
+    def accepts_source(self, receipt):
+        return receipt.get("stage") in self.source_stages and (
+            self.source_updates is None
+            or receipt["learning_updates"] == self.source_updates
+        )
 
 
 ENVIRONMENT_STAGES = {
@@ -109,20 +123,24 @@ ENVIRONMENT_STAGES = {
         contact_conditioned=True,
         source_contact_conditioned=True,
     ),
-    "contact_stumble": EnvironmentStage(
-        "operator_roa_contact_stumble_learning_v1",
-        "contact_followup_learning",
-        4000,
-        1000,
-        "ROA_CONTACT_STUMBLE_LEARNING_COMPLETED_NOT_QUALIFIED",
-        "contact_stumble_learning",
-        geometry_version="operator_step_field_bootstrap_v1",
-        support_resets=True,
-        contact_conditioned=True,
-        source_contact_conditioned=True,
-        stumble_cost=True,
-    ),
 }
+ENVIRONMENT_STAGES["contact_stumble"] = replace(
+    ENVIRONMENT_STAGES["contact_followup"],
+    version="operator_roa_contact_stumble_learning_v1",
+    source_stage="contact_followup_learning",
+    source_updates=4000,
+    status="ROA_CONTACT_STUMBLE_LEARNING_COMPLETED_NOT_QUALIFIED",
+    result_stage="contact_stumble_learning",
+    stumble_cost=True,
+)
+ENVIRONMENT_STAGES["contact_continue"] = replace(
+    ENVIRONMENT_STAGES["contact_stumble"],
+    version="operator_roa_contact_continuation_v1",
+    source_stage=("contact_stumble_learning", "contact_continuation"),
+    source_updates=None,
+    status="ROA_CONTACT_CONTINUATION_COMPLETED_NOT_QUALIFIED",
+    result_stage="contact_continuation",
+)
 REGULARIZATION_COEFFICIENTS = (0.1, 0.55, 1.0)
 ROLLOUT_STEPS = 24
 HISTORY_STEPS = 64
@@ -173,25 +191,25 @@ def parse_args(argv=None):
     parser.add_argument(
         "--environment-layout",
         choices=tuple(ENVIRONMENT_STAGES),
-        help="Bounded stage with a validated predecessor; contact_stumble requires inherited-posture contact_followup4000",
+        help="Bounded source-validated stage; contact_continue retains the completed zero-stumble control recipe",
     )
     parser.add_argument(
         "--regularization",
         choices=("ramp", "off"),
         help="Additional regularization only: zero for 20 updates then ramp to 0.1, or remain zero",
     )
-    parser.add_argument("--learning-updates", type=int, choices=(100, 500, 1000))
+    parser.add_argument("--learning-updates", type=int, choices=(100, 500, 1000, 2000))
     parser.add_argument(
         "--orientation-weight",
         type=float,
         choices=(-2.5, 0.0),
-        help="Required for contact follow-ups; contact_stumble preserves inherited -2.5",
+        help="Required for contact follow-ups; stumble/continuation retain inherited -2.5",
     )
     parser.add_argument(
         "--stumble-weight",
         type=float,
         choices=(0.0, -0.5),
-        help="Required only for contact_stumble: matched control or translation-gated wall-contact cost",
+        help="Required for contact_stumble or contact_continue; continuation permits only zero",
     )
     parser.add_argument(
         "--output-parent",
@@ -211,9 +229,14 @@ def parse_args(argv=None):
         parser.error("--orientation-weight is required only with contact follow-ups")
     stumble = bool(args.environment_checkpoint and stage.stumble_cost)
     if stumble != (args.stumble_weight is not None):
-        parser.error("--stumble-weight is required only with contact_stumble")
+        parser.error(
+            "--stumble-weight is required only with contact_stumble/contact_continue"
+        )
     if stumble and args.orientation_weight != -2.5:
-        parser.error("contact_stumble preserves --orientation-weight -2.5")
+        parser.error("Stumble/continuation preserves --orientation-weight -2.5")
+    continuation = args.environment_layout == "contact_continue"
+    if continuation and args.stumble_weight != 0.0:
+        parser.error("contact_continue preserves --stumble-weight 0")
     if (learning is None) != (args.regularization is None):
         parser.error("A learning checkpoint and --regularization must be used together")
     if args.learning_updates is not None and learning is None:
@@ -222,12 +245,15 @@ def parse_args(argv=None):
         args.learning_updates = (
             stage.updates if args.environment_checkpoint else LEARNING_UPDATES
         )
+    budgets = (1000, 2000) if continuation else (stage.updates,)
     if args.environment_checkpoint and (
-        args.regularization != "off" or args.learning_updates != stage.updates
+        args.regularization != "off" or args.learning_updates not in budgets
     ):
         parser.error(
-            f"{args.environment_layout} requires --regularization off and {stage.updates} new updates"
+            f"{args.environment_layout} requires --regularization off and updates in {budgets}"
         )
+    if not args.environment_checkpoint and args.learning_updates == 2000:
+        parser.error("2000 new updates are supported only by contact_continue")
     return args
 
 
@@ -319,26 +345,35 @@ def load_environment_source(path, physical_reference, seed, *, layout="hills"):
     policy, contract, _, receipt = load_completed_checkpoint(path)
     stage = ENVIRONMENT_STAGES[layout]
     if (
-        receipt.get("stage") != stage.source_stage
+        not stage.accepts_source(receipt)
         or receipt["physical_reference"] != physical_reference
-        or receipt["learning_updates"] != stage.source_updates
         or receipt["training_seed"] == seed
     ):
         raise ValueError(
-            f"Require completed {stage.source_stage} with {stage.source_updates} selected-lineage updates and a fresh seed"
+            f"Require completed {stage.source_stage}, its validated update count and a fresh seed"
         )
     if stage.stumble_cost:
-        require_inherited_posture(path)
+        require_inherited_posture(path, stumble_control=layout == "contact_continue")
     return {"policy_state": policy.state_dict(), "motor_contract": contract}, receipt
 
 
-def require_inherited_posture(path):
-    """The motor diagnostic and this single-objective pair share one posture arm."""
+def require_inherited_posture(path, *, stumble_control=False):
+    """Preserve the selected posture and, for continuation, the zero-stumble arm."""
     protocol = json.loads(
-        Path(path).parent.joinpath("training_protocol.json").read_text()
+        Path(path)
+        .resolve(strict=True)
+        .parent.joinpath("training_protocol.json")
+        .read_text()
     )
     if protocol.get("orientation_weight") != -2.5:
         raise ValueError("Stumble learning requires the inherited-posture source")
+    if stumble_control:
+        from .operator_rewards import stumble_objective
+
+        if json.dumps(protocol.get("stumble_objective"), sort_keys=True) != json.dumps(
+            stumble_objective(0.0), sort_keys=True
+        ):
+            raise ValueError("Continuation requires the completed zero-stumble control")
 
 
 def validate_events(cfg, *, support_resets=False):
@@ -1285,6 +1320,12 @@ def main(argv=None):
                 stumble_objective=stumble_objective(args.stumble_weight),
                 reward="Inherited -2.5 posture and native rewards; only translation-gated feet_stumble weight differs between arms",
                 learning_scope="Matched wall-contact cost from inherited-posture4000; unchanged free environments, not qualification",
+            )
+        if args.environment_layout == "contact_continue":
+            protocol.update(
+                reward="Unchanged inherited -2.5 posture and zero-stumble control recipe",
+                learning_scope=f"Same-recipe free-environment continuation from {metadata['learning_updates']} validated lineage updates; not qualification",
+                schedule_scope=f"{args.learning_updates} new PPO updates, H every20; zero additional regularization; fresh optimizers and native scene, not exact resume",
             )
     report = {
         "status": "RUNNING_NOT_QUALIFIED",

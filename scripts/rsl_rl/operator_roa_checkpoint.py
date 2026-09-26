@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -120,7 +121,7 @@ def _validate_native_motor(saved, report, count):
         raise ValueError("ROA checkpoint motor differs from native delivery receipts")
 
 
-def _load_refinement(path, hashes, saved, protocol, report):
+def _load_refinement(path, hashes, saved, protocol, report, visited):
     """One estimator-only stage over a completed v3 source; never recursive training."""
     from .operator_roa_adapt import DIFFICULTY, NATIVE_STEPS, SCHEDULE, VERSION
 
@@ -177,7 +178,7 @@ def _load_refinement(path, hashes, saved, protocol, report):
         )
     _validate_completion(report, status, NATIVE_STEPS, count)
     original, source_contract, _, source = load_completed_checkpoint(
-        source_path, allow_refinement=False
+        source_path, allow_refinement=False, _visited=visited
     )
     if (
         saved["source"] != source
@@ -291,8 +292,8 @@ def _validate_training_exposure(exposure, count, *, steps):
         raise ValueError("Incomplete ROA training exposure groups")
 
 
-def _environment_source(saved, protocol, report, layout, stage):
-    """Validate a bounded joint stage and its strictly earlier source stage."""
+def _environment_source(saved, protocol, report, layout, stage, visited):
+    """Validate a bounded joint stage and its completed, acyclic ancestry."""
     source_path = protocol["environment_checkpoint"]
     seed, count = protocol["seed"], protocol["num_envs"]
     if (
@@ -320,10 +321,10 @@ def _environment_source(saved, protocol, report, layout, stage):
         allow_step_fields=stage.support_resets,
         allow_step_support=stage.source_contact_conditioned,
         expected_stage=stage.source_stage,
+        _visited=visited,
     )
     if (
-        source.get("stage") != stage.source_stage
-        or source["learning_updates"] != stage.source_updates
+        not stage.accepts_source(source)
         or saved["learning_source"] != source
         or source["physical_reference"]
         != protocol["source_identity"]["physical_reference"]
@@ -331,7 +332,7 @@ def _environment_source(saved, protocol, report, layout, stage):
         or binding_sha256(contract["binding"])
         != binding_sha256(saved["motor_contract"]["binding"])
     ):
-        source_label = stage.source_stage.replace("_", "-")
+        source_label = "/".join(stage.source_stages).replace("_", "-")
         raise ValueError(f"Environment stage differs from its {source_label} source")
     _validate_training_exposure(
         report["training_exposure"],
@@ -420,11 +421,17 @@ def _environment_source(saved, protocol, report, layout, stage):
         from .operator_roa_pilot import require_inherited_posture
         from .operator_rewards import stumble_objective, validate_stumble_exposure
 
-        require_inherited_posture(source_path)
+        continuation = layout == "contact_continue"
+        require_inherited_posture(source_path, stumble_control=continuation)
         objective = stumble_objective(protocol["stumble_objective"]["weight"])
-        if protocol["orientation_weight"] != -2.5 or any(
-            json.dumps(item, sort_keys=True) != json.dumps(objective, sort_keys=True)
-            for item in (protocol["stumble_objective"], report["stumble_objective"])
+        if (
+            protocol["orientation_weight"] != -2.5
+            or (continuation and objective["weight"] != 0.0)
+            or any(
+                json.dumps(item, sort_keys=True)
+                != json.dumps(objective, sort_keys=True)
+                for item in (protocol["stumble_objective"], report["stumble_objective"])
+            )
         ):
             raise ValueError("Stumble objective or inherited posture changed")
         validate_stumble_exposure(
@@ -448,11 +455,15 @@ def load_completed_checkpoint(
     allow_step_fields=True,
     allow_step_support=True,
     expected_stage=None,
+    _visited=(),
 ):
     """Completed bounded stages with finite ancestry; no partial/resume selection."""
     from .operator_roa_pilot import ENVIRONMENT_STAGES, learning_coefficients
 
     path = Path(path).resolve(strict=True)
+    if path in _visited:
+        raise ValueError("Cyclic ROA checkpoint ancestry")
+    visited = (*_visited, path)
     paths = (path, path.parent / "training_protocol.json", path.parent / "report.json")
     encoded = {str(item): item.read_bytes() for item in paths}
     hashes = {name: hashlib.sha256(data).hexdigest() for name, data in encoded.items()}
@@ -480,10 +491,12 @@ def load_completed_checkpoint(
                 else None
             )
         )
-        if expected_stage is not None and declared_stage != expected_stage:
-            raise ValueError(
-                f"Require the declared {expected_stage.replace('_', '-')} source"
-            )
+        expected_stages = (
+            (expected_stage,) if isinstance(expected_stage, str) else expected_stage
+        )
+        if expected_stages is not None and declared_stage not in expected_stages:
+            source_label = "/".join(expected_stages).replace("_", "-")
+            raise ValueError(f"Require the declared {source_label} source")
         if environment and (not allow_refinement or not allow_environment):
             raise ValueError(
                 "Require original v3/refinement ancestry, not an environment stage"
@@ -499,8 +512,12 @@ def load_completed_checkpoint(
                 raise ValueError(
                     "ROA refinement requires a completed v3 source, not another refinement"
                 )
-            return _load_refinement(path, hashes, saved, protocol, report)
+            return _load_refinement(path, hashes, saved, protocol, report, visited)
         updates, count = saved["completed_cycles"], protocol["num_envs"]
+        if layout == "contact_continue":
+            if type(updates) is not int or updates not in (1000, 2000):
+                raise ValueError("Continuation requires 1000 or 2000 completed updates")
+            stage = replace(stage, updates=updates)
         status = (
             stage.status
             if environment
@@ -531,7 +548,8 @@ def load_completed_checkpoint(
             )
             or protocol["version"] != saved["version"]
             or type(updates) is not int
-            or updates not in (100, 500, 1000)
+            or updates
+            not in ((1000, 2000) if layout == "contact_continue" else (100, 500, 1000))
             or type(count) is not int
             or count not in (80, 160, 320)
             or protocol["cycles"] != updates
@@ -596,7 +614,7 @@ def load_completed_checkpoint(
             saved, report, contact_conditioned=bool(stage and stage.contact_conditioned)
         )
         source = (
-            _environment_source(saved, protocol, report, layout, stage)
+            _environment_source(saved, protocol, report, layout, stage, visited)
             if environment
             else None
         )
