@@ -392,6 +392,9 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
     """Validate a bounded joint stage and its completed, acyclic ancestry."""
     source_path = protocol["environment_checkpoint"]
     seed, count = protocol["seed"], protocol["num_envs"]
+    training_steps = (
+        stage.updates * 24 + stage.updates // saved["history_interval"] * 64
+    )
     if (
         type(source_path) is not str
         or not Path(source_path).is_absolute()
@@ -403,7 +406,7 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
         or protocol["difficulty_range"] != [0.15, 0.55]
         or protocol["evaluation"]["seed"] != seed + 1000
         or protocol["planned_environment_transitions"]
-        != (stage.updates * 24 + stage.updates // 20 * 64 + 1800) * count
+        != (training_steps + 1800) * count
         or protocol["adaptation_optimizer"]["learning_rate"] != 1e-4
         or report["ppo_options"]["learning_rate"] != 1e-4
         or report["ppo_options"]["schedule"] != "fixed"
@@ -433,7 +436,7 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
     _validate_training_exposure(
         report["training_exposure"],
         count,
-        steps=stage.updates * 24 + stage.updates // 20 * 64,
+        steps=training_steps,
     )
     if stage.geometry_version and protocol["environment_layout"] != layout:
         raise ValueError("Step-field environment layout changed")
@@ -443,7 +446,7 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
         stage,
         count,
         seed,
-        stage.updates * 24 + stage.updates // 20 * 64,
+        training_steps,
     )
     if stage.step_clearance:
         from . import operator_step_clearance
@@ -457,7 +460,7 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
         operator_step_clearance.validate_training_report(
             report["training_step_clearance"],
             num_envs=count,
-            steps=stage.updates * 24 + stage.updates // 20 * 64,
+            steps=training_steps,
         )
     initial_digest = source["policy_state_sha256"]
     if stage.contact_conditioned:
@@ -506,7 +509,7 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
         validate_stumble_exposure(
             report["training_stumble_exposure"],
             num_envs=count,
-            steps=stage.updates * 24 + stage.updates // 20 * 64,
+            steps=training_steps,
         )
     for key, digest in (
         ("evaluation_before", initial_digest),
@@ -527,7 +530,11 @@ def load_completed_checkpoint(
     _visited=(),
 ):
     """Completed bounded stages with finite ancestry; no partial/resume selection."""
-    from .operator_roa_pilot import ENVIRONMENT_STAGES, learning_coefficients
+    from .operator_roa_pilot import (
+        ENVIRONMENT_STAGES,
+        learning_coefficients,
+        validate_history_interval,
+    )
 
     path = Path(path).resolve(strict=True)
     if path in _visited:
@@ -600,7 +607,8 @@ def load_completed_checkpoint(
             if environment
             else "ROA_INCREMENTAL_EXPERIMENT_COMPLETED_NOT_QUALIFIED"
         )
-        expected_steps = updates * 24 + updates // 20 * 64 + 1800
+        interval = validate_history_interval(saved["history_interval"], layout)
+        expected_steps = updates * 24 + updates // interval * 64 + 1800
         physical = protocol["source_identity"]["physical_reference"]
         if (
             set(saved)
@@ -637,8 +645,10 @@ def load_completed_checkpoint(
             or saved["readiness_only"] is not True
             or saved["deployment_allowed"] is not False
             or protocol["exit_allowed"] is not False
-            or saved["history_interval"] != 20
-            or protocol["history_interval"] != 20
+            or type(protocol["history_interval"]) is not int
+            or protocol["history_interval"] != interval
+            or type(protocol["history_blocks"]) is not int
+            or protocol["history_blocks"] != updates // interval
             or saved["learning_source"] != protocol["learning_source"]
             or protocol["rollout_steps_per_update"] != 24
             or protocol["history_steps_per_cycle"] != 64
@@ -671,7 +681,7 @@ def load_completed_checkpoint(
                 learning_coefficients("off", updates),
                 learning_coefficients("ramp", updates),
             )
-            or report["adaptation_optimizer_steps"] != updates // 20 * 16
+            or report["adaptation_optimizer_steps"] != updates // interval * 16
             or set(physical) != {"checkpoint", "agent.yaml", "env.yaml"}
             or any(
                 type(digest) is not str

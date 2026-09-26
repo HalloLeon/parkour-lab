@@ -136,7 +136,11 @@ ENVIRONMENT_STAGES["contact_stumble"] = replace(
 ENVIRONMENT_STAGES["contact_continue"] = replace(
     ENVIRONMENT_STAGES["contact_stumble"],
     version="operator_roa_contact_continuation_v1",
-    source_stage=("contact_stumble_learning", "contact_continuation"),
+    source_stage=(
+        "contact_stumble_learning",
+        "contact_continuation",
+        "contact_estimator_refinement",
+    ),
     source_updates=None,
     status="ROA_CONTACT_CONTINUATION_COMPLETED_NOT_QUALIFIED",
     result_stage="contact_continuation",
@@ -200,6 +204,12 @@ def parse_args(argv=None):
     )
     parser.add_argument("--learning-updates", type=int, choices=(100, 500, 1000, 2000))
     parser.add_argument(
+        "--history-interval",
+        type=int,
+        default=HISTORY_INTERVAL,
+        help="PPO updates per estimator block: 20, or 5 for contact_continue only; 5 also quadruples causal collection and estimator updates",
+    )
+    parser.add_argument(
         "--orientation-weight",
         type=float,
         choices=(-2.5, 0.0),
@@ -254,7 +264,23 @@ def parse_args(argv=None):
         )
     if not args.environment_checkpoint and args.learning_updates == 2000:
         parser.error("2000 new updates are supported only by contact_continue")
+    try:
+        validate_history_interval(args.history_interval, args.environment_layout)
+    except ValueError as error:
+        parser.error(str(error))
     return args
+
+
+def validate_history_interval(interval, layout=None):
+    """Historical recipes retain H20; only continuation admits the H5 treatment."""
+    choices = (
+        (5, HISTORY_INTERVAL) if layout == "contact_continue" else (HISTORY_INTERVAL,)
+    )
+    if type(interval) is not int or interval not in choices:
+        raise ValueError(
+            f"History interval must be an integer in {choices} for {layout}"
+        )
+    return interval
 
 
 def learning_coefficients(regularization, updates=LEARNING_UPDATES):
@@ -584,6 +610,7 @@ def run_pilot(
     learning=None,
     environment=False,
     layout="hills",
+    history_interval=HISTORY_INTERVAL,
 ):
     started = time.perf_counter()
     stage = ENVIRONMENT_STAGES[layout] if environment else None
@@ -603,6 +630,7 @@ def run_pilot(
             learning=learning,
             environment=environment,
             layout=layout,
+            history_interval=history_interval,
         )
     finally:
         set_training_mechanisms(env, active=False)
@@ -750,6 +778,7 @@ def _learn_pilot(
     learning=None,
     environment=False,
     layout="hills",
+    history_interval=HISTORY_INTERVAL,
 ):
     import torch
     from parkour_lab.learning.operator_roa import (
@@ -764,6 +793,7 @@ def _learn_pilot(
 
     env = host.env
     stage = ENVIRONMENT_STAGES[layout] if environment else None
+    validate_history_interval(history_interval, layout if environment else None)
     if environment and learning is None:
         raise ValueError("Environment learning requires a validated warm start")
     evaluation_seed = learning[3] + 1000 if environment else EVALUATION_SEED
@@ -805,13 +835,14 @@ def _learn_pilot(
         motor_verification=host.bridge.motor_verification,
     )
     coefficients = REGULARIZATION_COEFFICIENTS
-    history_interval = 1
+    if learning is None:
+        history_interval = 1
     if learning is not None:
         from .operator_roa_evaluation import evaluate_history
         from parkour_lab.learning.motor_contract import binding_sha256
 
         checkpoint, metadata, regularization, seed, updates = learning
-        if updates % HISTORY_INTERVAL:
+        if updates % history_interval:
             raise ValueError("Learning budget must end on a complete adaptation block")
         if binding_sha256(checkpoint["motor_contract"]["binding"]) != binding_sha256(
             host.motor_contract["binding"]
@@ -863,7 +894,6 @@ def _learn_pilot(
         obs, _ = host.reset(seed=seed)
         policy.train()
         coefficients = learning_coefficients(regularization, updates)
-        history_interval = HISTORY_INTERVAL
         if environment:
             from .operator_roa_adapt import TerrainExposure
 
@@ -1224,8 +1254,8 @@ def main(argv=None):
             regularization_coefficients=learning_coefficients(
                 args.regularization, args.learning_updates
             ),
-            history_interval=HISTORY_INTERVAL,
-            history_blocks=args.learning_updates // HISTORY_INTERVAL,
+            history_interval=args.history_interval,
+            history_blocks=args.learning_updates // args.history_interval,
             checkpoint_interval=100,
             frozen_history_steps=2 * EVALUATION_STEPS,
             evaluation={
@@ -1239,10 +1269,10 @@ def main(argv=None):
             planned_environment_transitions=args.num_envs
             * (
                 args.learning_updates * ROLLOUT_STEPS
-                + args.learning_updates // HISTORY_INTERVAL * HISTORY_STEPS
+                + args.learning_updates // args.history_interval * HISTORY_STEPS
                 + 2 * EVALUATION_STEPS
             ),
-            adaptation_collection="64 fixed-weight history-owned steps after each 20 PPO updates; then estimator-only fitting",
+            adaptation_collection=f"64 fixed-weight history-owned steps after each {args.history_interval} PPO updates; then estimator-only fitting",
             schedule_scope="Bounded incremental experiment; warmup20 then lambda ramp to0.1 at100 and hold versus0 control, NOT original paper schedule or convergence",
             learning_scope=(
                 "Joint hill/rough-environment motor acquisition from estimator-refined policy; NOT true vertical-step training or qualification"
@@ -1325,7 +1355,7 @@ def main(argv=None):
             protocol.update(
                 reward="Unchanged inherited -2.5 posture and zero-stumble control recipe",
                 learning_scope=f"Same-recipe free-environment continuation from {metadata['learning_updates']} validated lineage updates; not qualification",
-                schedule_scope=f"{args.learning_updates} new PPO updates, H every20; zero additional regularization; fresh optimizers and native scene, not exact resume",
+                schedule_scope=f"{args.learning_updates} new PPO updates, H every{args.history_interval}; zero additional regularization; fresh optimizers and native scene, not exact resume. H5 versus H20 changes frequency, causal data and optimizer budget, not cadence alone",
             )
     report = {
         "status": "RUNNING_NOT_QUALIFIED",
@@ -1415,6 +1445,7 @@ def main(argv=None):
             learning=learning,
             environment=environment,
             layout=args.environment_layout,
+            history_interval=args.history_interval,
         )
         if training.recurrent_training_identity(args.reference) != identity:
             raise RuntimeError("Source or runtime changed during learning pilot")
