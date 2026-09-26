@@ -59,7 +59,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--diagnostic-input",
         choices=("true_velocity", "privileged_latent"),
-        help="Traversal only: frozen privileged input intervention, NOT deployable or qualifying",
+        help="Traversal or step_fields: frozen privileged input intervention, NOT deployable or qualifying",
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--cpu-threads", type=int, default=4)
@@ -76,8 +76,10 @@ def parse_args(argv=None):
         parser.error("--capture-motor-diagnostics requires --terrain-suite traversal")
     if args.terrain_suite == "traversal":
         args.traversal_layout = args.traversal_layout or "standard"
-    if args.diagnostic_input and args.terrain_suite != "traversal":
-        parser.error("Input diagnostics require --terrain-suite traversal")
+    if args.diagnostic_input and args.terrain_suite == "procedural":
+        parser.error(
+            "Input diagnostics require --terrain-suite traversal or step_fields"
+        )
     if args.terrain_suite != "procedural" and args.difficulty is not None:
         parser.error(
             "Only procedural accepts --difficulty; other suites fix their geometry"
@@ -218,7 +220,7 @@ def main(argv=None):
             input_telemetry={
                 "version": "operator_roa_input_diagnostic_v2",
                 "trace": "input_diagnostic_trace.npz",
-                "scope": "Observer-only causal inputs/actions and actual commands, checked against delivered observations; join pre-action index/mask to field_trace.npz; no entry line or corridor",
+                "scope": "Observer-only history estimates, shadow causal actions, applied actions/latents and actual commands; only an explicit diagnostic-input replaces a motor input. Join pre-action index/mask to field_trace.npz; no entry line or corridor",
             },
         )
     if args.diagnostic_input:
