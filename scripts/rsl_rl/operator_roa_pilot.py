@@ -34,6 +34,7 @@ class EnvironmentStage:
     step_clearance: bool = False
     contact_conditioned: bool = False
     source_contact_conditioned: bool = False
+    stumble_cost: bool = False
 
 
 ENVIRONMENT_STAGES = {
@@ -108,6 +109,19 @@ ENVIRONMENT_STAGES = {
         contact_conditioned=True,
         source_contact_conditioned=True,
     ),
+    "contact_stumble": EnvironmentStage(
+        "operator_roa_contact_stumble_learning_v1",
+        "contact_followup_learning",
+        4000,
+        1000,
+        "ROA_CONTACT_STUMBLE_LEARNING_COMPLETED_NOT_QUALIFIED",
+        "contact_stumble_learning",
+        geometry_version="operator_step_field_bootstrap_v1",
+        support_resets=True,
+        contact_conditioned=True,
+        source_contact_conditioned=True,
+        stumble_cost=True,
+    ),
 }
 REGULARIZATION_COEFFICIENTS = (0.1, 0.55, 1.0)
 ROLLOUT_STEPS = 24
@@ -159,7 +173,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--environment-layout",
         choices=tuple(ENVIRONMENT_STAGES),
-        help="hills: refined source; step_fields: hills source; contact_followup: contact-teacher source; other step stages: step-field source",
+        help="Bounded stage with a validated predecessor; contact_stumble requires inherited-posture contact_followup4000",
     )
     parser.add_argument(
         "--regularization",
@@ -171,7 +185,13 @@ def parse_args(argv=None):
         "--orientation-weight",
         type=float,
         choices=(-2.5, 0.0),
-        help="Required for contact_followup: inherited flat-posture cost or zero; other rewards unchanged",
+        help="Required for contact follow-ups; contact_stumble preserves inherited -2.5",
+    )
+    parser.add_argument(
+        "--stumble-weight",
+        type=float,
+        choices=(0.0, -0.5),
+        help="Required only for contact_stumble: matched control or translation-gated wall-contact cost",
     )
     parser.add_argument(
         "--output-parent",
@@ -188,7 +208,12 @@ def parse_args(argv=None):
     stage = ENVIRONMENT_STAGES[args.environment_layout]
     followup = bool(args.environment_checkpoint and stage.source_contact_conditioned)
     if followup != (args.orientation_weight is not None):
-        parser.error("--orientation-weight is required only with contact_followup")
+        parser.error("--orientation-weight is required only with contact follow-ups")
+    stumble = bool(args.environment_checkpoint and stage.stumble_cost)
+    if stumble != (args.stumble_weight is not None):
+        parser.error("--stumble-weight is required only with contact_stumble")
+    if stumble and args.orientation_weight != -2.5:
+        parser.error("contact_stumble preserves --orientation-weight -2.5")
     if (learning is None) != (args.regularization is None):
         parser.error("A learning checkpoint and --regularization must be used together")
     if args.learning_updates is not None and learning is None:
@@ -302,7 +327,18 @@ def load_environment_source(path, physical_reference, seed, *, layout="hills"):
         raise ValueError(
             f"Require completed {stage.source_stage} with {stage.source_updates} selected-lineage updates and a fresh seed"
         )
+    if stage.stumble_cost:
+        require_inherited_posture(path)
     return {"policy_state": policy.state_dict(), "motor_contract": contract}, receipt
+
+
+def require_inherited_posture(path):
+    """The motor diagnostic and this single-objective pair share one posture arm."""
+    protocol = json.loads(
+        Path(path).parent.joinpath("training_protocol.json").read_text()
+    )
+    if protocol.get("orientation_weight") != -2.5:
+        raise ValueError("Stumble learning requires the inherited-posture source")
 
 
 def validate_events(cfg, *, support_resets=False):
@@ -557,7 +593,16 @@ def set_training_mechanisms(env, *, active):
 
 
 def _adapt_history(
-    host, policy, optimizer, obs, record, report, *, require_change, observe=None
+    host,
+    policy,
+    optimizer,
+    obs,
+    record,
+    report,
+    *,
+    require_change,
+    observe=None,
+    after_step=None,
 ):
     """Collect with fixed causal weights, then fit only the history estimator."""
     import torch
@@ -602,7 +647,10 @@ def _adapt_history(
                 )
             )
             action = actor.history_action(obs["policy"], frames(obs))
-            obs, _, _, _ = host.step(action, "history_adaptation")
+            command = obs["policy"][:, 6:9].clone() if after_step is not None else None
+            obs, _, done, _ = host.step(action, "history_adaptation")
+            if after_step is not None:
+                after_step(done, command)
     record["estimator_unchanged_during_history_collection"] = (
         state_sha256(actor.estimator) == fixed_estimator
     )
@@ -685,6 +733,11 @@ def _learn_pilot(
         raise ValueError("Environment learning requires a validated warm start")
     evaluation_seed = learning[3] + 1000 if environment else EVALUATION_SEED
     exposure = None
+    stumble = None
+    if stage and stage.stumble_cost:
+        from .operator_rewards import StumbleExposure
+
+        stumble = StumbleExposure(env)
     support = getattr(env, "_operator_step_support", None)
     if (support is not None) != bool(stage and stage.support_resets):
         raise ValueError("Support-reset admission must match the selected stage")
@@ -817,6 +870,8 @@ def _learn_pilot(
             report["training_support_resets"] = support.report()
         if clearance is not None:
             report["training_step_clearance"] = clearance.report()
+        if stumble is not None:
+            report["training_stumble_exposure"] = stumble.report()
         if host.contacts is not None:
             report["teacher_contact_observations"] = host.contacts.report()
 
@@ -861,7 +916,10 @@ def _learn_pilot(
             for _ in range(ROLLOUT_STEPS):
                 observe()
                 action = algorithm.act(obs)
+                command = obs["policy"][:, 6:9].clone() if stumble is not None else None
                 obs, reward, done, extras = host.step(action, "privileged_ppo")
+                if stumble is not None:
+                    stumble.sample(done, command)
                 algorithm.process_env_step(obs, reward, done.long(), extras)
             algorithm.compute_returns(obs)
         record["ppo_losses"] = algorithm.update()
@@ -908,6 +966,7 @@ def _learn_pilot(
             report,
             require_change=learning is None,
             observe=observe,
+            after_step=stumble.sample if stumble is not None else None,
         )
         print(
             f"ROA update {cycle}/{len(coefficients)}: history adaptation complete",
@@ -1219,6 +1278,14 @@ def main(argv=None):
             protocol["model"][
                 "motor"
             ] = "Full contact-teacher policy warm start; no new modules or observation changes"
+        if stage.stumble_cost:
+            from .operator_rewards import stumble_objective
+
+            protocol.update(
+                stumble_objective=stumble_objective(args.stumble_weight),
+                reward="Inherited -2.5 posture and native rewards; only translation-gated feet_stumble weight differs between arms",
+                learning_scope="Matched wall-contact cost from inherited-posture4000; unchanged free environments, not qualification",
+            )
     report = {
         "status": "RUNNING_NOT_QUALIFIED",
         "exit_allowed": False,
@@ -1266,6 +1333,10 @@ def main(argv=None):
             step_clearance.configure(cfg)
         if stage and stage.source_contact_conditioned:
             cfg.rewards.flat_orientation_l2.weight = args.orientation_weight
+        if stage and stage.stumble_cost:
+            from .operator_rewards import configure_stumble, verify_stumble_objective
+
+            configure_stumble(cfg, args.stumble_weight)
         validate_events(cfg, support_resets=bool(stage and stage.support_resets))
         cfg.validate()
         (output / "resolved_env.yaml").write_text(
@@ -1275,6 +1346,10 @@ def main(argv=None):
         if stage and stage.source_contact_conditioned:
             report["orientation_objective"] = verify_orientation_objective(
                 env, args.orientation_weight
+            )
+        if stage and stage.stumble_cost:
+            report["stumble_objective"] = verify_stumble_objective(
+                env, args.stumble_weight
             )
         if stage and stage.geometry_version:
             report["native_step_field_geometry"] = step_field.verify_native_geometry(

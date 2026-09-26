@@ -416,6 +416,22 @@ def _environment_source(saved, protocol, report, layout, stage):
             or "contact_initialization" in report
         ):
             raise ValueError("Contact follow-up objective or initialization changed")
+    if stage.stumble_cost:
+        from .operator_roa_pilot import require_inherited_posture
+        from .operator_rewards import stumble_objective, validate_stumble_exposure
+
+        require_inherited_posture(source_path)
+        objective = stumble_objective(protocol["stumble_objective"]["weight"])
+        if protocol["orientation_weight"] != -2.5 or any(
+            json.dumps(item, sort_keys=True) != json.dumps(objective, sort_keys=True)
+            for item in (protocol["stumble_objective"], report["stumble_objective"])
+        ):
+            raise ValueError("Stumble objective or inherited posture changed")
+        validate_stumble_exposure(
+            report["training_stumble_exposure"],
+            num_envs=count,
+            steps=stage.updates * 24 + stage.updates // 20 * 64,
+        )
     for key, digest in (
         ("evaluation_before", initial_digest),
         ("evaluation_after", report["policy_state_sha256"]),
