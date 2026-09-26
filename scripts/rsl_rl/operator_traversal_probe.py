@@ -8,6 +8,7 @@ not converted into unverified contact patches or support-polygon claims.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 import hashlib
 
@@ -25,8 +26,31 @@ CORRIDOR_HALF_WIDTH = 2.0
 CONTACT_FORCE_Z = 1.0
 
 
+def motor_diagnostic_protocol():
+    return {
+        "version": "operator_traversal_motor_diagnostic_v1",
+        "sampling": "State sample t follows input-trace action t-1; sample0 and ended/reset rows are excluded by motor_response_valid",
+        "torques": "Computed/applied actuator commands from BEFORE the final physics substep of the preceding control interval; not measured torques, interval extrema or PD recomputable from post-step q/qd",
+        "targets": "Native joint_pos_target for the verified nondelayed DCMotor; absolute radians, not clipped or altered by this observer",
+        "limits": "Hard positions and velocity/effort limits are PhysX bounds; soft positions are reward bounds. Actuator caps and torque-speed configuration are in native_motor_binding, not inferred from PhysX effort limits",
+        "feet": "World LINK-origin velocities; air time uses native net-normal-force norm and the recorded sensor threshold, not the traversal upward-force test",
+        "scope": "Observer-only mechanical diagnostics; no policy inputs, control changes or qualification",
+    }
+
+
+def _snapshot(value, shape, name):
+    result = value.detach().cpu().numpy().copy()
+    if (
+        result.shape != shape
+        or result.dtype.kind != "f"
+        or not np.isfinite(result).all()
+    ):
+        raise ValueError(f"Invalid native motor diagnostic field: {name}")
+    return result
+
+
 class TraversalProbe:
-    def __init__(self, env, output, *, layout="standard"):
+    def __init__(self, env, output, *, layout="standard", motor_binding=None):
         profiles = profiles_for_layout(layout)
         self.env, self.output = env, Path(output)
         self.robot = env.scene["robot"]
@@ -63,6 +87,40 @@ class TraversalProbe:
         ):
             raise ValueError("Invalid traversal origins")
         self.records = []
+        self.motor_records = []
+        self.motor_binding = deepcopy(motor_binding)
+        self.motor_limits = {}
+        if motor_binding is not None:
+            if (
+                list(self.robot.joint_names) != motor_binding["joint_names"]
+                or len(set(self.robot.joint_names)) != 12
+                or not self.contacts.cfg.track_air_time
+                or not np.isfinite(self.contacts.cfg.force_threshold)
+                or self.contacts.cfg.force_threshold <= 0
+                or any(
+                    item["configuration"]["class_type"]
+                    != "isaaclab.actuators.actuator_pd:DCMotor"
+                    for item in motor_binding["actuators"].values()
+                )
+            ):
+                raise ValueError(
+                    "Motor capture requires the verified named DCMotor and air timers"
+                )
+            for name in (
+                "joint_pos_limits",
+                "soft_joint_pos_limits",
+                "joint_vel_limits",
+                "joint_effort_limits",
+            ):
+                shape = (env.num_envs, 12, 2) if "pos" in name else (env.num_envs, 12)
+                value = _snapshot(getattr(self.robot.data, name), shape, name)
+                if (
+                    (value[..., 0] >= value[..., 1]).any()
+                    if "pos" in name
+                    else (value <= 0).any()
+                ):
+                    raise ValueError(f"Invalid native motor limits: {name}")
+                self.motor_limits[name] = value
 
     def observe(self, step, alive):
         """Capture initial state or a nonterminal post-step state, on native clock."""
@@ -103,6 +161,36 @@ class TraversalProbe:
                     "Traversal requires the fixed native approach origin and heading"
                 )
         self.records.append((root.copy(), feet.copy(), forces.copy(), valid))
+        if self.motor_binding is not None:
+            self._observe_motor(step, valid)
+
+    def _observe_motor(self, step, valid):
+        data = self.robot.data
+        fields = {
+            "joint_pos_rad": data.joint_pos,
+            "joint_vel_rad_s": data.joint_vel,
+            "joint_target_rad": data.joint_pos_target,
+            "computed_torque_nm": data.computed_torque,
+            "applied_torque_nm": data.applied_torque,
+            "foot_link_velocity_world_m_s": data.body_link_lin_vel_w[:, self.foot_ids],
+            "foot_air_time_s": self.contacts.data.current_air_time[:, self.contact_ids],
+        }
+        response_valid = valid & (step > 0)
+        sample = {"motor_response_valid": response_valid.copy()}
+        for name, value in fields.items():
+            width = (
+                (4, 3)
+                if name == "foot_link_velocity_world_m_s"
+                else ((4,) if name == "foot_air_time_s" else (12,))
+            )
+            copied = _snapshot(value, (self.env.num_envs, *width), name)
+            if name == "foot_air_time_s" and (copied < 0).any():
+                raise ValueError("Native foot air time cannot be negative")
+            # Never expose reset buffers or the initial stale effort as response
+            # evidence. Zero is a placeholder; the mask is authoritative.
+            copied[~response_valid] = 0
+            sample[name] = copied
+        self.motor_records.append(sample)
 
     def input_diagnostic_samples(self, steps):
         """Align observer states with pre-action decisions, excluding the final state."""
@@ -198,6 +286,15 @@ class TraversalProbe:
                 }
             )
         self.output.parent.mkdir(parents=True, exist_ok=True)
+        motor_arrays = {}
+        if self.motor_binding is not None:
+            if len(self.motor_records) != len(self.records):
+                raise ValueError("Incomplete motor diagnostic samples")
+            motor_arrays = {
+                name: np.stack([sample[name] for sample in self.motor_records])
+                for name in self.motor_records[0]
+            }
+            motor_arrays.update(self.motor_limits)
         np.savez_compressed(
             self.output,
             root_local_m=root,
@@ -205,6 +302,7 @@ class TraversalProbe:
             foot_force_world_n=forces,
             first_attempt_valid=valid,
             route_eligible=eligible,
+            **motor_arrays,
         )
         return {
             "version": "operator_traversal_diagnostic_v1",
@@ -221,5 +319,20 @@ class TraversalProbe:
                 "sha256": hashlib.sha256(self.output.read_bytes()).hexdigest(),
             },
             "rows": rows,
+            **(
+                {
+                    "motor_diagnostics": {
+                        **motor_diagnostic_protocol(),
+                        "native_motor_binding": self.motor_binding,
+                        "contact_force_threshold_n": self.contacts.cfg.force_threshold,
+                        "valid_response_samples": int(
+                            motor_arrays["motor_response_valid"].sum()
+                        ),
+                        "trace": "Additional named arrays in traversal trace; static limits have no time axis",
+                    }
+                }
+                if self.motor_binding is not None
+                else {}
+            ),
             "exit_allowed": False,
         }

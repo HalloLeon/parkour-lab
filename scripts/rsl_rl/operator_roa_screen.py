@@ -44,6 +44,11 @@ def parse_args(argv=None):
         help="Traversal only: standard ramps/8/16cm, or fixed 2/4/6/8cm step diagnostics",
     )
     parser.add_argument(
+        "--capture-motor-diagnostics",
+        action="store_true",
+        help="Traversal only: record native joints, targets, actuator efforts and foot motion; no control changes",
+    )
+    parser.add_argument(
         "--difficulty",
         type=float,
         nargs=2,
@@ -67,6 +72,8 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if args.traversal_layout is not None and args.terrain_suite != "traversal":
         parser.error("--traversal-layout requires --terrain-suite traversal")
+    if args.capture_motor_diagnostics and args.terrain_suite != "traversal":
+        parser.error("--capture-motor-diagnostics requires --terrain-suite traversal")
     if args.terrain_suite == "traversal":
         args.traversal_layout = args.traversal_layout or "standard"
     if args.diagnostic_input and args.terrain_suite != "traversal":
@@ -182,6 +189,10 @@ def main(argv=None):
     }
     if fixtures:
         protocol["traversal_layout"] = args.traversal_layout
+        if args.capture_motor_diagnostics:
+            from .operator_traversal_probe import motor_diagnostic_protocol
+
+            protocol["motor_diagnostics"] = motor_diagnostic_protocol()
         protocol["input_telemetry"] = {
             "version": "operator_roa_input_diagnostic_v2",
             "scope": "Observer-only pre-action estimates, true velocity and root position; no change to actor inputs except an explicitly selected diagnostic-input intervention",
@@ -278,7 +289,12 @@ def main(argv=None):
         publish()
         probe = (
             TraversalProbe(
-                env, output / "traversal_trace.npz", layout=args.traversal_layout
+                env,
+                output / "traversal_trace.npz",
+                layout=args.traversal_layout,
+                motor_binding=(
+                    host.bridge.binding if args.capture_motor_diagnostics else None
+                ),
             )
             if fixtures
             else None
