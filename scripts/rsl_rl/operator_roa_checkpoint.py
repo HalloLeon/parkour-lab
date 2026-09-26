@@ -122,10 +122,18 @@ def _validate_native_motor(saved, report, count):
 
 
 def _load_refinement(path, hashes, saved, protocol, report, visited):
-    """One estimator-only stage over a completed v3 source; never recursive training."""
-    from .operator_roa_adapt import DIFFICULTY, NATIVE_STEPS, SCHEDULE, VERSION
+    """Estimator-only refinement with versioned source and native recipe admission."""
+    from .operator_roa_adapt import (
+        DIFFICULTY,
+        NATIVE_STEPS,
+        SCHEDULE,
+        VERSION,
+        CONTACT_VERSION,
+        refinement_recipe,
+    )
 
     status = "ROA_ESTIMATOR_REFINEMENT_COMPLETED_NOT_QUALIFIED"
+    contact = saved["version"] == CONTACT_VERSION
     count, seed = protocol["num_envs"], protocol["seed"]
     source_path = saved["source_checkpoint"]
     if (
@@ -143,7 +151,7 @@ def _load_refinement(path, hashes, saved, protocol, report, visited):
             "completed_blocks",
         }
         or path.name != "adapted.pt"
-        or protocol["version"] != VERSION
+        or protocol["version"] != (CONTACT_VERSION if contact else VERSION)
         or saved["readiness_only"] is not True
         or saved["deployment_allowed"] is not False
         or type(saved["adaptation_optimizer"]) is not dict
@@ -178,7 +186,12 @@ def _load_refinement(path, hashes, saved, protocol, report, visited):
         )
     _validate_completion(report, status, NATIVE_STEPS, count)
     original, source_contract, _, source = load_completed_checkpoint(
-        source_path, allow_refinement=False, _visited=visited
+        source_path,
+        allow_refinement=contact,
+        expected_stage=(
+            ("contact_stumble_learning", "contact_continuation") if contact else None
+        ),
+        _visited=visited,
     )
     if (
         saved["source"] != source
@@ -186,7 +199,39 @@ def _load_refinement(path, hashes, saved, protocol, report, visited):
         or protocol["source_identity"]["physical_reference"]
         != source["physical_reference"]
     ):
-        raise ValueError("ROA refinement differs from its completed v3 source receipt")
+        raise ValueError("ROA refinement differs from its completed source receipt")
+    recipe = refinement_recipe(source_path, source)
+    if bool(recipe) != contact or any(
+        json.dumps(protocol.get(key), sort_keys=True)
+        != json.dumps(value, sort_keys=True)
+        for key, value in recipe.items()
+    ):
+        raise ValueError("Refinement changed its source terrain or contact recipe")
+    if contact:
+        from .operator_roa_pilot import ENVIRONMENT_STAGES, orientation_objective
+
+        if (
+            type(report["inherited_ppo_updates"]) is not int
+            or report["inherited_ppo_updates"] != source["learning_updates"]
+            or any(
+                json.dumps(report.get(key), sort_keys=True)
+                != json.dumps(value, sort_keys=True)
+                for key, value in (
+                    ("orientation_objective", orientation_objective(-2.5)),
+                    ("stumble_objective", recipe["stumble_objective"]),
+                )
+            )
+        ):
+            raise ValueError("Refinement changed the inherited control recipe or count")
+        _validate_native_collection(
+            protocol,
+            report,
+            ENVIRONMENT_STAGES["contact_continue"],
+            count,
+            seed,
+            SCHEDULE["blocks"] * SCHEDULE["history_block_steps"],
+            full_resets=3,
+        )
     _validate_training_exposure(
         report["training_exposure"],
         count,
@@ -202,7 +247,7 @@ def _load_refinement(path, hashes, saved, protocol, report, visited):
         source_contract["binding"]
     ):
         raise ValueError("ROA refinement changed the source motor binding")
-    policy = _validated_policy(saved, report)
+    policy = _validated_policy(saved, report, contact_conditioned=contact)
     before, after = original.state_dict(), policy.state_dict()
     if any(
         not torch.equal(value, after[key])
@@ -222,13 +267,22 @@ def _load_refinement(path, hashes, saved, protocol, report, visited):
         "policy_state_sha256": report["policy_state_sha256"],
         "learning_updates": source["learning_updates"],
         "additional_adaptation_optimizer_steps": SCHEDULE["estimator_optimizer_steps"],
-        "stage": "estimator_refinement",
+        "stage": "contact_estimator_refinement" if contact else "estimator_refinement",
         "physical_reference": source["physical_reference"],
         "training_seed": seed,
         "training_evaluation_reset_seed": seed + 1000,
         "source_cleanup": report.get("cleanup"),
         "scope": "Estimator-only diagnostic refinement; simulator-development only, not terrain or hardware qualification",
     }
+    if contact:
+        receipt.update(
+            inherited_adaptation_optimizer_steps=source[
+                "total_adaptation_optimizer_steps"
+            ],
+            total_adaptation_optimizer_steps=source["total_adaptation_optimizer_steps"]
+            + SCHEDULE["estimator_optimizer_steps"],
+            counting_scope=source["counting_scope"],
+        )
     verify_source_files(receipt)
     return policy, saved["motor_contract"], saved["motor_manifest"], receipt
 
@@ -292,6 +346,48 @@ def _validate_training_exposure(exposure, count, *, steps):
         raise ValueError("Incomplete ROA training exposure groups")
 
 
+def _validate_native_collection(
+    protocol, report, stage, count, seed, steps, *, full_resets=4
+):
+    """Shared native terrain, support-start and teacher-observation receipts."""
+    if stage.geometry_version:
+        from . import operator_step_field
+
+        if (
+            protocol["step_field_geometry"]
+            != operator_step_field.envelope(stage.geometry_version)
+            or report["native_step_field_geometry"]["version"] != stage.geometry_version
+            or report["training_exposure"]["geometry_overrides"]
+            != {"step_hills": stage.geometry_version}
+        ):
+            raise ValueError("Step-field geometry or measured exposure recipe changed")
+        operator_step_field.validate_geometry_report(
+            report["native_step_field_geometry"], seed=seed
+        )
+    if stage.support_resets:
+        from . import operator_step_support
+
+        if protocol["support_reset_recipe"] != operator_step_support.recipe():
+            raise ValueError("Support-reset recipe changed")
+        operator_step_support.validate_receipt(
+            report["native_support_patches"], report["native_step_field_geometry"]
+        )
+        operator_step_support.validate_training_report(
+            report["training_support_resets"], num_envs=count, steps=steps
+        )
+    if stage.contact_conditioned:
+        from . import operator_roa_contacts
+
+        if protocol["teacher_contacts"] != operator_roa_contacts.recipe():
+            raise ValueError("Teacher contact recipe changed")
+        operator_roa_contacts.validate_report(
+            report["teacher_contact_observations"],
+            num_envs=count,
+            steps=steps + 1800,
+            full_resets=full_resets,
+        )
+
+
 def _environment_source(saved, protocol, report, layout, stage, visited):
     """Validate a bounded joint stage and its completed, acyclic ancestry."""
     source_path = protocol["environment_checkpoint"]
@@ -339,34 +435,16 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
         count,
         steps=stage.updates * 24 + stage.updates // 20 * 64,
     )
-    if stage.geometry_version:
-        from . import operator_step_field
-
-        if (
-            protocol["environment_layout"] != layout
-            or protocol["step_field_geometry"]
-            != operator_step_field.envelope(stage.geometry_version)
-            or report["native_step_field_geometry"]["version"] != stage.geometry_version
-            or report["training_exposure"]["geometry_overrides"]
-            != {"step_hills": stage.geometry_version}
-        ):
-            raise ValueError("Step-field geometry or measured exposure recipe changed")
-        operator_step_field.validate_geometry_report(
-            report["native_step_field_geometry"], seed=seed
-        )
-    if stage.support_resets:
-        from . import operator_step_support
-
-        if protocol["support_reset_recipe"] != operator_step_support.recipe():
-            raise ValueError("Support-reset recipe changed")
-        operator_step_support.validate_receipt(
-            report["native_support_patches"], report["native_step_field_geometry"]
-        )
-        operator_step_support.validate_training_report(
-            report["training_support_resets"],
-            num_envs=count,
-            steps=stage.updates * 24 + stage.updates // 20 * 64,
-        )
+    if stage.geometry_version and protocol["environment_layout"] != layout:
+        raise ValueError("Step-field environment layout changed")
+    _validate_native_collection(
+        protocol,
+        report,
+        stage,
+        count,
+        seed,
+        stage.updates * 24 + stage.updates // 20 * 64,
+    )
     if stage.step_clearance:
         from . import operator_step_clearance
 
@@ -383,10 +461,6 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
         )
     initial_digest = source["policy_state_sha256"]
     if stage.contact_conditioned:
-        from . import operator_roa_contacts
-
-        if protocol["teacher_contacts"] != operator_roa_contacts.recipe():
-            raise ValueError("Teacher contact recipe changed")
         if not stage.source_contact_conditioned:
             original.actor.enable_contact_conditioning()
             initial_digest = state_sha256(original)
@@ -401,11 +475,6 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
                 raise ValueError(
                     "Teacher contact initialization differs from its source"
                 )
-        operator_roa_contacts.validate_report(
-            report["teacher_contact_observations"],
-            num_envs=count,
-            steps=stage.updates * 24 + stage.updates // 20 * 64 + 1800,
-        )
     if stage.source_contact_conditioned:
         from .operator_roa_pilot import orientation_objective
 
@@ -486,9 +555,10 @@ def load_completed_checkpoint(
             stage.result_stage
             if stage
             else (
-                "estimator_refinement"
-                if saved["version"] == "operator_roa_estimator_refinement_v1"
-                else None
+                {
+                    "operator_roa_estimator_refinement_v1": "estimator_refinement",
+                    "operator_roa_estimator_refinement_v2": "contact_estimator_refinement",
+                }.get(saved["version"])
             )
         )
         expected_stages = (
@@ -497,6 +567,10 @@ def load_completed_checkpoint(
         if expected_stages is not None and declared_stage not in expected_stages:
             source_label = "/".join(expected_stages).replace("_", "-")
             raise ValueError(f"Require the declared {source_label} source")
+        if declared_stage == "contact_estimator_refinement" and not (
+            allow_environment and allow_step_fields and allow_step_support
+        ):
+            raise ValueError("Require earlier ancestry, not a contact refinement")
         if environment and (not allow_refinement or not allow_environment):
             raise ValueError(
                 "Require original v3/refinement ancestry, not an environment stage"
@@ -507,7 +581,10 @@ def load_completed_checkpoint(
             raise ValueError(
                 "Require earlier ancestry, not another support-reset stage"
             )
-        if saved["version"] == "operator_roa_estimator_refinement_v1":
+        if saved["version"] in (
+            "operator_roa_estimator_refinement_v1",
+            "operator_roa_estimator_refinement_v2",
+        ):
             if not allow_refinement:
                 raise ValueError(
                     "ROA refinement requires a completed v3 source, not another refinement"

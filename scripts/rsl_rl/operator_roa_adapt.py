@@ -15,6 +15,7 @@ import time
 import traceback
 
 VERSION = "operator_roa_estimator_refinement_v1"
+CONTACT_VERSION = "operator_roa_estimator_refinement_v2"
 SCHEDULE = {
     "history_block_steps": 64,
     "blocks": 75,
@@ -35,7 +36,7 @@ def parse_args(argv=None):
         "--checkpoint",
         type=Path,
         required=True,
-        help="Completed final v3 ROA checkpoint; fresh estimator Adam",
+        help="Completed v3 or zero-stumble contact continuation; fresh estimator Adam",
     )
     parser.add_argument("--seed", type=int, default=1045)
     parser.add_argument("--num-envs", type=int, choices=(80, 160, 320), default=80)
@@ -51,6 +52,28 @@ def parse_args(argv=None):
     if args.seed < 0 or args.cpu_threads < 1:
         parser.error("Require nonnegative seed and positive threads")
     return args
+
+
+def refinement_recipe(path, source):
+    """Preserve the admitted source recipe; never infer it from a filename."""
+    if "stage" not in source:
+        return {}  # Historical v3 source: the original slanted-hill refinement.
+    if source["stage"] not in ("contact_stumble_learning", "contact_continuation"):
+        raise ValueError("Refinement requires v3 or a completed contact control source")
+    from .operator_roa_pilot import require_inherited_posture
+    from .operator_roa_contacts import recipe as contacts
+    from .operator_step_support import recipe as support
+    from .operator_step_field import envelope
+    from .operator_rewards import stumble_objective
+
+    require_inherited_posture(path, stumble_control=True)
+    return {
+        "step_field_geometry": envelope("operator_step_field_bootstrap_v1"),
+        "support_reset_recipe": support(),
+        "teacher_contacts": contacts(),
+        "orientation_weight": -2.5,
+        "stumble_objective": stumble_objective(0.0),
+    }
 
 
 class TerrainExposure:
@@ -158,16 +181,38 @@ class TerrainExposure:
         return result
 
 
-def refine(host, policy, source, output, report, publish, *, seed, source_checkpoint):
+def refine(
+    host,
+    policy,
+    source,
+    output,
+    report,
+    publish,
+    *,
+    seed,
+    source_checkpoint,
+    recipe=None,
+):
     """Reuse the existing H-phase optimizer/collector; never construct PPO."""
     import torch
     from parkour_lab.learning.operator_roa import state_sha256, set_phase
-    from .operator_roa_pilot import _adapt_history, HISTORY_STEPS
+    from .operator_roa_pilot import (
+        _adapt_history,
+        HISTORY_STEPS,
+        set_training_mechanisms,
+    )
     from .operator_roa_evaluation import evaluate_history
     from .operator_roa_checkpoint import verify_source_files
 
     if HISTORY_STEPS != SCHEDULE["history_block_steps"]:
         raise ValueError("History collector budget changed")
+    recipe = recipe or {}
+    contact = bool(recipe)
+    support = getattr(host.env, "_operator_step_support", None)
+    if (support is not None) != contact or policy.actor.contact_conditioned != contact:
+        raise ValueError(
+            "Refinement recipe differs from native support or teacher schema"
+        )
     policy.to(host.env.device)
     if state_sha256(policy) != source["policy_state_sha256"]:
         raise ValueError("Source policy changed before refinement")
@@ -180,37 +225,57 @@ def refine(host, policy, source, output, report, publish, *, seed, source_checkp
         completed_blocks=0,
         blocks=[],
         motor_verification=host.bridge.motor_verification,
+        inherited_ppo_updates=source["learning_updates"],
     )
+    set_training_mechanisms(host.env, active=False)
     report["evaluations_before"] = evaluate_history(host, policy, seed=seed + 1000)
     publish()
     # Native reset restores stochastic command timers; no scripted-command
     # override or hidden-history injection survives the frozen check.
-    obs, _ = host.reset(seed=seed)
-    exposure = TerrainExposure(host.env)
     optimizer = torch.optim.Adam(
         policy.actor.estimator.parameters(), lr=SCHEDULE["learning_rate"]
     )
-    for block in range(1, SCHEDULE["blocks"] + 1):
-        record = {"block": block}
-        report["blocks"].append(record)
-        obs = _adapt_history(
-            host,
-            policy,
-            optimizer,
-            obs,
-            record,
-            report,
-            require_change=True,
-            observe=exposure.sample,
+    try:
+        set_training_mechanisms(host.env, active=True)
+        obs, _ = host.reset(seed=seed)
+        exposure = TerrainExposure(
+            host.env,
+            geometry_version=recipe.get("step_field_geometry", {}).get("version"),
         )
-        report["completed_blocks"] = block
-        if block % 5 == 0:
-            report["training_exposure"] = exposure.report()
-            print(
-                f"ROA estimator block {block}/{SCHEDULE['blocks']}; no PPO", flush=True
+
+        def observe():
+            exposure.sample()
+            if support is not None:
+                support.sample()
+
+        for block in range(1, SCHEDULE["blocks"] + 1):
+            record = {"block": block}
+            report["blocks"].append(record)
+            obs = _adapt_history(
+                host,
+                policy,
+                optimizer,
+                obs,
+                record,
+                report,
+                require_change=True,
+                observe=observe,
             )
-            publish()
+            report["completed_blocks"] = block
+            report["training_exposure"] = exposure.report()
+            if support is not None:
+                report["training_support_resets"] = support.report()
+            if block % 5 == 0:
+                print(
+                    f"ROA estimator block {block}/{SCHEDULE['blocks']}; no PPO",
+                    flush=True,
+                )
+                publish()
+    finally:
+        set_training_mechanisms(host.env, active=False)
     report["evaluations_after"] = evaluate_history(host, policy, seed=seed + 1000)
+    if host.contacts is not None:
+        report["teacher_contact_observations"] = host.contacts.report()
     state = policy.state_dict()
     report["fixed_modules_unchanged"] = all(
         torch.equal(value, state[name])
@@ -234,7 +299,7 @@ def refine(host, policy, source, output, report, publish, *, seed, source_checkp
     pending = output / "adapted.pt.pending"
     torch.save(
         {
-            "version": VERSION,
+            "version": CONTACT_VERSION if contact else VERSION,
             "readiness_only": True,
             "deployment_allowed": False,
             "policy_state": state,
@@ -272,9 +337,8 @@ def main(argv=None):
     agent = training.read_yaml_data(args.reference.parent / "params/agent.yaml")
     saved = training.read_yaml_data(args.reference.parent / "params/env.yaml")
     training.load_reference_checkpoint(args.reference, agent)
-    policy, contract, _, source = load_completed_checkpoint(
-        args.checkpoint, allow_refinement=False
-    )
+    policy, contract, _, source = load_completed_checkpoint(args.checkpoint)
+    recipe = refinement_recipe(args.checkpoint, source)
     if (
         source["physical_reference"] != identity["physical_reference"]
         or args.seed == source["training_seed"]
@@ -288,7 +352,7 @@ def main(argv=None):
         tempfile.mkdtemp(prefix="operator_roa_adapt_", dir=args.output_parent)
     ).resolve()
     protocol = {
-        "version": VERSION,
+        "version": CONTACT_VERSION if recipe else VERSION,
         "source_identity": identity,
         "source_checkpoint": str(args.checkpoint),
         "source": source,
@@ -304,7 +368,13 @@ def main(argv=None):
         "evaluation": "Frozen before/after 900-step command checks in the SAME procedural training geometry; diagnostic retention, not held-out or course qualification.",
         "scope": "Whole freely commanded procedural environments at three static difficulty rows. Existing step_hills has slanted risers, NOT true high-step/stair coverage. No new locomotion-policy updates or sim-to-real validation.",
         "exit_allowed": False,
+        **recipe,
     }
+    if recipe:
+        protocol.update(
+            scope="Joint velocity+latent estimator consolidation on the source bootstrap step fields with training-only mixed support starts. Motor, teacher, critic and action noise frozen; no PPO or qualification.",
+            collection="75 persistent 64-step causal blocks under native free body-twist sampling; source mixed support starts only during collection, center starts for frozen checks. No routes, waypoints or success resets.",
+        )
     training.write_json(output / "training_protocol.json", protocol)
     report = {
         "status": "SOURCE_VALIDATED_NOT_SIMULATED",
@@ -343,13 +413,33 @@ def main(argv=None):
         cfg, _ = training.proprioceptive_procedural_configs(saved, agent, args)
         training._configure_recurrent_terrain(cfg, DIFFICULTY, num_rows=3)
         cfg.seed = cfg.scene.terrain.terrain_generator.seed = args.seed
-        validate_events(cfg)
+        if recipe:
+            from . import operator_step_field, operator_step_support
+            from .operator_rewards import configure_stumble, verify_stumble_objective
+            from .operator_roa_pilot import verify_orientation_objective
+
+            operator_step_field.configure(
+                cfg, version=recipe["step_field_geometry"]["version"]
+            )
+            operator_step_support.configure(cfg)
+            cfg.rewards.flat_orientation_l2.weight = recipe["orientation_weight"]
+            configure_stumble(cfg, 0.0)
+        validate_events(cfg, support_resets=bool(recipe))
         cfg.validate()
         (output / "resolved_env.yaml").write_text(
             yaml.dump(cfg.to_dict(), sort_keys=False)
         )
         env = ManagerBasedRLEnv(cfg=cfg)
-        host = PilotEnvironment(env, app)
+        if recipe:
+            report["orientation_objective"] = verify_orientation_objective(env, -2.5)
+            report["stumble_objective"] = verify_stumble_objective(env, 0.0)
+            report["native_step_field_geometry"] = (
+                operator_step_field.verify_native_geometry(env)
+            )
+            report["native_support_patches"] = operator_step_support.install(
+                env, report["native_step_field_geometry"]
+            )
+        host = PilotEnvironment(env, app, contact_conditioned=bool(recipe))
         if binding_sha256(contract["binding"]) != binding_sha256(
             host.motor_contract["binding"]
         ):
@@ -364,6 +454,7 @@ def main(argv=None):
             publish,
             seed=args.seed,
             source_checkpoint=args.checkpoint,
+            recipe=recipe,
         )
         if training.recurrent_training_identity(args.reference) != identity:
             raise RuntimeError("Physical source or runtime changed during refinement")

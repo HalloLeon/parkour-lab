@@ -86,7 +86,7 @@ class ContactFeatures:
         }
 
 
-def validate_report(report, *, num_envs, steps):
+def validate_report(report, *, num_envs, steps, full_resets=4):
     """Bind source loading to complete native collection, not only a feature flag."""
     if not isinstance(report, dict):
         raise ValueError("Require a teacher contact observation receipt")
@@ -96,12 +96,14 @@ def validate_report(report, *, num_envs, steps):
     )
     ids = report["contact_body_ids"]
     if (
-        report["recipe"] != recipe()
+        type(full_resets) is not int
+        or full_resets < 1
+        or report["recipe"] != recipe()
         or type(report["num_envs"]) is not int
         or report["num_envs"] != num_envs
         or any(type(value) is not int for value in (calls, resets, nonzero))
-        or calls != steps + 4
-        or not 4 * num_envs <= resets <= calls * num_envs
+        or calls != steps + full_resets
+        or not full_resets * num_envs <= resets <= calls * num_envs
         or not 0 < nonzero <= calls * num_envs - resets
         or not isinstance(ids, list)
         or len(ids) != 4
