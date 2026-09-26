@@ -33,6 +33,7 @@ class EnvironmentStage:
     support_resets: bool = False
     step_clearance: bool = False
     contact_conditioned: bool = False
+    source_contact_conditioned: bool = False
 
 
 ENVIRONMENT_STAGES = {
@@ -95,6 +96,18 @@ ENVIRONMENT_STAGES = {
         support_resets=True,
         contact_conditioned=True,
     ),
+    "contact_followup": EnvironmentStage(
+        "operator_roa_contact_followup_learning_v1",
+        "contact_teacher_learning",
+        3000,
+        1000,
+        "ROA_CONTACT_FOLLOWUP_LEARNING_COMPLETED_NOT_QUALIFIED",
+        "contact_followup_learning",
+        geometry_version="operator_step_field_bootstrap_v1",
+        support_resets=True,
+        contact_conditioned=True,
+        source_contact_conditioned=True,
+    ),
 }
 REGULARIZATION_COEFFICIENTS = (0.1, 0.55, 1.0)
 ROLLOUT_STEPS = 24
@@ -146,7 +159,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--environment-layout",
         choices=tuple(ENVIRONMENT_STAGES),
-        help="hills: refined source; step_fields: hills source; other step stages: step-field source",
+        help="hills: refined source; step_fields: hills source; contact_followup: contact-teacher source; other step stages: step-field source",
     )
     parser.add_argument(
         "--regularization",
@@ -154,6 +167,12 @@ def parse_args(argv=None):
         help="Additional regularization only: zero for 20 updates then ramp to 0.1, or remain zero",
     )
     parser.add_argument("--learning-updates", type=int, choices=(100, 500, 1000))
+    parser.add_argument(
+        "--orientation-weight",
+        type=float,
+        choices=(-2.5, 0.0),
+        help="Required for contact_followup: inherited flat-posture cost or zero; other rewards unchanged",
+    )
     parser.add_argument(
         "--output-parent",
         type=Path,
@@ -167,6 +186,9 @@ def parse_args(argv=None):
         parser.error("--environment-layout requires --environment-checkpoint")
     args.environment_layout = args.environment_layout or "hills"
     stage = ENVIRONMENT_STAGES[args.environment_layout]
+    followup = bool(args.environment_checkpoint and stage.source_contact_conditioned)
+    if followup != (args.orientation_weight is not None):
+        parser.error("--orientation-weight is required only with contact_followup")
     if (learning is None) != (args.regularization is None):
         parser.error("A learning checkpoint and --regularization must be used together")
     if args.learning_updates is not None and learning is None:
@@ -194,10 +216,42 @@ def learning_coefficients(regularization, updates=LEARNING_UPDATES):
     )
 
 
+def orientation_objective(weight):
+    """The one selected objective in the bounded contact follow-up pair."""
+    if type(weight) not in (int, float) or weight not in (-2.5, 0.0):
+        raise ValueError("Require inherited -2.5 or zero flat-orientation weight")
+    return {
+        "term": "flat_orientation_l2",
+        "function": "isaaclab.envs.mdp.rewards:flat_orientation_l2",
+        "weight": float(weight),
+        "registered": True,
+        "contributes": weight != 0,
+        "scope": "Native reward rate times control dt once; physical tilt termination unchanged",
+    }
+
+
+def verify_orientation_objective(env, weight):
+    expected = orientation_objective(weight)
+    name = expected["term"]
+    if name not in env.reward_manager.active_terms:
+        raise ValueError("Native flat-orientation objective is not registered")
+    terms = (getattr(env.cfg.rewards, name), env.reward_manager.get_term_cfg(name))
+    if any(
+        type(item.weight) not in (int, float)
+        or item.weight != weight
+        or item.params != {}
+        or f"{item.func.__module__}:{item.func.__name__}" != expected["function"]
+        for item in terms
+    ):
+        raise ValueError("Native flat-orientation objective differs from selected arm")
+    return expected
+
+
 def load_learning_source(path, physical_reference):
     """Admit only completed v2 mechanism evidence, never a deployment artifact."""
     import torch
     from parkour_lab.learning.motor_contract import validate_motor_contract
+    from .operator_roa_checkpoint import _validate_completion
     from .operator_train import file_sha256
 
     path = path.resolve(strict=True)
@@ -205,18 +259,10 @@ def load_learning_source(path, physical_reference):
     identity = {str(item): file_sha256(item) for item in files}
     protocol, report = (json.loads(item.read_text()) for item in files[1:])
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    motor = report["motor_delivery"]
     if (
         protocol["version"] != "operator_roa_learning_pilot_v2"
         or checkpoint["version"] != protocol["version"]
         or protocol["source_identity"]["physical_reference"] != physical_reference
-        or report.get("session_status", report["status"])
-        != "ROA_LEARNING_PILOT_COMPLETED_NOT_QUALIFIED"
-        or report["status"]
-        not in (
-            "ROA_LEARNING_PILOT_COMPLETED_NOT_QUALIFIED",
-            "SESSION_COMPLETED_CLEANUP_PENDING",
-        )
         or report["checkpoint_sha256"] != identity[str(path)]
         or checkpoint["readiness_only"] is not True
         or checkpoint["deployment_allowed"] is not False
@@ -225,21 +271,11 @@ def load_learning_source(path, physical_reference):
         != REGULARIZATION_COEFFICIENTS
         or report["ppo_updates_completed"] != 3
         or report["adaptation_optimizer_steps"] != 48
-        or report["exit_allowed"] is not False
-        or report["behavior_validated"] is not False
-        or motor["faulted"] is not False
-        or motor["pending_delivery"] is not False
-        or any(
-            motor[name] != 296
-            for name in (
-                "encoded_steps",
-                "verified_delivery_steps",
-                "native_step_returns",
-            )
-        )
-        or report["environment_transitions"] != 296 * protocol["num_envs"]
     ):
         raise ValueError("Require a completed, source-bound v2 ROA pilot")
+    _validate_completion(
+        report, "ROA_LEARNING_PILOT_COMPLETED_NOT_QUALIFIED", 296, protocol["num_envs"]
+    )
     validate_motor_contract(checkpoint["motor_contract"], checkpoint["motor_manifest"])
     if any(file_sha256(item) != identity[str(item)] for item in files):
         raise ValueError("Learning source changed while loading")
@@ -657,7 +693,11 @@ def _learn_pilot(
         raise ValueError("Foot-clearance admission must match the selected stage")
     set_training_mechanisms(env, active=False)
     obs, _ = host.reset()
-    policy, reference = build_policy(obs, source_state)
+    policy, reference = build_policy(
+        obs,
+        source_state,
+        contact_conditioned=bool(stage and stage.source_contact_conditioned),
+    )
     actor = policy.actor
 
     def frames(observations):
@@ -698,7 +738,7 @@ def _learn_pilot(
             raise ValueError(
                 "Learning checkpoint state is invalid or differs from report"
             )
-        if stage and stage.contact_conditioned:
+        if stage and stage.contact_conditioned and not stage.source_contact_conditioned:
             with torch.no_grad():
                 before_teacher = actor.encode(obs["dynamics"]).clone()
                 before_action = actor.history_action(obs["policy"], frames(obs)).clone()
@@ -1169,6 +1209,16 @@ def main(argv=None):
             protocol["learning_scope"] = (
                 "Matched contact-teacher information ablation; unchanged bootstrap geometry, rewards, lambda-off schedule and 2500-update source; not qualification"
             )
+        if stage.source_contact_conditioned:
+            protocol.update(
+                orientation_weight=args.orientation_weight,
+                reward="Only flat_orientation_l2 weight selected explicitly; all other native rewards unchanged",
+                learning_scope="Matched posture-cost ablation from contact-teacher3000; unchanged free environments, not qualification",
+                schedule_scope="1000 new PPO updates, H every20; zero additional regularization; fresh optimizers, not resume",
+            )
+            protocol["model"][
+                "motor"
+            ] = "Full contact-teacher policy warm start; no new modules or observation changes"
     report = {
         "status": "RUNNING_NOT_QUALIFIED",
         "exit_allowed": False,
@@ -1214,12 +1264,18 @@ def main(argv=None):
             step_support.configure(cfg)
         if stage and stage.step_clearance:
             step_clearance.configure(cfg)
+        if stage and stage.source_contact_conditioned:
+            cfg.rewards.flat_orientation_l2.weight = args.orientation_weight
         validate_events(cfg, support_resets=bool(stage and stage.support_resets))
         cfg.validate()
         (output / "resolved_env.yaml").write_text(
             yaml.dump(cfg.to_dict(), sort_keys=False)
         )
         env = ManagerBasedRLEnv(cfg=cfg)
+        if stage and stage.source_contact_conditioned:
+            report["orientation_objective"] = verify_orientation_objective(
+                env, args.orientation_weight
+            )
         if stage and stage.geometry_version:
             report["native_step_field_geometry"] = step_field.verify_native_geometry(
                 env
@@ -1246,11 +1302,8 @@ def main(argv=None):
         )
         if training.recurrent_training_identity(args.reference) != identity:
             raise RuntimeError("Source or runtime changed during learning pilot")
-        if learning is not None and any(
-            training.file_sha256(Path(path)) != digest
-            for path, digest in metadata["files"].items()
-        ):
-            raise RuntimeError("Learning source changed during experiment")
+        if learning is not None:
+            verify_source_files(metadata)
         report["checkpoint_sha256"] = training.file_sha256(
             output
             / (

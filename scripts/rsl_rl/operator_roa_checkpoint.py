@@ -48,6 +48,28 @@ def verify_source_files(receipt):
             raise ValueError(f"ROA source changed: {name}")
 
 
+def _validate_completion(report, status, steps, count):
+    """Completed work can retain pending cleanup, but never an error or lost delivery."""
+    motor = report["motor_delivery"]
+    counts = [
+        motor[key]
+        for key in ("encoded_steps", "verified_delivery_steps", "native_step_returns")
+    ]
+    if (
+        report.get("session_status", report["status"]) != status
+        or report["status"] not in (status, "SESSION_COMPLETED_CLEANUP_PENDING")
+        or any(
+            report[key] is not False for key in ("exit_allowed", "behavior_validated")
+        )
+        or motor["faulted"] is not False
+        or motor["pending_delivery"] is not False
+        or any(type(value) is not int or value != steps for value in counts)
+        or type(report["environment_transitions"]) is not int
+        or report["environment_transitions"] != steps * count
+    ):
+        raise ValueError("Incomplete ROA session or native delivery receipt")
+
+
 def _validated_policy(saved, report, *, contact_conditioned=False):
     policy = _policy_template(contact_conditioned=contact_conditioned)
     expected, state = policy.state_dict(), saved["policy_state"]
@@ -104,7 +126,6 @@ def _load_refinement(path, hashes, saved, protocol, report):
 
     status = "ROA_ESTIMATOR_REFINEMENT_COMPLETED_NOT_QUALIFIED"
     count, seed = protocol["num_envs"], protocol["seed"]
-    motor = report["motor_delivery"]
     source_path = saved["source_checkpoint"]
     if (
         set(saved)
@@ -140,36 +161,21 @@ def _load_refinement(path, hashes, saved, protocol, report):
         or saved["completed_blocks"] != SCHEDULE["blocks"]
         or protocol["schedule"] != SCHEDULE
         or protocol["exit_allowed"] is not False
-        or report.get("session_status", report["status"]) != status
-        or report["status"] not in (status, "SESSION_COMPLETED_CLEANUP_PENDING")
         or report["checkpoint_sha256"] != hashes[str(path)]
         or report["ppo_updates_completed"] != 0
         or report["adaptation_optimizer_steps"] != SCHEDULE["estimator_optimizer_steps"]
         or report["completed_blocks"] != SCHEDULE["blocks"]
-        or report["environment_transitions"] != NATIVE_STEPS * count
-        or any(
-            report[key] is not False for key in ("exit_allowed", "behavior_validated")
-        )
         or report["fixed_modules_unchanged"] is not True
         or report["estimator_changed"] is not True
         or any(
             not isinstance(report[key], dict)
             for key in ("evaluations_before", "evaluations_after")
         )
-        or motor["faulted"] is not False
-        or motor["pending_delivery"] is not False
-        or any(
-            motor[key] != NATIVE_STEPS
-            for key in (
-                "encoded_steps",
-                "verified_delivery_steps",
-                "native_step_returns",
-            )
-        )
     ):
         raise ValueError(
             "Require a source-bound completed estimator-only ROA refinement"
         )
+    _validate_completion(report, status, NATIVE_STEPS, count)
     original, source_contract, _, source = load_completed_checkpoint(
         source_path, allow_refinement=False
     )
@@ -312,7 +318,8 @@ def _environment_source(saved, protocol, report, layout, stage):
         source_path,
         allow_environment=bool(stage.geometry_version),
         allow_step_fields=stage.support_resets,
-        allow_step_support=False,
+        allow_step_support=stage.source_contact_conditioned,
+        expected_stage=stage.source_stage,
     )
     if (
         source.get("stage") != stage.source_stage
@@ -379,22 +386,36 @@ def _environment_source(saved, protocol, report, layout, stage):
 
         if protocol["teacher_contacts"] != operator_roa_contacts.recipe():
             raise ValueError("Teacher contact recipe changed")
-        original.actor.enable_contact_conditioning()
-        initial_digest = state_sha256(original)
-        if report["contact_initialization"] != {
-            "source_policy_state_sha256": source["policy_state_sha256"],
-            "initialized_policy_state_sha256": initial_digest,
-            "teacher_latent_exact": True,
-            "causal_action_exact": True,
-            "privileged_action_exact": True,
-            "new_projection_zero": True,
-        }:
-            raise ValueError("Teacher contact initialization differs from its source")
+        if not stage.source_contact_conditioned:
+            original.actor.enable_contact_conditioning()
+            initial_digest = state_sha256(original)
+            if report["contact_initialization"] != {
+                "source_policy_state_sha256": source["policy_state_sha256"],
+                "initialized_policy_state_sha256": initial_digest,
+                "teacher_latent_exact": True,
+                "causal_action_exact": True,
+                "privileged_action_exact": True,
+                "new_projection_zero": True,
+            }:
+                raise ValueError(
+                    "Teacher contact initialization differs from its source"
+                )
         operator_roa_contacts.validate_report(
             report["teacher_contact_observations"],
             num_envs=count,
             steps=stage.updates * 24 + stage.updates // 20 * 64 + 1800,
         )
+    if stage.source_contact_conditioned:
+        from .operator_roa_pilot import orientation_objective
+
+        if (
+            json.dumps(report["orientation_objective"], sort_keys=True)
+            != json.dumps(
+                orientation_objective(protocol["orientation_weight"]), sort_keys=True
+            )
+            or "contact_initialization" in report
+        ):
+            raise ValueError("Contact follow-up objective or initialization changed")
     for key, digest in (
         ("evaluation_before", initial_digest),
         ("evaluation_after", report["policy_state_sha256"]),
@@ -410,6 +431,7 @@ def load_completed_checkpoint(
     allow_environment=True,
     allow_step_fields=True,
     allow_step_support=True,
+    expected_stage=None,
 ):
     """Completed bounded stages with finite ancestry; no partial/resume selection."""
     from .operator_roa_pilot import ENVIRONMENT_STAGES, learning_coefficients
@@ -433,6 +455,19 @@ def load_completed_checkpoint(
         )
         environment = layout is not None
         stage = ENVIRONMENT_STAGES[layout] if environment else None
+        declared_stage = (
+            stage.result_stage
+            if stage
+            else (
+                "estimator_refinement"
+                if saved["version"] == "operator_roa_estimator_refinement_v1"
+                else None
+            )
+        )
+        if expected_stage is not None and declared_stage != expected_stage:
+            raise ValueError(
+                f"Require the declared {expected_stage.replace('_', '-')} source"
+            )
         if environment and (not allow_refinement or not allow_environment):
             raise ValueError(
                 "Require original v3/refinement ancestry, not an environment stage"
@@ -456,7 +491,6 @@ def load_completed_checkpoint(
             else "ROA_INCREMENTAL_EXPERIMENT_COMPLETED_NOT_QUALIFIED"
         )
         expected_steps = updates * 24 + updates // 20 * 64 + 1800
-        motor = report["motor_delivery"]
         physical = protocol["source_identity"]["physical_reference"]
         if (
             set(saved)
@@ -486,17 +520,11 @@ def load_completed_checkpoint(
             or count not in (80, 160, 320)
             or protocol["cycles"] != updates
             or report["ppo_updates_completed"] != updates
-            or report.get("session_status", report["status"]) != status
-            or report["status"] not in (status, "SESSION_COMPLETED_CLEANUP_PENDING")
             or report["checkpoint_sha256"] != hashes[str(path)]
             or {"path": path.name, "sha256": hashes[str(path)], "ppo_updates": updates}
             not in report["checkpoints"]
             or saved["readiness_only"] is not True
             or saved["deployment_allowed"] is not False
-            or any(
-                report[key] is not False
-                for key in ("exit_allowed", "behavior_validated")
-            )
             or protocol["exit_allowed"] is not False
             or saved["history_interval"] != 20
             or protocol["history_interval"] != 20
@@ -533,17 +561,6 @@ def load_completed_checkpoint(
                 learning_coefficients("ramp", updates),
             )
             or report["adaptation_optimizer_steps"] != updates // 20 * 16
-            or motor["faulted"] is not False
-            or motor["pending_delivery"] is not False
-            or any(
-                motor[key] != expected_steps
-                for key in (
-                    "encoded_steps",
-                    "verified_delivery_steps",
-                    "native_step_returns",
-                )
-            )
-            or report["environment_transitions"] != expected_steps * count
             or set(physical) != {"checkpoint", "agent.yaml", "env.yaml"}
             or any(
                 type(digest) is not str
@@ -557,6 +574,7 @@ def load_completed_checkpoint(
                 if environment
                 else "Require a source-bound completed final v3 ROA experiment"
             )
+        _validate_completion(report, status, expected_steps, count)
         _validate_native_motor(saved, report, count)
         policy = _validated_policy(
             saved, report, contact_conditioned=bool(stage and stage.contact_conditioned)

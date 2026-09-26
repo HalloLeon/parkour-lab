@@ -294,6 +294,7 @@ def _input_diagnostic_report(
         "causal_actor_inputs_only": mode is None,
         "scope": "Frozen input telemetry, not an oracle upper bound, deployment validation or acceptance evidence",
         "sampling": "Pre-action decision index times 0.02s; first_attempt_valid includes the decision causing first termination, excludes all later episodes",
+        "projected_gravity": "Native clean body-frame gravity unit vector from critic_state[6:9]; pre-action telemetry, not the post-physics orientation reward sample",
         "comparison": (
             "History actions are shadows on the INTERVENED trajectory, not an independent baseline rollout"
             if mode
@@ -551,6 +552,7 @@ def evaluate_history(
                         for name, value in {
                             "estimated_velocity_b_m_s": estimate[:, :3],
                             "true_velocity_b_m_s": clean[:, :3],
+                            "projected_gravity_b": clean[:, 6:9],
                             "history_latent": estimate[:, 3:],
                             "applied_latent": code[:, 3:],
                             "history_raw_action": raw,
