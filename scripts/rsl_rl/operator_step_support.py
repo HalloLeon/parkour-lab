@@ -9,6 +9,7 @@ import numpy as np
 from . import operator_step_field as geometry
 
 VERSION = "operator_step_support_v1"
+# Native reset sampling slots; several slots may reference the same safe patch.
 PATCHES = 16
 OFFSETS = np.array([(x, y, 0.0) for x in (-0.5, 0.0, 0.5) for y in (-0.5, 0.0, 0.5)])
 SCOPE = "Training initial-state exposure only; imported USD/Warp support rays, NOT PhysX contact, foot support or climbing qualification"
@@ -56,6 +57,7 @@ def configure(cfg):
 
 
 def _tiles(report):
+    """Balance raised levels, reusing verified centers when a level has few patches."""
     result = []
     for tile in report["tiles"]:
         levels = geometry._levels(tile["seed"], tile["variant"])
@@ -69,14 +71,21 @@ def _tiles(report):
                     if (levels[i - 1 : i + 2, j - 1 : j + 2] == level).all()
                 ]
             )
-            if len(candidates) < PATCHES // 2:
-                raise ValueError("Insufficient same-level supported start patches")
+            if not len(candidates):
+                raise ValueError(
+                    "Insufficient same-level supported start patches: "
+                    f"seed={tile['seed']}, variant={tile['variant']}, "
+                    f"row={tile['row']}, level={level}; no valid centers"
+                )
             candidate_counts[str(level)] = len(candidates)
-            cells.extend(
-                candidates[
-                    np.linspace(0, len(candidates) - 1, PATCHES // 2, dtype=int)
-                ].tolist()
+            # Preserve every historically admitted selection. Sparse levels use
+            # balanced repetition, without shrinking the certified support square.
+            indices = (
+                np.linspace(0, len(candidates) - 1, PATCHES // 2, dtype=int)
+                if len(candidates) >= PATCHES // 2
+                else np.arange(PATCHES // 2) % len(candidates)
             )
+            cells.extend(candidates[indices].tolist())
             selected_levels.extend([level] * (PATCHES // 2))
         origin = np.array([16 * (tile["row"] - 1), 16 * (tile["variant"] - 9.5), 0.0])
         rise, rough = tile["riser_height_m"], tile["roughness_absolute_bound_m"]
