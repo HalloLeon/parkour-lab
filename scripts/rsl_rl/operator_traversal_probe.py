@@ -13,7 +13,7 @@ import hashlib
 
 import numpy as np
 
-from .operator_traversal_terrain import PROFILES, geometry
+from .operator_traversal_terrain import geometry, profiles_for_layout
 
 COMMAND_TAPE = (
     {"name": "initial_stop", "steps": 100, "command": (0.0, 0.0, 0.0)},
@@ -26,16 +26,36 @@ CONTACT_FORCE_Z = 1.0
 
 
 class TraversalProbe:
-    def __init__(self, env, output):
+    def __init__(self, env, output, *, layout="standard"):
+        profiles = profiles_for_layout(layout)
         self.env, self.output = env, Path(output)
         self.robot = env.scene["robot"]
         self.contacts = env.scene["contact_forces"]
         self.foot_ids = [self.robot.body_names.index(name) for name in FEET]
         self.contact_ids = [self.contacts.body_names.index(name) for name in FEET]
+        generator = getattr(
+            getattr(env.scene.terrain, "cfg", None), "terrain_generator", None
+        )
+        terrains = getattr(generator, "sub_terrains", None)
+        if (
+            getattr(generator, "curriculum", None) is not True
+            or getattr(generator, "num_cols", None) != 4
+            or not isinstance(terrains, dict)
+            or tuple(
+                (getattr(term, "profile", None), getattr(term, "proportion", None))
+                for term in terrains.values()
+            )
+            != tuple((profile, 0.25) for profile in profiles)
+        ):
+            raise ValueError("Traversal observer layout differs from native columns")
         columns = env.scene.terrain.terrain_types.detach().cpu().numpy()
-        if columns.shape != (env.num_envs,) or set(columns.tolist()) != set(range(4)):
+        if (
+            columns.shape != (env.num_envs,)
+            or columns.dtype.kind not in "iu"
+            or set(columns.tolist()) != set(range(4))
+        ):
             raise ValueError("Traversal requires all four native terrain columns")
-        self.specs = [geometry(PROFILES[column]) for column in columns]
+        self.specs = [geometry(profiles[column]) for column in columns]
         self.origins = env.scene.env_origins.detach().cpu().numpy().copy()
         if (
             self.origins.shape != (env.num_envs, 3)

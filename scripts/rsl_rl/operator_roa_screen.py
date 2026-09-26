@@ -39,6 +39,11 @@ def parse_args(argv=None):
         help="Traversal uses four fixed rough ramp/vertical-step fixtures and a straight approach tape",
     )
     parser.add_argument(
+        "--traversal-layout",
+        choices=("standard", "step_ladder"),
+        help="Traversal only: standard ramps/8/16cm, or fixed 2/4/6/8cm step diagnostics",
+    )
+    parser.add_argument(
         "--difficulty",
         type=float,
         nargs=2,
@@ -60,6 +65,10 @@ def parse_args(argv=None):
         default=Path("logs/rsl_rl/go2_operator_refinement"),
     )
     args = parser.parse_args(argv)
+    if args.traversal_layout is not None and args.terrain_suite != "traversal":
+        parser.error("--traversal-layout requires --terrain-suite traversal")
+    if args.terrain_suite == "traversal":
+        args.traversal_layout = args.traversal_layout or "standard"
     if args.diagnostic_input and args.terrain_suite != "traversal":
         parser.error("Input diagnostics require --terrain-suite traversal")
     if args.terrain_suite == "traversal" and args.difficulty is not None:
@@ -110,7 +119,7 @@ def main(argv=None):
         )
 
         command_tape = TRAVERSAL_TAPE
-        fixtures = traversal.preflight(args.seed)
+        fixtures = traversal.preflight(args.seed, args.traversal_layout)
     args.reference = args.reference.resolve(strict=True)
     args.checkpoint = args.checkpoint.resolve(strict=True)
     args.controller_artifact = args.controller_artifact.resolve(strict=True)
@@ -164,7 +173,7 @@ def main(argv=None):
         "command_tape_sha256": command_tape_sha256(command_tape),
         "sensing": "Original noisy45 proprioceptive frame, unchanged scales; controller receives no true velocity, dynamics or scan",
         "scope": (
-            "Four fixed full-width rough ramp/vertical-step layouts; yaw-zero fixed approach, no feedback steering. Root/foot/contact diagnostics, not supported completion, sim-to-real or exit qualification"
+            "Four fixed full-width rough profiles in the declared traversal layout; yaw-zero fixed approach, no feedback steering. Root/foot/contact diagnostics, not supported completion, sim-to-real or exit qualification"
             if fixtures
             else "Newly generated five-profile terrain, frozen causal development screen; not high-step/stair, sim-to-real or exit qualification"
         ),
@@ -172,6 +181,7 @@ def main(argv=None):
         "exit_allowed": False,
     }
     if fixtures:
+        protocol["traversal_layout"] = args.traversal_layout
         protocol["input_telemetry"] = {
             "version": "operator_roa_input_diagnostic_v2",
             "scope": "Observer-only pre-action estimates, true velocity and root position; no change to actor inputs except an explicitly selected diagnostic-input intervention",
@@ -231,7 +241,7 @@ def main(argv=None):
         args.iterations = 0
         cfg, _ = training.proprioceptive_procedural_configs(saved, agent, args)
         if fixtures:
-            traversal.configure(cfg, args.seed, fixtures)
+            traversal.configure(cfg, args.seed, fixtures, layout=args.traversal_layout)
         else:
             training._configure_recurrent_terrain(cfg, args.difficulty)
         cfg.seed = cfg.scene.terrain.terrain_generator.seed = args.seed
@@ -267,7 +277,11 @@ def main(argv=None):
         report["status"] = "RUNNING_NOT_QUALIFIED"
         publish()
         probe = (
-            TraversalProbe(env, output / "traversal_trace.npz") if fixtures else None
+            TraversalProbe(
+                env, output / "traversal_trace.npz", layout=args.traversal_layout
+            )
+            if fixtures
+            else None
         )
         report["evaluation"] = evaluate_history(
             host,

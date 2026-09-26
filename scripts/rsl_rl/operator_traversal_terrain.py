@@ -1,4 +1,4 @@
-"""Four fixed, full-width rough obstacles; evaluation geometry, not a curriculum.
+"""Fixed four-profile rough layouts; diagnostic geometry, not a curriculum.
 
 Step lips use duplicate X coordinates with different heights: their triangles
 are vertical collision faces, not heightfield ramps. All surfaces are supported
@@ -17,21 +17,28 @@ from .operator_stress_terrain import RESOLUTION, TILE_SIZE, multiscale_field
 
 VERSION = "operator_traversal_geometry_v1"
 PROFILES = ("ramp_6deg", "ramp_12deg", "step_08m", "step_16m")
+PROFILE_LAYOUTS = {
+    "standard": PROFILES,
+    "step_ladder": ("step_02m", "step_04m", "step_06m", "step_08m"),
+}
+STEP_HEIGHTS = {f"step_{cm:02d}m": cm / 100 for cm in (2, 4, 6, 8, 16)}
 ROUGHNESS_BOUND = 0.008
 _RECEIPTS = []
 
 
+def profiles_for_layout(layout):
+    if type(layout) is not str or layout not in PROFILE_LAYOUTS:
+        raise ValueError(f"Unknown traversal layout: {layout}")
+    return PROFILE_LAYOUTS[layout]
+
+
 def geometry(profile):
     """Obstacle coordinates relative to the native spawn origin, in metres."""
-    if profile not in PROFILES:
+    if type(profile) is not str or profile not in (*PROFILES, *STEP_HEIGHTS):
         raise ValueError(f"Unknown traversal profile: {profile}")
     ramp = profile.startswith("ramp")
     angle = (6.0 if profile == "ramp_6deg" else 12.0) if ramp else None
-    height = (
-        1.2 * math.tan(math.radians(angle))
-        if ramp
-        else (0.08 if profile == "step_08m" else 0.16)
-    )
+    height = 1.2 * math.tan(math.radians(angle)) if ramp else STEP_HEIGHTS[profile]
     return {
         "profile": profile,
         "entry_x_m": 1.0,
@@ -123,8 +130,8 @@ def build_surface(profile, seed):
     return vertices, faces, metadata
 
 
-def preflight(seed):
-    return [build_surface(profile, seed)[2] for profile in PROFILES]
+def preflight(seed, layout="standard"):
+    return [build_surface(profile, seed)[2] for profile in profiles_for_layout(layout)]
 
 
 def native_receipts():
@@ -154,7 +161,7 @@ def traversal_terrain(difficulty, cfg):
     return [mesh], np.array(receipt["origin_m"])
 
 
-def configure(cfg, seed, expected):
+def configure(cfg, seed, expected, *, layout="standard"):
     """Install the fixed fixture and external commands; preserve sensors/motors."""
     from isaaclab.terrains import SubTerrainBaseCfg, TerrainGeneratorCfg
     from isaaclab.utils import configclass
@@ -166,7 +173,7 @@ def configure(cfg, seed, expected):
         profile: str = ""
         expected_geometry: dict = {}
 
-    if expected != preflight(seed):
+    if expected != preflight(seed, layout):
         raise ValueError("Traversal preflight identity changed")
     _RECEIPTS.clear()
     cfg.scene.terrain.terrain_generator = TerrainGeneratorCfg(
