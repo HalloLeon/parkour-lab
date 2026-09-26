@@ -34,9 +34,9 @@ def parse_args(argv=None):
     parser.add_argument("--seed", type=int, default=1043)
     parser.add_argument(
         "--terrain-suite",
-        choices=("procedural", "traversal"),
+        choices=("procedural", "traversal", "step_fields"),
         default="procedural",
-        help="Traversal uses four fixed rough ramp/vertical-step fixtures and a straight approach tape",
+        help="Procedural: easy retention; traversal: fixed fixtures; step_fields: whole bootstrap fields, fixed body-command tape and ordinary center starts",
     )
     parser.add_argument(
         "--traversal-layout",
@@ -78,10 +78,16 @@ def parse_args(argv=None):
         args.traversal_layout = args.traversal_layout or "standard"
     if args.diagnostic_input and args.terrain_suite != "traversal":
         parser.error("Input diagnostics require --terrain-suite traversal")
-    if args.terrain_suite == "traversal" and args.difficulty is not None:
-        parser.error("Traversal has fixed SI geometry; do not supply --difficulty")
+    if args.terrain_suite != "procedural" and args.difficulty is not None:
+        parser.error(
+            "Only procedural accepts --difficulty; other suites fix their geometry"
+        )
     if args.terrain_suite == "procedural" and args.difficulty is None:
         args.difficulty = (0.05, 0.15)
+    if args.terrain_suite == "step_fields":
+        from .operator_step_field import DIFFICULTY
+
+        args.difficulty = DIFFICULTY
     if (
         args.seed < 0
         or args.cpu_threads < 1
@@ -118,6 +124,11 @@ def main(argv=None):
 
     command_tape = COMMAND_TAPE
     fixtures = None
+    field_screen = args.terrain_suite == "step_fields"
+    if field_screen:
+        from . import operator_step_field as step_field
+
+        command_tape = step_field.SCREEN_COMMAND_TAPE
     if args.terrain_suite == "traversal":
         from . import operator_traversal_terrain as traversal
         from .operator_traversal_probe import (
@@ -199,6 +210,17 @@ def main(argv=None):
             "trace": "input_diagnostic_trace.npz",
             "conditions": "First-episode profile/phase; instantaneous XY speed <0.05m/s; root within0.5m before entry and inside corridor",
         }
+    if field_screen:
+        protocol.update(
+            step_field_geometry=step_field.envelope(step_field.BOOTSTRAP_VERSION),
+            scope="Newly seeded whole bootstrap fields with fixed body-command tape and ordinary center/random-yaw starts; not the native training command sampler or mixed raised starts. Measured ground exposure, not foot support, climbing success, sim-to-real or exit qualification",
+            field_observer=step_field.SCREEN_SCOPE,
+            input_telemetry={
+                "version": "operator_roa_input_diagnostic_v2",
+                "trace": "input_diagnostic_trace.npz",
+                "scope": "Observer-only causal inputs/actions and actual commands, checked against delivered observations; join pre-action index/mask to field_trace.npz; no entry line or corridor",
+            },
+        )
     if args.diagnostic_input:
         protocol.update(
             diagnostic_input=args.diagnostic_input,
@@ -254,8 +276,12 @@ def main(argv=None):
         if fixtures:
             traversal.configure(cfg, args.seed, fixtures, layout=args.traversal_layout)
         else:
-            training._configure_recurrent_terrain(cfg, args.difficulty)
+            training._configure_recurrent_terrain(
+                cfg, args.difficulty, num_rows=3 if field_screen else 1
+            )
         cfg.seed = cfg.scene.terrain.terrain_generator.seed = args.seed
+        if field_screen:
+            step_field.configure(cfg, version=step_field.BOOTSTRAP_VERSION)
         validate_events(cfg)
         cfg.validate()
         (output / "resolved_env.yaml").write_text(
@@ -266,6 +292,10 @@ def main(argv=None):
             report["native_geometry"] = traversal.native_receipts()
             if report["native_geometry"] != fixtures:
                 raise ValueError("Require all four constructed traversal mesh receipts")
+        if field_screen:
+            report["native_step_field_geometry"] = step_field.verify_native_geometry(
+                env
+            )
         host = PilotEnvironment(
             env, app, contact_conditioned=policy.actor.contact_conditioned
         )
@@ -299,6 +329,10 @@ def main(argv=None):
             if fixtures
             else None
         )
+        if field_screen:
+            probe = step_field.FieldProbe(
+                env, output / "field_trace.npz", report["native_step_field_geometry"]
+            )
         report["evaluation"] = evaluate_history(
             host,
             policy,
@@ -308,13 +342,15 @@ def main(argv=None):
             observer=probe,
             diagnostic_input=args.diagnostic_input,
             diagnostic_output=(
-                output / "input_diagnostic_trace.npz" if fixtures else None
+                output / "input_diagnostic_trace.npz"
+                if fixtures or field_screen
+                else None
             ),
         )
         if host.contacts is not None:
             report["teacher_contact_observations"] = host.contacts.report()
         if probe is not None:
-            report["traversal"] = probe.report()
+            report["field_exposure" if field_screen else "traversal"] = probe.report()
         report["evaluation"]["scope"] = protocol["scope"]
         verify_source_files(source)
         if training.recurrent_training_identity(args.reference) != identity:

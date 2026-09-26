@@ -10,6 +10,7 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import math
+from pathlib import Path
 
 import numpy as np
 
@@ -23,6 +24,19 @@ CELL_SIZE = 0.5
 RESOLUTION = 0.1
 _CONFIGURATION = None
 _RECEIPTS = []
+SCREEN_COMMAND_TAPE = (
+    {"name": "initial_stop", "steps": 100, "command": (0.0, 0.0, 0.0)},
+    {"name": "forward", "steps": 400, "command": (0.4, 0.0, 0.0)},
+    {"name": "pivot_positive", "steps": 100, "command": (0.0, 0.0, 0.5)},
+    {"name": "forward_arc", "steps": 200, "command": (0.35, 0.0, 0.3)},
+    {"name": "final_stop", "steps": 100, "command": (0.0, 0.0, 0.0)},
+)
+SCREEN_SCOPE = (
+    "First-attempt pre-action ground exposure on the assigned16m tile; "
+    "exclude auto-reset states and permanently censor exposure after leaving that tile. "
+    "Leaving the certified1m spawn pad does not prove encountering steps; "
+    "center-ray levels are ground observations, NOT foot support or climbing success."
+)
 
 
 def envelope(version=VERSION):
@@ -565,3 +579,192 @@ def verify_native_geometry(env):
     }
     _validate_imported_geometry(generated, imported)
     return {**generated, "imported_geometry": imported}
+
+
+class FieldProbe:
+    """Read-only ground exposure; never feeds observations, resets or commands."""
+
+    def __init__(self, env, output, geometry):
+        self.env, self.output = env, Path(output)
+        if self.output.exists():
+            raise FileExistsError(self.output)
+        terrain = env.scene.terrain
+        self.columns = terrain.terrain_types.detach().cpu().numpy().copy()
+        self.rows = terrain.terrain_levels.detach().cpu().numpy().copy()
+        self.origins = env.scene.env_origins.detach().cpu().numpy().copy()
+        profiles = [
+            item.profile for item in terrain.cfg.terrain_generator.sub_terrains.values()
+        ]
+        if (
+            geometry["version"] != BOOTSTRAP_VERSION
+            or hasattr(env, "_operator_step_support")
+            or self.columns.shape != (env.num_envs,)
+            or self.rows.shape != (env.num_envs,)
+            or any(ids.dtype.kind not in "iu" for ids in (self.columns, self.rows))
+            or np.any((self.columns < 0) | (self.columns >= 20))
+            or np.any((self.rows < 0) | (self.rows >= 3))
+            or len(profiles) != 20
+            or self.origins.shape != (env.num_envs, 3)
+            or not np.isfinite(self.origins).all()
+        ):
+            raise ValueError(
+                "Field observer requires bootstrap geometry, ordinary starts and native assignments"
+            )
+        self.profiles = np.asarray(profiles)[self.columns]
+        self.profile_names = tuple(dict.fromkeys(profiles))
+        tiles = {(tile["variant"], tile["row"]): tile for tile in geometry["tiles"]}
+        self.rise, self.rough = np.ones(env.num_envs), np.zeros(env.num_envs)
+        for index in np.flatnonzero(self.profiles == "step_hills"):
+            tile = tiles[(int(self.columns[index]), int(self.rows[index]))]
+            self.rise[index] = tile["riser_height_m"]
+            self.rough[index] = tile["roughness_absolute_bound_m"]
+        if not (
+            np.isfinite(self.rise).all()
+            and np.isfinite(self.rough).all()
+            and (self.rise > 0).all()
+            and (self.rough >= 0).all()
+        ):
+            raise ValueError("Invalid native field riser or roughness")
+        self.records = []
+
+    def observe(self, step, alive):
+        if type(step) is not int or not 0 <= step <= 900:
+            raise ValueError("Field observer requires an integer state index0..900")
+        data = self.env.scene["robot"].data
+        fields = {
+            "root_local_m": (data.root_pos_w, 3),
+            "root_quat_wxyz": (data.root_quat_w, 4),
+            "angular_velocity_body_rad_s": (data.root_ang_vel_b, 3),
+        }
+        sample = {}
+        for name, (value, width) in fields.items():
+            value = value.detach().cpu().numpy().copy()
+            if (
+                value.shape != (self.env.num_envs, width)
+                or not np.isfinite(value).all()
+            ):
+                raise ValueError(f"Invalid field observer {name}")
+            sample[name] = value
+        if not np.allclose(
+            np.linalg.norm(sample["root_quat_wxyz"], axis=1), 1.0, rtol=0, atol=1e-4
+        ):
+            raise ValueError("Invalid field observer unit quaternion")
+        sample["root_local_m"] -= self.origins
+        valid = alive.detach().cpu().numpy().copy()
+        if (
+            step != len(self.records)
+            or valid.shape != (self.env.num_envs,)
+            or valid.dtype != np.bool_
+            or (not self.records and not valid.all())
+            or (
+                self.records
+                and (valid & ~self.records[-1]["first_attempt_valid"]).any()
+            )
+        ):
+            raise ValueError("Field observer requires contiguous first-attempt masks")
+        hits = (
+            self.env.scene["base_height_scanner"].data.ray_hits_w.detach().cpu().numpy()
+        )
+        if hits.shape != (self.env.num_envs, 1, 3):
+            raise ValueError("Field exposure requires the native central ray")
+        hit_valid = np.isfinite(hits[:, 0]).all(axis=1)
+        sample.update(
+            first_attempt_valid=valid,
+            ground_hit_valid=hit_valid,
+            ground_height_local_m=np.where(
+                hit_valid, hits[:, 0, 2] - self.origins[:, 2], 0.0
+            ),
+        )
+        self.records.append(sample)
+
+    def report(self):
+        if len(self.records) != 901:
+            raise ValueError("Field exposure requires all901 initial/post-step states")
+        arrays = {
+            name: np.stack([sample[name] for sample in self.records])
+            for name in self.records[0]
+        }
+        root, valid = arrays["root_local_m"], arrays["first_attempt_valid"]
+        own_tile = (np.abs(root[..., :2]) < 8.0).all(axis=-1)
+        eligible = valid & np.logical_and.accumulate(own_tile, axis=0)
+        # Samples0..899 precede actions, including the first-ending decision;
+        # sample900 is trajectory-only. Never credit the auto-reset observation.
+        exposure = eligible[:-1]
+        height = arrays["ground_height_local_m"][:-1]
+        level = np.rint(height / self.rise).clip(-1, 3).astype(np.int64)
+        level_valid = (
+            exposure
+            & arrays["ground_hit_valid"][:-1]
+            & (self.profiles == "step_hills")
+            & (level >= 0)
+            & (level <= 2)
+            & (np.abs(height - level * self.rise) <= self.rough + 2e-4)
+        )
+        off_pad = (np.abs(root[:-1, :, :2]) > 1.0).any(axis=-1) & exposure
+        displacement = np.linalg.norm(root[..., :2] - root[0, :, :2], axis=-1)
+        groups = {}
+        for profile in self.profile_names:
+            groups[profile] = {}
+            for row in range(3):
+                selected = (self.profiles == profile) & (self.rows == row)
+                sampled = exposure[:, selected]
+                groups[profile][str(row)] = {
+                    "row_count": int(selected.sum()),
+                    "first_attempt_decisions": int(valid[:-1, selected].sum()),
+                    "assigned_tile_decisions": int(sampled.sum()),
+                    "beyond_certified_spawn_pad_decisions": int(
+                        off_pad[:, selected].sum()
+                    ),
+                    "rows_leaving_certified_spawn_pad": int(
+                        off_pad[:, selected].any(axis=0).sum()
+                    ),
+                    "rows_leaving_assigned_tile": int(
+                        (valid[:, selected] & ~own_tile[:, selected]).any(axis=0).sum()
+                    ),
+                    "invalid_ground_ray_decisions": int(
+                        (sampled & ~arrays["ground_hit_valid"][:-1, selected]).sum()
+                    ),
+                    "center_ground_level_decisions": (
+                        [
+                            int(
+                                (
+                                    level_valid[:, selected]
+                                    & (level[:, selected] == value)
+                                ).sum()
+                            )
+                            for value in range(3)
+                        ]
+                        if profile == "step_hills"
+                        else None
+                    ),
+                    "maximum_observed_xy_displacement_m": (
+                        float(displacement[:, selected][valid[:, selected]].max())
+                        if selected.any()
+                        else None
+                    ),
+                }
+        arrays.update(
+            assigned_tile_eligible=eligible,
+            terrain_column_id=self.columns,
+            terrain_level_id=self.rows,
+            step_riser_m=self.rise,
+            step_roughness_bound_m=self.rough,
+        )
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        with self.output.open("xb") as stream:
+            np.savez_compressed(stream, **arrays)
+        return {
+            "version": "operator_step_field_screen_v1",
+            "scope": SCREEN_SCOPE,
+            "sampling": "901 state samples, index times0.02s; first900 are pre-action decisions; root LINK origin, world wxyz quaternion and body angular velocity; not COM or foot support",
+            "ray_misses": "Finite zero height placeholder; ground_hit_valid is authoritative",
+            "level_rule": "Step columns only: nearest level0..2 within the native tile roughness bound +0.2mm; not inferred from root height. Nonstep riser array values are unused placeholders",
+            "tracking_scope": "Evaluator input telemetry groups all first-attempt commands by initially assigned profile; use assigned_tile_eligible to exclude neighboring tiles in spatial comparisons",
+            "displacement_scope": "Maximum displacement uses the entire observed first-attempt trajectory, including travel after leaving the assigned tile; not terrain-specific progress",
+            "by_profile_level": groups,
+            "trace": {
+                "path": str(self.output),
+                "sha256": hashlib.sha256(self.output.read_bytes()).hexdigest(),
+            },
+            "exit_allowed": False,
+        }
