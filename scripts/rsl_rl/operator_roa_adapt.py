@@ -16,6 +16,20 @@ import traceback
 
 VERSION = "operator_roa_estimator_refinement_v1"
 CONTACT_VERSION = "operator_roa_estimator_refinement_v2"
+VELOCITY_VERSION = "operator_roa_velocity_refinement_v1"
+REFINEMENT_STAGES = {
+    VERSION: "estimator_refinement",
+    CONTACT_VERSION: "contact_estimator_refinement",
+    VELOCITY_VERSION: "causal_velocity_refinement",
+}
+VELOCITY_RECIPE = {
+    "trainable_slices": {
+        "actor.estimator.4.weight": [0, 3],
+        "actor.estimator.4.bias": [0, 3],
+    },
+    "trainable_parameters": 195,
+    "loss": "pre_action_body_com_velocity_mse",
+}
 SCHEDULE = {
     "history_block_steps": 64,
     "blocks": 75,
@@ -36,7 +50,12 @@ def parse_args(argv=None):
         "--checkpoint",
         type=Path,
         required=True,
-        help="Completed v3 or zero-stumble contact continuation; fresh estimator Adam",
+        help="Completed refinement source; fresh Adam, never an exact resume",
+    )
+    parser.add_argument(
+        "--velocity-only",
+        action="store_true",
+        help="Calibrate only the velocity readout of a completed causal fine-tune",
     )
     parser.add_argument("--seed", type=int, default=1045)
     parser.add_argument("--num-envs", type=int, choices=(80, 160, 320), default=80)
@@ -54,11 +73,16 @@ def parse_args(argv=None):
     return args
 
 
-def refinement_recipe(path, source):
+def refinement_recipe(path, source, *, velocity_only=False):
     """Preserve the admitted source recipe; never infer it from a filename."""
-    if "stage" not in source:
+    if velocity_only:
+        if source.get("stage") != "contact_causal_finetuning":
+            raise ValueError(
+                "Velocity refinement requires completed causal fine-tuning"
+            )
+    elif "stage" not in source:
         return {}  # Historical v3 source: the original slanted-hill refinement.
-    if source["stage"] not in ("contact_stumble_learning", "contact_continuation"):
+    elif source["stage"] not in ("contact_stumble_learning", "contact_continuation"):
         raise ValueError("Refinement requires v3 or a completed contact control source")
     from .operator_roa_pilot import require_inherited_posture
     from .operator_roa_contacts import recipe as contacts
@@ -74,6 +98,23 @@ def refinement_recipe(path, source):
         "orientation_weight": -2.5,
         "stumble_objective": stumble_objective(0.0),
     }
+
+
+def frozen_state_unchanged(before, after, *, velocity_only=False):
+    """Compare actual tensor bytes outside the declared refinement scope."""
+    import torch
+
+    if before.keys() != after.keys():
+        return False
+    for name, value in before.items():
+        other = after[name]
+        if velocity_only and name in VELOCITY_RECIPE["trainable_slices"]:
+            value, other = value[3:], other[3:]
+        elif not velocity_only and name.startswith("actor.estimator."):
+            continue
+        if not torch.equal(value, other):
+            return False
+    return True
 
 
 class TerrainExposure:
@@ -192,6 +233,7 @@ def refine(
     seed,
     source_checkpoint,
     recipe=None,
+    velocity_only=False,
 ):
     """Reuse the existing H-phase optimizer/collector; never construct PPO."""
     import torch
@@ -208,6 +250,10 @@ def refine(
         raise ValueError("History collector budget changed")
     recipe = recipe or {}
     contact = bool(recipe)
+    if velocity_only and (
+        not contact or source.get("stage") != "contact_causal_finetuning"
+    ):
+        raise ValueError("Velocity refinement requires the causal contact recipe")
     support = getattr(host.env, "_operator_step_support", None)
     if (support is not None) != contact or policy.actor.contact_conditioned != contact:
         raise ValueError(
@@ -232,8 +278,21 @@ def refine(
     publish()
     # Native reset restores stochastic command timers; no scripted-command
     # override or hidden-history injection survives the frozen check.
+    # Separate leaves avoid optimizer state or weight decay touching latent rows.
+    # Cloning consumes no RNG; the delivered policy stays frozen during each block.
+    velocity_head = (
+        tuple(
+            torch.nn.Parameter(original[name][:3].clone())
+            for name in VELOCITY_RECIPE["trainable_slices"]
+        )
+        if velocity_only
+        else None
+    )
+    if velocity_only:
+        report["velocity_refinement"] = VELOCITY_RECIPE
     optimizer = torch.optim.Adam(
-        policy.actor.estimator.parameters(), lr=SCHEDULE["learning_rate"]
+        velocity_head if velocity_only else policy.actor.estimator.parameters(),
+        lr=SCHEDULE["learning_rate"],
     )
     try:
         set_training_mechanisms(host.env, active=True)
@@ -260,7 +319,14 @@ def refine(
                 report,
                 require_change=True,
                 observe=observe,
+                **({"velocity_head": velocity_head} if velocity_only else {}),
             )
+            if velocity_only:
+                record["fixed_velocity_features_unchanged"] = frozen_state_unchanged(
+                    original, policy.state_dict(), velocity_only=True
+                )
+                if not record["fixed_velocity_features_unchanged"]:
+                    raise RuntimeError("Velocity refinement changed a frozen tensor")
             report["completed_blocks"] = block
             report["training_exposure"] = exposure.report()
             if support is not None:
@@ -277,10 +343,8 @@ def refine(
     if host.contacts is not None:
         report["teacher_contact_observations"] = host.contacts.report()
     state = policy.state_dict()
-    report["fixed_modules_unchanged"] = all(
-        torch.equal(value, state[name])
-        for name, value in original.items()
-        if not name.startswith("actor.estimator.")
+    report["fixed_modules_unchanged"] = frozen_state_unchanged(
+        original, state, velocity_only=velocity_only
     )
     report["estimator_changed"] = any(
         not torch.equal(value, state[name])
@@ -299,7 +363,11 @@ def refine(
     pending = output / "adapted.pt.pending"
     torch.save(
         {
-            "version": CONTACT_VERSION if contact else VERSION,
+            "version": (
+                VELOCITY_VERSION
+                if velocity_only
+                else CONTACT_VERSION if contact else VERSION
+            ),
             "readiness_only": True,
             "deployment_allowed": False,
             "policy_state": state,
@@ -338,7 +406,9 @@ def main(argv=None):
     saved = training.read_yaml_data(args.reference.parent / "params/env.yaml")
     training.load_reference_checkpoint(args.reference, agent)
     policy, contract, _, source = load_completed_checkpoint(args.checkpoint)
-    recipe = refinement_recipe(args.checkpoint, source)
+    recipe = refinement_recipe(
+        args.checkpoint, source, velocity_only=args.velocity_only
+    )
     if (
         source["physical_reference"] != identity["physical_reference"]
         or args.seed == source["training_seed"]
@@ -352,7 +422,11 @@ def main(argv=None):
         tempfile.mkdtemp(prefix="operator_roa_adapt_", dir=args.output_parent)
     ).resolve()
     protocol = {
-        "version": CONTACT_VERSION if recipe else VERSION,
+        "version": (
+            VELOCITY_VERSION
+            if args.velocity_only
+            else CONTACT_VERSION if recipe else VERSION
+        ),
         "source_identity": identity,
         "source_checkpoint": str(args.checkpoint),
         "source": source,
@@ -374,6 +448,12 @@ def main(argv=None):
         protocol.update(
             scope="Joint velocity+latent estimator consolidation on the source bootstrap step fields with training-only mixed support starts. Motor, teacher, critic and action noise frozen; no PPO or qualification.",
             collection="75 persistent 64-step causal blocks under native free body-twist sampling; source mixed support starts only during collection, center starts for frozen checks. No routes, waypoints or success resets.",
+        )
+    if args.velocity_only:
+        protocol.update(
+            velocity_refinement=VELOCITY_RECIPE,
+            supervision="Pre-action true COM velocity MSE on 195 temporary velocity-readout parameters; frozen history features, latent rows, teacher and motor. Copy only velocity rows after each collected block. Fresh Adam, clip1, four epochs/four minibatches per64 steps; labels never substitute actor inputs.",
+            scope="Readout calibration of the contact-causal ablation, not original ROA equivalence. No PPO, automatic continuation, terrain qualification or sim-to-real validation.",
         )
     training.write_json(output / "training_protocol.json", protocol)
     report = {
@@ -455,6 +535,7 @@ def main(argv=None):
             seed=args.seed,
             source_checkpoint=args.checkpoint,
             recipe=recipe,
+            velocity_only=args.velocity_only,
         )
         if training.recurrent_training_identity(args.reference) != identity:
             raise RuntimeError("Physical source or runtime changed during refinement")

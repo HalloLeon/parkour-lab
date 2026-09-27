@@ -128,12 +128,15 @@ def _load_refinement(path, hashes, saved, protocol, report, visited):
         NATIVE_STEPS,
         SCHEDULE,
         VERSION,
-        CONTACT_VERSION,
+        VELOCITY_VERSION,
+        REFINEMENT_STAGES,
         refinement_recipe,
+        frozen_state_unchanged,
     )
 
     status = "ROA_ESTIMATOR_REFINEMENT_COMPLETED_NOT_QUALIFIED"
-    contact = saved["version"] == CONTACT_VERSION
+    velocity_only = saved["version"] == VELOCITY_VERSION
+    contact = saved["version"] != VERSION
     count, seed = protocol["num_envs"], protocol["seed"]
     source_path = saved["source_checkpoint"]
     if (
@@ -151,7 +154,7 @@ def _load_refinement(path, hashes, saved, protocol, report, visited):
             "completed_blocks",
         }
         or path.name != "adapted.pt"
-        or protocol["version"] != (CONTACT_VERSION if contact else VERSION)
+        or protocol["version"] != saved["version"]
         or saved["readiness_only"] is not True
         or saved["deployment_allowed"] is not False
         or type(saved["adaptation_optimizer"]) is not dict
@@ -189,7 +192,13 @@ def _load_refinement(path, hashes, saved, protocol, report, visited):
         source_path,
         allow_refinement=contact,
         expected_stage=(
-            ("contact_stumble_learning", "contact_continuation") if contact else None
+            "contact_causal_finetuning"
+            if velocity_only
+            else (
+                ("contact_stumble_learning", "contact_continuation")
+                if contact
+                else None
+            )
         ),
         _visited=visited,
     )
@@ -200,7 +209,7 @@ def _load_refinement(path, hashes, saved, protocol, report, visited):
         != source["physical_reference"]
     ):
         raise ValueError("ROA refinement differs from its completed source receipt")
-    recipe = refinement_recipe(source_path, source)
+    recipe = refinement_recipe(source_path, source, velocity_only=velocity_only)
     if bool(recipe) != contact or any(
         json.dumps(protocol.get(key), sort_keys=True)
         != json.dumps(value, sort_keys=True)
@@ -249,25 +258,24 @@ def _load_refinement(path, hashes, saved, protocol, report, visited):
         raise ValueError("ROA refinement changed the source motor binding")
     policy = _validated_policy(saved, report, contact_conditioned=contact)
     before, after = original.state_dict(), policy.state_dict()
-    if any(
-        not torch.equal(value, after[key])
-        for key, value in before.items()
-        if not key.startswith("actor.estimator.")
-    ):
-        raise ValueError("ROA refinement changed a frozen non-estimator tensor")
+    if not frozen_state_unchanged(before, after, velocity_only=velocity_only):
+        scope = "frozen tensor" if velocity_only else "frozen non-estimator tensor"
+        raise ValueError(f"ROA refinement changed a {scope}")
     if all(
         torch.equal(value, after[key])
         for key, value in before.items()
         if key.startswith("actor.estimator.")
     ):
         raise ValueError("ROA refinement did not change the estimator")
+    if velocity_only:
+        _validate_velocity_refinement(saved, protocol, report)
     receipt = {
         "files": {**source["files"], **hashes},
         "checkpoint_sha256": hashes[str(path)],
         "policy_state_sha256": report["policy_state_sha256"],
         "learning_updates": source["learning_updates"],
         "additional_adaptation_optimizer_steps": SCHEDULE["estimator_optimizer_steps"],
-        "stage": "contact_estimator_refinement" if contact else "estimator_refinement",
+        "stage": REFINEMENT_STAGES[saved["version"]],
         "physical_reference": source["physical_reference"],
         "training_seed": seed,
         "training_evaluation_reset_seed": seed + 1000,
@@ -285,6 +293,82 @@ def _load_refinement(path, hashes, saved, protocol, report, visited):
         )
     verify_source_files(receipt)
     return policy, saved["motor_contract"], saved["motor_manifest"], receipt
+
+
+def _validate_velocity_refinement(saved, protocol, report):
+    """Bind the new readout-only format without rewriting historical receipts."""
+    import math
+    from .operator_roa_adapt import SCHEDULE, VELOCITY_RECIPE
+
+    blocks = report["blocks"]
+    if (
+        any(
+            json.dumps(item.get("velocity_refinement"), sort_keys=True, allow_nan=False)
+            != json.dumps(VELOCITY_RECIPE, sort_keys=True)
+            for item in (protocol, report)
+        )
+        or type(blocks) is not list
+        or len(blocks) != SCHEDULE["blocks"]
+    ):
+        raise ValueError("Velocity refinement scope or block count changed")
+    for index, block in enumerate(blocks, 1):
+        if (
+            type(block["block"]) is not int
+            or block["block"] != index
+            or any(
+                block[key] is not True
+                for key in (
+                    "estimator_unchanged_during_history_collection",
+                    "privileged_modules_unchanged_during_adaptation",
+                    "estimator_changed_during_adaptation",
+                    "fixed_velocity_features_unchanged",
+                )
+            )
+        ):
+            raise ValueError("Velocity refinement violated block ownership")
+        for name in ("adaptation_before", "adaptation_after"):
+            loss = block[name]
+            if (
+                set(loss) != {"velocity"}
+                or type(loss["velocity"]) not in (int, float)
+                or not math.isfinite(loss["velocity"])
+                or loss["velocity"] < 0
+            ):
+                raise ValueError("Require finite velocity-only supervision")
+    optimizer = saved["adaptation_optimizer"]
+    groups, states = optimizer["param_groups"], optimizer["state"]
+    if len(groups) != 1:
+        raise ValueError("Velocity refinement requires one fresh Adam group")
+    group = groups[0]
+    if (
+        len(group["params"]) != 2
+        or any(type(value) is not int for value in group["params"])
+        or len(states) != 2
+        or set(group["params"]) != set(states)
+        or group["lr"] != SCHEDULE["learning_rate"]
+        or group["weight_decay"] != 0
+        or type(group["weight_decay"]) not in (int, float)
+        or tuple(group["betas"]) != (0.9, 0.999)
+        or group["eps"] != 1e-8
+        or group["amsgrad"] is not False
+        or group["maximize"] is not False
+    ):
+        raise ValueError("Velocity refinement optimizer scope or recipe changed")
+    for param, shape in zip(group["params"], ((3, 64), (3,))):
+        state = states[param]
+        if (
+            set(state) != {"step", "exp_avg", "exp_avg_sq"}
+            or state["step"].numel() != 1
+            or state["step"].item() != SCHEDULE["estimator_optimizer_steps"]
+            or any(
+                tuple(state[key].shape) != shape
+                or not state[key].is_floating_point()
+                or not torch.isfinite(state[key]).all()
+                for key in ("exp_avg", "exp_avg_sq")
+            )
+            or (state["exp_avg_sq"] < 0).any()
+        ):
+            raise ValueError("Velocity refinement requires 1200 updates of 195 scalars")
 
 
 def _validate_frozen_evaluation(evaluation, count, seed, digest):
@@ -586,6 +670,7 @@ def load_completed_checkpoint(
         learning_coefficients,
         validate_history_interval,
     )
+    from .operator_roa_adapt import REFINEMENT_STAGES
 
     path = Path(path).resolve(strict=True)
     if path in _visited:
@@ -610,14 +695,7 @@ def load_completed_checkpoint(
         environment = layout is not None
         stage = ENVIRONMENT_STAGES[layout] if environment else None
         declared_stage = (
-            stage.result_stage
-            if stage
-            else (
-                {
-                    "operator_roa_estimator_refinement_v1": "estimator_refinement",
-                    "operator_roa_estimator_refinement_v2": "contact_estimator_refinement",
-                }.get(saved["version"])
-            )
+            stage.result_stage if stage else REFINEMENT_STAGES.get(saved["version"])
         )
         expected_stages = (
             (expected_stage,) if isinstance(expected_stage, str) else expected_stage
@@ -625,9 +703,10 @@ def load_completed_checkpoint(
         if expected_stages is not None and declared_stage not in expected_stages:
             source_label = "/".join(expected_stages).replace("_", "-")
             raise ValueError(f"Require the declared {source_label} source")
-        if declared_stage == "contact_estimator_refinement" and not (
-            allow_environment and allow_step_fields and allow_step_support
-        ):
+        if declared_stage in (
+            "contact_estimator_refinement",
+            "causal_velocity_refinement",
+        ) and not (allow_environment and allow_step_fields and allow_step_support):
             raise ValueError("Require earlier ancestry, not a contact refinement")
         if environment and (not allow_refinement or not allow_environment):
             raise ValueError(
@@ -639,10 +718,7 @@ def load_completed_checkpoint(
             raise ValueError(
                 "Require earlier ancestry, not another support-reset stage"
             )
-        if saved["version"] in (
-            "operator_roa_estimator_refinement_v1",
-            "operator_roa_estimator_refinement_v2",
-        ):
+        if saved["version"] in REFINEMENT_STAGES:
             if not allow_refinement:
                 raise ValueError(
                     "ROA refinement requires a completed v3 source, not another refinement"

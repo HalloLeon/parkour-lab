@@ -697,6 +697,7 @@ def _adapt_history(
     require_change,
     observe=None,
     after_step=None,
+    velocity_head=None,
 ):
     """Collect with fixed causal weights, then fit only the history estimator."""
     import torch
@@ -733,13 +734,10 @@ def _adapt_history(
         for _ in range(HISTORY_STEPS):
             if observe is not None:
                 observe()
-            samples.append(
-                (
-                    frames(obs).clone(),
-                    actor.privileged_input(obs).clone(),
-                    obs["critic_state"][:, :3].clone(),
-                )
-            )
+            sample = (frames(obs).clone(), obs["critic_state"][:, :3].clone())
+            if velocity_head is None:
+                sample += (actor.privileged_input(obs).clone(),)
+            samples.append(sample)
             action = actor.history_action(obs["policy"], frames(obs))
             command = obs["policy"][:, 6:9].clone() if after_step is not None else None
             obs, _, done, _ = host.step(action, "history_adaptation")
@@ -750,33 +748,54 @@ def _adapt_history(
     )
     if not record["estimator_unchanged_during_history_collection"]:
         raise RuntimeError("History estimator changed before block collection ended")
-    histories, privilege, velocities = (
+    histories, velocities, *privilege = (
         torch.cat(values, dim=0) for values in zip(*samples)
     )
     del samples
+    if velocity_head is not None:
+        with torch.no_grad():
+            features = actor.estimator[:-1](histories.flatten(1))
+        trainable = velocity_head
+    else:
+        trainable = tuple(actor.estimator.parameters())
+
+    def adaptation_loss(indices=slice(None)):
+        if velocity_head is not None:
+            predicted = torch.nn.functional.linear(features[indices], *velocity_head)
+            return {
+                "velocity": torch.nn.functional.mse_loss(predicted, velocities[indices])
+            }
+        return actor.adaptation_losses(
+            histories[indices], privilege[0][indices], velocities[indices]
+        )
+
     with torch.no_grad():
-        before = actor.adaptation_losses(histories, privilege, velocities)
+        before = adaptation_loss()
     record["adaptation_before"] = {name: float(value) for name, value in before.items()}
-    set_phase(policy, "history")
+    if velocity_head is None:
+        set_phase(policy, "history")
     for _ in range(ADAPTATION_EPOCHS):
         for indices in torch.randperm(len(histories), device=env.device).chunk(
             ADAPTATION_BATCHES
         ):
             optimizer.zero_grad(set_to_none=True)
-            losses = actor.adaptation_losses(
-                histories[indices], privilege[indices], velocities[indices]
+            losses = adaptation_loss(indices)
+            loss = (
+                losses["latent"] + losses["velocity"]
+                if velocity_head is None
+                else losses["velocity"]
             )
-            loss = losses["latent"] + losses["velocity"]
             if not torch.isfinite(loss):
                 raise RuntimeError("Nonfinite ROA adaptation loss")
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                actor.estimator.parameters(), 1.0, error_if_nonfinite=True
-            )
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0, error_if_nonfinite=True)
             optimizer.step()
             report["adaptation_optimizer_steps"] += 1
     with torch.no_grad():
-        after = actor.adaptation_losses(histories, privilege, velocities)
+        after = adaptation_loss()
+        if velocity_head is not None:
+            actor.estimator[-1].weight[:3].copy_(velocity_head[0])
+            actor.estimator[-1].bias[:3].copy_(velocity_head[1])
     record["adaptation_after"] = {name: float(value) for name, value in after.items()}
     record["privileged_modules_unchanged_during_adaptation"] = (
         fixed_hashes == privileged_hashes() and torch.equal(fixed_std, policy.std)
