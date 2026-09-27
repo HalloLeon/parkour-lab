@@ -724,9 +724,11 @@ def load_completed_checkpoint(
                 )
             return _load_refinement(path, hashes, saved, protocol, report, visited)
         updates, count = saved["completed_cycles"], protocol["num_envs"]
-        if layout == "contact_continue":
-            if type(updates) is not int or updates not in (1000, 2000):
-                raise ValueError("Continuation requires 1000 or 2000 completed updates")
+        if stage:
+            if type(updates) is not int or updates not in stage.allowed_updates:
+                raise ValueError(
+                    f"{layout} requires completed updates in {stage.allowed_updates}"
+                )
             stage = replace(stage, updates=updates)
         status = (
             stage.status
@@ -759,8 +761,7 @@ def load_completed_checkpoint(
             )
             or protocol["version"] != saved["version"]
             or type(updates) is not int
-            or updates
-            not in ((1000, 2000) if layout == "contact_continue" else (100, 500, 1000))
+            or (stage is None and updates not in (100, 500, 1000))
             or type(count) is not int
             or count not in (80, 160, 320)
             or protocol["cycles"] != updates

@@ -26,7 +26,7 @@ class EnvironmentStage:
     version: str
     source_stage: str | tuple[str, ...]
     source_updates: int | None
-    updates: int
+    updates: int | tuple[int, ...]
     status: str
     result_stage: str
     geometry_version: str | None = None
@@ -37,6 +37,10 @@ class EnvironmentStage:
     stumble_cost: bool = False
     stumble_control: bool = False
     causal_ppo: bool = False
+
+    @property
+    def allowed_updates(self):
+        return (self.updates,) if isinstance(self.updates, int) else self.updates
 
     @property
     def source_stages(self):
@@ -144,6 +148,7 @@ ENVIRONMENT_STAGES["contact_continue"] = replace(
         "contact_estimator_refinement",
     ),
     source_updates=None,
+    updates=(1000, 2000, 6000),
     status="ROA_CONTACT_CONTINUATION_COMPLETED_NOT_QUALIFIED",
     result_stage="contact_continuation",
     stumble_control=True,
@@ -153,6 +158,7 @@ ENVIRONMENT_STAGES["contact_acquire"] = replace(
     version="operator_roa_contact_acquisition_v1",
     source_stage="contact_estimator_refinement",
     source_updates=9000,
+    updates=(1000, 6000),
     status="ROA_CONTACT_ACQUISITION_COMPLETED_NOT_QUALIFIED",
     result_stage="contact_acquisition",
     geometry_version="operator_step_field_v1",
@@ -162,6 +168,7 @@ ENVIRONMENT_STAGES["contact_causal"] = replace(
     version="operator_roa_causal_finetuning_v1",
     source_stage="contact_estimator_refinement",
     source_updates=9000,
+    updates=1000,
     status="CAUSAL_FINETUNING_COMPLETED_NOT_QUALIFIED",
     result_stage="contact_causal_finetuning",
     causal_ppo=True,
@@ -223,7 +230,7 @@ def parse_args(argv=None):
         choices=("ramp", "off"),
         help="Additional regularization only: zero for 20 updates then ramp to 0.1, or remain zero",
     )
-    parser.add_argument("--learning-updates", type=int, choices=(100, 500, 1000, 2000))
+    parser.add_argument("--learning-updates", type=int)
     parser.add_argument(
         "--history-interval",
         type=int,
@@ -274,9 +281,11 @@ def parse_args(argv=None):
         parser.error("--learning-updates requires a learning checkpoint")
     if learning is not None and args.learning_updates is None:
         args.learning_updates = (
-            stage.updates if args.environment_checkpoint else LEARNING_UPDATES
+            stage.allowed_updates[0]
+            if args.environment_checkpoint
+            else LEARNING_UPDATES
         )
-    budgets = (1000, 2000) if continuation else (stage.updates,)
+    budgets = stage.allowed_updates
     regularizations = ("off", "ramp") if continuation else ("off",)
     if args.environment_checkpoint and (
         args.regularization not in regularizations
@@ -285,8 +294,8 @@ def parse_args(argv=None):
         parser.error(
             f"{args.environment_layout} requires regularization in {regularizations} and updates in {budgets}"
         )
-    if not args.environment_checkpoint and args.learning_updates == 2000:
-        parser.error("2000 new updates are supported only by contact_continue")
+    if args.learning_checkpoint and args.learning_updates not in (100, 500, 1000):
+        parser.error("Incremental learning supports 100, 500 or 1000 new updates")
     try:
         validate_history_interval(args.history_interval, args.environment_layout)
     except ValueError as error:
@@ -1093,7 +1102,8 @@ def _learn_pilot(
             flush=True,
         )
         publish_exposure()
-        publish()
+        if learning is None:
+            publish()
         if cycle % history_interval:
             continue
 
@@ -1118,6 +1128,7 @@ def _learn_pilot(
         ):
             save_checkpoint(cycle)
         publish_exposure()
+        # Keep every cycle, but write the growing receipt only at complete H blocks.
         publish()
 
     set_training_mechanisms(env, active=False)
