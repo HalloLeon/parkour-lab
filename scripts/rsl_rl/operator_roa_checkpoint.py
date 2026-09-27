@@ -577,12 +577,11 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
         from .operator_roa_pilot import require_inherited_posture
         from .operator_rewards import stumble_objective, validate_stumble_exposure
 
-        continuation = layout == "contact_continue" or stage.causal_ppo
-        require_inherited_posture(source_path, stumble_control=continuation)
+        require_inherited_posture(source_path, stumble_control=stage.stumble_control)
         objective = stumble_objective(protocol["stumble_objective"]["weight"])
         if (
             protocol["orientation_weight"] != -2.5
-            or (continuation and objective["weight"] != 0.0)
+            or (stage.stumble_control and objective["weight"] != 0.0)
             or any(
                 json.dumps(item, sort_keys=True)
                 != json.dumps(objective, sort_keys=True)

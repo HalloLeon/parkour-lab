@@ -596,7 +596,7 @@ class FieldProbe:
             item.profile for item in terrain.cfg.terrain_generator.sub_terrains.values()
         ]
         if (
-            geometry["version"] != BOOTSTRAP_VERSION
+            geometry["version"] not in (VERSION, BOOTSTRAP_VERSION)
             or hasattr(env, "_operator_step_support")
             or self.columns.shape != (env.num_envs,)
             or self.rows.shape != (env.num_envs,)
@@ -608,7 +608,7 @@ class FieldProbe:
             or not np.isfinite(self.origins).all()
         ):
             raise ValueError(
-                "Field observer requires bootstrap geometry, ordinary starts and native assignments"
+                "Field observer requires a known geometry version, ordinary starts and native assignments"
             )
         self.profiles = np.asarray(profiles)[self.columns]
         self.profile_names = tuple(dict.fromkeys(profiles))

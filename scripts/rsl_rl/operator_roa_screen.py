@@ -36,7 +36,14 @@ def parse_args(argv=None):
         "--terrain-suite",
         choices=("procedural", "traversal", "step_fields"),
         default="procedural",
-        help="Procedural: easy retention; traversal: fixed fixtures; step_fields: whole bootstrap fields, fixed body-command tape and ordinary center starts",
+        help="Procedural: easy retention; traversal: fixed fixtures; step_fields: versioned whole fields, fixed body-command tape and ordinary center starts",
+    )
+    from .operator_step_field import VERSION as FIELD_VERSION, BOOTSTRAP_VERSION
+
+    parser.add_argument(
+        "--step-field-version",
+        choices=(BOOTSTRAP_VERSION, FIELD_VERSION),
+        help="Step fields only: bootstrap 2–6cm (default) or original 5.2–8.4cm risers",
     )
     parser.add_argument(
         "--traversal-layout",
@@ -70,6 +77,8 @@ def parse_args(argv=None):
         default=Path("logs/rsl_rl/go2_operator_refinement"),
     )
     args = parser.parse_args(argv)
+    if args.step_field_version is not None and args.terrain_suite != "step_fields":
+        parser.error("--step-field-version requires --terrain-suite step_fields")
     if args.traversal_layout is not None and args.terrain_suite != "traversal":
         parser.error("--traversal-layout requires --terrain-suite traversal")
     if args.capture_motor_diagnostics and args.terrain_suite != "traversal":
@@ -90,6 +99,7 @@ def parse_args(argv=None):
         from .operator_step_field import DIFFICULTY
 
         args.difficulty = DIFFICULTY
+        args.step_field_version = args.step_field_version or BOOTSTRAP_VERSION
     if (
         args.seed < 0
         or args.cpu_threads < 1
@@ -214,8 +224,8 @@ def main(argv=None):
         }
     if field_screen:
         protocol.update(
-            step_field_geometry=step_field.envelope(step_field.BOOTSTRAP_VERSION),
-            scope="Newly seeded whole bootstrap fields with fixed body-command tape and ordinary center/random-yaw starts; not the native training command sampler or mixed raised starts. Measured ground exposure, not foot support, climbing success, sim-to-real or exit qualification",
+            step_field_geometry=step_field.envelope(args.step_field_version),
+            scope="Newly seeded versioned whole fields with fixed body-command tape and ordinary center/random-yaw starts; not the native training command sampler or mixed raised starts. Measured ground exposure, not foot support, climbing success, sim-to-real or exit qualification",
             field_observer=step_field.SCREEN_SCOPE,
             input_telemetry={
                 "version": "operator_roa_input_diagnostic_v2",
@@ -283,7 +293,7 @@ def main(argv=None):
             )
         cfg.seed = cfg.scene.terrain.terrain_generator.seed = args.seed
         if field_screen:
-            step_field.configure(cfg, version=step_field.BOOTSTRAP_VERSION)
+            step_field.configure(cfg, version=args.step_field_version)
         validate_events(cfg)
         cfg.validate()
         (output / "resolved_env.yaml").write_text(

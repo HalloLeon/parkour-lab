@@ -35,6 +35,7 @@ class EnvironmentStage:
     contact_conditioned: bool = False
     source_contact_conditioned: bool = False
     stumble_cost: bool = False
+    stumble_control: bool = False
     causal_ppo: bool = False
 
     @property
@@ -145,6 +146,16 @@ ENVIRONMENT_STAGES["contact_continue"] = replace(
     source_updates=None,
     status="ROA_CONTACT_CONTINUATION_COMPLETED_NOT_QUALIFIED",
     result_stage="contact_continuation",
+    stumble_control=True,
+)
+ENVIRONMENT_STAGES["contact_acquire"] = replace(
+    ENVIRONMENT_STAGES["contact_continue"],
+    version="operator_roa_contact_acquisition_v1",
+    source_stage="contact_estimator_refinement",
+    source_updates=9000,
+    status="ROA_CONTACT_ACQUISITION_COMPLETED_NOT_QUALIFIED",
+    result_stage="contact_acquisition",
+    geometry_version="operator_step_field_v1",
 )
 ENVIRONMENT_STAGES["contact_causal"] = replace(
     ENVIRONMENT_STAGES["contact_continue"],
@@ -217,7 +228,7 @@ def parse_args(argv=None):
         "--history-interval",
         type=int,
         default=HISTORY_INTERVAL,
-        help="PPO updates per estimator block: 20 historically, 5 or20 for contact_continue, exactly5 for contact_causal",
+        help="PPO updates per estimator block: 20 historically, 5 or 20 for contact_continue, exactly 5 for contact_acquire/contact_causal",
     )
     parser.add_argument(
         "--orientation-weight",
@@ -229,7 +240,7 @@ def parse_args(argv=None):
         "--stumble-weight",
         type=float,
         choices=(0.0, -0.5),
-        help="Required for stumble/continuation/causal stages; continuation and causal permit only zero",
+        help="Required for contact_stumble and its follow-ups; only contact_stumble permits nonzero cost",
     )
     parser.add_argument(
         "--output-parent",
@@ -250,12 +261,12 @@ def parse_args(argv=None):
     stumble = bool(args.environment_checkpoint and stage.stumble_cost)
     if stumble != (args.stumble_weight is not None):
         parser.error(
-            "--stumble-weight is required only with stumble/continuation/causal stages"
+            "--stumble-weight is required only with contact_stumble and its follow-ups"
         )
     if stumble and args.orientation_weight != -2.5:
         parser.error("Stumble/continuation preserves --orientation-weight -2.5")
     continuation = args.environment_layout == "contact_continue"
-    if (continuation or stage.causal_ppo) and args.stumble_weight != 0.0:
+    if stage.stumble_control and args.stumble_weight != 0.0:
         parser.error(f"{args.environment_layout} preserves --stumble-weight 0")
     if (learning is None) != (args.regularization is None):
         parser.error("A learning checkpoint and --regularization must be used together")
@@ -284,10 +295,10 @@ def parse_args(argv=None):
 
 
 def validate_history_interval(interval, layout=None):
-    """Keep historical recipes intact and bind the causal ablation to H5."""
+    """Keep historical recipes intact; bounded acquisition/causal stages use H5."""
     choices = (
         (5,)
-        if layout == "contact_causal"
+        if layout in ("contact_acquire", "contact_causal")
         else (
             (5, HISTORY_INTERVAL)
             if layout == "contact_continue"
@@ -408,9 +419,7 @@ def load_environment_source(path, physical_reference, seed, *, layout="hills"):
             f"Require completed {stage.source_stage}, its validated update count and a fresh seed"
         )
     if stage.stumble_cost:
-        require_inherited_posture(
-            path, stumble_control=layout == "contact_continue" or stage.causal_ppo
-        )
+        require_inherited_posture(path, stumble_control=stage.stumble_control)
     return {"policy_state": policy.state_dict(), "motor_contract": contract}, receipt
 
 
@@ -1417,7 +1426,7 @@ def main(argv=None):
                 reward="Inherited -2.5 posture and native rewards; only translation-gated feet_stumble weight differs between arms",
                 learning_scope="Matched wall-contact cost from inherited-posture4000; unchanged free environments, not qualification",
             )
-        if args.environment_layout == "contact_continue":
+        if stage.stumble_control:
             regularization_scope = (
                 "zero additional regularization"
                 if args.regularization == "off"
@@ -1435,6 +1444,12 @@ def main(argv=None):
                 reward="Unchanged inherited -2.5 posture and zero-stumble control recipe",
                 learning_scope="Opt-in causal-input fine-tuning from refined9000; not original ROA, qualification or promotion",
                 schedule_scope="1000 new causal PPO updates, H every5, lambda0; fresh optimizers and scene, not resume",
+            )
+        if args.environment_layout == "contact_acquire":
+            protocol["learning_scope"] = (
+                "Higher-step exposure from refined9000: original privileged-latent PPO route, "
+                "5.2–8.4cm risers instead of bootstrap2–6cm; all other recipes unchanged. "
+                "Fixed band, not an adaptive curriculum, regularization test or qualification"
             )
     report = {
         "status": "RUNNING_NOT_QUALIFIED",
