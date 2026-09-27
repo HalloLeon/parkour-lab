@@ -493,7 +493,7 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
         from .operator_roa_pilot import require_inherited_posture
         from .operator_rewards import stumble_objective, validate_stumble_exposure
 
-        continuation = layout == "contact_continue"
+        continuation = layout == "contact_continue" or stage.causal_ppo
         require_inherited_posture(source_path, stumble_control=continuation)
         objective = stumble_objective(protocol["stumble_objective"]["weight"])
         if (
@@ -511,12 +511,63 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
             num_envs=count,
             steps=training_steps,
         )
+    if stage.causal_ppo:
+        _validate_causal_finetuning(saved, protocol, report, original)
     for key, digest in (
         ("evaluation_before", initial_digest),
         ("evaluation_after", report["policy_state_sha256"]),
     ):
         _validate_frozen_evaluation(report[key], count, seed + 1000, digest)
     return source
+
+
+def _validate_causal_finetuning(saved, protocol, report, original):
+    """Bind the experimental route to its fixed teacher, not just a success flag."""
+    from .operator_roa_pilot import causal_finetuning_recipe
+
+    teacher = original.actor.encoder
+    if (
+        protocol.get("causal_finetuning") != causal_finetuning_recipe()
+        or saved["history_interval"] != 5
+        or any(saved["regularization_coefficients"])
+        or report.get("frozen_teacher_sha256") != state_sha256(teacher)
+        or any(
+            not torch.equal(value, saved["policy_state"]["actor.encoder." + name])
+            for name, value in teacher.state_dict().items()
+        )
+    ):
+        raise ValueError("Causal fine-tuning route or source teacher changed")
+    cycles = report["cycles"]
+    if len(cycles) != saved["completed_cycles"]:
+        raise ValueError("Incomplete causal fine-tuning ownership receipts")
+    for index, cycle in enumerate(cycles, 1):
+        losses = cycle["ppo_losses"]
+        if (
+            cycle["cycle"] != index
+            or cycle["regularization_coefficient"] != 0.0
+            or cycle["estimator_unchanged_during_ppo"] is not True
+            or cycle["encoder_changed_during_ppo"] is not False
+            or losses["regularization_coef"] != 0.0
+            or losses["regularization"] != 0.0
+            or losses["encoder_gradient_l2_max"] != 0.0
+            or losses["contact_projection_gradient_l2_max"] != 0.0
+            or losses["first_replay"]
+            != {
+                "samples": protocol["num_envs"] * 24,
+                "log_prob_abs_max": 0.0,
+                "ratio_min": 1.0,
+                "ratio_max": 1.0,
+            }
+            or (
+                index % 5 == 0
+                and (
+                    cycle["estimator_unchanged_during_history_collection"] is not True
+                    or cycle["privileged_modules_unchanged_during_adaptation"]
+                    is not True
+                )
+            )
+        ):
+            raise ValueError("Causal fine-tuning ownership or replay changed")
 
 
 def load_completed_checkpoint(
@@ -735,7 +786,11 @@ def load_completed_checkpoint(
             + report["adaptation_optimizer_steps"],
             counting_scope="Selected v3 experiment and descendant stages only; excludes the v2 initialization pilot and stock pretraining",
             stage=stage.result_stage,
-            scope="Bounded free-environment joint ROA stage; simulator-development only, not terrain or hardware qualification",
+            scope=(
+                "Fixed-teacher causal fine-tuning ablation; NOT original ROA equivalence or qualification"
+                if stage.causal_ppo
+                else "Bounded free-environment joint ROA stage; simulator-development only, not terrain or hardware qualification"
+            ),
         )
     verify_source_files(receipt)
     return policy, saved["motor_contract"], saved["motor_manifest"], receipt

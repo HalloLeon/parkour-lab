@@ -114,7 +114,7 @@ class ROAActor(nn.Module):
 
     Both routes insert the same detached velocity estimate into the stock motor.
     μ and φ are aligned by separately directed, unsquared per-row L2 objectives.
-    The native scheduler owns alternating blocks; forward is always privileged.
+    Forward defaults to privileged inputs; causal PPO is an explicit ablation.
     """
 
     def __init__(self, stock_motor, contact_conditioned=False):
@@ -122,6 +122,7 @@ class ROAActor(nn.Module):
         if type(contact_conditioned) is not bool:
             raise ValueError("Contact conditioning must be an explicit boolean")
         self.motor = LatentMotor(stock_motor)
+        self.causal_ppo = False
         self.encoder = nn.Sequential(
             nn.Linear(DYNAMICS_DIM, 64, device="cpu"),
             nn.ELU(),
@@ -177,16 +178,19 @@ class ROAActor(nn.Module):
         return latent
 
     def forward(self, observations):
+        privilege_width = 0 if self.causal_ppo else self.privileged_dim
         _batch(
             observations,
-            FRAME_DIM + self.privileged_dim + HISTORY_LENGTH * FRAME_DIM,
+            FRAME_DIM + privilege_width + HISTORY_LENGTH * FRAME_DIM,
             self.motor.stock_first.weight,
         )
         frame = observations[:, :FRAME_DIM]
-        history = observations[:, FRAME_DIM + self.privileged_dim :].reshape(
+        history = observations[:, FRAME_DIM + privilege_width :].reshape(
             -1, HISTORY_LENGTH, FRAME_DIM
         )
         predicted = self._current_estimate(frame, history)
+        if self.causal_ppo:
+            return self.motor(frame, predicted.detach())
         latent = self.encode(
             observations[:, FRAME_DIM : FRAME_DIM + self.privileged_dim]
         )
@@ -394,15 +398,19 @@ def build_policy(observations, source_state, contact_conditioned=False):
 
 
 def set_phase(policy, phase):
-    """Explicit optimizer ownership for privileged, history, and frozen blocks."""
+    """Original ROA ownership, plus the opt-in fixed-teacher causal ablation."""
     if (
-        phase not in ("privileged", "history", "frozen")
+        phase not in ("privileged", "causal", "history", "frozen")
         or type(policy.actor) is not ROAActor
     ):
         raise ValueError("Unknown ROA phase or actor")
     estimator = {id(p) for p in policy.actor.estimator.parameters()}
+    encoder = {id(p) for p in policy.actor.encoder.parameters()}
     for parameter in policy.parameters():
         parameter.requires_grad_(
-            phase == "history" if id(parameter) in estimator else phase == "privileged"
+            phase == "history"
+            if id(parameter) in estimator
+            else phase == "privileged"
+            or (phase == "causal" and id(parameter) not in encoder)
         )
         parameter.grad = None

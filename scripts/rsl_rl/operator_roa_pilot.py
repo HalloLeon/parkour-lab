@@ -35,6 +35,7 @@ class EnvironmentStage:
     contact_conditioned: bool = False
     source_contact_conditioned: bool = False
     stumble_cost: bool = False
+    causal_ppo: bool = False
 
     @property
     def source_stages(self):
@@ -145,6 +146,15 @@ ENVIRONMENT_STAGES["contact_continue"] = replace(
     status="ROA_CONTACT_CONTINUATION_COMPLETED_NOT_QUALIFIED",
     result_stage="contact_continuation",
 )
+ENVIRONMENT_STAGES["contact_causal"] = replace(
+    ENVIRONMENT_STAGES["contact_continue"],
+    version="operator_roa_causal_finetuning_v1",
+    source_stage="contact_estimator_refinement",
+    source_updates=9000,
+    status="CAUSAL_FINETUNING_COMPLETED_NOT_QUALIFIED",
+    result_stage="contact_causal_finetuning",
+    causal_ppo=True,
+)
 REGULARIZATION_COEFFICIENTS = (0.1, 0.55, 1.0)
 ROLLOUT_STEPS = 24
 HISTORY_STEPS = 64
@@ -195,7 +205,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--environment-layout",
         choices=tuple(ENVIRONMENT_STAGES),
-        help="Bounded source-validated stage; contact_continue retains the completed zero-stumble control recipe",
+        help="Bounded source-validated stage; contact_causal is a fixed-teacher causal-input ablation, NOT original ROA",
     )
     parser.add_argument(
         "--regularization",
@@ -207,7 +217,7 @@ def parse_args(argv=None):
         "--history-interval",
         type=int,
         default=HISTORY_INTERVAL,
-        help="PPO updates per estimator block: 20, or 5 for contact_continue only; 5 also quadruples causal collection and estimator updates",
+        help="PPO updates per estimator block: 20 historically, 5 or20 for contact_continue, exactly5 for contact_causal",
     )
     parser.add_argument(
         "--orientation-weight",
@@ -219,7 +229,7 @@ def parse_args(argv=None):
         "--stumble-weight",
         type=float,
         choices=(0.0, -0.5),
-        help="Required for contact_stumble or contact_continue; continuation permits only zero",
+        help="Required for stumble/continuation/causal stages; continuation and causal permit only zero",
     )
     parser.add_argument(
         "--output-parent",
@@ -240,13 +250,13 @@ def parse_args(argv=None):
     stumble = bool(args.environment_checkpoint and stage.stumble_cost)
     if stumble != (args.stumble_weight is not None):
         parser.error(
-            "--stumble-weight is required only with contact_stumble/contact_continue"
+            "--stumble-weight is required only with stumble/continuation/causal stages"
         )
     if stumble and args.orientation_weight != -2.5:
         parser.error("Stumble/continuation preserves --orientation-weight -2.5")
     continuation = args.environment_layout == "contact_continue"
-    if continuation and args.stumble_weight != 0.0:
-        parser.error("contact_continue preserves --stumble-weight 0")
+    if (continuation or stage.causal_ppo) and args.stumble_weight != 0.0:
+        parser.error(f"{args.environment_layout} preserves --stumble-weight 0")
     if (learning is None) != (args.regularization is None):
         parser.error("A learning checkpoint and --regularization must be used together")
     if args.learning_updates is not None and learning is None:
@@ -274,15 +284,32 @@ def parse_args(argv=None):
 
 
 def validate_history_interval(interval, layout=None):
-    """Historical recipes retain H20; only continuation admits the H5 treatment."""
+    """Keep historical recipes intact and bind the causal ablation to H5."""
     choices = (
-        (5, HISTORY_INTERVAL) if layout == "contact_continue" else (HISTORY_INTERVAL,)
+        (5,)
+        if layout == "contact_causal"
+        else (
+            (5, HISTORY_INTERVAL)
+            if layout == "contact_continue"
+            else (HISTORY_INTERVAL,)
+        )
     )
     if type(interval) is not int or interval not in choices:
         raise ValueError(
             f"History interval must be an integer in {choices} for {layout}"
         )
     return interval
+
+
+def causal_finetuning_recipe():
+    """Two-factor routing/teacher-stationarity ablation, not original ROA."""
+    return {
+        "actor_observations": ["policy", "history"],
+        "ppo_trainable": ["motor", "critic", "std"],
+        "teacher": "Source encoder fixed byte-for-byte throughout training",
+        "estimator": "Detached and fixed throughout PPO; supervised updates only in H blocks",
+        "scope": "Causal-input motor fine-tuning AND fixed teacher; not route-only attribution or original ROA equivalence",
+    }
 
 
 def learning_coefficients(regularization, updates=LEARNING_UPDATES):
@@ -381,7 +408,9 @@ def load_environment_source(path, physical_reference, seed, *, layout="hills"):
             f"Require completed {stage.source_stage}, its validated update count and a fresh seed"
         )
     if stage.stumble_cost:
-        require_inherited_posture(path, stumble_control=layout == "contact_continue")
+        require_inherited_posture(
+            path, stumble_control=layout == "contact_continue" or stage.causal_ppo
+        )
     return {"policy_state": policy.state_dict(), "motor_contract": contract}, receipt
 
 
@@ -915,7 +944,19 @@ def _learn_pilot(
         rnd_cfg=None,
     )
     report["ppo_options"] = options
-    algorithm = ROAPPO(policy, device=env.device, **options)
+    causal = bool(stage and stage.causal_ppo)
+    algorithm = ROAPPO(
+        policy,
+        device=env.device,
+        causal=causal,
+        regularization_coef=0.0 if causal else 0.1,
+        **options,
+    )
+    if causal:
+        report["frozen_teacher_sha256"] = state_sha256(actor.encoder)
+        report["latent_branch_scope"] = (
+            "Privileged teacher shadow probes, not the causal actor's input dependence"
+        )
     algorithm.init_storage("rl", env.num_envs, ROLLOUT_STEPS, obs, [12])
     optimizer = torch.optim.Adam(
         actor.estimator.parameters(), lr=1e-4 if environment else 1e-3
@@ -945,6 +986,8 @@ def _learn_pilot(
     def save_checkpoint(update):
         from .operator_train import file_sha256
 
+        if causal and state_sha256(actor.encoder) != report["frozen_teacher_sha256"]:
+            raise RuntimeError("Causal fine-tuning changed its fixed teacher")
         path = output / ("pilot.pt" if learning is None else f"learning_{update}.pt")
         pending = path.with_suffix(".pt.pending")
         torch.save(
@@ -975,7 +1018,7 @@ def _learn_pilot(
     for cycle, coefficient in enumerate(coefficients, 1):
         record = {"cycle": cycle, "regularization_coefficient": coefficient}
         report["cycles"].append(record)
-        set_phase(policy, "privileged")
+        set_phase(policy, algorithm.phase)
         estimator_before = state_sha256(actor.estimator)
         encoder_before = state_sha256(actor.encoder)
         algorithm.regularization_coef = coefficient
@@ -984,7 +1027,7 @@ def _learn_pilot(
                 observe()
                 action = algorithm.act(obs)
                 command = obs["policy"][:, 6:9].clone() if stumble is not None else None
-                obs, reward, done, extras = host.step(action, "privileged_ppo")
+                obs, reward, done, extras = host.step(action, algorithm.phase + "_ppo")
                 if stumble is not None:
                     stumble.sample(done, command)
                 algorithm.process_env_step(obs, reward, done.long(), extras)
@@ -1008,6 +1051,8 @@ def _learn_pilot(
         record["latent_branch"] = branch_diagnostics(actor, obs)
         if not record["estimator_unchanged_during_ppo"]:
             raise RuntimeError("ROA PPO changed the frozen history/velocity estimator")
+        if causal and record["encoder_changed_during_ppo"]:
+            raise RuntimeError("Causal PPO changed the frozen teacher")
         if learning is None and not record["encoder_changed_during_ppo"]:
             raise RuntimeError("ROA privileged encoder did not update")
         if learning is None and (
@@ -1016,7 +1061,7 @@ def _learn_pilot(
         ):
             raise RuntimeError("ROA latent branch is constant or unused")
         print(
-            f"ROA update {cycle}/{len(coefficients)}: privileged PPO complete; lambda={coefficient}",
+            f"ROA update {cycle}/{len(coefficients)}: {algorithm.phase} PPO complete; lambda={coefficient}",
             flush=True,
         )
         publish_exposure()
@@ -1363,6 +1408,14 @@ def main(argv=None):
                 reward="Unchanged inherited -2.5 posture and zero-stumble control recipe",
                 learning_scope=f"Same terrain/reward free-environment continuation from {metadata['learning_updates']} validated lineage updates; not qualification",
                 schedule_scope=f"{args.learning_updates} new PPO updates, H every{args.history_interval}; {regularization_scope}; fresh optimizers and native scene, not exact resume. H5 versus H20 changes frequency, causal data and optimizer budget, not cadence alone",
+            )
+        if stage.causal_ppo:
+            protocol.update(
+                causal_finetuning=causal_finetuning_recipe(),
+                privileged_update="Disabled: PPO motor uses only detached history estimates; source teacher frozen",
+                reward="Unchanged inherited -2.5 posture and zero-stumble control recipe",
+                learning_scope="Opt-in causal-input fine-tuning from refined9000; not original ROA, qualification or promotion",
+                schedule_scope="1000 new causal PPO updates, H every5, lambda0; fresh optimizers and scene, not resume",
             )
     report = {
         "status": "RUNNING_NOT_QUALIFIED",

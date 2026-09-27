@@ -17,9 +17,13 @@ class ROAPPO(PPO):
     The history estimator is excluded from Adam, not just gradient-detached.
     """
 
-    def __init__(self, policy, *, regularization_coef=0.1, **kwargs):
+    def __init__(self, policy, *, regularization_coef=0.1, causal=False, **kwargs):
         if type(policy.actor) is not ROAActor or policy.is_recurrent:
             raise ValueError("ROAPPO requires the explicit feedforward ROA actor")
+        if type(causal) is not bool or (causal and regularization_coef != 0.0):
+            raise ValueError(
+                "Causal fine-tuning requires an explicit route and zero regularization"
+            )
         for key in ("rnd_cfg", "symmetry_cfg", "multi_gpu_cfg", "desired_kl"):
             if kwargs.get(key) is not None:
                 raise ValueError(f"ROAPPO does not support {key}")
@@ -27,33 +31,51 @@ class ROAPPO(PPO):
             raise ValueError("ROAPPO requires fixed learning rate")
         kwargs.update(schedule="fixed", desired_kl=None)
         super().__init__(policy, **kwargs)
+        self.causal = policy.actor.causal_ppo = causal
+        self.phase = "causal" if causal else "privileged"
+        policy.obs_groups["policy"] = (
+            ["policy", "history"] if causal else policy.actor.privileged_obs_groups
+        )
         self.regularization_coef = regularization_coef
-        estimator = {id(p) for p in policy.actor.estimator.parameters()}
+        frozen = {
+            id(p) for module in self._frozen_modules() for p in module.parameters()
+        }
         self.ppo_parameters = tuple(
-            p for p in policy.parameters() if id(p) not in estimator
+            p for p in policy.parameters() if id(p) not in frozen
         )
         self.optimizer = torch.optim.Adam(self.ppo_parameters, lr=self.learning_rate)
-        set_phase(policy, "privileged")
+        set_phase(policy, self.phase)
+
+    def _frozen_modules(self):
+        actor = self.policy.actor
+        return (actor.estimator, actor.encoder) if self.causal else (actor.estimator,)
 
     def _check_phase(self):
-        estimator = {id(p) for p in self.policy.actor.estimator.parameters()}
-        expected_ppo = {id(p) for p in self.policy.parameters()} - estimator
+        frozen = {
+            id(p) for module in self._frozen_modules() for p in module.parameters()
+        }
+        expected_ppo = {id(p) for p in self.policy.parameters()} - frozen
         if (
             self.policy.obs_groups
             != {
-                "policy": self.policy.actor.privileged_obs_groups,
+                "policy": (
+                    ["policy", "history"]
+                    if self.causal
+                    else self.policy.actor.privileged_obs_groups
+                ),
                 "critic": ["critic_state", "terrain"],
             }
             or self.policy.actor_obs_normalization
             or self.policy.critic_obs_normalization
-            or any(p.requires_grad for p in self.policy.actor.estimator.parameters())
+            or self.policy.actor.causal_ppo is not self.causal
+            or any(p.requires_grad for p in self.policy.parameters() if id(p) in frozen)
             or not all(p.requires_grad for p in self.ppo_parameters)
             or {id(p) for p in self.ppo_parameters} != expected_ppo
             or {id(p) for group in self.optimizer.param_groups for p in group["params"]}
             != {id(p) for p in self.ppo_parameters}
         ):
             raise ValueError(
-                "PPO requires privileged routing and exclusive optimizer ownership"
+                "PPO requires its declared routing and exclusive optimizer ownership"
             )
 
     def act(self, obs):
@@ -67,7 +89,7 @@ class ROAPPO(PPO):
             self.storage is None
             or self.storage.step != self.storage.num_transitions_per_env
         ):
-            raise ValueError("Require a complete privileged rollout before PPO replay")
+            raise ValueError("Require a complete rollout before PPO replay")
         for step in range(self.storage.step):
             self.policy._update_distribution(
                 self.policy.get_actor_obs(self.storage.observations[step])
@@ -96,6 +118,7 @@ class ROAPPO(PPO):
             or not isinstance(coefficient, (float, int))
             or not math.isfinite(coefficient)
             or coefficient < 0
+            or (self.causal and coefficient != 0.0)
         ):
             raise ValueError("ROA coefficient must be finite and nonnegative")
         replay = self.verify_first_replay()
@@ -112,7 +135,7 @@ class ROAPPO(PPO):
         gradient_max = {
             name + "_max": 0.0 for name in gradient_norms(self.policy.actor)
         }
-        estimator_before = state_sha256(self.policy.actor.estimator)
+        frozen_before = tuple(state_sha256(module) for module in self._frozen_modules())
         count = 0
         for (
             obs,
@@ -149,7 +172,11 @@ class ROAPPO(PPO):
                 )
                 value_error = torch.maximum(value_error, (clipped - returns).square())
             value_loss = value_error.mean()
-            regularization = self.policy.actor.regularization_loss(obs)
+            regularization = (
+                surrogate.new_zeros(())
+                if self.causal
+                else self.policy.actor.regularization_loss(obs)
+            )
             loss = (
                 surrogate
                 + self.value_loss_coef * value_loss
@@ -161,6 +188,10 @@ class ROAPPO(PPO):
             self.optimizer.zero_grad(set_to_none=True)
             loss.backward()
             for name, value in gradient_norms(self.policy.actor).items():
+                if self.causal and name != "projection_gradient_l2":
+                    if value is not None:
+                        raise RuntimeError("Causal PPO reached the frozen teacher")
+                    continue
                 if value is None or not math.isfinite(value):
                     raise RuntimeError("Missing or nonfinite ROA branch gradient")
                 gradient_max[name + "_max"] = max(gradient_max[name + "_max"], value)
@@ -180,8 +211,11 @@ class ROAPPO(PPO):
             ):
                 sums[name] += float(value.detach())
             count += 1
-        if state_sha256(self.policy.actor.estimator) != estimator_before:
-            raise RuntimeError("PPO unexpectedly changed the causal estimator")
+        if (
+            tuple(state_sha256(module) for module in self._frozen_modules())
+            != frozen_before
+        ):
+            raise RuntimeError("PPO unexpectedly changed a frozen estimator or teacher")
         self.storage.clear()
         return {
             **{name: value / count for name, value in sums.items()},
