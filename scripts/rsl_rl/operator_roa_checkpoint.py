@@ -401,7 +401,7 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
         or type(seed) is not int
         or seed < 0
         or saved["completed_cycles"] != stage.updates
-        or any(saved["regularization_coefficients"])
+        or (layout != "contact_continue" and any(saved["regularization_coefficients"]))
         or protocol["terrain_rows"] != 3
         or protocol["difficulty_range"] != [0.15, 0.55]
         or protocol["evaluation"]["seed"] != seed + 1000

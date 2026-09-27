@@ -256,11 +256,13 @@ def parse_args(argv=None):
             stage.updates if args.environment_checkpoint else LEARNING_UPDATES
         )
     budgets = (1000, 2000) if continuation else (stage.updates,)
+    regularizations = ("off", "ramp") if continuation else ("off",)
     if args.environment_checkpoint and (
-        args.regularization != "off" or args.learning_updates not in budgets
+        args.regularization not in regularizations
+        or args.learning_updates not in budgets
     ):
         parser.error(
-            f"{args.environment_layout} requires --regularization off and updates in {budgets}"
+            f"{args.environment_layout} requires regularization in {regularizations} and updates in {budgets}"
         )
     if not args.environment_checkpoint and args.learning_updates == 2000:
         parser.error("2000 new updates are supported only by contact_continue")
@@ -1352,10 +1354,15 @@ def main(argv=None):
                 learning_scope="Matched wall-contact cost from inherited-posture4000; unchanged free environments, not qualification",
             )
         if args.environment_layout == "contact_continue":
+            regularization_scope = (
+                "zero additional regularization"
+                if args.regularization == "off"
+                else "additional regularization follows the recorded gentle ramp, not the paper's convergence schedule"
+            )
             protocol.update(
                 reward="Unchanged inherited -2.5 posture and zero-stumble control recipe",
-                learning_scope=f"Same-recipe free-environment continuation from {metadata['learning_updates']} validated lineage updates; not qualification",
-                schedule_scope=f"{args.learning_updates} new PPO updates, H every{args.history_interval}; zero additional regularization; fresh optimizers and native scene, not exact resume. H5 versus H20 changes frequency, causal data and optimizer budget, not cadence alone",
+                learning_scope=f"Same terrain/reward free-environment continuation from {metadata['learning_updates']} validated lineage updates; not qualification",
+                schedule_scope=f"{args.learning_updates} new PPO updates, H every{args.history_interval}; {regularization_scope}; fresh optimizers and native scene, not exact resume. H5 versus H20 changes frequency, causal data and optimizer budget, not cadence alone",
             )
     report = {
         "status": "RUNNING_NOT_QUALIFIED",
