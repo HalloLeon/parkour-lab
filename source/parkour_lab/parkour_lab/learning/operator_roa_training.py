@@ -17,12 +17,26 @@ class ROAPPO(PPO):
     The history estimator is excluded from Adam, not just gradient-detached.
     """
 
-    def __init__(self, policy, *, regularization_coef=0.1, causal=False, **kwargs):
+    def __init__(
+        self,
+        policy,
+        *,
+        regularization_coef=0.1,
+        causal=False,
+        freeze_action_std=False,
+        **kwargs,
+    ):
         if type(policy.actor) is not ROAActor or policy.is_recurrent:
             raise ValueError("ROAPPO requires the explicit feedforward ROA actor")
         if type(causal) is not bool or (causal and regularization_coef != 0.0):
             raise ValueError(
                 "Causal fine-tuning requires an explicit route and zero regularization"
+            )
+        if type(freeze_action_std) is not bool or (
+            freeze_action_std and (causal or kwargs.get("entropy_coef") != 0.0)
+        ):
+            raise ValueError(
+                "Fixed action std requires privileged PPO and zero entropy bonus"
             )
         for key in ("rnd_cfg", "symmetry_cfg", "multi_gpu_cfg", "desired_kl"):
             if kwargs.get(key) is not None:
@@ -37,23 +51,59 @@ class ROAPPO(PPO):
             ["policy", "history"] if causal else policy.actor.privileged_obs_groups
         )
         self.regularization_coef = regularization_coef
-        frozen = {
-            id(p) for module in self._frozen_modules() for p in module.parameters()
-        }
+        self.fixed_action_std = (
+            policy.std.detach().clone() if freeze_action_std else None
+        )
+        if freeze_action_std and (
+            self.fixed_action_std.shape != (12,)
+            or not torch.isfinite(self.fixed_action_std).all()
+            or (self.fixed_action_std <= 0).any()
+        ):
+            raise ValueError(
+                "Fixed action std must inherit twelve finite positive values"
+            )
+        frozen = self._frozen_parameter_ids()
         self.ppo_parameters = tuple(
             p for p in policy.parameters() if id(p) not in frozen
         )
         self.optimizer = torch.optim.Adam(self.ppo_parameters, lr=self.learning_rate)
-        set_phase(policy, self.phase)
+        self.start_phase()
+
+    def start_phase(self):
+        """Re-enter PPO after history fitting without unfreezing inherited noise."""
+        set_phase(self.policy, self.phase)
+        if self.fixed_action_std is not None:
+            self.policy.std.requires_grad_(False)
+            self.check_fixed_action_std()
+
+    def check_fixed_action_std(self):
+        if self.fixed_action_std is not None and (
+            self.policy.std.requires_grad
+            or self.policy.std.grad is not None
+            or not torch.equal(self.policy.std, self.fixed_action_std)
+            or any(
+                parameter is self.policy.std
+                for group in self.optimizer.param_groups
+                for parameter in group["params"]
+            )
+        ):
+            raise ValueError("Frozen parent action std or optimizer ownership changed")
+
+    def _frozen_parameter_ids(self):
+        frozen = {
+            id(p) for module in self._frozen_modules() for p in module.parameters()
+        }
+        if self.fixed_action_std is not None:
+            frozen.add(id(self.policy.std))
+        return frozen
 
     def _frozen_modules(self):
         actor = self.policy.actor
         return (actor.estimator, actor.encoder) if self.causal else (actor.estimator,)
 
     def _check_phase(self):
-        frozen = {
-            id(p) for module in self._frozen_modules() for p in module.parameters()
-        }
+        self.check_fixed_action_std()
+        frozen = self._frozen_parameter_ids()
         expected_ppo = {id(p) for p in self.policy.parameters()} - frozen
         if (
             self.policy.obs_groups
@@ -200,6 +250,7 @@ class ROAPPO(PPO):
                 self.ppo_parameters, self.max_grad_norm, error_if_nonfinite=True
             )
             self.optimizer.step()
+            self.check_fixed_action_std()
             if (
                 any(not torch.isfinite(p).all() for p in self.ppo_parameters)
                 or (self.policy.std <= 0).any()

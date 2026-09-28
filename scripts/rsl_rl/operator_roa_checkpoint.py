@@ -518,6 +518,11 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
     ):
         source_label = "/".join(stage.source_stages).replace("_", "-")
         raise ValueError(f"Environment stage differs from its {source_label} source")
+    if (
+        protocol.get("entropy_ablation", {}).get("action_std_mode")
+        == "frozen_parent_per_joint"
+    ):
+        _validate_fixed_action_std(saved, report, original)
     _validate_training_exposure(
         report["training_exposure"],
         count,
@@ -613,6 +618,11 @@ def _validate_entropy_ablation(saved, protocol, report, layout):
     )
 
     declared = protocol.get("entropy_ablation")
+    frozen_std = bool(
+        declared and declared.get("action_std_mode") == "frozen_parent_per_joint"
+    )
+    if not frozen_std and report.get("fixed_action_std") is not None:
+        raise ValueError("Undeclared action-std constraint")
     if declared is None:
         # Some historical synthetic receipts omit inherited PPO defaults.
         if (
@@ -621,7 +631,9 @@ def _validate_entropy_ablation(saved, protocol, report, layout):
         ):
             raise ValueError("Undeclared entropy-objective change")
         return
-    expected = entropy_ablation_recipe(declared["coefficient"])
+    expected = entropy_ablation_recipe(
+        declared["coefficient"], freeze_action_std=frozen_std
+    )
     if (
         declared != expected
         or report.get("entropy_ablation") != expected
@@ -635,6 +647,59 @@ def _validate_entropy_ablation(saved, protocol, report, layout):
     ):
         raise ValueError("Entropy ablation recipe/report mismatch")
     validate_entropy_ablation_source(saved["learning_source"])
+
+
+def _validate_fixed_action_std(saved, report, original):
+    """Bind fixed noise to the actual ancestor tensors and saved Adam ownership."""
+    values = original.std.detach().cpu().tolist()
+    parameters = [
+        (name, p)
+        for name, p in original.named_parameters()
+        if name != "std" and not name.startswith("actor.estimator.")
+    ]
+    optimizer = saved["ppo_optimizer"]
+    indices = list(range(len(parameters)))
+    if (
+        not torch.equal(saved["policy_state"]["std"], original.std)
+        or report.get("fixed_action_std")
+        != {
+            "initial": values,
+            "final": values,
+            "ppo_parameter_names": [name for name, _ in parameters],
+        }
+        or len(optimizer["param_groups"]) != 1
+        or optimizer["param_groups"][0]["params"] != indices
+        or set(optimizer["state"]) != set(indices)
+        or report["ppo_options"]["num_learning_epochs"] != 5
+        or report["ppo_options"]["num_mini_batches"] != 4
+        or len(report["cycles"]) != 1000
+    ):
+        raise ValueError("Fixed action std differs from its parent or Adam ownership")
+    for index, (_, parameter) in enumerate(parameters):
+        state = optimizer["state"][index]
+        if (
+            set(state) != {"step", "exp_avg", "exp_avg_sq"}
+            or state["step"].numel() != 1
+            or state["step"].item() != 20000
+            or any(
+                state[key].shape != parameter.shape
+                or not torch.isfinite(state[key]).all()
+                for key in ("exp_avg", "exp_avg_sq")
+            )
+            or (state["exp_avg_sq"] < 0).any()
+        ):
+            raise ValueError("Fixed-std Adam tensor ownership or step count changed")
+    for index, cycle in enumerate(report["cycles"], 1):
+        if (
+            cycle["cycle"] != index
+            or cycle.get("fixed_action_std_unchanged") is not True
+            or cycle["ppo_losses"]["optimizer_steps"] != 20
+            or (
+                index % 5 == 0
+                and cycle["privileged_modules_unchanged_during_adaptation"] is not True
+            )
+        ):
+            raise ValueError("Incomplete fixed-action-std phase receipts")
 
 
 def _validate_causal_finetuning(saved, protocol, report, original):

@@ -247,6 +247,11 @@ def parse_args(argv=None):
         help="Opt-in 1000-update H5 exploration-bonus ablation from refined9000; omit to preserve historical recipes",
     )
     parser.add_argument(
+        "--freeze-action-std",
+        action="store_true",
+        help="Bounded entropy-zero ablation: keep the parent's per-joint PPO sampling std fixed, not zero",
+    )
+    parser.add_argument(
         "--history-interval",
         type=int,
         default=HISTORY_INTERVAL,
@@ -328,13 +333,25 @@ def parse_args(argv=None):
         parser.error(
             "--entropy-coef requires a 1000-update H5 lambda-off contact_continue/contact_acquire run with --training-telemetry"
         )
+    if args.freeze_action_std and args.entropy_coef != 0.0:
+        parser.error("--freeze-action-std requires explicit --entropy-coef 0")
     return args
 
 
-def entropy_ablation_recipe(coefficient):
-    """One optimizer-objective change; policy std remains learned and sampled."""
+def entropy_ablation_recipe(coefficient, *, freeze_action_std=False):
+    """Version the two bounded experiments without changing archived v1 recipes."""
     if type(coefficient) not in (int, float) or coefficient not in (0.0, 0.01):
         raise ValueError("Entropy ablation supports only 0 or inherited 0.01")
+    if type(freeze_action_std) is not bool or (freeze_action_std and coefficient != 0):
+        raise ValueError("Fixed action std requires explicit zero entropy bonus")
+    if freeze_action_std:
+        return {
+            "version": "operator_roa_fixed_std_ablation_v1",
+            "coefficient": 0.0,
+            "baseline_coefficient": 0.0,
+            "action_std_mode": "frozen_parent_per_joint",
+            "scope": "1000 H5 PPO updates from refined9000, lambda0; versus entropy-zero learned std, exclude inherited per-joint std from Adam and gradient clipping. Keep stochastic sampling, rewards, LR, adaptation and domain randomization. No automatic descendant learning or promotion.",
+        }
     return {
         "version": "operator_roa_entropy_ablation_v1",
         "coefficient": float(coefficient),
@@ -734,6 +751,7 @@ def run_pilot(
     history_interval=HISTORY_INTERVAL,
     training_telemetry=False,
     entropy_coef=None,
+    freeze_action_std=False,
 ):
     started = time.perf_counter()
     stage = ENVIRONMENT_STAGES[layout] if environment else None
@@ -756,6 +774,7 @@ def run_pilot(
             history_interval=history_interval,
             training_telemetry=training_telemetry,
             entropy_coef=entropy_coef,
+            freeze_action_std=freeze_action_std,
         )
     finally:
         if host.telemetry is not None:
@@ -927,6 +946,7 @@ def _learn_pilot(
     history_interval=HISTORY_INTERVAL,
     training_telemetry=False,
     entropy_coef=None,
+    freeze_action_std=False,
 ):
     import torch
     from parkour_lab.learning.operator_roa import (
@@ -946,8 +966,10 @@ def _learn_pilot(
         raise ValueError("Environment learning requires a validated warm start")
     if training_telemetry and not environment:
         raise ValueError("Training telemetry requires environment learning")
+    if type(freeze_action_std) is not bool or (freeze_action_std and entropy_coef != 0):
+        raise ValueError("Fixed action std requires explicit zero entropy bonus")
     if entropy_coef is not None:
-        entropy_ablation_recipe(entropy_coef)
+        entropy_ablation_recipe(entropy_coef, freeze_action_std=freeze_action_std)
         if not (
             environment
             and learning is not None
@@ -959,7 +981,9 @@ def _learn_pilot(
         ):
             raise ValueError("Entropy ablation requires its bounded telemetry recipe")
         validate_entropy_ablation_source(learning[1])
-        report["entropy_ablation"] = entropy_ablation_recipe(entropy_coef)
+        report["entropy_ablation"] = entropy_ablation_recipe(
+            entropy_coef, freeze_action_std=freeze_action_std
+        )
     evaluation_seed = learning[3] + 1000 if environment else EVALUATION_SEED
     exposure = None
     stumble = None
@@ -1074,9 +1098,18 @@ def _learn_pilot(
         policy,
         device=env.device,
         causal=causal,
+        freeze_action_std=freeze_action_std,
         regularization_coef=0.0 if causal else 0.1,
         **options,
     )
+    if freeze_action_std:
+        trainable = {id(p) for p in algorithm.ppo_parameters}
+        report["fixed_action_std"] = {
+            "initial": policy.std.detach().cpu().tolist(),
+            "ppo_parameter_names": [
+                name for name, p in policy.named_parameters() if id(p) in trainable
+            ],
+        }
     if causal:
         report["frozen_teacher_sha256"] = state_sha256(actor.encoder)
         report["latent_branch_scope"] = (
@@ -1128,6 +1161,7 @@ def _learn_pilot(
 
         if causal and state_sha256(actor.encoder) != report["frozen_teacher_sha256"]:
             raise RuntimeError("Causal fine-tuning changed its fixed teacher")
+        algorithm.check_fixed_action_std()
         path = output / ("pilot.pt" if learning is None else f"learning_{update}.pt")
         pending = path.with_suffix(".pt.pending")
         torch.save(
@@ -1160,7 +1194,7 @@ def _learn_pilot(
             telemetry.begin_cycle(cycle)
         record = {"cycle": cycle, "regularization_coefficient": coefficient}
         report["cycles"].append(record)
-        set_phase(policy, algorithm.phase)
+        algorithm.start_phase()
         estimator_before = state_sha256(actor.estimator)
         encoder_before = state_sha256(actor.encoder)
         algorithm.regularization_coef = coefficient
@@ -1180,6 +1214,9 @@ def _learn_pilot(
         else:
             record["ppo_losses"] = algorithm.update()
         report["ppo_updates_completed"] += 1
+        if freeze_action_std:
+            algorithm.check_fixed_action_std()
+            record["fixed_action_std_unchanged"] = True
         if learning is None and (
             min(
                 record["ppo_losses"]["encoder_gradient_l2_max"],
@@ -1249,6 +1286,9 @@ def _learn_pilot(
     set_training_mechanisms(env, active=False)
     policy.eval()
     set_phase(policy, "frozen")
+    if freeze_action_std:
+        algorithm.check_fixed_action_std()
+        report["fixed_action_std"]["final"] = policy.std.detach().cpu().tolist()
     frozen_hash = state_sha256(policy)
     if learning is None:
         obs, _ = host.reset()
@@ -1579,10 +1619,14 @@ def main(argv=None):
             )
     if args.entropy_coef is not None:
         validate_entropy_ablation_source(metadata)
-        protocol["entropy_ablation"] = entropy_ablation_recipe(args.entropy_coef)
-        protocol[
-            "learning_scope"
-        ] += " Explicit entropy-bonus ablation; all other learning settings retained."
+        protocol["entropy_ablation"] = entropy_ablation_recipe(
+            args.entropy_coef, freeze_action_std=args.freeze_action_std
+        )
+        protocol["learning_scope"] += (
+            " Fixed-parent per-joint action std ablation against entropy-zero learned std; sampling retained."
+            if args.freeze_action_std
+            else " Explicit entropy-bonus ablation; all other learning settings retained."
+        )
     if args.training_telemetry:
         from .operator_control_trace import ROATrainingTelemetry
 
@@ -1680,6 +1724,7 @@ def main(argv=None):
             history_interval=args.history_interval,
             training_telemetry=args.training_telemetry,
             entropy_coef=args.entropy_coef,
+            freeze_action_std=args.freeze_action_std,
         )
         if training.recurrent_training_identity(args.reference) != identity:
             raise RuntimeError("Source or runtime changed during learning pilot")
