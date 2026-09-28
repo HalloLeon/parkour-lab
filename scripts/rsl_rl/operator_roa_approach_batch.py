@@ -1,4 +1,4 @@
-"""One bounded approach-acquisition run and matched frozen screens; never promotion.
+"""Bounded approach trials and optional paired raised-start controls; never promotion.
 
 Run with the Isaac Lab Python from the repository root. Children are sequential,
 without execution timeouts. Each owns a fresh directory and process receipt.
@@ -22,7 +22,7 @@ from .operator_roa_checkpoint import (
 )
 from .operator_roa_pilot import ENVIRONMENT_STAGES, load_environment_source
 from .operator_roa_evaluation import COMMAND_TAPE, command_tape_sha256
-from . import operator_step_approach, operator_step_field
+from . import operator_step_approach, operator_step_field, operator_step_support
 from .operator_traversal_probe import COMMAND_TAPE as TRAVERSAL_TAPE
 from .operator_train import file_sha256, recurrent_training_identity
 
@@ -93,15 +93,78 @@ def trace_check(path, expected_hash):
         )
 
 
-def train_check(run, expected):
+def seed_admission(seed, *, paired):
+    """CPU XY admission only; the children still verify actual imported geometry.
+
+    Cell levels and reset XY do not depend on difficulty. Generate each variant
+    at a representative difficulty, then check every row's world-coordinate pool.
+    """
+    tiles = []
+    for variant in range(12, 16):
+        _, _, tile = operator_step_field.build_surface(0.35, seed=seed, variant=variant)
+        tiles.extend(dict(tile, row=row) for row in range(3))
+    preview = dict(seed=seed, tiles=tiles)
+    table = operator_step_approach.candidates(preview)
+    result = dict(seed=seed, directed_approaches=len(table))
+    if paired:
+        clearance = []
+        for tile in operator_step_support._tiles(preview):
+            origin = np.array([16 * (tile["row"] - 1), 16 * (tile["variant"] - 9.5)])
+            positions = np.asarray(tile["positions_world_m"])[..., :2] - origin
+            clearance.append(
+                float(
+                    (
+                        operator_step_approach.WORKSPACE_HALF
+                        - np.abs(positions)
+                        - operator_step_approach.FOOTPRINT_RADIUS
+                    ).min()
+                )
+            )
+        require(
+            min(clearance) > 0, f"Raised-start control outside workspace: seed {seed}"
+        )
+        result["raised_start_minimum_workspace_clearance_m"] = min(clearance)
+    return result
+
+
+def train_check(run, expected, *, seed=1063, layout="contact_approach", source=None):
     report, protocol = read(run / "report.json"), read(run / "training_protocol.json")
+    stage = ENVIRONMENT_STAGES[layout]
+    approach = layout == "contact_approach"
     require(
-        protocol["approach_recipe"] == operator_step_approach.recipe(),
-        "Training requires workspace-admitted v2 approaches, not historical v1",
+        layout in ("contact_approach", "contact_acquire")
+        and protocol["environment_layout"] == layout
+        and protocol["version"] == stage.version
+        and protocol["seed"] == seed
+        and protocol["num_envs"] == 160
+        and protocol["history_interval"] == 5
+        and protocol["cycles"] == 1000
+        and report["native_step_field_geometry"]["seed"] == seed
+        and all(
+            report[key]["seed"] == seed + 1000
+            for key in ("evaluation_before", "evaluation_after")
+        ),
+        "Training case seed/layout/budget changed",
     )
-    _validate_completion(
-        report, ENVIRONMENT_STAGES["contact_approach"].status, 38600, 160
+    require(
+        source is None or protocol["learning_source"] == source,
+        "Training did not start from the retained parent",
     )
+    require(
+        (
+            (
+                protocol.get("approach_recipe") == operator_step_approach.recipe()
+                and "support_reset_recipe" not in protocol
+            )
+            if approach
+            else (
+                protocol.get("support_reset_recipe") == operator_step_support.recipe()
+                and "approach_recipe" not in protocol
+            )
+        ),
+        "Training occupancy recipe changed; approaches require workspace-admitted v2",
+    )
+    _validate_completion(report, stage.status, 38600, 160)
     require(
         protocol["source_identity"] == expected, "Training runtime/reference changed"
     )
@@ -148,6 +211,8 @@ def train_check(run, expected):
                 and arrays["ppo_return"].shape == (5, 24, 160, 1),
                 "Wrong training trace dimensions",
             )
+            if not approach:
+                continue
             holding = arrays["approach_hold_pre"]
             command = arrays["command_b_pre"][holding]
             require(
@@ -165,7 +230,8 @@ def train_check(run, expected):
             )
             holds += int(holding.sum())
     require(
-        holds > 0, "The approach mechanism never delivered a sampled training command"
+        not approach or holds > 0,
+        "The approach mechanism never delivered a sampled training command",
     )
     checkpoint = run / "learning_1000.pt"
     require(
@@ -340,7 +406,17 @@ def main(argv=None):
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--cpu-threads", type=int, default=2)
+    parser.add_argument("--training-seeds", nargs="+", type=int, default=[1063])
+    parser.add_argument(
+        "--paired-control",
+        action="store_true",
+        help="Also train the existing raised-start/free-command recipe for each seed",
+    )
     args = parser.parse_args(argv)
+    if any(seed < 0 for seed in args.training_seeds) or len(
+        set(args.training_seeds)
+    ) != len(args.training_seeds):
+        parser.error("training-seeds must be distinct nonnegative integers")
     args.reference, args.parent = args.reference.resolve(
         strict=True
     ), args.parent.resolve(strict=True)
@@ -359,8 +435,33 @@ def main(argv=None):
 
     preflight()
     _, source = load_environment_source(
-        args.parent, expected["physical_reference"], 1063, layout="contact_approach"
+        args.parent,
+        expected["physical_reference"],
+        args.training_seeds[0],
+        layout="contact_approach",
     )
+    require(
+        source["training_seed"] not in args.training_seeds,
+        "Training seeds must differ from the retained parent's seed",
+    )
+    admissions = [
+        seed_admission(seed, paired=args.paired_control) for seed in args.training_seeds
+    ]
+    layouts = (
+        ("contact_approach", "contact_acquire")
+        if args.paired_control
+        else ("contact_approach",)
+    )
+    sweep = len(args.training_seeds) > 1 or args.paired_control
+    trials = [
+        dict(
+            seed=seed,
+            layout=layout,
+            label=f"seed{seed}/{layout}" if sweep else "candidate",
+        )
+        for seed in args.training_seeds
+        for layout in layouts
+    ]
     require(
         not any(
             args.output_parent.resolve().is_relative_to(Path(path).parent)
@@ -378,19 +479,22 @@ def main(argv=None):
         exit_allowed=False,
         source_identity=expected,
         parent=source,
+        trials=trials,
         screens={},
     )
     write(
         output / "batch_plan.json",
         dict(
             summary,
-            training_layout="contact_approach",
+            seed_admission=admissions,
             approach_recipe=operator_step_approach.recipe(),
-            training_seed=1063,
+            control_recipe=(
+                operator_step_support.recipe() if args.paired_control else None
+            ),
             updates=1000,
             screens=SCREENS,
             routes=["causal", "privileged_latent"],
-            scope="One occupancy recipe; same-state initial controls, not same-state trajectories or qualification",
+            scope="Prespecified development seeds, each from the same immutable parent. Optional paired bundled occupancy recipes, not a single-factor intervention or independent parent replications. Parent screens once; no ranking, chaining, retries or promotion. Analytic seed admission is not native contact certification.",
         ),
     )
     started = time.monotonic()
@@ -443,77 +547,99 @@ def main(argv=None):
         require(len(reports) == 1, f"Missing or ambiguous child report: {folder}")
         return reports[0].parent
 
-    try:
-        run = child(
-            output / "training",
-            "scripts.rsl_rl.operator_roa_pilot",
-            [
-                "--environment-checkpoint",
-                args.parent,
-                "--environment-layout",
-                "contact_approach",
-                "--regularization",
-                "off",
-                "--orientation-weight",
-                "-2.5",
-                "--stumble-weight",
-                "0",
-                "--learning-updates",
-                "1000",
-                "--history-interval",
-                "5",
-                "--num-envs",
-                "160",
-                "--seed",
-                "1063",
-                "--training-telemetry",
-            ],
-        )
-        checkpoint = train_check(run, expected)
-        controls = {}
-        for label, weights in (("parent", args.parent), ("candidate", checkpoint)):
-            case = output / label
-            case.mkdir()
-            exported = export_roa_actor(
-                weights, case / "actor.pt"
-            )  # Validates native acquisition receipts too.
-            write(case / "export.json", exported)
-            summary["screens"][label] = {}
-            for name, (n, seed, options) in SCREENS.items():
-                for route in (
-                    ["causal"]
-                    if name == "retention"
-                    else ["causal", "privileged_latent"]
-                ):
-                    extra = [] if route == "causal" else ["--diagnostic-input", route]
-                    run = child(
-                        case / name / route,
-                        "scripts.rsl_rl.operator_roa_screen",
-                        [
-                            "--checkpoint",
-                            weights,
-                            "--controller-artifact",
-                            case / "actor.pt",
-                            "--num-envs",
-                            n,
-                            "--seed",
-                            seed,
-                            *options,
-                            *extra,
-                        ],
-                    )
-                    baseline = controls.get(name)
-                    report = screen_check(
-                        run, exported, expected, name, route, baseline
-                    )
+    controls, paired_starts = {}, {}
+
+    def screens(label, weights):
+        case = output / label
+        case.mkdir(parents=True, exist_ok=True)
+        exported = export_roa_actor(weights, case / "actor.pt")
+        write(case / "export.json", exported)
+        summary["screens"][label] = {}
+        for name, (n, seed, options) in SCREENS.items():
+            for route in (
+                ["causal"] if name == "retention" else ["causal", "privileged_latent"]
+            ):
+                extra = [] if route == "causal" else ["--diagnostic-input", route]
+                run = child(
+                    case / name / route,
+                    "scripts.rsl_rl.operator_roa_screen",
+                    [
+                        "--checkpoint",
+                        weights,
+                        "--controller-artifact",
+                        case / "actor.pt",
+                        "--num-envs",
+                        n,
+                        "--seed",
+                        seed,
+                        *options,
+                        *extra,
+                    ],
+                )
+                report = screen_check(
+                    run, exported, expected, name, route, controls.get(name)
+                )
+                if label == "parent":
                     controls.setdefault(name, report)
-                    summary["screens"][label][f"{name}/{route}"] = dict(
-                        report=str(run / "report.json"),
-                        sha256=file_sha256(run / "report.json"),
-                        first_episode=report["evaluation"]["first_episode"],
-                        tracking=report["evaluation"]["tracking"]["first_episode"],
-                        behavior_accepted=False,
-                    )
+                summary["screens"][label][f"{name}/{route}"] = dict(
+                    report=str(run / "report.json"),
+                    sha256=file_sha256(run / "report.json"),
+                    first_episode=report["evaluation"]["first_episode"],
+                    tracking=report["evaluation"]["tracking"]["first_episode"],
+                    behavior_accepted=False,
+                )
+
+    try:
+        for trial in trials:
+            seed, layout, label = trial["seed"], trial["layout"], trial["label"]
+            case = output / label if sweep else output
+            run = child(
+                case / "training",
+                "scripts.rsl_rl.operator_roa_pilot",
+                [
+                    "--environment-checkpoint",
+                    args.parent,
+                    "--environment-layout",
+                    layout,
+                    "--regularization",
+                    "off",
+                    "--orientation-weight",
+                    "-2.5",
+                    "--stumble-weight",
+                    "0",
+                    "--learning-updates",
+                    "1000",
+                    "--history-interval",
+                    "5",
+                    "--num-envs",
+                    "160",
+                    "--seed",
+                    seed,
+                    "--training-telemetry",
+                ],
+            )
+            checkpoint = train_check(
+                run, expected, seed=seed, layout=layout, source=source
+            )
+            report = read(run / "report.json")
+            start = {
+                key: report["evaluation_before"][key]
+                for key in (*INITIAL_KEYS, "policy_state_sha256_before")
+            }
+            start["native_step_field_geometry"] = report["native_step_field_geometry"]
+            require(
+                start == paired_starts.setdefault(seed, start),
+                f"Paired training initial conditions differ: seed {seed}",
+            )
+            trial.update(
+                checkpoint=str(checkpoint),
+                training_report=str(run / "report.json"),
+                training_report_sha256=file_sha256(run / "report.json"),
+            )
+            if not controls:
+                screens("parent", args.parent)
+            screens(label, checkpoint)
+            trial["status"] = "COMPLETE_NOT_PROMOTED"
         summary["status"] = "COMPLETE_NOT_PROMOTED"
     except BaseException as exc:
         summary.update(status="FAILED_OR_INTERRUPTED_NOT_QUALIFIED", error=repr(exc))
