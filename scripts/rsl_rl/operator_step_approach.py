@@ -7,9 +7,12 @@ import numpy as np
 
 from . import operator_step_field as geometry
 
-VERSION = "operator_step_approach_v1"
+LEGACY_VERSION = "operator_step_approach_v1"
+VERSION = "operator_step_approach_v2"
 HOLD_STEPS = 250
 FOOTPRINT_RADIUS = 0.5
+WORKSPACE_MARGIN = 1.25
+WORKSPACE_HALF = 8.0 - WORKSPACE_MARGIN
 COUNTERS = (
     "at_risk_decisions",
     "approach_decisions",
@@ -26,9 +29,11 @@ COUNTERS = (
 )
 
 
-def recipe():
-    return {
-        "version": VERSION,
+def recipe(version=VERSION):
+    if version not in (LEGACY_VERSION, VERSION):
+        raise ValueError("Unknown approach recipe version")
+    result = {
+        "version": version,
         "geometry_version": geometry.VERSION,
         "approach_probability_on_step_rows": 0.75,
         "directions": "Uniform ascent/descent of each certified seam",
@@ -44,15 +49,26 @@ def recipe():
         "background": "25% step resets and all nonstep resets retain ordinary center starts and free commands",
         "scope": "Fixed training occupancy experiment; analytic patch coverage plus imported rays and nominal link-footprint check, NOT a PhysX collision certificate or supported traversal qualification",
     }
+    if version == VERSION:
+        result["workspace_admission"] = {
+            "tile_size_m": [16.0, 16.0],
+            "margin_m": WORKSPACE_MARGIN,
+            "body_center_limit_m": WORKSPACE_HALF,
+            "rule": "Both approach/landing centers plus XY jitter and nominal footprint strictly inside unchanged all-body workspace; admit or reject each seam pair together",
+        }
+    return result
 
 
-def candidates(report):
+def candidates(report, *, version=VERSION):
     """All straight seams with a complete3x3-cell patch on EACH side.
 
     Each undirected seam appears once, then in both travel directions. Root
     jitter plus the0.5m footprint stays inside its1.5m square with0.15m margin.
+    v2 also intersects both center envelopes with the existing workspace.
+    v1 is retained only to reconstruct historical, confounded receipts.
     No assumption is made about support after leaving these two rectangles.
     """
+    settings = recipe(version)
     result = []
     for tile in report["tiles"]:
         levels = geometry._levels(tile["seed"], tile["variant"])
@@ -71,6 +87,18 @@ def candidates(report):
                     edge = np.array([(i + 1) * 0.5 - 8, (j + 0.5) * 0.5 - 8])
                     if axis == 1:
                         edge = edge[::-1]
+                    normal = np.eye(2)[axis]
+                    if (
+                        version == VERSION
+                        and (
+                            np.abs(edge)
+                            + normal * settings["start_distance_m"]
+                            + settings["seam_frame_xy_jitter_m"]
+                            + FOOTPRINT_RADIUS
+                            >= WORKSPACE_HALF
+                        ).any()
+                    ):
+                        continue
                     for sign in (1, -1):
                         normal = np.eye(2)[axis] * sign
                         start, target = (a, b) if sign == 1 else (b, a)
@@ -116,8 +144,9 @@ def support_probes(table):
 
 
 def validate_receipt(receipt, report):
-    table = candidates(report)
-    if receipt["recipe"] != recipe() or receipt["candidates"] != table:
+    version = receipt["recipe"]["version"]
+    table = candidates(report, version=version)
+    if receipt["recipe"] != recipe(version) or receipt["candidates"] != table:
         raise ValueError("Approach recipe or certified seam table changed")
     expected = support_probes(table)
     hits, faces = np.asarray(receipt["hits_world_m"]), np.asarray(receipt["face_ids"])
@@ -137,12 +166,27 @@ def validate_receipt(receipt, report):
     return deepcopy(receipt)
 
 
+def validate_workspace(cfg):
+    """Admission must describe the live termination, never enlarge its bounds."""
+    from .operator_command import procedural_workspace
+
+    term = cfg.terminations.procedural_workspace
+    if (
+        tuple(cfg.scene.terrain.terrain_generator.size) != (16.0, 16.0)
+        or term.func is not procedural_workspace
+        or term.params != {"margin_m": WORKSPACE_MARGIN}
+        or term.time_out is not True
+    ):
+        raise ValueError("Approaches require the unchanged all-body workspace")
+
+
 def configure(cfg):
     from .operator_command import (
         ProceduralStepApproachCommand,
         ProceduralTerrainCommand,
     )
 
+    validate_workspace(cfg)
     term = cfg.events.reset_base
     if (
         term.func.__name__ != "reset_root_state_uniform"
@@ -169,6 +213,7 @@ def install(env, report):
     import torch
     from isaaclab.utils.warp import raycast_mesh
 
+    validate_workspace(env.cfg)
     if hasattr(env, "_operator_step_approach") or hasattr(
         env, "_operator_step_support"
     ):
@@ -438,7 +483,7 @@ def validate_training_report(report, *, steps, num_envs):
     footprint = report["nominal_footprint"]
     holds = np.asarray(report["forward_windows_by_level_direction"])
     if (
-        report["recipe"] != recipe()
+        report["recipe"] != recipe(report["recipe"]["version"])
         or report["control_steps"] != steps
         or report["pending_step"] is not False
         or counts.shape != (2, 3, 2, len(COUNTERS))
@@ -512,6 +557,11 @@ def reset_root_state(env, env_ids, pose_range, velocity_range, asset_cfg=None):
         + (-0.75 + 0.1 * jitter[:, :1]) * normal
         + 0.1 * jitter[:, 1:2] * tangent
     )
+    if (
+        (pose[:, :2] - env.scene.env_origins[selected, :2]).abs() + FOOTPRINT_RADIUS
+        >= WORKSPACE_HALF
+    ).any():
+        raise ValueError("Sampled approach footprint exceeds the live workspace")
     pose[:, 2] += values["start_height_m"] + values["roughness_m"]
     yaw = torch.atan2(normal[:, 1], normal[:, 0]) + math.pi / 18 * jitter[:, 2]
     pose[:, 3:7] = 0

@@ -473,7 +473,12 @@ def _validate_native_collection(
     if stage.approach_resets:
         from . import operator_step_approach
 
-        if protocol["approach_recipe"] != operator_step_approach.recipe():
+        recipe = protocol["approach_recipe"]
+        if (
+            recipe != operator_step_approach.recipe(recipe["version"])
+            or report["native_approach_patches"]["recipe"] != recipe
+            or report["training_approaches"]["recipe"] != recipe
+        ):
             raise ValueError("Approach recipe changed")
         operator_step_approach.validate_receipt(
             report["native_approach_patches"], report["native_step_field_geometry"]

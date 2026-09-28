@@ -22,7 +22,7 @@ from .operator_roa_checkpoint import (
 )
 from .operator_roa_pilot import ENVIRONMENT_STAGES, load_environment_source
 from .operator_roa_evaluation import COMMAND_TAPE, command_tape_sha256
-from . import operator_step_field
+from . import operator_step_approach, operator_step_field
 from .operator_traversal_probe import COMMAND_TAPE as TRAVERSAL_TAPE
 from .operator_train import file_sha256, recurrent_training_identity
 
@@ -95,6 +95,10 @@ def trace_check(path, expected_hash):
 
 def train_check(run, expected):
     report, protocol = read(run / "report.json"), read(run / "training_protocol.json")
+    require(
+        protocol["approach_recipe"] == operator_step_approach.recipe(),
+        "Training requires workspace-admitted v2 approaches, not historical v1",
+    )
     _validate_completion(
         report, ENVIRONMENT_STAGES["contact_approach"].status, 38600, 160
     )
@@ -381,6 +385,7 @@ def main(argv=None):
         dict(
             summary,
             training_layout="contact_approach",
+            approach_recipe=operator_step_approach.recipe(),
             training_seed=1063,
             updates=1000,
             screens=SCREENS,
