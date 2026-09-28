@@ -34,6 +34,103 @@ def command_tape_sha256(tape):
 COMMAND_TAPE_SHA256 = command_tape_sha256(COMMAND_TAPE)
 
 
+def frozen_start_comparison(first, second, *, contact_conditioned):
+    """Compare known frozen ROA routes, not PPO critic inputs or scan determinism.
+
+    Neither history actions nor the privileged-latent diagnostic consumes terrain.
+    Keep its exact mismatch visible; do not introduce a numerical tolerance.
+    Callers must separately bind the same native geometry and validated model.
+    """
+    groups = {"policy", "history", "critic_state", "terrain", "dynamics"}
+    if contact_conditioned:
+        groups.add("contacts")
+    hashes = (
+        "initial_observation_sha256",
+        "initial_dynamics_sha256",
+        "initial_root_state_sha256",
+        "initial_joint_pos_sha256",
+        "initial_joint_vel_sha256",
+        "command_tape_sha256",
+    )
+    try:
+        for value in (first, second):
+            observed = value["initial_observation_group_sha256"]
+            if (
+                type(contact_conditioned) is not bool
+                or value["version"] != VERSION
+                or value.get("diagnostic_input") not in (None, "privileged_latent")
+                or set(observed) != groups
+                or any(
+                    not isinstance(digest, str)
+                    or len(digest) != 64
+                    or any(char not in "0123456789abcdef" for char in digest)
+                    for digest in [*(value[key] for key in hashes), *observed.values()]
+                )
+                or value["initial_dynamics_sha256"] != observed["dynamics"]
+                or value["initial_root_state_status"] != "RECORDED_ROOT_STATE_W"
+                or value["command_tape_sha256"]
+                != command_tape_sha256(value["command_tape"])
+                or type(value["seed"]) is not int
+                or value["seed"] < 0
+                or type(value["num_envs"]) is not int
+                or value["num_envs"] < 1
+                or value["terrain_assignment"]["status"]
+                != "RECORDED_NATIVE_ASSIGNMENTS"
+                or any(
+                    not isinstance(value["terrain_assignment"][key], list)
+                    or len(value["terrain_assignment"][key]) != value["num_envs"]
+                    or any(
+                        type(item) is not int or item < 0
+                        for item in value["terrain_assignment"][key]
+                    )
+                    for key in ("column_ids", "level_ids")
+                )
+                or not isinstance(value["period_s"], (int, float))
+                or not math.isfinite(value["period_s"])
+                or value["period_s"] <= 0
+            ):
+                raise ValueError("Invalid or unknown frozen-start receipt/route")
+        matches = {
+            name: first["initial_observation_group_sha256"][name]
+            == second["initial_observation_group_sha256"][name]
+            for name in sorted(groups)
+        }
+        full_match = first[hashes[0]] == second[hashes[0]]
+        if full_match != all(matches.values()):
+            raise ValueError("Inconsistent aggregate/group observation hashes")
+        changed = [
+            name for name, same in matches.items() if not same and name != "terrain"
+        ]
+        changed.extend(
+            key
+            for key in (
+                *hashes[1:],
+                "seed",
+                "num_envs",
+                "period_s",
+                "terrain_assignment",
+            )
+            if first[key] != second[key]
+        )
+        if changed:
+            raise ValueError(
+                f"Frozen actor/physical starts differ: {', '.join(changed)}"
+            )
+    except (KeyError, TypeError, AttributeError) as error:
+        raise ValueError("Missing or malformed frozen-start receipt") from error
+    return {
+        "version": "operator_roa_frozen_start_comparison_v1",
+        "status": (
+            "FULL_OBSERVATIONS_EXACT"
+            if full_match
+            else "FROZEN_ROUTE_INPUTS_EXACT_TERRAIN_DIFFERS"
+        ),
+        "full_observation_match": full_match,
+        "observation_group_matches": matches,
+        "scope": "Frozen actor inputs and recorded physical starts only; not training-critic equivalence, raycast determinism or promotion",
+    }
+
+
 def _finite(value, shape, name):
     if (
         not isinstance(value, torch.Tensor)
@@ -336,6 +433,7 @@ def evaluate_history(
     observer=None,
     diagnostic_input=None,
     diagnostic_output=None,
+    initial_terrain_output=None,
 ):
     """Evaluate a fixed tape without updates; shorter prefixes are diagnostic only.
 
@@ -361,6 +459,10 @@ def evaluate_history(
         )
     if diagnostic_output is not None and Path(diagnostic_output).exists():
         raise FileExistsError(f"Diagnostic trace already exists: {diagnostic_output}")
+    if initial_terrain_output is not None and Path(initial_terrain_output).exists():
+        raise FileExistsError(
+            f"Initial terrain already exists: {initial_terrain_output}"
+        )
     if type(seed) is not int or seed < 0:
         raise ValueError("Evaluation seed must be a nonnegative integer")
     if type(steps) is not int or not 1 <= steps <= EVALUATION_STEPS:
@@ -460,6 +562,24 @@ def evaluate_history(
         root_state_hash = _native_state_hash(host.env, "root_state_w", 13)
         joint_pos_hash = _native_state_hash(host.env, "joint_pos", 12)
         joint_vel_hash = _native_state_hash(host.env, "joint_vel", 12)
+        initial_terrain = None
+        if initial_terrain_output is not None:
+            import numpy as np
+
+            output = Path(initial_terrain_output)
+            # Copy the already-observed tensor: no sensor refresh, reset or RNG draw.
+            scan = observations["terrain"].detach().cpu().numpy()
+            with output.open("xb") as stream:
+                np.savez_compressed(stream, terrain=scan)
+            initial_terrain = {
+                "version": "operator_roa_initial_terrain_v1",
+                "path": output.name,
+                "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+                "observation_group_sha256": initial_group_hashes["terrain"],
+                "shape": list(scan.shape),
+                "dtype": str(scan.dtype),
+                "sampling": "Initial post-reset, pre-action terrain observation; observer-only",
+            }
         alive = torch.ones(count, dtype=torch.bool, device=device)
         if observer is not None:
             observer.observe(0, alive)
@@ -753,6 +873,8 @@ def evaluate_history(
             diagnostic_input=diagnostic_input,
             action_source="PRIVILEGED_SIMULATION_DIAGNOSTIC_NOT_DEPLOYABLE",
         )
+    if initial_terrain is not None:
+        report["initial_terrain"] = initial_terrain
     if diagnostic_output is not None:
         spatial_samples = getattr(observer, "input_diagnostic_samples", None)
         report["input_diagnostic"] = _input_diagnostic_report(

@@ -18,10 +18,16 @@ import numpy as np
 from .operator_roa_checkpoint import (
     _validate_completion,
     export_roa_actor,
+    load_completed_checkpoint,
     verify_source_files,
 )
 from .operator_roa_pilot import ENVIRONMENT_STAGES, load_environment_source
-from .operator_roa_evaluation import COMMAND_TAPE, command_tape_sha256
+from .operator_roa_evaluation import (
+    COMMAND_TAPE,
+    _hash_tensors,
+    command_tape_sha256,
+    frozen_start_comparison,
+)
 from . import operator_step_approach, operator_step_field, operator_step_support
 from .operator_traversal_probe import COMMAND_TAPE as TRAVERSAL_TAPE
 from .operator_train import file_sha256, recurrent_training_identity
@@ -182,9 +188,10 @@ def train_check(run, expected, *, seed=1063, layout="contact_approach", source=N
         and "entropy_ablation" not in protocol,
         "Unrequested noise ablation",
     )
-    require(
-        all(report["evaluation_initial_conditions_match"].values()),
-        "Training before/after starts differ",
+    frozen_start_comparison(
+        report["evaluation_before"],
+        report["evaluation_after"],
+        contact_conditioned=stage.contact_conditioned,
     )
     telemetry = report["training_telemetry"]
     require(
@@ -239,6 +246,97 @@ def train_check(run, expected, *, seed=1063, layout="contact_approach", source=N
         "Training checkpoint changed",
     )
     return checkpoint
+
+
+def recovery_files(run):
+    """Immutable evidence of one endpoint in a seed/layout batch, not a resume."""
+    batch = run.parents[3]
+    paths = (
+        batch / "batch_plan.json",
+        batch / "batch_check.json",
+        run.parent / "process_exit.json",
+        *(
+            run / name
+            for name in ("report.json", "training_protocol.json", "learning_1000.pt")
+        ),
+    )
+    return {str(path.relative_to(batch)): file_sha256(path) for path in paths}
+
+
+def recovery_check(run, evidence_sha256, expected, source):
+    files = recovery_files(run)
+    require(
+        identity_sha256(files) == evidence_sha256, "Archived training evidence changed"
+    )
+    batch = run.parents[3]
+    plan, failed = read(batch / "batch_plan.json"), read(batch / "batch_check.json")
+    protocol = read(run / "training_protocol.json")
+    seed, layout = protocol["seed"], protocol["environment_layout"]
+    label = f"seed{seed}/{layout}"
+    require(
+        layout in ("contact_approach", "contact_acquire")
+        and run.parent.relative_to(batch).as_posix() == f"{label}/training"
+        and dict(seed=seed, layout=layout, label=label) in plan["trials"]
+        and plan["updates"] == 1000
+        and plan["parent"] == source
+        and failed["status"] == "FAILED_OR_INTERRUPTED_NOT_QUALIFIED"
+        and failed["error"] == "ValueError('Training before/after starts differ')",
+        "Recovery requires the reviewed failed-start-comparison batch endpoint",
+    )
+    original = protocol["source_identity"]
+    require(
+        original == plan["source_identity"] == failed["source_identity"]
+        and original["physical_reference"] == expected["physical_reference"]
+        and original["runtime"].keys() == expected["runtime"].keys(),
+        "Archived runtime/reference is not the planned training identity",
+    )
+    changed = {
+        name: dict(training=old, screening=expected["runtime"][name])
+        for name, old in original["runtime"].items()
+        if old != expected["runtime"][name]
+    }
+    require(
+        changed.keys()
+        <= {
+            "scripts/rsl_rl/operator_roa_approach_batch.py",
+            "scripts/rsl_rl/operator_roa_evaluation.py",
+            "scripts/rsl_rl/operator_roa_screen.py",
+        },
+        "Recovery runtime changed beyond the reviewed frozen-screen repair",
+    )
+    process = read(run.parent / "process_exit.json")
+    require(
+        process["returncode"] == 0
+        and process["interrupted"] is False
+        and process["error"] is None,
+        "Archived training process did not exit cleanly",
+    )
+    checkpoint = train_check(run, original, seed=seed, layout=layout, source=source)
+    # Preserve all native geometry, checkpoint, motor and ancestry validators.
+    policy, _, _, receipt = load_completed_checkpoint(checkpoint)
+    require(
+        policy.actor.contact_conditioned,
+        "Recovery requires the contact-conditioned ROA",
+    )
+    report = read(run / "report.json")
+    return checkpoint, dict(
+        version="operator_roa_frozen_recovery_v1",
+        batch=str(batch),
+        training_run=str(run),
+        evidence_sha256=evidence_sha256,
+        files={str(batch / name): digest for name, digest in files.items()},
+        source=receipt,
+        training_identity_sha256=identity_sha256(original),
+        reviewed_runtime_changes=changed,
+        original_initial_conditions_match=report["evaluation_initial_conditions_match"],
+        frozen_start_comparison=frozen_start_comparison(
+            report["evaluation_before"],
+            report["evaluation_after"],
+            contact_conditioned=True,
+        ),
+        new_learning_updates=0,
+        exit_allowed=False,
+    )
 
 
 def screen_check(run, exported, expected, name, route, baseline=None):
@@ -360,16 +458,36 @@ def screen_check(run, exported, expected, name, route, baseline=None):
         "Invalid motor verification",
     )
     if baseline is not None:
-        require(
-            all(ev[key] == baseline["evaluation"][key] for key in INITIAL_KEYS),
-            "Unmatched frozen initial conditions",
-        )
+        frozen_start_comparison(baseline["evaluation"], ev, contact_conditioned=True)
         require(
             all(
                 report.get(key) == baseline.get(key)
                 for key in ("native_geometry", "native_step_field_geometry")
             ),
             "Unmatched frozen geometry",
+        )
+    initial = ev["initial_terrain"]
+    require(
+        initial["version"] == "operator_roa_initial_terrain_v1"
+        and initial["path"] == "initial_terrain.npz"
+        and initial["shape"] == [n, 264]
+        and initial["dtype"] == "float32"
+        and initial["observation_group_sha256"]
+        == ev["initial_observation_group_sha256"]["terrain"],
+        "Invalid initial terrain capture",
+    )
+    trace_check(run / initial["path"], initial["sha256"])
+    with np.load(run / initial["path"], allow_pickle=False) as arrays:
+        import torch
+
+        scan = arrays["terrain"]
+        require(
+            arrays.files == ["terrain"]
+            and scan.shape == (n, 264)
+            and scan.dtype == np.float32
+            and _hash_tensors({"terrain": torch.from_numpy(scan)})
+            == initial["observation_group_sha256"],
+            "Initial terrain capture differs from the frozen observation",
         )
     if name != "retention":
         traces = [("input_diagnostic_trace.npz", ev["input_diagnostic"]["trace"])]
@@ -406,13 +524,39 @@ def main(argv=None):
     )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--cpu-threads", type=int, default=2)
-    parser.add_argument("--training-seeds", nargs="+", type=int, default=[1063])
+    parser.add_argument("--training-seeds", nargs="+", type=int)
     parser.add_argument(
         "--paired-control",
         action="store_true",
         help="Also train the existing raised-start/free-command recipe for each seed",
     )
+    parser.add_argument(
+        "--screen-training-run",
+        type=Path,
+        help="Screen one reviewed archived seed/layout endpoint and its parent; no training or batch resume",
+    )
+    parser.add_argument(
+        "--training-evidence-sha256",
+        help="Reviewed digest of recovery_files for --screen-training-run",
+    )
     args = parser.parse_args(argv)
+    if bool(args.screen_training_run) != bool(args.training_evidence_sha256):
+        parser.error(
+            "screen-training-run and training-evidence-sha256 require each other"
+        )
+    if args.screen_training_run and (
+        args.training_seeds is not None or args.paired_control
+    ):
+        parser.error(
+            "screens-only recovery cannot request training seeds or paired training"
+        )
+    if args.screen_training_run:
+        args.screen_training_run = args.screen_training_run.resolve(strict=True)
+        args.training_seeds = [
+            read(args.screen_training_run / "training_protocol.json")["seed"]
+        ]
+    else:
+        args.training_seeds = args.training_seeds or [1063]
     if any(seed < 0 for seed in args.training_seeds) or len(
         set(args.training_seeds)
     ) != len(args.training_seeds):
@@ -421,6 +565,7 @@ def main(argv=None):
         strict=True
     ), args.parent.resolve(strict=True)
     expected = recurrent_training_identity(args.reference)
+    recovery = None
 
     def preflight():
         require(args.cpu_threads > 0, "cpu-threads must be positive")
@@ -432,6 +577,9 @@ def main(argv=None):
         require(
             file_sha256(args.parent) == args.parent_sha256, "Retained parent changed"
         )
+        if recovery is not None:
+            verify_source_files(recovery)
+            verify_source_files(recovery["source"])
 
     preflight()
     _, source = load_environment_source(
@@ -444,9 +592,14 @@ def main(argv=None):
         source["training_seed"] not in args.training_seeds,
         "Training seeds must differ from the retained parent's seed",
     )
-    admissions = [
-        seed_admission(seed, paired=args.paired_control) for seed in args.training_seeds
-    ]
+    admissions = (
+        []
+        if args.screen_training_run
+        else [
+            seed_admission(seed, paired=args.paired_control)
+            for seed in args.training_seeds
+        ]
+    )
     layouts = (
         ("contact_approach", "contact_acquire")
         if args.paired_control
@@ -462,6 +615,23 @@ def main(argv=None):
         for seed in args.training_seeds
         for layout in layouts
     ]
+    if args.screen_training_run:
+        checkpoint, recovery = recovery_check(
+            args.screen_training_run, args.training_evidence_sha256, expected, source
+        )
+        trials = [
+            dict(
+                seed=args.training_seeds[0],
+                layout=read(args.screen_training_run / "training_protocol.json")[
+                    "environment_layout"
+                ],
+                label="candidate",
+            )
+        ]
+        require(
+            not args.output_parent.resolve().is_relative_to(Path(recovery["batch"])),
+            "Recovery output must be outside the immutable failed batch",
+        )
     require(
         not any(
             args.output_parent.resolve().is_relative_to(Path(path).parent)
@@ -481,6 +651,7 @@ def main(argv=None):
         parent=source,
         trials=trials,
         screens={},
+        training_recovery=recovery,
     )
     write(
         output / "batch_plan.json",
@@ -491,10 +662,14 @@ def main(argv=None):
             control_recipe=(
                 operator_step_support.recipe() if args.paired_control else None
             ),
-            updates=1000,
+            updates=0 if recovery else 1000,
             screens=SCREENS,
             routes=["causal", "privileged_latent"],
-            scope="Prespecified development seeds, each from the same immutable parent. Optional paired bundled occupancy recipes, not a single-factor intervention or independent parent replications. Parent screens once; no ranking, chaining, retries or promotion. Analytic seed admission is not native contact certification.",
+            scope=(
+                "One archived endpoint and its parent, fourteen fresh frozen screens; no training, resume or promotion. Historical full-observation mismatch remains unresolved."
+                if recovery
+                else "Prespecified development seeds, each from the same immutable parent. Optional paired bundled occupancy recipes, not a single-factor intervention or independent parent replications. Parent screens once; no ranking, chaining, retries or promotion. Analytic seed admission is not native contact certification."
+            ),
         ),
     )
     started = time.monotonic()
@@ -586,6 +761,11 @@ def main(argv=None):
                     sha256=file_sha256(run / "report.json"),
                     first_episode=report["evaluation"]["first_episode"],
                     tracking=report["evaluation"]["tracking"]["first_episode"],
+                    frozen_start_comparison=frozen_start_comparison(
+                        controls[name]["evaluation"],
+                        report["evaluation"],
+                        contact_conditioned=True,
+                    ),
                     behavior_accepted=False,
                 )
 
@@ -593,33 +773,45 @@ def main(argv=None):
         for trial in trials:
             seed, layout, label = trial["seed"], trial["layout"], trial["label"]
             case = output / label if sweep else output
-            run = child(
-                case / "training",
-                "scripts.rsl_rl.operator_roa_pilot",
-                [
-                    "--environment-checkpoint",
-                    args.parent,
-                    "--environment-layout",
-                    layout,
-                    "--regularization",
-                    "off",
-                    "--orientation-weight",
-                    "-2.5",
-                    "--stumble-weight",
-                    "0",
-                    "--learning-updates",
-                    "1000",
-                    "--history-interval",
-                    "5",
-                    "--num-envs",
-                    "160",
-                    "--seed",
-                    seed,
-                    "--training-telemetry",
-                ],
+            run = (
+                args.screen_training_run
+                if recovery
+                else child(
+                    case / "training",
+                    "scripts.rsl_rl.operator_roa_pilot",
+                    [
+                        "--environment-checkpoint",
+                        args.parent,
+                        "--environment-layout",
+                        layout,
+                        "--regularization",
+                        "off",
+                        "--orientation-weight",
+                        "-2.5",
+                        "--stumble-weight",
+                        "0",
+                        "--learning-updates",
+                        "1000",
+                        "--history-interval",
+                        "5",
+                        "--num-envs",
+                        "160",
+                        "--seed",
+                        seed,
+                        "--training-telemetry",
+                    ],
+                )
             )
             checkpoint = train_check(
-                run, expected, seed=seed, layout=layout, source=source
+                run,
+                (
+                    read(run / "training_protocol.json")["source_identity"]
+                    if recovery
+                    else expected
+                ),
+                seed=seed,
+                layout=layout,
+                source=source,
             )
             report = read(run / "report.json")
             start = {
@@ -635,6 +827,11 @@ def main(argv=None):
                 checkpoint=str(checkpoint),
                 training_report=str(run / "report.json"),
                 training_report_sha256=file_sha256(run / "report.json"),
+                frozen_start_comparison=frozen_start_comparison(
+                    report["evaluation_before"],
+                    report["evaluation_after"],
+                    contact_conditioned=True,
+                ),
             )
             if not controls:
                 screens("parent", args.parent)

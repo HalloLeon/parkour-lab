@@ -352,6 +352,7 @@ def main(argv=None):
             controller=loaded.controller,
             command_tape=command_tape,
             observer=probe,
+            initial_terrain_output=output / "initial_terrain.npz",
             diagnostic_input=args.diagnostic_input,
             diagnostic_output=(
                 output / "input_diagnostic_trace.npz"
