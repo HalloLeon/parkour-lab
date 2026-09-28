@@ -498,6 +498,7 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
         raise ValueError(
             f"Require the bounded {stage.updates}-update free-environment ROA stage"
         )
+    _validate_entropy_ablation(saved, protocol, report, layout)
     original, contract, _, source = load_completed_checkpoint(
         source_path,
         allow_environment=bool(stage.geometry_version),
@@ -602,6 +603,38 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
     ):
         _validate_frozen_evaluation(report[key], count, seed + 1000, digest)
     return source
+
+
+def _validate_entropy_ablation(saved, protocol, report, layout):
+    """Keep experimental entropy endpoints distinct from historical controls."""
+    from .operator_roa_pilot import (
+        entropy_ablation_recipe,
+        validate_entropy_ablation_source,
+    )
+
+    declared = protocol.get("entropy_ablation")
+    if declared is None:
+        # Some historical synthetic receipts omit inherited PPO defaults.
+        if (
+            report.get("entropy_ablation") is not None
+            or report["ppo_options"].get("entropy_coef", 0.01) != 0.01
+        ):
+            raise ValueError("Undeclared entropy-objective change")
+        return
+    expected = entropy_ablation_recipe(declared["coefficient"])
+    if (
+        declared != expected
+        or report.get("entropy_ablation") != expected
+        or layout not in ("contact_continue", "contact_acquire")
+        or saved["completed_cycles"] != 1000
+        or saved["history_interval"] != 5
+        or any(saved["regularization_coefficients"])
+        or report["ppo_options"].get("entropy_coef") != expected["coefficient"]
+        or "training_telemetry" not in protocol
+        or report.get("training_telemetry", {}).get("complete") is not True
+    ):
+        raise ValueError("Entropy ablation recipe/report mismatch")
+    validate_entropy_ablation_source(saved["learning_source"])
 
 
 def _validate_causal_finetuning(saved, protocol, report, original):
@@ -868,6 +901,8 @@ def load_completed_checkpoint(
                 else "Bounded free-environment joint ROA stage; simulator-development only, not terrain or hardware qualification"
             ),
         )
+    if protocol.get("entropy_ablation") is not None:
+        receipt["entropy_ablation"] = protocol["entropy_ablation"]
     verify_source_files(receipt)
     return policy, saved["motor_contract"], saved["motor_manifest"], receipt
 

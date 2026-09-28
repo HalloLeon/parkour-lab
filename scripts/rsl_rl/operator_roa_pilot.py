@@ -51,9 +51,13 @@ class EnvironmentStage:
         )
 
     def accepts_source(self, receipt):
-        return receipt.get("stage") in self.source_stages and (
-            self.source_updates is None
-            or receipt["learning_updates"] == self.source_updates
+        return (
+            receipt.get("entropy_ablation") is None
+            and receipt.get("stage") in self.source_stages
+            and (
+                self.source_updates is None
+                or receipt["learning_updates"] == self.source_updates
+            )
         )
 
 
@@ -237,6 +241,12 @@ def parse_args(argv=None):
         help="Passive sampled native reward/PPO credit traces for environment learning; no recipe change",
     )
     parser.add_argument(
+        "--entropy-coef",
+        type=float,
+        choices=(0.0, 0.01),
+        help="Opt-in 1000-update H5 exploration-bonus ablation from refined9000; omit to preserve historical recipes",
+    )
+    parser.add_argument(
         "--history-interval",
         type=int,
         default=HISTORY_INTERVAL,
@@ -307,7 +317,57 @@ def parse_args(argv=None):
         validate_history_interval(args.history_interval, args.environment_layout)
     except ValueError as error:
         parser.error(str(error))
+    if args.entropy_coef is not None and (
+        not args.environment_checkpoint
+        or args.environment_layout not in ("contact_continue", "contact_acquire")
+        or args.learning_updates != 1000
+        or args.history_interval != 5
+        or args.regularization != "off"
+        or not args.training_telemetry
+    ):
+        parser.error(
+            "--entropy-coef requires a 1000-update H5 lambda-off contact_continue/contact_acquire run with --training-telemetry"
+        )
     return args
+
+
+def entropy_ablation_recipe(coefficient):
+    """One optimizer-objective change; policy std remains learned and sampled."""
+    if type(coefficient) not in (int, float) or coefficient not in (0.0, 0.01):
+        raise ValueError("Entropy ablation supports only 0 or inherited 0.01")
+    return {
+        "version": "operator_roa_entropy_ablation_v1",
+        "coefficient": float(coefficient),
+        "baseline_coefficient": 0.01,
+        "scope": "1000 H5 PPO updates from refined9000, lambda0; only entropy bonus changes, NOT action sampling, fixed std, rewards, adaptation or domain randomization. No automatic descendant learning or promotion.",
+    }
+
+
+def validate_entropy_ablation_source(source):
+    if (
+        source.get("stage") != "contact_estimator_refinement"
+        or source.get("learning_updates") != 9000
+        or source.get("entropy_ablation") is not None
+    ):
+        raise ValueError("Entropy ablation requires the retained refined9000 source")
+
+
+def learning_ppo_options(runner_cfg, entropy_coef=None):
+    options = copy.deepcopy(runner_cfg["algorithm"])
+    options.pop("class_name")
+    options.update(
+        learning_rate=1e-4,
+        schedule="fixed",
+        desired_kl=None,
+        symmetry_cfg=None,
+        rnd_cfg=None,
+    )
+    if entropy_coef is not None:
+        entropy_ablation_recipe(entropy_coef)
+        if options.get("entropy_coef") != 0.01:
+            raise ValueError("Entropy ablation requires the inherited 0.01 baseline")
+        options["entropy_coef"] = float(entropy_coef)
+    return options
 
 
 def validate_history_interval(interval, layout=None):
@@ -673,6 +733,7 @@ def run_pilot(
     layout="hills",
     history_interval=HISTORY_INTERVAL,
     training_telemetry=False,
+    entropy_coef=None,
 ):
     started = time.perf_counter()
     stage = ENVIRONMENT_STAGES[layout] if environment else None
@@ -694,6 +755,7 @@ def run_pilot(
             layout=layout,
             history_interval=history_interval,
             training_telemetry=training_telemetry,
+            entropy_coef=entropy_coef,
         )
     finally:
         if host.telemetry is not None:
@@ -864,6 +926,7 @@ def _learn_pilot(
     layout="hills",
     history_interval=HISTORY_INTERVAL,
     training_telemetry=False,
+    entropy_coef=None,
 ):
     import torch
     from parkour_lab.learning.operator_roa import (
@@ -883,6 +946,20 @@ def _learn_pilot(
         raise ValueError("Environment learning requires a validated warm start")
     if training_telemetry and not environment:
         raise ValueError("Training telemetry requires environment learning")
+    if entropy_coef is not None:
+        entropy_ablation_recipe(entropy_coef)
+        if not (
+            environment
+            and learning is not None
+            and training_telemetry
+            and layout in ("contact_continue", "contact_acquire")
+            and history_interval == 5
+            and learning[2] == "off"
+            and learning[4] == 1000
+        ):
+            raise ValueError("Entropy ablation requires its bounded telemetry recipe")
+        validate_entropy_ablation_source(learning[1])
+        report["entropy_ablation"] = entropy_ablation_recipe(entropy_coef)
     evaluation_seed = learning[3] + 1000 if environment else EVALUATION_SEED
     exposure = None
     stumble = None
@@ -990,15 +1067,7 @@ def _learn_pilot(
                 optimizer_initialization="Fresh PPO and history Adam; full-policy warm start, NOT exact resume",
                 update_counting_scope="Counts from the selected v3 experiment onward; excludes the ancestor's three-update mechanism pilot",
             )
-    options = copy.deepcopy(runner_cfg["algorithm"])
-    options.pop("class_name")
-    options.update(
-        learning_rate=1e-4,
-        schedule="fixed",
-        desired_kl=None,
-        symmetry_cfg=None,
-        rnd_cfg=None,
-    )
+    options = learning_ppo_options(runner_cfg, entropy_coef)
     report["ppo_options"] = options
     causal = bool(stage and stage.causal_ppo)
     algorithm = ROAPPO(
@@ -1508,6 +1577,12 @@ def main(argv=None):
                 "5.2–8.4cm risers instead of bootstrap2–6cm; all other recipes unchanged. "
                 "Fixed band, not an adaptive curriculum, regularization test or qualification"
             )
+    if args.entropy_coef is not None:
+        validate_entropy_ablation_source(metadata)
+        protocol["entropy_ablation"] = entropy_ablation_recipe(args.entropy_coef)
+        protocol[
+            "learning_scope"
+        ] += " Explicit entropy-bonus ablation; all other learning settings retained."
     if args.training_telemetry:
         from .operator_control_trace import ROATrainingTelemetry
 
@@ -1604,6 +1679,7 @@ def main(argv=None):
             layout=args.environment_layout,
             history_interval=args.history_interval,
             training_telemetry=args.training_telemetry,
+            entropy_coef=args.entropy_coef,
         )
         if training.recurrent_training_identity(args.reference) != identity:
             raise RuntimeError("Source or runtime changed during learning pilot")

@@ -75,6 +75,10 @@ def parse_args(argv=None):
 
 def refinement_recipe(path, source, *, velocity_only=False):
     """Preserve the admitted source recipe; never infer it from a filename."""
+    if source.get("entropy_ablation") is not None:
+        raise ValueError(
+            "Entropy ablation endpoints require a separate reviewed continuation"
+        )
     if velocity_only:
         if source.get("stage") != "contact_causal_finetuning":
             raise ValueError(
