@@ -470,6 +470,17 @@ def _validate_native_collection(
             steps=steps + 1800,
             full_resets=full_resets,
         )
+    if stage.approach_resets:
+        from . import operator_step_approach
+
+        if protocol["approach_recipe"] != operator_step_approach.recipe():
+            raise ValueError("Approach recipe changed")
+        operator_step_approach.validate_receipt(
+            report["native_approach_patches"], report["native_step_field_geometry"]
+        )
+        operator_step_approach.validate_training_report(
+            report["training_approaches"], steps=steps, num_envs=count
+        )
 
 
 def _environment_source(saved, protocol, report, layout, stage, visited):
@@ -502,7 +513,7 @@ def _environment_source(saved, protocol, report, layout, stage, visited):
     original, contract, _, source = load_completed_checkpoint(
         source_path,
         allow_environment=bool(stage.geometry_version),
-        allow_step_fields=stage.support_resets,
+        allow_step_fields=stage.support_resets or stage.approach_resets,
         allow_step_support=stage.source_contact_conditioned,
         expected_stage=stage.source_stage,
         _visited=visited,
@@ -811,7 +822,11 @@ def load_completed_checkpoint(
             )
         if stage and stage.geometry_version and not allow_step_fields:
             raise ValueError("Require earlier ancestry, not another step-field stage")
-        if stage and stage.support_resets and not allow_step_support:
+        if (
+            stage
+            and (stage.support_resets or stage.approach_resets)
+            and not allow_step_support
+        ):
             raise ValueError(
                 "Require earlier ancestry, not another support-reset stage"
             )

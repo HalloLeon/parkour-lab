@@ -154,6 +154,51 @@ class ProceduralTerrainCommand(OperatorTransitionCommand):
         return "ProceduralTerrainCommand: operator body twist on every row; no route guidance"
 
 
+class ProceduralStepApproachCommand(ProceduralTerrainCommand):
+    """One training-owned forward window per selected physical episode."""
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.holding = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+
+    def _resample_command(self, env_ids):
+        ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        super()._resample_command(ids)
+        self.holding[ids] = False
+        state = getattr(self._env, "_operator_step_approach", None)
+        if state is None or not state.active:
+            return
+        selected = ids[(state.edge[ids] >= 0) & (self.command_counter[ids] == 0)]
+        self.holding[selected] = True
+        self.category[selected] = 3
+        self.vel_command_b[selected] = 0
+        self.vel_command_b[selected, 0] = torch.empty(
+            len(selected), device=self.device
+        ).uniform_(0.3, 0.5)
+        self.is_heading_env[selected] = self.is_standing_env[selected] = False
+        self.time_left[selected] = float("inf")
+        edges = state.edge[selected]
+        direction = (
+            state.values["target_height_m"][edges]
+            < state.values["start_height_m"][edges]
+        ).long()
+        state.holds.view(-1).index_add_(
+            0, state.rows[selected] * 2 + direction, torch.ones_like(direction)
+        )
+
+    def _update_command(self):
+        from .operator_step_approach import HOLD_STEPS
+
+        state = getattr(self._env, "_operator_step_approach", None)
+        expired = self._env.episode_length_buf >= HOLD_STEPS
+        if state is None or not state.active:
+            expired = torch.ones_like(expired)
+        ids = (self.holding & expired).nonzero().flatten()
+        if len(ids):
+            self._resample(ids)
+        super()._update_command()
+
+
 class ProceduralArrivalHoldCommand(ProceduralTerrainCommand):
     """Mix long arrival/hold sequences into training, never into live control."""
 

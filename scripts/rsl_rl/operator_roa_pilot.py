@@ -37,6 +37,7 @@ class EnvironmentStage:
     stumble_cost: bool = False
     stumble_control: bool = False
     causal_ppo: bool = False
+    approach_resets: bool = False
 
     @property
     def allowed_updates(self):
@@ -177,6 +178,15 @@ ENVIRONMENT_STAGES["contact_causal"] = replace(
     result_stage="contact_causal_finetuning",
     causal_ppo=True,
 )
+ENVIRONMENT_STAGES["contact_approach"] = replace(
+    ENVIRONMENT_STAGES["contact_acquire"],
+    version="operator_roa_contact_approach_v1",
+    updates=1000,
+    status="ROA_CONTACT_APPROACH_COMPLETED_NOT_QUALIFIED",
+    result_stage="contact_approach",
+    support_resets=False,
+    approach_resets=True,
+)
 REGULARIZATION_COEFFICIENTS = (0.1, 0.55, 1.0)
 ROLLOUT_STEPS = 24
 HISTORY_STEPS = 64
@@ -284,6 +294,8 @@ def parse_args(argv=None):
         parser.error("--environment-layout requires --environment-checkpoint")
     args.environment_layout = args.environment_layout or "hills"
     stage = ENVIRONMENT_STAGES[args.environment_layout]
+    if stage.approach_resets and not args.training_telemetry:
+        parser.error("contact_approach requires --training-telemetry")
     followup = bool(args.environment_checkpoint and stage.source_contact_conditioned)
     if followup != (args.orientation_weight is not None):
         parser.error("--orientation-weight is required only with contact follow-ups")
@@ -391,7 +403,7 @@ def validate_history_interval(interval, layout=None):
     """Keep historical recipes intact; bounded acquisition/causal stages use H5."""
     choices = (
         (5,)
-        if layout in ("contact_acquire", "contact_causal")
+        if layout in ("contact_acquire", "contact_causal", "contact_approach")
         else (
             (5, HISTORY_INTERVAL)
             if layout == "contact_continue"
@@ -535,7 +547,7 @@ def require_inherited_posture(path, *, stumble_control=False):
             raise ValueError("Continuation requires the completed zero-stumble control")
 
 
-def validate_events(cfg, *, support_resets=False):
+def validate_events(cfg, *, support_resets=False, approach_resets=False):
     """Only this reconstructed startup-persistent physics recipe can be cached."""
     expected = {
         "physics_material": ("startup", "randomize_rigid_body_material"),
@@ -555,8 +567,13 @@ def validate_events(cfg, *, support_resets=False):
         )
     for name, (mode, function) in expected.items():
         term = active[name]
-        if support_resets and name == "reset_base":
-            from .operator_step_support import reset_root_state
+        if (support_resets or approach_resets) and name == "reset_base":
+            if support_resets and approach_resets:
+                raise ValueError("Reset mechanisms cannot be combined")
+            if approach_resets:
+                from .operator_step_approach import reset_root_state
+            else:
+                from .operator_step_support import reset_root_state
 
             if term.mode != mode or term.func is not reset_root_state:
                 raise ValueError("Unreviewed support-patch reset event")
@@ -693,6 +710,9 @@ class PilotEnvironment:
         import torch
 
         native, _ = self.env.reset(**({"seed": seed} if seed is not None else {}))
+        approach = getattr(self.env, "_operator_step_approach", None)
+        if approach is not None:
+            approach.verify_nominal_footprint()
         if not torch.equal(read_dynamics(self.env), self.dynamics):
             raise ValueError("Persistent dynamics changed on reset")
         self.previous.zero_()
@@ -710,11 +730,16 @@ class PilotEnvironment:
         delivered = self.bridge.encode(
             JointTargets(self.bridge.joint_names, targets, raw)
         )
+        approach = getattr(self.env, "_operator_step_approach", None)
+        if approach is not None:
+            approach.before_step(stage)
         if self.telemetry is not None:
             self.telemetry.before_step(self.steps, stage, raw)
         with torch.no_grad():
             native, reward, terminated, timed_out, extras = self.env.step(delivered)
         self.bridge.verify_delivery(terminated, timed_out)
+        if approach is not None:
+            approach.after_step(terminated, timed_out)
         if self.telemetry is not None:
             self.telemetry.after_step(reward, terminated, timed_out)
         done = terminated | timed_out
@@ -779,6 +804,9 @@ def run_pilot(
     finally:
         if host.telemetry is not None:
             report["training_telemetry"] = host.telemetry.report()
+        approach = getattr(env, "_operator_step_approach", None)
+        if approach is not None:
+            report["training_approaches"] = approach.report()
         set_training_mechanisms(env, active=False)
         if host.contacts is not None:
             report["teacher_contact_observations"] = host.contacts.report()
@@ -795,10 +823,18 @@ def run_pilot(
 
 def set_training_mechanisms(env, *, active):
     """Keep experimental resets/rewards out of frozen screens and cleanup."""
-    for name in ("_operator_step_support", "_operator_step_clearance"):
+    for name in (
+        "_operator_step_support",
+        "_operator_step_clearance",
+        "_operator_step_approach",
+    ):
         state = getattr(env, name, None)
         if state is not None:
             state.active = active
+            if name == "_operator_step_approach" and not active:
+                command = env.command_manager.get_term("base_velocity")
+                command.time_left[command.holding] = 0
+                command.holding.zero_()
 
 
 def _adapt_history(
@@ -994,6 +1030,9 @@ def _learn_pilot(
     support = getattr(env, "_operator_step_support", None)
     if (support is not None) != bool(stage and stage.support_resets):
         raise ValueError("Support-reset admission must match the selected stage")
+    approach = getattr(env, "_operator_step_approach", None)
+    if (approach is not None) != bool(stage and stage.approach_resets):
+        raise ValueError("Approach-reset admission must match the selected stage")
     clearance = getattr(env, "_operator_step_clearance", None)
     if (clearance is not None) != bool(stage and stage.step_clearance):
         raise ValueError("Foot-clearance admission must match the selected stage")
@@ -1149,6 +1188,8 @@ def _learn_pilot(
             report["training_exposure"] = exposure.report()
         if support is not None:
             report["training_support_resets"] = support.report()
+        if approach is not None:
+            report["training_approaches"] = approach.report()
         if clearance is not None:
             report["training_step_clearance"] = clearance.report()
         if stumble is not None:
@@ -1617,6 +1658,13 @@ def main(argv=None):
                 "5.2–8.4cm risers instead of bootstrap2–6cm; all other recipes unchanged. "
                 "Fixed band, not an adaptive curriculum, regularization test or qualification"
             )
+        if stage.approach_resets:
+            from . import operator_step_approach as step_approach
+
+            protocol.update(
+                approach_recipe=step_approach.recipe(),
+                learning_scope="Approach-to-riser reset/command occupancy from refined9000; unchanged higher-field geometry, rewards, learned std and ROA routes. One bounded recipe, not single-factor attribution or qualification",
+            )
     if args.entropy_coef is not None:
         validate_entropy_ablation_source(metadata)
         protocol["entropy_ablation"] = entropy_ablation_recipe(
@@ -1676,6 +1724,8 @@ def main(argv=None):
             step_field.configure(cfg, version=stage.geometry_version)
         if stage and stage.support_resets:
             step_support.configure(cfg)
+        if stage and stage.approach_resets:
+            step_approach.configure(cfg)
         if stage and stage.step_clearance:
             step_clearance.configure(cfg)
         if stage and stage.source_contact_conditioned:
@@ -1684,7 +1734,11 @@ def main(argv=None):
             from .operator_rewards import configure_stumble, verify_stumble_objective
 
             configure_stumble(cfg, args.stumble_weight)
-        validate_events(cfg, support_resets=bool(stage and stage.support_resets))
+        validate_events(
+            cfg,
+            support_resets=bool(stage and stage.support_resets),
+            approach_resets=bool(stage and stage.approach_resets),
+        )
         cfg.validate()
         (output / "resolved_env.yaml").write_text(
             yaml.dump(cfg.to_dict(), sort_keys=False)
@@ -1705,6 +1759,11 @@ def main(argv=None):
             publish()
         if stage and stage.support_resets:
             report["native_support_patches"] = step_support.install(
+                env, report["native_step_field_geometry"]
+            )
+            publish()
+        if stage and stage.approach_resets:
+            report["native_approach_patches"] = step_approach.install(
                 env, report["native_step_field_geometry"]
             )
             publish()

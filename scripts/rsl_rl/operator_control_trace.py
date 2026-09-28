@@ -245,6 +245,11 @@ class ROATrainingTelemetry:
             profiles=list(exposure.profiles),
             geometry_version=exposure.geometry_version,
         )
+        approach = getattr(env, "_operator_step_approach", None)
+        if approach is not None:
+            from .operator_step_approach import recipe
+
+            self.metadata["approach"] = dict(recipe=recipe(), candidates=approach.table)
         self.output = Path(output) / "training_telemetry"
         self.output.mkdir()  # A new run owns a new directory; never overwrite evidence.
         self.cycle = 0
@@ -339,6 +344,9 @@ class ROATrainingTelemetry:
         self.pending = dict(
             _snapshot(values), cycle=self.cycle, phase=phase, native_index=native_index
         )
+        approach = getattr(self.env, "_operator_step_approach", None)
+        if approach is not None:
+            self.pending.update(_snapshot(approach.last))
 
     @torch.no_grad()
     def after_step(self, reward, terminated, timed_out):
