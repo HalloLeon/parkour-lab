@@ -814,19 +814,27 @@ def main(argv=None):
                 source=source,
             )
             report = read(run / "report.json")
-            start = {
-                key: report["evaluation_before"][key]
-                for key in (*INITIAL_KEYS, "policy_state_sha256_before")
-            }
-            start["native_step_field_geometry"] = report["native_step_field_geometry"]
+            # These are frozen pre-training evaluations, not initial PPO states:
+            # the two training occupancy recipes intentionally differ.
+            start = report["evaluation_before"]
+            geometry = report["native_step_field_geometry"]
+            paired_start, paired_geometry = paired_starts.setdefault(
+                seed, (start, geometry)
+            )
             require(
-                start == paired_starts.setdefault(seed, start),
-                f"Paired training initial conditions differ: seed {seed}",
+                start["policy_state_sha256_before"]
+                == paired_start["policy_state_sha256_before"]
+                == source["policy_state_sha256"]
+                and geometry == paired_geometry,
+                f"Paired frozen parent policy or geometry differs: seed {seed}",
             )
             trial.update(
                 checkpoint=str(checkpoint),
                 training_report=str(run / "report.json"),
                 training_report_sha256=file_sha256(run / "report.json"),
+                paired_frozen_start_comparison=frozen_start_comparison(
+                    paired_start, start, contact_conditioned=True
+                ),
                 frozen_start_comparison=frozen_start_comparison(
                     report["evaluation_before"],
                     report["evaluation_after"],
