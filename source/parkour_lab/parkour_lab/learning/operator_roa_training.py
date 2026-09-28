@@ -111,7 +111,8 @@ class ROAPPO(PPO):
             "ratio_max": 1.0,
         }
 
-    def update(self):
+    def update(self, *, after_update=None):
+        """Update normally; an optional read-only observer runs before buffer clear."""
         coefficient = self.regularization_coef
         if (
             isinstance(coefficient, bool)
@@ -216,6 +217,8 @@ class ROAPPO(PPO):
             != frozen_before
         ):
             raise RuntimeError("PPO unexpectedly changed a frozen estimator or teacher")
+        if after_update is not None:
+            after_update(self)
         self.storage.clear()
         return {
             **{name: value / count for name, value in sums.items()},

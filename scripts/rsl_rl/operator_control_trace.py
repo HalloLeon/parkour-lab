@@ -139,7 +139,11 @@ def _snapshot(values):
 
 
 def native_reward_snapshot(env, names, weights):
-    """Read once-computed Isaac Lab 2.3.2 rewards before reset; never recompute terms."""
+    """Read cached pre-reset rewards; the pinned manager retains them across reset.
+
+    Call after reward computation, before the next step. Never re-execute terms
+    using the now-reset state or resampled command.
+    """
     names, weights = tuple(names), tuple(weights)
     if (
         env.cfg.decimation != 4
@@ -170,6 +174,400 @@ def native_reward_snapshot(env, names, weights):
     if not torch.allclose(contribution.sum(-1), total, atol=2e-6, rtol=1e-5):
         raise ValueError("Native reward decomposition does not sum to reward_buf")
     return {"reward_contribution": contribution, "reward_total": total}
+
+
+class ROATrainingTelemetry:
+    """Opt-in sampled credit proxies, not per-terrain gradients or qualification.
+
+    Copy only selected complete PPO/H blocks to CPU. No reward calls, random
+    draws, actions, optimizer writes or persistent changes to policy caches.
+    Common rows are pre-action states paired with native cached transition
+    rewards. PPO rows join them by index; H rewards never enter the PPO buffer.
+    """
+
+    @staticmethod
+    def recipe(updates, history_interval, rollout_steps, history_steps):
+        if (
+            any(
+                type(x) is not int or x < 1
+                for x in (updates, history_interval, rollout_steps, history_steps)
+            )
+            or history_interval not in (5, 20)
+            or updates % history_interval
+        ):
+            raise ValueError("Telemetry requires complete H5/H20 training blocks")
+        ends = sorted({history_interval, updates, *range(100, updates + 1, 100)})
+        return {
+            "schema_version": "operator_roa_training_telemetry_v1",
+            "updates": updates,
+            "history_interval": history_interval,
+            "rollout_steps": rollout_steps,
+            "history_steps": history_steps,
+            "block_end_cycles": ends,
+            "decisions_per_block": history_interval * rollout_steps + history_steps,
+            "sampling": "Complete first/final H blocks and blocks ending every100 PPO updates; deterministic, not random sampling or whole-run means",
+            "phase_ids": {"ppo": 0, "history_collection": 1},
+            "native_timing": "Pre-action state/command/action; cached post-physics pre-reset native rewards, read after step returns; frozen checks excluded",
+            "timeout_rule": "RSL3.1.2 native_reward + gamma * stored pre-action value * (timed_out & ~terminated); not terminal-state V",
+            "ppo_axes": "update, rollout_step, environment, optional feature; ppo_sample_index joins common transition rows",
+            "policy_probe": "After all PPO Adam steps, before storage clear and H collection; old actions under old/new diagonal Gaussians, not minibatch-average KL",
+            "ratio_outside_clip": "abs(exp(new_log_prob - old_log_prob) -1) > clip_param; indicator, not whether the signed PPO surrogate chose its clipped branch",
+            "advantage": "Raw = returns - stored values; normalized globally over the complete rollout using sample std (ddof1) +1e-8",
+            "ground": "Center-ray height relative to tile origin; invalid hits encoded0 with explicit mask; NOT foot support",
+            "scope": "Sampled learning-credit proxies only; no gradient attribution, causal claim, promotion or deployment evidence",
+        }
+
+    def __init__(
+        self,
+        env,
+        output,
+        exposure,
+        *,
+        updates,
+        history_interval,
+        rollout_steps,
+        history_steps,
+    ):
+        self.env = env
+        self.metadata = self.recipe(
+            updates, history_interval, rollout_steps, history_steps
+        )
+        self.exposure = exposure
+        self.names = tuple(env.reward_manager.active_terms)
+        self.weights = tuple(
+            float(env.reward_manager.get_term_cfg(n).weight) for n in self.names
+        )
+        self.metadata.update(
+            reward_names=list(self.names),
+            reward_weights=list(self.weights),
+            reward_units="Native weighted rates * control dt exactly once",
+            step_dt_s=env.step_dt,
+            profiles=list(exposure.profiles),
+            geometry_version=exposure.geometry_version,
+        )
+        self.output = Path(output) / "training_telemetry"
+        self.output.mkdir()  # A new run owns a new directory; never overwrite evidence.
+        self.cycle = 0
+        self.active = self.complete = False
+        self.pending = None
+        self.samples, self.rollouts, self.files = [], [], []
+        self.last_native_index = None
+
+    def begin_cycle(self, cycle):
+        if (
+            self.pending is not None
+            or cycle != self.cycle + 1
+            or cycle > self.metadata["updates"]
+        ):
+            raise ValueError(
+                "Telemetry cycles must be consecutive with no pending step"
+            )
+        if self.active and self.cycle % self.metadata["history_interval"] == 0:
+            raise ValueError("Previous telemetry block was not finished")
+        self.cycle = cycle
+        interval = self.metadata["history_interval"]
+        end = ((cycle - 1) // interval + 1) * interval
+        self.active = end in self.metadata["block_end_cycles"]
+
+    @torch.no_grad()
+    def before_step(self, native_index, stage, raw):
+        if not self.active:
+            return
+        if self.pending is not None or stage not in (
+            "privileged_ppo",
+            "causal_ppo",
+            "history_adaptation",
+        ):
+            raise ValueError("Telemetry requires exactly one pre-action training frame")
+        phase = int(stage == "history_adaptation")
+        steps = self.metadata["rollout_steps"]
+        interval = self.metadata["history_interval"]
+        expected = ((self.cycle - 1) % interval) * steps
+        if phase:
+            valid_order = self.cycle % interval == 0 and len(self.rollouts) == interval
+            valid_order &= all(
+                r.get("post_update_complete", False) for r in self.rollouts
+            )
+            valid_order &= (
+                interval * steps
+                <= len(self.samples)
+                < self.metadata["decisions_per_block"]
+            )
+        else:
+            valid_order = len(self.rollouts) == (self.cycle - 1) % interval
+            valid_order &= expected <= len(self.samples) < expected + steps
+        if not valid_order or (
+            self.last_native_index is not None
+            and native_index != self.last_native_index + 1
+        ):
+            raise ValueError(
+                "Telemetry phase/step order or native decision index changed"
+            )
+        data, scene = self.env.scene["robot"].data, self.env.scene
+        if not (
+            torch.equal(scene.terrain.terrain_types, self.exposure.columns)
+            and torch.equal(scene.terrain.terrain_levels, self.exposure.levels)
+        ):
+            raise ValueError("Telemetry terrain assignments changed")
+        hits = scene["base_height_scanner"].data.ray_hits_w
+        if hits.shape != (self.env.num_envs, 1, 3):
+            raise ValueError("Telemetry requires a single native center-ground ray")
+        valid = torch.isfinite(hits[:, 0]).all(-1)
+        values = {
+            "command_b_pre": self.env.command_manager.get_command("base_velocity"),
+            "raw_action": raw,
+            "root_local_pre": data.root_pos_w - scene.env_origins,
+            "velocity_b_pre": data.root_lin_vel_b,
+            "ground_height_pre": torch.where(
+                valid, hits[:, 0, 2] - scene.env_origins[:, 2], 0
+            ),
+            "ground_valid_pre": valid,
+        }
+        shapes = {
+            "command_b_pre": (self.env.num_envs, 3),
+            "raw_action": (self.env.num_envs, 12),
+            "root_local_pre": (self.env.num_envs, 3),
+            "velocity_b_pre": (self.env.num_envs, 3),
+            "ground_height_pre": (self.env.num_envs,),
+            "ground_valid_pre": (self.env.num_envs,),
+        }
+        if any(
+            v.shape != shapes[k] or not torch.isfinite(v).all()
+            for k, v in values.items()
+        ):
+            raise ValueError("Invalid pre-action telemetry state")
+        self.pending = dict(
+            _snapshot(values), cycle=self.cycle, phase=phase, native_index=native_index
+        )
+
+    @torch.no_grad()
+    def after_step(self, reward, terminated, timed_out):
+        if not self.active:
+            return
+        if self.pending is None:
+            raise ValueError("Telemetry has no matching pre-action frame")
+        snapshot = native_reward_snapshot(self.env, self.names, self.weights)
+        if not torch.equal(reward, snapshot["reward_total"]) or any(
+            v.shape != (self.env.num_envs,) or v.dtype != torch.bool
+            for v in (terminated, timed_out)
+        ):
+            raise ValueError(
+                "Telemetry reward/termination differs from native transition"
+            )
+        self.pending.update(
+            _snapshot(
+                dict(
+                    snapshot,
+                    terminated=terminated,
+                    timed_out=timed_out,
+                    bootstrap_time_out=timed_out & ~terminated,
+                )
+            )
+        )
+        self.samples.append(self.pending)
+        self.last_native_index = self.pending["native_index"]
+        self.pending = None
+
+    @torch.no_grad()
+    def capture_rollout(self, algorithm, last_obs):
+        """After compute_returns, before PPO mutates parameters or clears storage."""
+        if not self.active:
+            return
+        storage = algorithm.storage
+        steps = self.metadata["rollout_steps"]
+        slot = (self.cycle - 1) % self.metadata["history_interval"]
+        if (
+            self.pending is not None
+            or len(self.rollouts) != slot
+            or len(self.samples) != (slot + 1) * steps
+            or storage.step != steps
+            or algorithm.normalize_advantage_per_mini_batch
+        ):
+            raise ValueError(
+                "Telemetry requires a complete globally-normalized PPO rollout"
+            )
+        rows = self.samples[-steps:]
+        for field, stored in (
+            ("raw_action", storage.actions),
+            ("command_b_pre", storage.observations["policy"][..., 6:9]),
+        ):
+            if not np.array_equal(
+                np.stack([r[field] for r in rows]), stored.detach().cpu().numpy()
+            ):
+                raise ValueError("PPO storage does not match captured pre-action rows")
+        native = np.stack([r["reward_total"] for r in rows])
+        timeout = np.stack([r["bootstrap_time_out"] for r in rows])
+        done = np.stack([r["terminated"] | r["timed_out"] for r in rows])
+        snapshot = _snapshot(
+            {
+                "ppo_reward": storage.rewards,
+                "ppo_value": storage.values,
+                "ppo_return": storage.returns,
+                "ppo_advantage_raw": storage.returns - storage.values,
+                "ppo_advantage_normalized": storage.advantages,
+                "ppo_old_log_prob": storage.actions_log_prob,
+                "ppo_old_mean": storage.mu,
+                "ppo_old_std": storage.sigma,
+                "ppo_boundary_value": algorithm.policy.evaluate(last_obs),
+            }
+        )
+        expected = native + algorithm.gamma * snapshot["ppo_value"][..., 0] * timeout
+        if not np.array_equal(
+            done, storage.dones[..., 0].cpu().numpy().astype(bool)
+        ) or not np.allclose(
+            expected, snapshot["ppo_reward"][..., 0], atol=2e-6, rtol=1e-5
+        ):
+            raise ValueError(
+                "PPO reward/timeout ownership differs from native transition"
+            )
+        if any(not np.isfinite(v).all() for v in snapshot.values()):
+            raise ValueError("Nonfinite PPO telemetry")
+        parameters = dict(
+            gamma=algorithm.gamma,
+            gae_lambda=algorithm.lam,
+            clip_param=algorithm.clip_param,
+            num_learning_epochs=algorithm.num_learning_epochs,
+            num_mini_batches=algorithm.num_mini_batches,
+            route=algorithm.phase,
+        )
+        if "ppo" in self.metadata and self.metadata["ppo"] != parameters:
+            raise ValueError("PPO telemetry recipe changed")
+        self.metadata["ppo"] = parameters
+        self.rollouts.append(
+            dict(
+                snapshot,
+                ppo_cycle=self.cycle,
+                ppo_sample_index=np.arange(slot * steps, (slot + 1) * steps),
+            )
+        )
+
+    @torch.no_grad()
+    def after_update(self, algorithm):
+        if not self.active:
+            return
+        if (
+            not self.rollouts
+            or self.rollouts[-1]["ppo_cycle"] != self.cycle
+            or self.rollouts[-1].get("post_update_complete", False)
+            or algorithm.storage.step != self.metadata["rollout_steps"]
+        ):
+            raise ValueError(
+                "Telemetry policy probe must precede storage clear exactly once"
+            )
+        policy, storage = algorithm.policy, algorithm.storage
+        distribution = policy.distribution
+        probes = []
+        try:
+            for step in range(storage.step):
+                # Same batch size as collection; do not call act() or sample().
+                policy._update_distribution(
+                    policy.get_actor_obs(storage.observations[step])
+                )
+                probes.append(
+                    _snapshot(
+                        {
+                            "ppo_new_mean": policy.action_mean,
+                            "ppo_new_std": policy.action_std,
+                            "ppo_new_log_prob": policy.get_actions_log_prob(
+                                storage.actions[step]
+                            ).unsqueeze(-1),
+                        }
+                    )
+                )
+        finally:
+            policy.distribution = distribution
+        values = {key: np.stack([row[key] for row in probes]) for key in probes[0]}
+        old = self.rollouts[-1]
+        old_mean, old_std, new_mean, new_std = (
+            a.astype(np.float64)
+            for a in (
+                old["ppo_old_mean"],
+                old["ppo_old_std"],
+                values["ppo_new_mean"],
+                values["ppo_new_std"],
+            )
+        )
+        values["ppo_kl_old_new"] = (
+            np.log(new_std / old_std)
+            + (old_std**2 + (old_mean - new_mean) ** 2) / (2 * new_std**2)
+            - 0.5
+        ).sum(-1)
+        values["ppo_ratio"] = np.exp(
+            values["ppo_new_log_prob"].astype(np.float64)[..., 0]
+            - old["ppo_old_log_prob"].astype(np.float64)[..., 0]
+        )
+        values["ppo_ratio_outside_clip"] = (
+            np.abs(values["ppo_ratio"] - 1) > algorithm.clip_param
+        )
+        if any(not np.isfinite(v).all() for v in values.values()):
+            raise ValueError("Nonfinite post-update policy probe")
+        self.rollouts[-1].update(values, post_update_complete=True)
+
+    def finish_block(self):
+        if not self.active:
+            return
+        if (
+            self.cycle not in self.metadata["block_end_cycles"]
+            or self.pending is not None
+            or len(self.samples) != self.metadata["decisions_per_block"]
+            or len(self.rollouts) != self.metadata["history_interval"]
+            or not all(r.get("post_update_complete", False) for r in self.rollouts)
+        ):
+            raise ValueError("Refuse to publish an incomplete telemetry block")
+        arrays = {k: np.stack([r[k] for r in self.samples]) for k in self.samples[0]}
+        arrays.update(
+            {
+                k: np.stack([r[k] for r in self.rollouts])
+                for k in self.rollouts[0]
+                if k != "post_update_complete"
+            }
+        )
+        arrays.update(
+            _snapshot(
+                {
+                    "column_id": self.exposure.columns,
+                    "level_id": self.exposure.levels,
+                    "profile_id": self.exposure.groups // 3,
+                }
+            )
+        )
+        arrays["metadata_json"] = np.asarray(json.dumps(self.metadata, sort_keys=True))
+        path = self.output / f"block_{self.cycle:06d}.npz"
+        # Exclusive creation and hash receipt: a partial file is never a completed block.
+        with path.open("xb") as stream:
+            np.savez_compressed(stream, **arrays)
+        self.files.append(
+            dict(
+                path=str(path.relative_to(self.output.parent)),
+                sha256=file_sha256(path),
+                end_cycle=self.cycle,
+                decisions=len(self.samples),
+                transition_rows=len(self.samples) * self.env.num_envs,
+            )
+        )
+        self.samples.clear()
+        self.rollouts.clear()
+        self.last_native_index = None
+        self.active = False
+
+    def finish(self):
+        if (
+            self.cycle != self.metadata["updates"]
+            or self.active
+            or self.pending is not None
+            or [f["end_cycle"] for f in self.files] != self.metadata["block_end_cycles"]
+        ):
+            raise ValueError("Telemetry did not complete every declared block")
+        self.complete = True
+
+    def report(self):
+        return dict(
+            self.metadata,
+            complete=self.complete,
+            files=list(self.files),
+            incomplete_block_decisions=len(self.samples),
+            pending_step=self.pending is not None,
+        )
 
 
 class OperatorControlTrace:

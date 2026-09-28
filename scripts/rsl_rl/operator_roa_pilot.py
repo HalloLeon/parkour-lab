@@ -232,6 +232,11 @@ def parse_args(argv=None):
     )
     parser.add_argument("--learning-updates", type=int)
     parser.add_argument(
+        "--training-telemetry",
+        action="store_true",
+        help="Passive sampled native reward/PPO credit traces for environment learning; no recipe change",
+    )
+    parser.add_argument(
         "--history-interval",
         type=int,
         default=HISTORY_INTERVAL,
@@ -258,6 +263,8 @@ def parse_args(argv=None):
     if args.seed < 0 or args.cpu_threads < 1:
         parser.error("seed must be nonnegative and cpu-threads positive")
     learning = args.learning_checkpoint or args.environment_checkpoint
+    if args.training_telemetry and args.environment_checkpoint is None:
+        parser.error("--training-telemetry requires --environment-checkpoint")
     if args.environment_layout is not None and args.environment_checkpoint is None:
         parser.error("--environment-layout requires --environment-checkpoint")
     args.environment_layout = args.environment_layout or "hills"
@@ -519,6 +526,7 @@ class PilotEnvironment:
         )
 
         self.env, self.app = env, app
+        self.telemetry = None
         self.history = CausalHistory()
         binding, digest = _runtime_motor_binding(env)
         self.manifest = {
@@ -625,9 +633,13 @@ class PilotEnvironment:
         delivered = self.bridge.encode(
             JointTargets(self.bridge.joint_names, targets, raw)
         )
+        if self.telemetry is not None:
+            self.telemetry.before_step(self.steps, stage, raw)
         with torch.no_grad():
             native, reward, terminated, timed_out, extras = self.env.step(delivered)
         self.bridge.verify_delivery(terminated, timed_out)
+        if self.telemetry is not None:
+            self.telemetry.after_step(reward, terminated, timed_out)
         done = terminated | timed_out
         self.previous = delivered.clone()
         self.steps += 1
@@ -660,6 +672,7 @@ def run_pilot(
     environment=False,
     layout="hills",
     history_interval=HISTORY_INTERVAL,
+    training_telemetry=False,
 ):
     started = time.perf_counter()
     stage = ENVIRONMENT_STAGES[layout] if environment else None
@@ -680,8 +693,11 @@ def run_pilot(
             environment=environment,
             layout=layout,
             history_interval=history_interval,
+            training_telemetry=training_telemetry,
         )
     finally:
+        if host.telemetry is not None:
+            report["training_telemetry"] = host.telemetry.report()
         set_training_mechanisms(env, active=False)
         if host.contacts is not None:
             report["teacher_contact_observations"] = host.contacts.report()
@@ -847,6 +863,7 @@ def _learn_pilot(
     environment=False,
     layout="hills",
     history_interval=HISTORY_INTERVAL,
+    training_telemetry=False,
 ):
     import torch
     from parkour_lab.learning.operator_roa import (
@@ -864,6 +881,8 @@ def _learn_pilot(
     validate_history_interval(history_interval, layout if environment else None)
     if environment and learning is None:
         raise ValueError("Environment learning requires a validated warm start")
+    if training_telemetry and not environment:
+        raise ValueError("Training telemetry requires environment learning")
     evaluation_seed = learning[3] + 1000 if environment else EVALUATION_SEED
     exposure = None
     stumble = None
@@ -995,6 +1014,19 @@ def _learn_pilot(
             "Privileged teacher shadow probes, not the causal actor's input dependence"
         )
     algorithm.init_storage("rl", env.num_envs, ROLLOUT_STEPS, obs, [12])
+    telemetry = None
+    if training_telemetry:
+        from .operator_control_trace import ROATrainingTelemetry
+
+        telemetry = host.telemetry = ROATrainingTelemetry(
+            env,
+            output,
+            exposure,
+            updates=len(coefficients),
+            history_interval=history_interval,
+            rollout_steps=ROLLOUT_STEPS,
+            history_steps=HISTORY_STEPS,
+        )
     optimizer = torch.optim.Adam(
         actor.estimator.parameters(), lr=1e-4 if environment else 1e-3
     )
@@ -1009,6 +1041,8 @@ def _learn_pilot(
             support.sample()
 
     def publish_exposure():
+        if telemetry is not None:
+            report["training_telemetry"] = telemetry.report()
         if exposure is not None:
             report["training_exposure"] = exposure.report()
         if support is not None:
@@ -1053,6 +1087,8 @@ def _learn_pilot(
         report.setdefault("checkpoints", []).append(receipt)
 
     for cycle, coefficient in enumerate(coefficients, 1):
+        if telemetry is not None:
+            telemetry.begin_cycle(cycle)
         record = {"cycle": cycle, "regularization_coefficient": coefficient}
         report["cycles"].append(record)
         set_phase(policy, algorithm.phase)
@@ -1069,7 +1105,11 @@ def _learn_pilot(
                     stumble.sample(done, command)
                 algorithm.process_env_step(obs, reward, done.long(), extras)
             algorithm.compute_returns(obs)
-        record["ppo_losses"] = algorithm.update()
+        if telemetry is not None and telemetry.active:
+            telemetry.capture_rollout(algorithm, obs)
+            record["ppo_losses"] = algorithm.update(after_update=telemetry.after_update)
+        else:
+            record["ppo_losses"] = algorithm.update()
         report["ppo_updates_completed"] += 1
         if learning is None and (
             min(
@@ -1118,6 +1158,8 @@ def _learn_pilot(
             observe=observe,
             after_step=stumble.sample if stumble is not None else None,
         )
+        if telemetry is not None:
+            telemetry.finish_block()
         print(
             f"ROA update {cycle}/{len(coefficients)}: history adaptation complete",
             flush=True,
@@ -1131,6 +1173,10 @@ def _learn_pilot(
         # Keep every cycle, but write the growing receipt only at complete H blocks.
         publish()
 
+    if telemetry is not None:
+        telemetry.finish()
+        report["training_telemetry"] = telemetry.report()
+        host.telemetry = None  # Frozen checks are deliberately outside the trace.
     set_training_mechanisms(env, active=False)
     policy.eval()
     set_phase(policy, "frozen")
@@ -1462,6 +1508,12 @@ def main(argv=None):
                 "5.2–8.4cm risers instead of bootstrap2–6cm; all other recipes unchanged. "
                 "Fixed band, not an adaptive curriculum, regularization test or qualification"
             )
+    if args.training_telemetry:
+        from .operator_control_trace import ROATrainingTelemetry
+
+        protocol["training_telemetry"] = ROATrainingTelemetry.recipe(
+            args.learning_updates, args.history_interval, ROLLOUT_STEPS, HISTORY_STEPS
+        )
     report = {
         "status": "RUNNING_NOT_QUALIFIED",
         "exit_allowed": False,
@@ -1551,6 +1603,7 @@ def main(argv=None):
             environment=environment,
             layout=args.environment_layout,
             history_interval=args.history_interval,
+            training_telemetry=args.training_telemetry,
         )
         if training.recurrent_training_identity(args.reference) != identity:
             raise RuntimeError("Source or runtime changed during learning pilot")
