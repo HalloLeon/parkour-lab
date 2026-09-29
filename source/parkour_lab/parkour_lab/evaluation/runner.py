@@ -10,7 +10,6 @@ import numpy as np
 import torch
 
 from parkour_lab.control.command_tape import TapeBuilder, validate_tape, write_tape
-from parkour_lab.methods.roa.runtime import roa_tensor_sha256
 from parkour_lab.runtime.native import NativeControllerSession
 
 
@@ -40,7 +39,7 @@ def evaluate(env, app, loaded, commands, output, report):
         env, loaded.controller, loaded.motor_contract, preserve_native_raw=True
     )
     controller = loaded.controller
-    before = roa_tensor_sha256(controller.motor, controller.estimator)
+    before = controller.state_sha256()
     recorder = TapeBuilder({"seed": env.cfg.seed, "controller_sha256": before})
     _, _ = env.reset(seed=env.cfg.seed)
     reset = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
@@ -85,7 +84,7 @@ def evaluate(env, app, loaded, commands, output, report):
             timeout_rows=timeout_count,
             motor_delivery=host.motor.progress(),
         )
-        after = roa_tensor_sha256(controller.motor, controller.estimator)
+        after = controller.state_sha256()
         if before != after:
             raise RuntimeError("Frozen evaluation changed controller weights")
         report["policy_unchanged"] = True

@@ -91,6 +91,10 @@ class Controller(Protocol):
 
     def reset(self, mask: torch.Tensor) -> None: ...
 
+    def state_sha256(self) -> str:
+        """Fingerprint trained weights/buffers/preprocessing, excluding episode memory."""
+        ...
+
     def act(self, inputs: ControllerInput) -> JointTargets: ...
 
 

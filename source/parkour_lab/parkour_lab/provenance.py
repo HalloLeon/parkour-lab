@@ -134,3 +134,29 @@ def package_source_identity():
         path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
         for path in sorted(root.rglob("*.py"))
     }
+
+
+def dependency_identity(module_name, distribution):
+    """Identify the imported dependency, including an editable pinned checkout.
+
+    This records evidence, not an exact-wheel admission gate. A wheel without
+    Git still records its version, module path and package-source hash.
+    """
+    from importlib import import_module
+    from importlib.metadata import version
+
+    module = import_module(module_name)
+    root = Path(module.__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*.py")):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(path.read_bytes())
+    receipt = {
+        "version": version(distribution),
+        "module_path": str(root),
+        "source_sha256": digest.hexdigest(),
+    }
+    if (root.parent / ".git").exists():
+        receipt["commit"] = _git(root.parent, "rev-parse", "HEAD").decode().strip()
+        receipt["dirty"] = bool(_git(root.parent, "status", "--porcelain"))
+    return receipt

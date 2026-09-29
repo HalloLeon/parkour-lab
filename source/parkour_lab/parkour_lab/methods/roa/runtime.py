@@ -175,6 +175,9 @@ class ROAHistoryController:
             },
         )
 
+    def state_sha256(self):
+        return roa_tensor_sha256(self.motor, self.estimator)
+
     @property
     def history_frames(self):
         return None if self._history.frames is None else self._history.frames.clone()

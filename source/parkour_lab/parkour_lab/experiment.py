@@ -1,10 +1,11 @@
 """Training orchestration: configuration, native lifecycle and current snapshots.
 
-The host manages run lifecycle; ROA owns its learning schedule and optimizer state.
+The host manages run lifecycle; each method owns learning and persistence.
 """
 
-from dataclasses import asdict
+import json
 from pathlib import Path
+import time
 
 from parkour_lab.provenance import write_json
 
@@ -12,37 +13,16 @@ from parkour_lab.provenance import write_json
 def train(env, app, config, output, report, *, checkpoint=None):
     from parkour_lab.artifacts import file_sha256, load_artifact, save_artifact
     from parkour_lab.config import ExperimentConfig
-    from parkour_lab.methods.roa.environment import ROAEnvironment
-    from parkour_lab.methods.roa.model import build_policy
-    from parkour_lab.methods.roa.training import ROATrainingMethod
+    from parkour_lab.methods import get_backend
+    from parkour_lab.runtime.training import TrainingHost
 
     config.validate_training()
-    host = ROAEnvironment(env, app, contact_conditioned=config.roa.contact_conditioned)
-    observations, _ = host.reset(seed=config.task.seed)
-    policy, _ = build_policy(
-        observations,
-        contact_conditioned=config.roa.contact_conditioned,
-        initial_action_std=config.roa.initial_action_std,
-    )
-    options = asdict(config.roa)
-    for key in ("contact_conditioned", "initial_action_std"):
-        options.pop(key)
-    method = ROATrainingMethod(
-        policy,
-        observations,
-        num_envs=env.num_envs,
-        device=env.device,
-        gamma=0.99,
-        lam=0.95,
-        clip_param=0.2,
-        value_loss_coef=1.0,
-        use_clipped_value_loss=True,
-        max_grad_norm=1.0,
-        **options,
-    )
+    host = TrainingHost(env, app)
+    backend = get_backend(config.method.name)
+    method = backend.create(host, config.method.options, config.task.seed)
     if checkpoint is not None:
         previous = load_artifact(checkpoint, kind="training")
-        if ExperimentConfig.from_dict(previous["config"]).roa != config.roa:
+        if ExperimentConfig.from_dict(previous["config"]).method != config.method:
             raise ValueError("Continuing learning requires unchanged method settings")
         from parkour_lab.runtime.motor import NativeJointTargetBridge
 
@@ -63,24 +43,28 @@ def train(env, app, config, output, report, *, checkpoint=None):
             "sha256": file_sha256(checkpoint),
         }
     report["initial_updates"] = method.updates
+    report["dependencies"] = backend.dependencies()
+    started = time.monotonic()
     write_json(Path(output) / "report.json", report)
     with (Path(output) / "metrics.jsonl").open("x") as stream:
         for index in range(config.updates):
-            observations, metrics = method.advance(host, observations)
-            import json
-
+            metrics = dict(method.advance())
+            metrics.update(
+                environment_transitions=host.steps * env.num_envs,
+                training_wall_seconds=time.monotonic() - started,
+            )
             stream.write(json.dumps(metrics, allow_nan=False) + "\n")
             stream.flush()
             report.update(
                 updates=method.updates,
                 environment_transitions=host.steps * env.num_envs,
-                adaptation_optimizer_steps=method.adaptation_optimizer_steps,
+                method_metrics=metrics,
             )
             if (
                 method.updates % config.save_interval == 0
                 or index + 1 == config.updates
             ):
-                path = Path(output) / f"checkpoint_{method.updates:06d}.pt"
+                path = Path(output) / f"checkpoint_{method.updates:06d}.plab"
                 save_artifact(
                     path,
                     kind="training",
@@ -92,7 +76,7 @@ def train(env, app, config, output, report, *, checkpoint=None):
                 )
                 report["checkpoint"] = str(path)
                 write_json(Path(output) / "report.json", report)
-            print(f"Update {method.updates}: {metrics['ppo_losses']}", flush=True)
+            print(f"Update {method.updates}: {metrics}", flush=True)
     report["motor_delivery"] = host.bridge.progress()
     report["status"] = "TRAINING_COMPLETE_NOT_QUALIFIED"
     # Evaluation/export are explicit operations, never inferred from training loss.

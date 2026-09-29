@@ -36,7 +36,7 @@ def parse_args(argv=None):
             command.add_argument(
                 "--updates",
                 type=int,
-                help="Additional updates; not a wall-clock guarantee",
+                help="Additional method-owned collection/update cycles; not equal compute or a time guarantee",
             )
             command.add_argument(
                 "--checkpoint",
@@ -72,19 +72,27 @@ def parse_args(argv=None):
 
 
 def resolve_config(args):
-    if args.config is not None:
-        config = ExperimentConfig.load(args.config)
-    else:
-        artifact = getattr(args, "checkpoint", None) or getattr(args, "actor", None)
-        if artifact is None:
-            config = ExperimentConfig()
-        else:
-            from parkour_lab.artifacts import load_artifact
+    artifact = getattr(args, "checkpoint", None) or getattr(args, "actor", None)
+    values = {}
+    if artifact is not None:
+        from parkour_lab.artifacts import load_artifact
 
-            data = load_artifact(
-                artifact, kind="training" if args.operation == "train" else "actor"
-            )
-            config = ExperimentConfig.from_dict(data["config"])
+        values = load_artifact(
+            artifact, kind="training" if args.operation == "train" else "actor"
+        )["config"]
+    if args.config is not None:
+        supplied = json.loads(args.config.read_text())
+        explicit = ExperimentConfig.from_dict(supplied)
+        if values:
+            frozen = ExperimentConfig.from_dict(values)
+            if "method" in supplied and explicit.method != frozen.method:
+                raise ValueError("Artifact method settings cannot be overridden")
+        values = {
+            **values,
+            **supplied,
+            "task": {**values.get("task", {}), **supplied.get("task", {})},
+        }
+    config = ExperimentConfig.from_dict(values)
     overrides = {
         key: getattr(args, key)
         for key in ("device", "seed", "num_envs")
@@ -113,6 +121,9 @@ def main(argv=None, *, standalone=False):
     config = resolve_config(args)
     if args.operation == "train":
         config.validate_training()
+    from parkour_lab.methods import get_backend
+
+    dependencies = get_backend(config.method.name).dependencies()
     import numpy as np
     import torch
 
@@ -148,6 +159,7 @@ def main(argv=None, *, standalone=False):
         "exit_allowed": False,
         "operation": args.operation,
         "config": config.to_dict(),
+        "dependencies": dependencies,
         "package_sources": package_source_identity(),
     }
 
