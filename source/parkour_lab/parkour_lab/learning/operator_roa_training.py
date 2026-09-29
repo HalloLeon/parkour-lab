@@ -1,4 +1,4 @@
-"""Explicit fixed-RSL PPO objective for the bounded ROA training pilot."""
+"""ROA training method: PPO collection/update and teacher-to-history fitting."""
 
 import math
 
@@ -6,7 +6,253 @@ import torch
 from torch import nn
 from rsl_rl.algorithms import PPO
 
-from .operator_roa import ROAActor, gradient_norms, set_phase, state_sha256
+from .operator_roa import (
+    FRAME_DIM,
+    HISTORY_LENGTH,
+    ROAActor,
+    gradient_norms,
+    set_phase,
+    state_sha256,
+)
+
+
+class ROATrainingMethod:
+    """Real ROA collection/update/adaptation with the legacy checkpoint payload.
+
+    The pilot still owns ROA admission, scheduling and diagnostic gates. This
+    adapter isolates the learner lifecycle without claiming that its simulator
+    provider or experiment runner can already host an arbitrary learner.
+    """
+
+    def __init__(
+        self,
+        policy,
+        observations,
+        *,
+        num_envs,
+        rollout_steps,
+        history_steps,
+        adaptation_epochs,
+        adaptation_batches,
+        adaptation_learning_rate,
+        **ppo_options,
+    ):
+        self.policy = policy
+        self.rollout_steps = rollout_steps
+        self.history_options = {
+            "history_steps": history_steps,
+            "epochs": adaptation_epochs,
+            "minibatches": adaptation_batches,
+        }
+        self.algorithm = ROAPPO(policy, **ppo_options)
+        self.algorithm.init_storage("rl", num_envs, rollout_steps, observations, [12])
+        self.adaptation_optimizer = torch.optim.Adam(
+            policy.actor.estimator.parameters(), lr=adaptation_learning_rate
+        )
+
+    @torch.no_grad()
+    def collect(self, environment, observations, *, before_step=None, after_step=None):
+        """Collect one PPO batch; the caller configures its regularization."""
+        algorithm = self.algorithm
+        algorithm.start_phase()
+        for _ in range(self.rollout_steps):
+            if before_step is not None:
+                before_step()
+            action = algorithm.act(observations)
+            command = (
+                observations["policy"][:, 6:9].clone()
+                if after_step is not None
+                else None
+            )
+            observations, reward, done, extras = environment.step(
+                action, algorithm.phase + "_ppo"
+            )
+            if after_step is not None:
+                after_step(done, command)
+            algorithm.process_env_step(observations, reward, done.long(), extras)
+        algorithm.compute_returns(observations)
+        return observations
+
+    def update(self, observations, *, observer=None):
+        if observer is not None and observer.active:
+            observer.capture_rollout(self.algorithm, observations)
+            return self.algorithm.update(after_update=observer.after_update)
+        return self.algorithm.update()
+
+    def adapt(self, environment, observations, record, report, **options):
+        return adapt_history(
+            environment,
+            self.policy,
+            self.adaptation_optimizer,
+            observations,
+            record,
+            report,
+            **self.history_options,
+            **options,
+        )
+
+    def state_dict(self):
+        """Snapshot at an update boundary; no simulator/RNG resume claim."""
+        if self.algorithm.storage.step:
+            raise ValueError("Cannot checkpoint an in-flight ROA rollout")
+        self.algorithm.check_fixed_action_std()
+        return {
+            "policy_state": self.policy.state_dict(),
+            "ppo_optimizer": self.algorithm.optimizer.state_dict(),
+            "adaptation_optimizer": self.adaptation_optimizer.state_dict(),
+        }
+
+    def load_state_dict(self, state):
+        """Restore a verified, same-configuration learning snapshot, not a rollout."""
+        if self.algorithm.storage.step:
+            raise ValueError("Cannot restore over an in-flight ROA rollout")
+        if set(state) != {"policy_state", "ppo_optimizer", "adaptation_optimizer"}:
+            raise ValueError("ROA learning state requires policy and both optimizers")
+        parameters = state["policy_state"]
+        std = parameters.get("std")
+        if (
+            not isinstance(std, torch.Tensor)
+            or std.shape != self.policy.std.shape
+            or (std <= 0).any()
+            or any(not torch.isfinite(value).all() for value in parameters.values())
+        ):
+            raise ValueError(
+                "ROA learning state requires finite weights and positive action std"
+            )
+        fixed = self.algorithm.fixed_action_std
+        if fixed is not None and not torch.equal(std.to(fixed), fixed):
+            raise ValueError("ROA learning state differs from the fixed action std")
+        self.policy.load_state_dict(parameters, strict=True)
+        self.algorithm.optimizer.load_state_dict(state["ppo_optimizer"])
+        self.adaptation_optimizer.load_state_dict(state["adaptation_optimizer"])
+        self.algorithm.learning_rate = self.algorithm.optimizer.param_groups[0]["lr"]
+        self.algorithm.start_phase()
+
+
+def adapt_history(
+    host,
+    policy,
+    optimizer,
+    obs,
+    record,
+    report,
+    *,
+    require_change,
+    history_steps,
+    epochs,
+    minibatches,
+    observe=None,
+    after_step=None,
+    velocity_head=None,
+):
+    """Collect with fixed causal weights, then fit only the history estimator."""
+    actor, env = policy.actor, host.env
+
+    def frames(observations):
+        return observations["history"].reshape(-1, HISTORY_LENGTH, FRAME_DIM)
+
+    def privileged_hashes():
+        return {
+            name: state_sha256(module)
+            for name, module in (
+                ("motor", actor.motor),
+                ("encoder", actor.encoder),
+                ("critic", policy.critic),
+            )
+        }
+
+    # Collect the whole history-owned block with fixed weights. Fit only
+    # afterwards, so no action can incorporate its own privileged label.
+    set_phase(policy, "frozen")
+    fixed_hashes = privileged_hashes()
+    fixed_std = policy.std.detach().clone()
+    fixed_estimator = state_sha256(actor.estimator)
+    samples = []
+    with torch.no_grad():
+        for _ in range(history_steps):
+            if observe is not None:
+                observe()
+            sample = (frames(obs).clone(), obs["critic_state"][:, :3].clone())
+            if velocity_head is None:
+                sample += (actor.privileged_input(obs).clone(),)
+            samples.append(sample)
+            action = actor.history_action(obs["policy"], frames(obs))
+            command = obs["policy"][:, 6:9].clone() if after_step is not None else None
+            obs, _, done, _ = host.step(action, "history_adaptation")
+            if after_step is not None:
+                after_step(done, command)
+    record["estimator_unchanged_during_history_collection"] = (
+        state_sha256(actor.estimator) == fixed_estimator
+    )
+    if not record["estimator_unchanged_during_history_collection"]:
+        raise RuntimeError("History estimator changed before block collection ended")
+    histories, velocities, *privilege = (
+        torch.cat(values, dim=0) for values in zip(*samples)
+    )
+    del samples
+    if velocity_head is not None:
+        with torch.no_grad():
+            features = actor.estimator[:-1](histories.flatten(1))
+        trainable = velocity_head
+    else:
+        trainable = tuple(actor.estimator.parameters())
+
+    def adaptation_loss(indices=slice(None)):
+        if velocity_head is not None:
+            predicted = torch.nn.functional.linear(features[indices], *velocity_head)
+            return {
+                "velocity": torch.nn.functional.mse_loss(predicted, velocities[indices])
+            }
+        return actor.adaptation_losses(
+            histories[indices], privilege[0][indices], velocities[indices]
+        )
+
+    with torch.no_grad():
+        before = adaptation_loss()
+    record["adaptation_before"] = {name: float(value) for name, value in before.items()}
+    if velocity_head is None:
+        set_phase(policy, "history")
+    for _ in range(epochs):
+        for indices in torch.randperm(len(histories), device=env.device).chunk(
+            minibatches
+        ):
+            optimizer.zero_grad(set_to_none=True)
+            losses = adaptation_loss(indices)
+            loss = (
+                losses["latent"] + losses["velocity"]
+                if velocity_head is None
+                else losses["velocity"]
+            )
+            if not torch.isfinite(loss):
+                raise RuntimeError("Nonfinite ROA adaptation loss")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0, error_if_nonfinite=True)
+            optimizer.step()
+            report["adaptation_optimizer_steps"] += 1
+    with torch.no_grad():
+        after = adaptation_loss()
+        if velocity_head is not None:
+            actor.estimator[-1].weight[:3].copy_(velocity_head[0])
+            actor.estimator[-1].bias[:3].copy_(velocity_head[1])
+    record["adaptation_after"] = {name: float(value) for name, value in after.items()}
+    record["privileged_modules_unchanged_during_adaptation"] = (
+        fixed_hashes == privileged_hashes() and torch.equal(fixed_std, policy.std)
+    )
+    record["estimator_changed_during_adaptation"] = (
+        state_sha256(actor.estimator) != fixed_estimator
+    )
+    if not record["privileged_modules_unchanged_during_adaptation"] or (
+        require_change and not record["estimator_changed_during_adaptation"]
+    ):
+        raise RuntimeError(
+            "ROA adaptation violated optimizer ownership or did not learn"
+        )
+    if (
+        not all(torch.isfinite(p).all() for p in policy.parameters())
+        or (policy.std <= 0).any()
+    ):
+        raise RuntimeError("Invalid ROA parameters")
+    return obs
 
 
 class ROAPPO(PPO):

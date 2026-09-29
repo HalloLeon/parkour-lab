@@ -28,7 +28,7 @@ def parse_args(argv=None):
         "--checkpoint",
         type=Path,
         required=True,
-        help="Completed ROA learning or estimator-refinement checkpoint",
+        help="Completed ROA checkpoint, or a listed evaluation-only snapshot of a completed learning curve",
     )
     parser.add_argument("--controller-artifact", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=1043)
@@ -123,7 +123,7 @@ def main(argv=None):
 
     execution = configure_live_execution(args.cpu_threads)
     from . import operator_train as training
-    from .operator_roa_checkpoint import load_completed_checkpoint, verify_source_files
+    from .operator_roa_checkpoint import load_screen_checkpoint, verify_source_files
     from .operator_roa_pilot import PilotEnvironment, validate_events, finish_session
     from .operator_backend import load_controller_artifact
     from .operator_roa_evaluation import (
@@ -162,7 +162,7 @@ def main(argv=None):
     agent = training.read_yaml_data(args.reference.parent / "params/agent.yaml")
     saved = training.read_yaml_data(args.reference.parent / "params/env.yaml")
     training.load_reference_checkpoint(args.reference, agent)
-    policy, contract, _, source = load_completed_checkpoint(args.checkpoint)
+    policy, contract, _, source = load_screen_checkpoint(args.checkpoint)
     loaded = load_controller_artifact(
         args.controller_artifact, backend="roa_history_v1"
     )

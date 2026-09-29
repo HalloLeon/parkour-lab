@@ -992,6 +992,163 @@ def load_completed_checkpoint(
     return policy, saved["motor_contract"], saved["motor_manifest"], receipt
 
 
+def _validate_snapshot_adam(optimizer, parameters, steps):
+    """A snapshot must carry the uninterrupted, finite Adam state for its prefix."""
+    groups, states = optimizer["param_groups"], optimizer["state"]
+    if (
+        len(groups) != 1
+        or groups[0]["params"] != list(range(len(parameters)))
+        or len(states) != len(parameters)
+        or set(groups[0]["params"]) != set(states)
+        or groups[0]["lr"] != 1e-4
+        or tuple(groups[0]["betas"]) != (0.9, 0.999)
+        or groups[0]["eps"] != 1e-8
+        or groups[0]["weight_decay"] != 0
+    ):
+        raise ValueError("Learning-curve Adam ownership or recipe changed")
+    for index, parameter in zip(groups[0]["params"], parameters, strict=True):
+        state = states[index]
+        if (
+            set(state) != {"step", "exp_avg", "exp_avg_sq"}
+            or state["step"].numel() != 1
+            or state["step"].item() != steps
+            or any(
+                state[key].shape != parameter.shape
+                or state[key].dtype != parameter.dtype
+                or not torch.isfinite(state[key]).all()
+                for key in ("exp_avg", "exp_avg_sq")
+            )
+            or (state["exp_avg_sq"] < 0).any()
+        ):
+            raise ValueError(
+                "Learning-curve Adam state does not match the selected update"
+            )
+
+
+def load_screen_checkpoint(path):
+    """Frozen-only snapshots require a fully admitted terminal run, never a resume.
+
+    Training entry points deliberately keep using load_completed_checkpoint.
+    No prefix report or prefix native evaluation is synthesized here.
+    """
+    from .operator_roa_pilot import LEARNING_CURVE_UPDATES, learning_curve_recipe
+
+    path = Path(path).resolve(strict=True)
+    protocol_path = path.parent / "training_protocol.json"
+    protocol_bytes = protocol_path.read_bytes()
+    protocol = json.loads(protocol_bytes)
+    if "learning_curve" not in protocol:
+        return load_completed_checkpoint(path)
+    try:
+        report_path = path.parent / "report.json"
+        report_bytes = report_path.read_bytes()
+        report = json.loads(report_bytes)
+        if (
+            protocol["learning_curve"] != learning_curve_recipe()
+            or protocol["environment_layout"]
+            not in ("contact_approach", "contact_acquire")
+            or protocol["cycles"] != 6000
+            or protocol["history_interval"] != 5
+            or protocol["num_envs"] != 160
+            or any(protocol["regularization_coefficients"])
+            or "entropy_ablation" in protocol
+            or report["ppo_options"]["entropy_coef"] != 0.01
+            or report["ppo_options"]["num_learning_epochs"] != 5
+            or report["ppo_options"]["num_mini_batches"] != 4
+            or report["cleanup"]["environment"] != "complete"
+            or [item["ppo_updates"] for item in report["checkpoints"]]
+            != list(LEARNING_CURVE_UPDATES)
+            or set(report["checkpoint_policy_sha256"])
+            != {str(n) for n in LEARNING_CURVE_UPDATES}
+        ):
+            raise ValueError("Invalid completed learning-curve recipe")
+        terminal = path.parent / "learning_6000.pt"
+        _, contract, manifest, receipt = load_completed_checkpoint(terminal)
+        for metadata_path, data in (
+            (protocol_path, protocol_bytes),
+            (report_path, report_bytes),
+        ):
+            if hashlib.sha256(data).hexdigest() != receipt["files"][str(metadata_path)]:
+                raise ValueError("Learning-curve metadata changed during admission")
+        entries = {item["path"]: item for item in report["checkpoints"]}
+        entry = entries[path.name]
+        updates = entry["ppo_updates"]
+        encoded = path.read_bytes()
+        digest = hashlib.sha256(encoded).hexdigest()
+        if entry != dict(
+            path=f"learning_{updates}.pt", sha256=digest, ppo_updates=updates
+        ):
+            raise ValueError("Learning-curve snapshot hash or path changed")
+        saved = torch.load(io.BytesIO(encoded), map_location="cpu", weights_only=True)
+        if (
+            set(saved)
+            != {
+                "version",
+                "readiness_only",
+                "deployment_allowed",
+                "policy_state",
+                "ppo_optimizer",
+                "adaptation_optimizer",
+                "motor_contract",
+                "motor_manifest",
+                "completed_cycles",
+                "regularization_coefficients",
+                "history_interval",
+                "learning_source",
+            }
+            or saved["version"] != protocol["version"]
+            or type(saved["completed_cycles"]) is not int
+            or saved["completed_cycles"] != updates
+            or saved["history_interval"] != 5
+            or saved["readiness_only"] is not True
+            or saved["deployment_allowed"] is not False
+            or saved["learning_source"] != protocol["learning_source"]
+            or list(saved["regularization_coefficients"])
+            != protocol["regularization_coefficients"][:updates]
+            or saved["motor_contract"] != contract
+            or saved["motor_manifest"] != manifest
+        ):
+            raise ValueError(
+                "Learning-curve snapshot differs from its completed trajectory"
+            )
+        policy = _validated_policy(
+            saved,
+            {"policy_state_sha256": report["checkpoint_policy_sha256"][str(updates)]},
+            contact_conditioned=True,
+        )
+        for name, estimator, steps in (
+            ("ppo_optimizer", False, updates * 20),
+            ("adaptation_optimizer", True, updates // 5 * 16),
+        ):
+            parameters = [
+                p
+                for key, p in policy.named_parameters()
+                if key.startswith("actor.estimator.") == estimator
+            ]
+            _validate_snapshot_adam(saved[name], parameters, steps)
+        if path != terminal:
+            receipt = dict(
+                receipt,
+                files={**receipt["files"], str(path): digest},
+                checkpoint_sha256=digest,
+                policy_state_sha256=state_sha256(policy),
+                learning_updates=receipt["learning_updates"] - 6000 + updates,
+                stage_learning_updates=updates,
+                stage_adaptation_optimizer_steps=updates // 5 * 16,
+                total_adaptation_optimizer_steps=receipt[
+                    "inherited_adaptation_optimizer_steps"
+                ]
+                + updates // 5 * 16,
+                stage="learning_curve_snapshot",
+                terminal_checkpoint_sha256=receipt["checkpoint_sha256"],
+                scope="Frozen evaluation-only prefix of a completed 6000-update trajectory; not a completed prefix experiment, training source, resume or promotion",
+            )
+        verify_source_files(receipt)
+        return policy, contract, manifest, receipt
+    except (KeyError, TypeError, AttributeError, RuntimeError, OverflowError) as error:
+        raise ValueError("Malformed or incomplete learning-curve snapshot") from error
+
+
 def export_roa_actor(checkpoint, output):
     from parkour_lab.learning.operator_roa_runtime import (
         ROAHistoryController,
@@ -1000,7 +1157,7 @@ def export_roa_actor(checkpoint, output):
         _load_actor_bytes,
     )
 
-    policy, contract, manifest, receipt = load_completed_checkpoint(checkpoint)
+    policy, contract, manifest, receipt = load_screen_checkpoint(checkpoint)
     output = Path(output).resolve()
     if any(output.is_relative_to(Path(name).parent) for name in receipt["files"]):
         raise ValueError("Export outside the immutable training run")

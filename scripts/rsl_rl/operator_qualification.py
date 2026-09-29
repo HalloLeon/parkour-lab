@@ -1,4 +1,4 @@
-"""Strict, offline kinematic component for a future qualification protocol.
+"""Declared terrain exit contract and strict offline kinematic component.
 
 This module does not launch simulations or certify terrain/physical/operator
 acceptance. The caller supplies an independently declared constant-command tape
@@ -22,6 +22,106 @@ except ImportError:
 
 
 VERSION = "operator_qualification_kinematic_component_v1"
+
+
+def qualification_contract():
+    """Return an independent, JSON-ready copy of the agreed project target.
+
+    These ROA-inspired engineering choices are not an official ROA benchmark.
+    This declaration neither generates native terrain nor reserves a test bank;
+    the existing kinematic component cannot certify this complete contract.
+    """
+    return {
+        "version": "go2_roa_inspired_sim_exit_v1",
+        "status": "DECLARED_NOT_EVALUATED",
+        "qualification_bank": None,
+        "target_met": False,
+        "exit_allowed": False,
+        "terrain": {
+            "steps": {
+                "realized_riser_levels_m": [0.04, 0.08, 0.12, 0.16],
+                "tread_range_m": [0.31, 0.50],
+                "required_shapes": ["isolated_step", "stair_flight"],
+                "flight_step_count_range": [4, 6],
+                "directions": ["ascent", "descent"],
+            },
+            "inclines": {
+                "grade_levels_deg": [10.0, 15.0, 20.0],
+                "required_shapes": ["ramp", "rounded_hill"],
+                "directions": ["ascent", "descent"],
+                "transitions_and_crests_required": True,
+            },
+            "roughness": {
+                "required_on": ["level", "steps", "inclines"],
+                "octaves": 2,
+                "lacunarity": 2.0,
+                "gain": 0.25,
+                "intermediate_residual_abs_cap_m": 0.02,
+                "maximum_geometry_residual_abs_cap_m": 0.01,
+                "nonzero_multiscale_content_required": True,
+                "combined_smooth_support_inclination_cap_deg": 25.0,
+                "intentional_riser_faces_excluded_from_slope_cap": True,
+            },
+            "optional_bank_deg": 12.0,
+            "limits_apply_after_roughness": True,
+            "measured_native_geometry_required": True,
+            "excluded": ["gaps", "floorless_holes", "mandatory_jumps"],
+        },
+        "sampling": {
+            "minimum_attempts_per_group": 100,
+            "minimum_observed_completion_fraction": 0.90,
+            "group_by": ["terrain_shape", "direction"],
+            "maximum_difficulty_separate_group": True,
+            "heldout_geometry_required": True,
+            "freeze_bank_before_qualification": True,
+            "first_attempt_only": True,
+            "report_counts_and_uncertainty": True,
+            "confidence_bound_requirement": None,
+        },
+        "completion": {
+            "ordered_full_obstacle_traversal_required": True,
+            "upright_exit_duration_s": 2.0,
+            "failures": [
+                "missing_evidence",
+                "incomplete_tape",
+                "fall",
+                "stall",
+                "off_course",
+                "timeout",
+                "reset_assistance",
+            ],
+            "same_checkpoint_across_required_groups": True,
+            "causal_student_only": True,
+            "privileged_input_at_evaluation_allowed": False,
+            "flat_command_following_stopping_turning_required": True,
+            "steep_reverse_required": False,
+        },
+        "architecture": {
+            "default_method": "roa_like_teacher_history_student",
+            "training_method_interface_required": True,
+            "inference_backbone_only_is_sufficient": False,
+            "external_method_adapter_targets": ["DreamFLEX", "DreamerV3_like"],
+            "external_implementation_rewrite_required": False,
+            "shared_environment_and_evaluation_required": True,
+            "demonstrated_alternative_training_cycle_required": True,
+        },
+        "review": {
+            "minimum_score": 18,
+            "maximum_score": 20,
+            "maximum_review_count": None,
+            "independent_critic_required": True,
+            "native_terrain_and_architecture_evidence_required": True,
+            "hardware_transfer_required": False,
+            "hardware_fault_recovery_required": False,
+            "outperform_roa_required": False,
+        },
+        "sources": {
+            "terrain_reference": "https://github.com/chengxuxin/extreme-parkour/blob/main/legged_gym/legged_gym/utils/terrain.py",
+            "terrain_default_weights": "https://github.com/chengxuxin/extreme-parkour/blob/main/legged_gym/legged_gym/envs/base/legged_robot_config.py",
+            "roa_fractal_reference": "https://proceedings.mlr.press/v205/fu23a/fu23a-supp.pdf",
+            "attribution": "Project choices: conventional reference stairs/ramps have zero default weight; roughness amplitudes are not upstream ROA thresholds.",
+        },
+    }
 
 
 def _steps(seconds, dt, label):

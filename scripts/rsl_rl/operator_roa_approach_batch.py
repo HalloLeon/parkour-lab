@@ -1,13 +1,19 @@
-"""Bounded approach trials and optional paired raised-start controls; never promotion.
+"""Configurable ROA development experiments; never qualification or promotion.
 
 Run with the Isaac Lab Python from the repository root. Children are sequential,
 without execution timeouts. Each owns a fresh directory and process receipt.
+Use --config FILE (or - for JSON on stdin) for explicit training cases and screen
+selection. The original CLI remains available for historical run recovery.
 """
 
 import argparse
+import csv
+import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -19,9 +25,17 @@ from .operator_roa_checkpoint import (
     _validate_completion,
     export_roa_actor,
     load_completed_checkpoint,
+    load_screen_checkpoint,
     verify_source_files,
 )
-from .operator_roa_pilot import ENVIRONMENT_STAGES, load_environment_source
+from .operator_roa_pilot import (
+    ENVIRONMENT_STAGES,
+    LEARNING_CURVE_UPDATES,
+    learning_curve_recipe,
+    learning_coefficients,
+    load_environment_source,
+    parse_args as training_args,
+)
 from .operator_roa_evaluation import (
     COMMAND_TAPE,
     _hash_tensors,
@@ -86,6 +100,211 @@ def identity_sha256(identity):
     ).hexdigest()
 
 
+def experiment_config(value):
+    """Validate data, not executable commands; native child admission stays strict."""
+    require(
+        type(value) is dict
+        and set(value) == {"version", "trials", "screens", "routes"}
+        and type(value["version"]) is int
+        and value["version"] == 1,
+        "Config requires version=1, trials, screens and routes",
+    )
+    require(type(value["trials"]) is list and value["trials"], "Empty trial list")
+    names, trials = set(), []
+    for raw in value["trials"]:
+        require(
+            type(raw) is dict
+            and set(raw)
+            == {
+                "name",
+                "layout",
+                "seed",
+                "updates",
+                "history_interval",
+                "regularization",
+                "num_envs",
+            },
+            "Each trial needs name/layout/seed/updates/history_interval/regularization/num_envs",
+        )
+        name = raw["name"]
+        require(
+            isinstance(name, str)
+            and re.fullmatch(r"[a-z][a-z0-9_-]*", name)
+            and name != "parent"
+            and name not in names,
+            "Trial names must be unique safe directory names, excluding parent",
+        )
+        require(
+            raw["layout"] in ("contact_approach", "contact_acquire", "contact_continue")
+            and raw["regularization"] in ("off", "ramp")
+            and all(
+                type(raw[k]) is int and raw[k] > 0
+                for k in ("updates", "history_interval", "num_envs")
+            )
+            and type(raw["seed"]) is int
+            and raw["seed"] >= 0,
+            "Invalid trial settings",
+        )
+        trial = {**raw, "label": name}
+        # Parse the actual pilot CLI before starting any children. Do not silently
+        # broaden the checkpoint/training recipes supported by that implementation.
+        training_args(
+            [
+                "reference.pt",
+                "--environment-checkpoint",
+                "parent.pt",
+                *trial_arguments(trial),
+            ]
+        )
+        names.add(name)
+        trials.append(trial)
+    for key, choices in (
+        ("screens", SCREENS),
+        ("routes", ("causal", "privileged_latent")),
+    ):
+        entries = value[key]
+        require(
+            type(entries) is list
+            and entries
+            and all(isinstance(x, str) and x in choices for x in entries)
+            and len(set(entries)) == len(entries),
+            f"Invalid or duplicate {key}",
+        )
+    require(value["routes"][0] == "causal", "Causal screens must run first")
+    return {**value, "trials": trials}
+
+
+def trial_arguments(trial):
+    """One path from declared settings to the training child command."""
+    return [
+        "--environment-layout",
+        trial["layout"],
+        "--regularization",
+        trial["regularization"],
+        "--orientation-weight",
+        "-2.5",
+        "--stumble-weight",
+        "0",
+        "--learning-updates",
+        str(trial["updates"]),
+        "--history-interval",
+        str(trial["history_interval"]),
+        "--num-envs",
+        str(trial["num_envs"]),
+        "--seed",
+        str(trial["seed"]),
+        "--training-telemetry",
+    ]
+
+
+def gpu_inventory():
+    """Fail closed if GPU/process accounting is unavailable; never kill processes."""
+
+    def query(arguments):
+        result = subprocess.run(
+            ["nvidia-smi", *arguments, "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return list(csv.reader(result.stdout.splitlines(), skipinitialspace=True))
+
+    processes = query(["--query-compute-apps=gpu_uuid"])
+    require(
+        all(
+            len(row) == 1 and re.fullmatch(r"GPU-[a-fA-F0-9-]+", row[0])
+            for row in processes
+        ),
+        "GPU process accounting is unavailable or malformed",
+    )
+    busy = {row[0] for row in processes}
+    return [
+        dict(
+            index=index,
+            uuid=uuid,
+            name=name,
+            memory_mib=int(memory),
+            utilization=int(utilization),
+            compute_busy=uuid in busy,
+        )
+        for index, uuid, name, memory, utilization in query(
+            ["--query-gpu=index,uuid,name,memory.used,utilization.gpu"]
+        )
+    ]
+
+
+def idle_gpu(model):
+    """Select within existing CUDA visibility and acquire a cooperative host lock.
+
+    This does not reserve a GPU against noncooperating jobs. Use the cluster
+    scheduler for exclusive allocation when available. File stays; flock is
+    released on close/process exit, so a crashed run cannot leave a stale lease.
+    """
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible = None if visible is None else {x.strip() for x in visible.split(",")}
+    require(
+        visible is None or all(x.startswith("GPU-") for x in visible),
+        "--idle-gpu requires UUID-based CUDA visibility or an unset CUDA_VISIBLE_DEVICES; for a scheduler-assigned numeric device, omit --idle-gpu",
+    )
+    for gpu in gpu_inventory():
+        if (
+            model not in gpu["name"]
+            or gpu["compute_busy"]
+            or gpu["memory_mib"] > 256
+            or gpu["utilization"] > 5
+            or (visible is not None and not (gpu["uuid"] in visible))
+        ):
+            continue
+        require(re.fullmatch(r"GPU-[a-fA-F0-9-]+", gpu["uuid"]), "Invalid GPU UUID")
+        try:
+            lock = str(Path("/tmp") / f"parkour-{gpu['uuid']}.lock")
+            flags = os.O_RDONLY | os.O_NOFOLLOW
+            try:
+                descriptor = os.open(lock, flags)
+            except FileNotFoundError:
+                descriptor = os.open(lock, flags | os.O_CREAT | os.O_EXCL, 0o644)
+            lease = os.fdopen(descriptor, "r")
+        except (PermissionError, FileExistsError):
+            continue
+        try:
+            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lease.close()
+            continue
+        try:
+            current = next(g for g in gpu_inventory() if g["uuid"] == gpu["uuid"])
+            if (
+                current["compute_busy"]
+                or current["memory_mib"] > 256
+                or current["utilization"] > 5
+            ):
+                lease.close()
+                continue
+        except BaseException:
+            lease.close()
+            raise
+        return lease, current
+    raise ValueError(f"No idle visible {model!r} GPU; no job started")
+
+
+def require_idle_gpu(uuid):
+    # Utilization is sampled over a driver interval and may lag an exited child.
+    # Retry that case briefly; an actual compute process is never ignored.
+    for attempt in range(4):
+        current = next(g for g in gpu_inventory() if g["uuid"] == uuid)
+        require(
+            not current["compute_busy"],
+            "Selected GPU has another compute process; batch stopped",
+        )
+        if current["memory_mib"] <= 256 and current["utilization"] <= 5:
+            return
+        if attempt < 3:
+            time.sleep(1)
+    raise ValueError(
+        "Selected GPU is no longer idle; batch stopped without killing any process"
+    )
+
+
 def trace_check(path, expected_hash):
     require(file_sha256(path) == expected_hash, f"Trace changed: {path}")
     with np.load(path, allow_pickle=False) as arrays:
@@ -133,18 +352,38 @@ def seed_admission(seed, *, paired):
     return result
 
 
-def train_check(run, expected, *, seed=1063, layout="contact_approach", source=None):
+def train_check(
+    run,
+    expected,
+    *,
+    seed=1063,
+    layout="contact_approach",
+    source=None,
+    learning_curve=False,
+    updates=None,
+    history_interval=5,
+    regularization="off",
+    num_envs=160,
+):
     report, protocol = read(run / "report.json"), read(run / "training_protocol.json")
     stage = ENVIRONMENT_STAGES[layout]
     approach = layout == "contact_approach"
+    updates = updates if updates is not None else 6000 if learning_curve else 1000
     require(
-        layout in ("contact_approach", "contact_acquire")
+        protocol.get("learning_curve")
+        == (learning_curve_recipe() if learning_curve else None),
+        "Training learning-curve recipe changed",
+    )
+    require(
+        layout in ("contact_approach", "contact_acquire", "contact_continue")
         and protocol["environment_layout"] == layout
         and protocol["version"] == stage.version
         and protocol["seed"] == seed
-        and protocol["num_envs"] == 160
-        and protocol["history_interval"] == 5
-        and protocol["cycles"] == 1000
+        and protocol["num_envs"] == num_envs
+        and protocol["history_interval"] == history_interval
+        and protocol["cycles"] == updates
+        and protocol["regularization_coefficients"]
+        == list(learning_coefficients(regularization, updates))
         and report["native_step_field_geometry"]["seed"] == seed
         and all(
             report[key]["seed"] == seed + 1000
@@ -170,7 +409,12 @@ def train_check(run, expected, *, seed=1063, layout="contact_approach", source=N
         ),
         "Training occupancy recipe changed; approaches require workspace-admitted v2",
     )
-    _validate_completion(report, stage.status, 38600, 160)
+    _validate_completion(
+        report,
+        stage.status,
+        updates * 24 + updates // history_interval * 64 + 1800,
+        num_envs,
+    )
     require(
         protocol["source_identity"] == expected, "Training runtime/reference changed"
     )
@@ -179,8 +423,8 @@ def train_check(run, expected, *, seed=1063, layout="contact_approach", source=N
         "Training environment cleanup failed",
     )
     require(
-        report["ppo_updates_completed"] == 1000
-        and report["adaptation_optimizer_steps"] == 3200,
+        report["ppo_updates_completed"] == updates
+        and report["adaptation_optimizer_steps"] == updates // history_interval * 16,
         "Incomplete learning budget",
     )
     require(
@@ -202,7 +446,7 @@ def train_check(run, expected, *, seed=1063, layout="contact_approach", source=N
     )
     require(
         [item["end_cycle"] for item in telemetry["files"]]
-        == [5, *range(100, 1001, 100)],
+        == sorted({history_interval, updates, *range(100, updates + 1, 100)}),
         "Missing training windows",
     )
     holds = 0
@@ -214,8 +458,8 @@ def train_check(run, expected, *, seed=1063, layout="contact_approach", source=N
         trace_check(path, item["sha256"])
         with np.load(path, allow_pickle=False) as arrays:
             require(
-                arrays["reward_total"].shape == (184, 160)
-                and arrays["ppo_return"].shape == (5, 24, 160, 1),
+                arrays["reward_total"].shape == (history_interval * 24 + 64, num_envs)
+                and arrays["ppo_return"].shape == (history_interval, 24, num_envs, 1),
                 "Wrong training trace dimensions",
             )
             if not approach:
@@ -223,7 +467,8 @@ def train_check(run, expected, *, seed=1063, layout="contact_approach", source=N
             holding = arrays["approach_hold_pre"]
             command = arrays["command_b_pre"][holding]
             require(
-                holding.dtype == np.bool_ and holding.shape == (184, 160),
+                holding.dtype == np.bool_
+                and holding.shape == (history_interval * 24 + 64, num_envs),
                 "Invalid approach hold mask",
             )
             require(
@@ -240,11 +485,14 @@ def train_check(run, expected, *, seed=1063, layout="contact_approach", source=N
         not approach or holds > 0,
         "The approach mechanism never delivered a sampled training command",
     )
-    checkpoint = run / "learning_1000.pt"
+    checkpoint = run / f"learning_{updates}.pt"
     require(
         file_sha256(checkpoint) == report["checkpoint_sha256"],
         "Training checkpoint changed",
     )
+    if learning_curve:
+        for n in LEARNING_CURVE_UPDATES:
+            load_screen_checkpoint(run / f"learning_{n}.pt")
     return checkpoint
 
 
@@ -301,8 +549,10 @@ def recovery_check(run, evidence_sha256, expected, source):
             "scripts/rsl_rl/operator_roa_approach_batch.py",
             "scripts/rsl_rl/operator_roa_evaluation.py",
             "scripts/rsl_rl/operator_roa_screen.py",
+            "scripts/rsl_rl/operator_roa_pilot.py",
+            "scripts/rsl_rl/operator_roa_checkpoint.py",
         },
-        "Recovery runtime changed beyond the reviewed frozen-screen repair",
+        "Recovery runtime changed beyond the reviewed frozen-screen and snapshot support",
     )
     process = read(run.parent / "process_exit.json")
     require(
@@ -378,12 +628,16 @@ def screen_check(run, exported, expected, name, route, baseline=None):
     layout = (
         None
         if field or retention
-        else "step_ladder" if name == "ladder_1045" else "standard"
+        else "step_ladder"
+        if name == "ladder_1045"
+        else "standard"
     )
     difficulty = (
         list(operator_step_field.DIFFICULTY)
         if field
-        else [0.05, 0.15] if retention else None
+        else [0.05, 0.15]
+        if retention
+        else None
     )
     require(
         protocol["terrain_suite"] == suite
@@ -399,7 +653,9 @@ def screen_check(run, exported, expected, name, route, baseline=None):
     tape = (
         operator_step_field.SCREEN_COMMAND_TAPE
         if field
-        else COMMAND_TAPE if retention else TRAVERSAL_TAPE
+        else COMMAND_TAPE
+        if retention
+        else TRAVERSAL_TAPE
     )
     tape_hash = command_tape_sha256(tape)
     require(
@@ -526,6 +782,25 @@ def main(argv=None):
     parser.add_argument("--cpu-threads", type=int, default=2)
     parser.add_argument("--training-seeds", nargs="+", type=int)
     parser.add_argument(
+        "--config",
+        help="Experiment JSON file, or - to read stdin; replaces legacy trial selectors",
+    )
+    parser.add_argument(
+        "--plan-only",
+        action="store_true",
+        help="Validate source/configuration and print the resolved workload without starting simulation",
+    )
+    parser.add_argument(
+        "--idle-gpu",
+        metavar="MODEL",
+        help="Select an idle visible model (e.g. 'RTX 5080'), cooperative lock and UUID isolation; does not replace scheduler reservation",
+    )
+    parser.add_argument(
+        "--learning-curve",
+        action="store_true",
+        help="Two paired seeds, four uninterrupted 6000-update runs with separate 1000/3000/6000 snapshot screens",
+    )
+    parser.add_argument(
         "--paired-control",
         action="store_true",
         help="Also train the existing raised-start/free-command recipe for each seed",
@@ -540,12 +815,27 @@ def main(argv=None):
         help="Reviewed digest of recovery_files for --screen-training-run",
     )
     args = parser.parse_args(argv)
+    configured = None
+    if args.config:
+        if (
+            args.training_seeds is not None
+            or args.paired_control
+            or args.learning_curve
+            or args.screen_training_run
+        ):
+            parser.error(
+                "--config cannot be combined with legacy trial/recovery selectors"
+            )
+        configured = experiment_config(
+            json.load(sys.stdin) if args.config == "-" else read(Path(args.config))
+        )
+        args.training_seeds = sorted({t["seed"] for t in configured["trials"]})
     if bool(args.screen_training_run) != bool(args.training_evidence_sha256):
         parser.error(
             "screen-training-run and training-evidence-sha256 require each other"
         )
     if args.screen_training_run and (
-        args.training_seeds is not None or args.paired_control
+        args.training_seeds is not None or args.paired_control or args.learning_curve
     ):
         parser.error(
             "screens-only recovery cannot request training seeds or paired training"
@@ -557,13 +847,20 @@ def main(argv=None):
         ]
     else:
         args.training_seeds = args.training_seeds or [1063]
+    if args.learning_curve and not (
+        args.paired_control and len(args.training_seeds) == 2
+    ):
+        parser.error(
+            "learning-curve requires --paired-control and exactly two training seeds"
+        )
     if any(seed < 0 for seed in args.training_seeds) or len(
         set(args.training_seeds)
     ) != len(args.training_seeds):
         parser.error("training-seeds must be distinct nonnegative integers")
-    args.reference, args.parent = args.reference.resolve(
-        strict=True
-    ), args.parent.resolve(strict=True)
+    args.reference, args.parent = (
+        args.reference.resolve(strict=True),
+        args.parent.resolve(strict=True),
+    )
     expected = recurrent_training_identity(args.reference)
     recovery = None
 
@@ -586,35 +883,55 @@ def main(argv=None):
         args.parent,
         expected["physical_reference"],
         args.training_seeds[0],
-        layout="contact_approach",
+        layout=configured["trials"][0]["layout"] if configured else "contact_approach",
     )
     require(
         source["training_seed"] not in args.training_seeds,
         "Training seeds must differ from the retained parent's seed",
-    )
-    admissions = (
-        []
-        if args.screen_training_run
-        else [
-            seed_admission(seed, paired=args.paired_control)
-            for seed in args.training_seeds
-        ]
     )
     layouts = (
         ("contact_approach", "contact_acquire")
         if args.paired_control
         else ("contact_approach",)
     )
-    sweep = len(args.training_seeds) > 1 or args.paired_control
-    trials = [
-        dict(
-            seed=seed,
-            layout=layout,
-            label=f"seed{seed}/{layout}" if sweep else "candidate",
-        )
-        for seed in args.training_seeds
-        for layout in layouts
-    ]
+    sweep = (
+        configured is not None or len(args.training_seeds) > 1 or args.paired_control
+    )
+    trials = (
+        [dict(trial) for trial in configured["trials"]]
+        if configured
+        else [
+            dict(
+                seed=seed,
+                layout=layout,
+                label=f"seed{seed}/{layout}" if sweep else "candidate",
+                updates=6000 if args.learning_curve else 1000,
+                history_interval=5,
+                regularization="off",
+                num_envs=160,
+            )
+            for seed in args.training_seeds
+            for layout in layouts
+        ]
+    )
+    admissions = []
+    if not args.screen_training_run:
+        for trial in trials:
+            _, trial_source = load_environment_source(
+                args.parent,
+                expected["physical_reference"],
+                trial["seed"],
+                layout=trial["layout"],
+            )
+            require(
+                trial_source == source, "Trials must share the same immutable parent"
+            )
+            if trial["layout"] in ("contact_approach", "contact_acquire"):
+                admissions.append(
+                    seed_admission(
+                        trial["seed"], paired=trial["layout"] == "contact_acquire"
+                    )
+                )
     if args.screen_training_run:
         checkpoint, recovery = recovery_check(
             args.screen_training_run, args.training_evidence_sha256, expected, source
@@ -626,6 +943,10 @@ def main(argv=None):
                     "environment_layout"
                 ],
                 label="candidate",
+                updates=1000,
+                history_interval=5,
+                regularization="off",
+                num_envs=160,
             )
         ]
         require(
@@ -639,9 +960,52 @@ def main(argv=None):
         ),
         "Output must be outside immutable source runs",
     )
+    selected_screens = configured["screens"] if configured else list(SCREENS)
+    routes = configured["routes"] if configured else ["causal", "privileged_latent"]
+    workload = dict(
+        training_children=0 if recovery else len(trials),
+        training_environment_transitions=0
+        if recovery
+        else sum(
+            t["num_envs"]
+            * (t["updates"] * 24 + t["updates"] // t["history_interval"] * 64)
+            for t in trials
+        ),
+        frozen_screen_children=(
+            1
+            + len(trials) * (len(LEARNING_CURVE_UPDATES) if args.learning_curve else 1)
+        )
+        * sum(1 if name == "retention" else len(routes) for name in selected_screens),
+    )
+    if args.plan_only:
+        print(
+            json.dumps(
+                dict(
+                    trials=trials,
+                    screens=selected_screens,
+                    routes=routes,
+                    workload=workload,
+                    source_identity=expected,
+                    exit_allowed=False,
+                ),
+                indent=2,
+            )
+        )
+        return
+    lease, gpu = idle_gpu(args.idle_gpu) if args.idle_gpu else (None, None)
+    child_environment = None
+    if gpu:
+        child_environment = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu["uuid"]}
+        args.device = "cuda:0"
+        print(
+            f"Selected {gpu['name']} ({gpu['uuid']}); cooperative lock held", flush=True
+        )
     args.output_parent.mkdir(parents=True, exist_ok=True)
     output = Path(
-        tempfile.mkdtemp(prefix="roa_step_approach_", dir=args.output_parent)
+        tempfile.mkdtemp(
+            prefix="operator_experiment_" if configured else "roa_step_approach_",
+            dir=args.output_parent,
+        )
     ).resolve()
     print(f"Output: {output}", flush=True)
     summary = dict(
@@ -652,6 +1016,10 @@ def main(argv=None):
         trials=trials,
         screens={},
         training_recovery=recovery,
+        workload=workload,
+        experiment_config=configured,
+        experiment_config_sha256=identity_sha256(configured) if configured else None,
+        gpu=gpu,
     )
     write(
         output / "batch_plan.json",
@@ -662,9 +1030,16 @@ def main(argv=None):
             control_recipe=(
                 operator_step_support.recipe() if args.paired_control else None
             ),
-            updates=0 if recovery else 1000,
-            screens=SCREENS,
-            routes=["causal", "privileged_latent"],
+            updates=0
+            if recovery
+            else None
+            if configured
+            else 6000
+            if args.learning_curve
+            else 1000,
+            learning_curve=learning_curve_recipe() if args.learning_curve else None,
+            screens={name: SCREENS[name] for name in selected_screens},
+            routes=routes,
             scope=(
                 "One archived endpoint and its parent, fourteen fresh frozen screens; no training, resume or promotion. Historical full-observation mismatch remains unresolved."
                 if recovery
@@ -677,6 +1052,8 @@ def main(argv=None):
     def child(folder, module, arguments):
         preflight()
         verify_source_files(source)
+        if gpu:
+            require_idle_gpu(gpu["uuid"])
         folder.mkdir(parents=True)
         command = [
             sys.executable,
@@ -700,7 +1077,11 @@ def main(argv=None):
         try:
             with (folder / "console.log").open("x") as log:
                 code = subprocess.run(
-                    command, stdout=log, stderr=subprocess.STDOUT, check=False
+                    command,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                    **({"env": child_environment} if child_environment else {}),
                 ).returncode
         except BaseException as exc:
             error = repr(exc)
@@ -730,10 +1111,9 @@ def main(argv=None):
         exported = export_roa_actor(weights, case / "actor.pt")
         write(case / "export.json", exported)
         summary["screens"][label] = {}
-        for name, (n, seed, options) in SCREENS.items():
-            for route in (
-                ["causal"] if name == "retention" else ["causal", "privileged_latent"]
-            ):
+        for name in selected_screens:
+            n, seed, options = SCREENS[name]
+            for route in ["causal"] if name == "retention" else routes:
                 extra = [] if route == "causal" else ["--diagnostic-input", route]
                 run = child(
                     case / name / route,
@@ -782,23 +1162,8 @@ def main(argv=None):
                     [
                         "--environment-checkpoint",
                         args.parent,
-                        "--environment-layout",
-                        layout,
-                        "--regularization",
-                        "off",
-                        "--orientation-weight",
-                        "-2.5",
-                        "--stumble-weight",
-                        "0",
-                        "--learning-updates",
-                        "1000",
-                        "--history-interval",
-                        "5",
-                        "--num-envs",
-                        "160",
-                        "--seed",
-                        seed,
-                        "--training-telemetry",
+                        *trial_arguments(trial),
+                        *(["--learning-curve"] if args.learning_curve else []),
                     ],
                 )
             )
@@ -812,6 +1177,11 @@ def main(argv=None):
                 seed=seed,
                 layout=layout,
                 source=source,
+                learning_curve=args.learning_curve,
+                updates=trial["updates"],
+                history_interval=trial["history_interval"],
+                regularization=trial["regularization"],
+                num_envs=trial["num_envs"],
             )
             report = read(run / "report.json")
             # These are frozen pre-training evaluations, not initial PPO states:
@@ -819,7 +1189,8 @@ def main(argv=None):
             start = report["evaluation_before"]
             geometry = report["native_step_field_geometry"]
             paired_start, paired_geometry = paired_starts.setdefault(
-                seed, (start, geometry)
+                (seed, ENVIRONMENT_STAGES[layout].geometry_version, trial["num_envs"]),
+                (start, geometry),
             )
             require(
                 start["policy_state_sha256_before"]
@@ -843,13 +1214,23 @@ def main(argv=None):
             )
             if not controls:
                 screens("parent", args.parent)
-            screens(label, checkpoint)
+            if args.learning_curve:
+                trial["milestone_checkpoints"] = {
+                    str(n): str(run / f"learning_{n}.pt")
+                    for n in LEARNING_CURVE_UPDATES
+                }
+                for n in LEARNING_CURVE_UPDATES:
+                    screens(f"{label}/updates{n}", run / f"learning_{n}.pt")
+            else:
+                screens(label, checkpoint)
             trial["status"] = "COMPLETE_NOT_PROMOTED"
         summary["status"] = "COMPLETE_NOT_PROMOTED"
     except BaseException as exc:
         summary.update(status="FAILED_OR_INTERRUPTED_NOT_QUALIFIED", error=repr(exc))
         raise
     finally:
+        if lease is not None:
+            lease.close()
         summary["wall_seconds"] = time.monotonic() - started
         write(output / "batch_check.json", summary)
         print(

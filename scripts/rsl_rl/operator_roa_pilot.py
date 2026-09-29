@@ -181,7 +181,7 @@ ENVIRONMENT_STAGES["contact_causal"] = replace(
 ENVIRONMENT_STAGES["contact_approach"] = replace(
     ENVIRONMENT_STAGES["contact_acquire"],
     version="operator_roa_contact_approach_v1",
-    updates=1000,
+    updates=(1000, 6000),
     status="ROA_CONTACT_APPROACH_COMPLETED_NOT_QUALIFIED",
     result_stage="contact_approach",
     support_resets=False,
@@ -196,6 +196,17 @@ FROZEN_STEPS = 32
 LEARNING_UPDATES = 100
 HISTORY_INTERVAL = 20
 EVALUATION_SEED = 1042
+LEARNING_CURVE_UPDATES = (1000, 3000, 6000)
+
+
+def learning_curve_recipe():
+    return {
+        "version": "operator_roa_learning_curve_v1",
+        "checkpoint_updates": list(LEARNING_CURVE_UPDATES),
+        "scope": "Post-history snapshots of one uninterrupted 6000-update trajectory; separate frozen screens only after completion, not resume or promotion",
+    }
+
+
 DYNAMICS_NAMES = (
     "base_mass_relative_to_nominal_minus_one",
     "base_local_com_x_m",
@@ -245,6 +256,11 @@ def parse_args(argv=None):
         help="Additional regularization only: zero for 20 updates then ramp to 0.1, or remain zero",
     )
     parser.add_argument("--learning-updates", type=int)
+    parser.add_argument(
+        "--learning-curve",
+        action="store_true",
+        help="Save 1000/3000/6000 post-history snapshots in one uninterrupted 6000-update approach/acquisition run",
+    )
     parser.add_argument(
         "--training-telemetry",
         action="store_true",
@@ -347,6 +363,19 @@ def parse_args(argv=None):
         )
     if args.freeze_action_std and args.entropy_coef != 0.0:
         parser.error("--freeze-action-std requires explicit --entropy-coef 0")
+    if args.learning_curve and not (
+        args.environment_checkpoint
+        and args.environment_layout in ("contact_approach", "contact_acquire")
+        and args.learning_updates == 6000
+        and args.num_envs == 160
+        and args.history_interval == 5
+        and args.regularization == "off"
+        and args.training_telemetry
+        and args.entropy_coef is None
+    ):
+        parser.error(
+            "learning-curve requires 6000-update H5/160-env approach/acquisition with telemetry and unchanged noise/regularization"
+        )
     return args
 
 
@@ -777,6 +806,7 @@ def run_pilot(
     training_telemetry=False,
     entropy_coef=None,
     freeze_action_std=False,
+    learning_curve=False,
 ):
     started = time.perf_counter()
     stage = ENVIRONMENT_STAGES[layout] if environment else None
@@ -800,6 +830,7 @@ def run_pilot(
             training_telemetry=training_telemetry,
             entropy_coef=entropy_coef,
             freeze_action_std=freeze_action_std,
+            learning_curve=learning_curve,
         )
     finally:
         if host.telemetry is not None:
@@ -844,128 +875,23 @@ def _adapt_history(
     obs,
     record,
     report,
-    *,
-    require_change,
-    observe=None,
-    after_step=None,
-    velocity_head=None,
+    **options,
 ):
-    """Collect with fixed causal weights, then fit only the history estimator."""
-    import torch
-    from parkour_lab.learning.operator_roa import (
-        FRAME_DIM,
-        HISTORY_LENGTH,
-        set_phase,
-        state_sha256,
+    """Compatibility entry point for the estimator-only adaptation runner."""
+    from parkour_lab.learning.operator_roa_training import adapt_history
+
+    return adapt_history(
+        host,
+        policy,
+        optimizer,
+        obs,
+        record,
+        report,
+        history_steps=HISTORY_STEPS,
+        epochs=ADAPTATION_EPOCHS,
+        minibatches=ADAPTATION_BATCHES,
+        **options,
     )
-
-    actor, env = policy.actor, host.env
-
-    def frames(observations):
-        return observations["history"].reshape(-1, HISTORY_LENGTH, FRAME_DIM)
-
-    def privileged_hashes():
-        return {
-            name: state_sha256(module)
-            for name, module in (
-                ("motor", actor.motor),
-                ("encoder", actor.encoder),
-                ("critic", policy.critic),
-            )
-        }
-
-    # Collect the whole history-owned block with fixed weights. Fit only
-    # afterwards, so no action can incorporate its own privileged label.
-    set_phase(policy, "frozen")
-    fixed_hashes = privileged_hashes()
-    fixed_std = policy.std.detach().clone()
-    fixed_estimator = state_sha256(actor.estimator)
-    samples = []
-    with torch.no_grad():
-        for _ in range(HISTORY_STEPS):
-            if observe is not None:
-                observe()
-            sample = (frames(obs).clone(), obs["critic_state"][:, :3].clone())
-            if velocity_head is None:
-                sample += (actor.privileged_input(obs).clone(),)
-            samples.append(sample)
-            action = actor.history_action(obs["policy"], frames(obs))
-            command = obs["policy"][:, 6:9].clone() if after_step is not None else None
-            obs, _, done, _ = host.step(action, "history_adaptation")
-            if after_step is not None:
-                after_step(done, command)
-    record["estimator_unchanged_during_history_collection"] = (
-        state_sha256(actor.estimator) == fixed_estimator
-    )
-    if not record["estimator_unchanged_during_history_collection"]:
-        raise RuntimeError("History estimator changed before block collection ended")
-    histories, velocities, *privilege = (
-        torch.cat(values, dim=0) for values in zip(*samples)
-    )
-    del samples
-    if velocity_head is not None:
-        with torch.no_grad():
-            features = actor.estimator[:-1](histories.flatten(1))
-        trainable = velocity_head
-    else:
-        trainable = tuple(actor.estimator.parameters())
-
-    def adaptation_loss(indices=slice(None)):
-        if velocity_head is not None:
-            predicted = torch.nn.functional.linear(features[indices], *velocity_head)
-            return {
-                "velocity": torch.nn.functional.mse_loss(predicted, velocities[indices])
-            }
-        return actor.adaptation_losses(
-            histories[indices], privilege[0][indices], velocities[indices]
-        )
-
-    with torch.no_grad():
-        before = adaptation_loss()
-    record["adaptation_before"] = {name: float(value) for name, value in before.items()}
-    if velocity_head is None:
-        set_phase(policy, "history")
-    for _ in range(ADAPTATION_EPOCHS):
-        for indices in torch.randperm(len(histories), device=env.device).chunk(
-            ADAPTATION_BATCHES
-        ):
-            optimizer.zero_grad(set_to_none=True)
-            losses = adaptation_loss(indices)
-            loss = (
-                losses["latent"] + losses["velocity"]
-                if velocity_head is None
-                else losses["velocity"]
-            )
-            if not torch.isfinite(loss):
-                raise RuntimeError("Nonfinite ROA adaptation loss")
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable, 1.0, error_if_nonfinite=True)
-            optimizer.step()
-            report["adaptation_optimizer_steps"] += 1
-    with torch.no_grad():
-        after = adaptation_loss()
-        if velocity_head is not None:
-            actor.estimator[-1].weight[:3].copy_(velocity_head[0])
-            actor.estimator[-1].bias[:3].copy_(velocity_head[1])
-    record["adaptation_after"] = {name: float(value) for name, value in after.items()}
-    record["privileged_modules_unchanged_during_adaptation"] = (
-        fixed_hashes == privileged_hashes() and torch.equal(fixed_std, policy.std)
-    )
-    record["estimator_changed_during_adaptation"] = (
-        state_sha256(actor.estimator) != fixed_estimator
-    )
-    if not record["privileged_modules_unchanged_during_adaptation"] or (
-        require_change and not record["estimator_changed_during_adaptation"]
-    ):
-        raise RuntimeError(
-            "ROA adaptation violated optimizer ownership or did not learn"
-        )
-    if (
-        not all(torch.isfinite(p).all() for p in policy.parameters())
-        or (policy.std <= 0).any()
-    ):
-        raise RuntimeError("Invalid ROA parameters")
-    return obs
 
 
 def _learn_pilot(
@@ -983,6 +909,7 @@ def _learn_pilot(
     training_telemetry=False,
     entropy_coef=None,
     freeze_action_std=False,
+    learning_curve=False,
 ):
     import torch
     from parkour_lab.learning.operator_roa import (
@@ -993,7 +920,7 @@ def _learn_pilot(
         branch_diagnostics,
         set_phase,
     )
-    from parkour_lab.learning.operator_roa_training import ROAPPO
+    from parkour_lab.learning.operator_roa_training import ROATrainingMethod
 
     env = host.env
     stage = ENVIRONMENT_STAGES[layout] if environment else None
@@ -1002,6 +929,18 @@ def _learn_pilot(
         raise ValueError("Environment learning requires a validated warm start")
     if training_telemetry and not environment:
         raise ValueError("Training telemetry requires environment learning")
+    if learning_curve and not (
+        environment
+        and layout in ("contact_approach", "contact_acquire")
+        and learning is not None
+        and learning[2] == "off"
+        and learning[4] == LEARNING_CURVE_UPDATES[-1]
+        and history_interval == 5
+        and training_telemetry
+        and entropy_coef is None
+        and not freeze_action_std
+    ):
+        raise ValueError("Invalid learning-curve training recipe")
     if type(freeze_action_std) is not bool or (freeze_action_std and entropy_coef != 0):
         raise ValueError("Fixed action std requires explicit zero entropy bonus")
     if entropy_coef is not None:
@@ -1133,14 +1072,22 @@ def _learn_pilot(
     options = learning_ppo_options(runner_cfg, entropy_coef)
     report["ppo_options"] = options
     causal = bool(stage and stage.causal_ppo)
-    algorithm = ROAPPO(
+    method = ROATrainingMethod(
         policy,
+        obs,
+        num_envs=env.num_envs,
+        rollout_steps=ROLLOUT_STEPS,
+        history_steps=HISTORY_STEPS,
+        adaptation_epochs=ADAPTATION_EPOCHS,
+        adaptation_batches=ADAPTATION_BATCHES,
+        adaptation_learning_rate=1e-4 if environment else 1e-3,
         device=env.device,
         causal=causal,
         freeze_action_std=freeze_action_std,
         regularization_coef=0.0 if causal else 0.1,
         **options,
     )
+    algorithm = method.algorithm
     if freeze_action_std:
         trainable = {id(p) for p in algorithm.ppo_parameters}
         report["fixed_action_std"] = {
@@ -1154,7 +1101,6 @@ def _learn_pilot(
         report["latent_branch_scope"] = (
             "Privileged teacher shadow probes, not the causal actor's input dependence"
         )
-    algorithm.init_storage("rl", env.num_envs, ROLLOUT_STEPS, obs, [12])
     telemetry = None
     if training_telemetry:
         from .operator_control_trace import ROATrainingTelemetry
@@ -1168,9 +1114,6 @@ def _learn_pilot(
             rollout_steps=ROLLOUT_STEPS,
             history_steps=HISTORY_STEPS,
         )
-    optimizer = torch.optim.Adam(
-        actor.estimator.parameters(), lr=1e-4 if environment else 1e-3
-    )
     report["cycles"] = []
     report["ppo_updates_completed"] = 0
     report["adaptation_optimizer_steps"] = 0
@@ -1210,9 +1153,7 @@ def _learn_pilot(
                 "version": stage.version if stage else VERSION,
                 "readiness_only": True,
                 "deployment_allowed": False,
-                "policy_state": policy.state_dict(),
-                "ppo_optimizer": algorithm.optimizer.state_dict(),
-                "adaptation_optimizer": optimizer.state_dict(),
+                **method.state_dict(),
                 "motor_contract": host.motor_contract,
                 "motor_manifest": host.manifest,
                 "completed_cycles": update,
@@ -1229,31 +1170,26 @@ def _learn_pilot(
             "ppo_updates": update,
         }
         report.setdefault("checkpoints", []).append(receipt)
+        if learning_curve:
+            report.setdefault("checkpoint_policy_sha256", {})[str(update)] = (
+                state_sha256(policy)
+            )
 
     for cycle, coefficient in enumerate(coefficients, 1):
         if telemetry is not None:
             telemetry.begin_cycle(cycle)
         record = {"cycle": cycle, "regularization_coefficient": coefficient}
         report["cycles"].append(record)
-        algorithm.start_phase()
         estimator_before = state_sha256(actor.estimator)
         encoder_before = state_sha256(actor.encoder)
         algorithm.regularization_coef = coefficient
-        with torch.no_grad():
-            for _ in range(ROLLOUT_STEPS):
-                observe()
-                action = algorithm.act(obs)
-                command = obs["policy"][:, 6:9].clone() if stumble is not None else None
-                obs, reward, done, extras = host.step(action, algorithm.phase + "_ppo")
-                if stumble is not None:
-                    stumble.sample(done, command)
-                algorithm.process_env_step(obs, reward, done.long(), extras)
-            algorithm.compute_returns(obs)
-        if telemetry is not None and telemetry.active:
-            telemetry.capture_rollout(algorithm, obs)
-            record["ppo_losses"] = algorithm.update(after_update=telemetry.after_update)
-        else:
-            record["ppo_losses"] = algorithm.update()
+        obs = method.collect(
+            host,
+            obs,
+            before_step=observe,
+            after_step=stumble.sample if stumble is not None else None,
+        )
+        record["ppo_losses"] = method.update(obs, observer=telemetry)
         report["ppo_updates_completed"] += 1
         if freeze_action_std:
             algorithm.check_fixed_action_std()
@@ -1294,10 +1230,8 @@ def _learn_pilot(
         if cycle % history_interval:
             continue
 
-        obs = _adapt_history(
+        obs = method.adapt(
             host,
-            policy,
-            optimizer,
             obs,
             record,
             report,
@@ -1313,7 +1247,9 @@ def _learn_pilot(
         )
         checkpoint_interval = len(coefficients) if environment else 100
         if learning is not None and (
-            cycle % checkpoint_interval == 0 or cycle == len(coefficients)
+            cycle in LEARNING_CURVE_UPDATES
+            if learning_curve
+            else cycle % checkpoint_interval == 0 or cycle == len(coefficients)
         ):
             save_checkpoint(cycle)
         publish_exposure()
@@ -1622,9 +1558,9 @@ def main(argv=None):
                 learning_scope="Matched posture-cost ablation from contact-teacher3000; unchanged free environments, not qualification",
                 schedule_scope="1000 new PPO updates, H every20; zero additional regularization; fresh optimizers, not resume",
             )
-            protocol["model"][
-                "motor"
-            ] = "Full contact-teacher policy warm start; no new modules or observation changes"
+            protocol["model"]["motor"] = (
+                "Full contact-teacher policy warm start; no new modules or observation changes"
+            )
         if stage.stumble_cost:
             from .operator_rewards import stumble_objective
 
@@ -1687,6 +1623,10 @@ def main(argv=None):
         "behavior_validated": False,
         "sim_to_real": "UNRUN",
     }
+
+    if args.learning_curve:
+        protocol["learning_curve"] = learning_curve_recipe()
+        protocol["checkpoint_interval"] = None  # Explicit nonuniform milestones.
 
     def publish():
         training.write_json(output / "report.json", report)
@@ -1784,6 +1724,7 @@ def main(argv=None):
             training_telemetry=args.training_telemetry,
             entropy_coef=args.entropy_coef,
             freeze_action_std=args.freeze_action_std,
+            learning_curve=args.learning_curve,
         )
         if training.recurrent_training_identity(args.reference) != identity:
             raise RuntimeError("Source or runtime changed during learning pilot")
