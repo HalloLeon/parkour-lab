@@ -134,6 +134,7 @@ class ROAEnvironment:
 
     def step(self, raw, stage, *, next_command=None):
         import torch
+        from tensordict import TensorDict
         from parkour_lab.control.controller import JointTargets
 
         if not self.app.is_running():
@@ -147,6 +148,22 @@ class ROAEnvironment:
             native, reward, terminated, timed_out, extras = self.env.step(delivered)
         self.bridge.verify_delivery(terminated, timed_out)
         done = terminated | timed_out
+        ids, final = extras["final_env_ids"], extras["final_observation"]
+        if not torch.equal(ids, done.nonzero(as_tuple=False).flatten()):
+            raise ValueError("Final observation rows do not match episode endings")
+        if len(ids):
+            if final is None or not torch.equal(
+                final["proprio"][:, -12:], delivered[ids]
+            ):
+                raise ValueError(
+                    "Final observations must precede the action-buffer reset"
+                )
+            # Timeout values need only the asymmetric critic's inputs. Do not
+            # push history or read teacher contacts again for an ended episode.
+            final = TensorDict(
+                {"critic_state": final["policy"], "terrain": final["terrain"]},
+                batch_size=[len(ids)],
+            )
         self.previous = delivered.clone()
         self.steps += 1
         self.resets += int(done.sum())
@@ -161,5 +178,11 @@ class ROAEnvironment:
             self.observations(native, done, next_command),
             reward,
             done,
-            {**extras, "time_outs": timed_out & ~terminated},
+            {
+                **extras,
+                "terminated": terminated,
+                "truncated": timed_out,
+                "time_outs": timed_out & ~terminated,
+                "final_observation": final,
+            },
         )

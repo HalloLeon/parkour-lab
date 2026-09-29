@@ -79,9 +79,22 @@ Package imports do not launch Isaac Lab. Inference does not import PPO.
 
 The host supports ROA only; a method interface alone does not demonstrate
 interchangeability with other learners. ROA owns its learning schedule and
-optimizer state. Pre-reset final observations and termination/truncation semantics
-must be preserved by any learner integration, rather than assuming every learner
-uses PPO. There is no placeholder plugin or unused external dependency.
+optimizer state. There is no placeholder plugin or unused external dependency.
+
+`environments/runtime.py` retains separate termination/truncation flags and owned
+pre-reset observation rows. Final samples retain the outgoing command: capture
+precedes reset, command resampling and interval events. They never replace the
+next-action reset observations. Native observation terms must be stateless;
+history, filters and stateful preprocessing belong in the learner adapter.
+An additional terminal noise sample is isolated from the ordinary Torch RNG
+stream so it does not change reset or survivor noise draws.
+
+ROA uses the final clean state/terrain only for timeout value bootstrapping;
+this does not add privileged student inputs or push causal history twice.
+True termination takes precedence over a simultaneous timeout. This intentionally
+replaces RSL-RL's previous-state timeout estimate with the final-state estimate;
+it is a learning correction, not a claim of identical historical training.
+Reports count captured final rows and metrics count timeout bootstraps per run.
 
 ## Breaking change and evidence
 

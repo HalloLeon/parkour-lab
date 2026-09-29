@@ -15,13 +15,16 @@ class TrainingEnvironment(Protocol):
     reset() returns observations and a boolean first-frame mask. step() returns
     (next_observations, rewards, done, info). A done row is already reset in
     next_observations; it MUST NOT be treated as a terminal observation. The
-    mandatory info['time_outs'] mask identifies truncation without termination;
-    termination wins if both occur, so terminated = done & ~time_outs.
+    info['terminated'] and info['truncated'] preserve both native flags;
+    info['time_outs'] identifies truncation without termination. Termination
+    wins for bootstrapping when both occur.
 
-    Final pre-reset observations are not currently supplied by the ROA host.
-    Adapters that need them for replay/bootstrapping must extend the provider or
-    reject that configuration, never substitute a reset observation. A method
-    must copy any observation retained across steps: buffers may be reused.
+    info['final_observation'] contains owned pre-reset rows, indexed by
+    info['final_env_ids']; None and an empty index tensor mean no episode ended.
+    The adapter declares the final schema: ROA supplies only critic inputs,
+    while the native provider retains all observation groups for other adapters.
+    Sampling precedes reset, command resampling and interval events. Learners
+    must copy ordinary observations retained across steps: buffers may be reused.
     """
 
     def reset(self, *, seed: int | None = None) -> tuple[Any, Any]: ...

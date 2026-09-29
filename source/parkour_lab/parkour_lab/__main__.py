@@ -174,8 +174,8 @@ def main(argv=None, *, standalone=False):
             device=config.task.device,
             fast_shutdown=False,
         ).app
-        from isaaclab.envs import ManagerBasedRLEnv
         from parkour_lab.environments.configuration import build_environment_config
+        from parkour_lab.environments.runtime import LocomotionEnv
 
         cfg = build_environment_config(
             config.task, evaluation=args.operation != "train"
@@ -186,7 +186,7 @@ def main(argv=None, *, standalone=False):
         (output / "resolved_env.yaml").write_text(
             yaml.dump(cfg.to_dict(), sort_keys=False)
         )
-        env = ManagerBasedRLEnv(cfg=cfg)
+        env = LocomotionEnv(cfg=cfg)
         if args.operation == "train":
             from parkour_lab.experiment import train
 
@@ -198,6 +198,7 @@ def main(argv=None, *, standalone=False):
             loaded = load_actor(args.actor, device=config.task.device)
             report["actor_sha256"] = file_sha256(args.actor)
             evaluate(env, app, loaded, commands, output, report)
+        report["transition_observations"] = dict(env.transition_counts)
         code = 0
     except BaseException as error:
         report.update(status="ERROR", error=repr(error))

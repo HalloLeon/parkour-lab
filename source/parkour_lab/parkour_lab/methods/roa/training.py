@@ -163,6 +163,7 @@ class ROATrainingMethod:
             self.adaptation_optimizer_steps = report["adaptation_optimizer_steps"]
             metrics["adaptation"] = record
         metrics["adaptation_optimizer_steps"] = self.adaptation_optimizer_steps
+        metrics["timeout_bootstrap_rows"] = self.algorithm.timeout_bootstrap_rows
         self._advance_in_progress = False
         return observations, metrics
 
@@ -442,7 +443,30 @@ class ROAPPO(PPO):
             p for p in policy.parameters() if id(p) not in frozen
         )
         self.optimizer = torch.optim.Adam(self.ppo_parameters, lr=self.learning_rate)
+        self.timeout_bootstrap_rows = 0
         self.start_phase()
+
+    @torch.no_grad()
+    def process_env_step(self, obs, rewards, dones, extras):
+        """Bootstrap pure truncations from the final state, never a reset frame."""
+        timeouts = extras.get("time_outs")
+        if timeouts is not None and timeouts.any():
+            ids = extras["final_env_ids"]
+            if not torch.equal(ids, dones.nonzero(as_tuple=False).flatten()):
+                raise ValueError(
+                    "Timeout bootstrap requires every ended episode's final observation"
+                )
+            rows = timeouts[ids]
+            values = self.policy.evaluate(extras["final_observation"][rows]).flatten()
+            if not torch.isfinite(values).all():
+                raise ValueError("Nonfinite final-state value")
+            rewards = rewards.clone()
+            rewards[ids[rows]] += self.gamma * values
+            self.timeout_bootstrap_rows += int(rows.sum())
+        # RSL-RL's default uses V(previous); do not add that second bootstrap.
+        super().process_env_step(
+            obs, rewards, dones, {k: v for k, v in extras.items() if k != "time_outs"}
+        )
 
     def start_phase(self):
         """Re-enter PPO after history fitting without unfreezing inherited noise."""
