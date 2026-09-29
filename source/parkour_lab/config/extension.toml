@@ -20,7 +20,7 @@ repository = "https://github.com/HalloLeon/parkour-lab.git"
 "isaaclab_tasks" = {}
 
 [[python.module]]
-name = "parkour_lab.tasks"
+name = "parkour_lab"
 
 [isaaclab_settings]
 # Optional system dependencies can be declared here when needed.

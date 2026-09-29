@@ -1,15 +1,8 @@
 # Parkour Lab
 
-Parkour Lab is an Isaac Lab reinforcement-learning environment for training a
-Unitree Go2 with a balanced obstacle-family by difficulty curriculum. It also
-provides fixed-cell, seeded evaluation with numerical metrics and optional
-video recording. The playback script can sweep the complete family/difficulty
-matrix with ``--all_courses`` or evaluate one explicitly selected cell.
+An Isaac Lab / Unitree Go2 locomotion research package with an ROA-like teacher
+and causal history student. Run `python -m parkour_lab --help` for training,
+export, evaluation, playback and analysis commands.
 
-The registered Gym tasks are:
-
-- `Parkour-Lab-v0` for adaptive training
-- `Parkour-Lab-Play-v0` for reproducible evaluation and video
-
-See the repository's top-level `README.md` for installation, training, and
-evaluation commands.
+See the repository's [README](../../../README.md) for setup and package boundaries,
+and [ACCEPTANCE.md](../../../ACCEPTANCE.md) for qualification requirements.

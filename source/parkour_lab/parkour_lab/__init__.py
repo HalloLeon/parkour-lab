@@ -5,7 +5,6 @@
 
 """Parkour Lab package.
 
-Import :mod:`parkour_lab.tasks` explicitly to register the simulator tasks.
-Keeping the root package inert lets model and checkpoint utilities run without
-loading Isaac Lab.
+The root package is inert. Native environments are constructed explicitly after
+AppLauncher; configuration, models and artifact utilities need no Isaac Lab import.
 """
