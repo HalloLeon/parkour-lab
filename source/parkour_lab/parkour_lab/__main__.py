@@ -8,6 +8,7 @@ from pathlib import Path
 import random
 import tempfile
 import time
+import traceback
 
 from parkour_lab.config import ExperimentConfig
 
@@ -97,7 +98,8 @@ def resolve_config(args):
     return config
 
 
-def main(argv=None):
+def main(argv=None, *, standalone=False):
+    """Run a command; only the standalone native CLI owns process termination."""
     args = parse_args(argv)
     if args.operation == "analyze":
         report = args.run / "report.json" if args.run.is_dir() else args.run
@@ -138,7 +140,7 @@ def main(argv=None):
         write_json,
         write_run_provenance,
     )
-    from parkour_lab.runtime.session import finish_session
+    from parkour_lab.runtime.session import exit_native_process, finish_session
 
     report = {
         "status": "RUNNING",
@@ -199,13 +201,33 @@ def main(argv=None):
         code = 0
     except BaseException as error:
         report.update(status="ERROR", error=repr(error))
-        raise
+        if not standalone or app is None:
+            raise
+        # Print before controlled exit: it intentionally skips exception unwinding.
+        traceback.print_exc()
+        if isinstance(error, KeyboardInterrupt):
+            code = 130
+        elif (
+            isinstance(error, SystemExit)
+            and type(error.code) is int
+            and 1 <= error.code <= 255
+        ):
+            code = error.code
     finally:
         report["wall_seconds"] = time.monotonic() - started
         code = finish_session(env, app, report, publish, code)
-        print(f"Results: {output}", flush=True)
+        try:
+            print(f"Results: {output}", flush=True)
+        except (OSError, ValueError):
+            if not standalone:
+                raise
+            code = code or 2
+        if standalone and app is not None:
+            # Stay inside this frame until exit: even unwinding its native locals
+            # can touch plugins already released by app.close().
+            exit_native_process(code)
     return code
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(standalone=True))
