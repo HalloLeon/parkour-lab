@@ -7,7 +7,6 @@ selection. The original CLI remains available for historical run recovery.
 """
 
 import argparse
-import csv
 import fcntl
 import hashlib
 import json
@@ -18,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
@@ -198,62 +198,127 @@ def trial_arguments(trial):
 
 
 def gpu_inventory():
-    """Fail closed if GPU/process accounting is unavailable; never kill processes."""
+    """One snapshot, including graphics/other contexts missed by compute-apps.
 
-    def query(arguments):
+    Driver-reserved memory need not be near zero on an otherwise idle card.
+    NVIDIA's full process inventory and free memory are separate admission gates.
+    """
+    try:
         result = subprocess.run(
-            ["nvidia-smi", *arguments, "--format=csv,noheader,nounits"],
+            ["nvidia-smi", "-q", "-x"],
             capture_output=True,
             text=True,
             check=True,
         )
-        return list(csv.reader(result.stdout.splitlines(), skipinitialspace=True))
+        root = ET.fromstring(result.stdout)
+    except (OSError, subprocess.CalledProcessError, ET.ParseError) as error:
+        raise ValueError(
+            "GPU inventory unavailable; inspect nvidia-smi -q -x"
+        ) from error
+    require(root.tag == "nvidia_smi_log", "Unexpected GPU inventory format")
+    inventory = []
+    for index, node in enumerate(root.findall("gpu")):
+        uuid, name = (
+            node.findtext("uuid", "").strip(),
+            node.findtext("product_name", "").strip(),
+        )
+        require(
+            re.fullmatch(r"GPU-[a-fA-F0-9-]+", uuid) and name, "Invalid GPU identity"
+        )
 
-    processes = query(["--query-compute-apps=gpu_uuid"])
-    require(
-        all(
-            len(row) == 1 and re.fullmatch(r"GPU-[a-fA-F0-9-]+", row[0])
-            for row in processes
-        ),
-        "GPU process accounting is unavailable or malformed",
+        def number(field, unit):
+            match = re.fullmatch(
+                rf"(\d+)\s*{re.escape(unit)}", node.findtext(field, "").strip()
+            )
+            require(match is not None, f"{uuid}: unavailable {field}")
+            return int(match.group(1))
+
+        processes = node.find("processes")
+        require(
+            processes is not None and not (processes.text or "").strip(),
+            f"{uuid}: GPU process accounting is unavailable",
+        )
+        entries = []
+        for process in processes:
+            pid, kind = (
+                process.findtext("pid", "").strip(),
+                process.findtext("type", "").strip(),
+            )
+            require(
+                process.tag == "process_info"
+                and pid.isdecimal()
+                and int(pid) > 0
+                and kind,
+                f"{uuid}: malformed GPU process accounting",
+            )
+            entries.append(dict(pid=int(pid), type=kind))
+        inventory.append(
+            dict(
+                index=str(index),
+                uuid=uuid,
+                name=name,
+                memory_mib=number("fb_memory_usage/used", "MiB"),
+                free_mib=number("fb_memory_usage/free", "MiB"),
+                utilization=number("utilization/gpu_util", "%"),
+                processes=entries,
+            )
+        )
+    return inventory
+
+
+def gpu_summary(gpu):
+    return (
+        f"GPU {gpu['index']} {gpu['name']} ({gpu['uuid']}): "
+        f"{gpu['free_mib']} MiB free, {gpu['memory_mib']} MiB used, "
+        f"{gpu['utilization']}% utilization, processes={gpu['processes']}"
     )
-    busy = {row[0] for row in processes}
-    return [
-        dict(
-            index=index,
-            uuid=uuid,
-            name=name,
-            memory_mib=int(memory),
-            utilization=int(utilization),
-            compute_busy=uuid in busy,
-        )
-        for index, uuid, name, memory, utilization in query(
-            ["--query-gpu=index,uuid,name,memory.used,utilization.gpu"]
-        )
-    ]
 
 
-def idle_gpu(model):
+def gpu_has_compute_context(gpu):
+    # Allow graphics-only contexts when the separate capacity/load gates pass.
+    # Compute/MPS/unclassified contexts may belong to a temporarily idle job.
+    return any(process["type"] != "G" for process in gpu["processes"])
+
+
+def idle_gpu(model, minimum_free_mib=14336):
     """Select within existing CUDA visibility and acquire a cooperative host lock.
 
     This does not reserve a GPU against noncooperating jobs. Use the cluster
     scheduler for exclusive allocation when available. File stays; flock is
     released on close/process exit, so a crashed run cannot leave a stale lease.
     """
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    visible = None if visible is None else {x.strip() for x in visible.split(",")}
     require(
-        visible is None or all(x.startswith("GPU-") for x in visible),
-        "--idle-gpu requires UUID-based CUDA visibility or an unset CUDA_VISIBLE_DEVICES; for a scheduler-assigned numeric device, omit --idle-gpu",
+        type(minimum_free_mib) is int and minimum_free_mib > 0,
+        "GPU minimum free memory must be a positive MiB count",
     )
-    for gpu in gpu_inventory():
-        if (
-            model not in gpu["name"]
-            or gpu["compute_busy"]
-            or gpu["memory_mib"] > 256
-            or gpu["utilization"] > 5
-            or (visible is not None and not (gpu["uuid"] in visible))
-        ):
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    visible = None if visible is None else [x.strip() for x in visible.split(",")]
+    require(
+        visible is None or visible != [""],
+        "CUDA_VISIBLE_DEVICES is empty: no GPU is visible",
+    )
+    inventory = gpu_inventory()
+    if visible == ["0"] and len(inventory) == 1:
+        visible = [inventory[0]["uuid"]]
+    require(
+        visible is None
+        or (
+            len(visible) == len(set(visible))
+            and set(visible) <= {gpu["uuid"] for gpu in inventory}
+        ),
+        "CUDA_VISIBLE_DEVICES must contain distinct full GPU UUIDs (or 0 on a single-GPU host); for scheduler-assigned numeric devices on a multi-GPU host, omit --idle-gpu and use the allocation",
+    )
+    rejected = []
+    for gpu in inventory:
+        reasons = []
+        if model.casefold() not in gpu["name"].casefold():
+            reasons.append(f"model does not match {model!r}")
+        if visible is not None and gpu["uuid"] not in visible:
+            reasons.append("excluded by CUDA_VISIBLE_DEVICES")
+        if gpu_has_compute_context(gpu):
+            reasons.append("GPU has compute or unclassified process contexts")
+        if reasons:
+            rejected.append(gpu_summary(gpu) + "; " + "; ".join(reasons))
             continue
         require(re.fullmatch(r"GPU-[a-fA-F0-9-]+", gpu["uuid"]), "Invalid GPU UUID")
         try:
@@ -264,44 +329,54 @@ def idle_gpu(model):
             except FileNotFoundError:
                 descriptor = os.open(lock, flags | os.O_CREAT | os.O_EXCL, 0o644)
             lease = os.fdopen(descriptor, "r")
-        except (PermissionError, FileExistsError):
+        except OSError as error:
+            rejected.append(
+                gpu_summary(gpu) + f"; cannot open cooperative lock: {error}"
+            )
             continue
         try:
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        except OSError as error:
             lease.close()
+            rejected.append(
+                gpu_summary(gpu) + f"; cooperative lock unavailable: {error}"
+            )
             continue
         try:
-            current = next(g for g in gpu_inventory() if g["uuid"] == gpu["uuid"])
-            if (
-                current["compute_busy"]
-                or current["memory_mib"] > 256
-                or current["utilization"] > 5
-            ):
-                lease.close()
-                continue
+            current = require_idle_gpu(gpu["uuid"], minimum_free_mib)
+        except ValueError as error:
+            lease.close()
+            rejected.append(str(error))
+            continue
         except BaseException:
             lease.close()
             raise
         return lease, current
-    raise ValueError(f"No idle visible {model!r} GPU; no job started")
+    raise ValueError(
+        f"No idle visible {model!r} GPU; no job started. "
+        f"Required: no compute/unclassified contexts, <=5% utilization, >= {minimum_free_mib} MiB free (graphics processes allowed).\n"
+        + "\n".join(rejected or ["nvidia-smi reported no GPUs"])
+    )
 
 
-def require_idle_gpu(uuid):
+def require_idle_gpu(uuid, minimum_free_mib=14336):
     # Utilization is sampled over a driver interval and may lag an exited child.
-    # Retry that case briefly; an actual compute process is never ignored.
+    # Retry that case briefly; an existing compute job is never ignored.
     for attempt in range(4):
-        current = next(g for g in gpu_inventory() if g["uuid"] == uuid)
+        current = next((g for g in gpu_inventory() if g["uuid"] == uuid), None)
+        require(current is not None, f"Selected GPU {uuid} disappeared")
         require(
-            not current["compute_busy"],
-            "Selected GPU has another compute process; batch stopped",
+            not gpu_has_compute_context(current),
+            gpu_summary(current)
+            + "; GPU has compute or unclassified process contexts; batch stopped",
         )
-        if current["memory_mib"] <= 256 and current["utilization"] <= 5:
-            return
+        if current["free_mib"] >= minimum_free_mib and current["utilization"] <= 5:
+            return current
         if attempt < 3:
             time.sleep(1)
     raise ValueError(
-        "Selected GPU is no longer idle; batch stopped without killing any process"
+        gpu_summary(current)
+        + f"; requires >= {minimum_free_mib} MiB free and <=5% utilization; batch stopped"
     )
 
 
@@ -796,6 +871,12 @@ def main(argv=None):
         help="Select an idle visible model (e.g. 'RTX 5080'), cooperative lock and UUID isolation; does not replace scheduler reservation",
     )
     parser.add_argument(
+        "--gpu-min-free-mib",
+        type=int,
+        default=14336,
+        help="Free VRAM required by --idle-gpu (default: 14336 MiB); compute jobs block selection, graphics processes do not",
+    )
+    parser.add_argument(
         "--learning-curve",
         action="store_true",
         help="Two paired seeds, four uninterrupted 6000-update runs with separate 1000/3000/6000 snapshot screens",
@@ -815,6 +896,8 @@ def main(argv=None):
         help="Reviewed digest of recovery_files for --screen-training-run",
     )
     args = parser.parse_args(argv)
+    if args.gpu_min_free_mib <= 0:
+        parser.error("gpu-min-free-mib must be positive")
     configured = None
     if args.config:
         if (
@@ -992,7 +1075,11 @@ def main(argv=None):
             )
         )
         return
-    lease, gpu = idle_gpu(args.idle_gpu) if args.idle_gpu else (None, None)
+    lease, gpu = (
+        idle_gpu(args.idle_gpu, args.gpu_min_free_mib)
+        if args.idle_gpu
+        else (None, None)
+    )
     child_environment = None
     if gpu:
         child_environment = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu["uuid"]}
@@ -1020,6 +1107,7 @@ def main(argv=None):
         experiment_config=configured,
         experiment_config_sha256=identity_sha256(configured) if configured else None,
         gpu=gpu,
+        gpu_min_free_mib=args.gpu_min_free_mib if gpu else None,
     )
     write(
         output / "batch_plan.json",
@@ -1053,7 +1141,7 @@ def main(argv=None):
         preflight()
         verify_source_files(source)
         if gpu:
-            require_idle_gpu(gpu["uuid"])
+            require_idle_gpu(gpu["uuid"], args.gpu_min_free_mib)
         folder.mkdir(parents=True)
         command = [
             sys.executable,
