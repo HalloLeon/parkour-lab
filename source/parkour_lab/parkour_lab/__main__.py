@@ -166,8 +166,11 @@ def main(argv=None):
         publish()
         from isaaclab.app import AppLauncher
 
+        # close() must return so we can publish cleanup and preserve the exit status.
         app = AppLauncher(
-            headless=args.operation != "play", device=config.task.device
+            headless=args.operation != "play",
+            device=config.task.device,
+            fast_shutdown=False,
         ).app
         from isaaclab.envs import ManagerBasedRLEnv
         from parkour_lab.environments.configuration import build_environment_config
