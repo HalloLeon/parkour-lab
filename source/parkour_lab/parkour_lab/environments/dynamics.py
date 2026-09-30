@@ -201,22 +201,28 @@ def dynamics_report(env):
     }
     for key, value in actual.items():
         expected = fixed[key].to(value)
+        if not torch.isfinite(value).all():
+            raise ValueError(f"Nonfinite native dynamics readback: {key}")
+        if key == "coms":
+            # set_inertias may change the principal-axis orientation, not the COM
+            # position. The full body-frame inertia tensor is checked separately.
+            value, expected = value[..., :3], expected[..., :3]
         # PhysX can round mass/inertia while converting internal representations.
         matches = (
-            torch.allclose(value, expected, rtol=1e-6, atol=1e-7)
+            torch.isclose(value, expected, rtol=1e-6, atol=1e-7)
             if key in ("masses", "inertias")
-            else torch.equal(value, expected)
+            else value == expected
         )
-        if not matches:
+        if not matches.all():
+            index = tuple((~matches).nonzero()[0].tolist())
             raise ValueError(
-                "Native dynamics readback differs from the declared fixed draw"
+                f"Native dynamics readback mismatch for {key}{index}: "
+                f"expected {expected[index].item():.9g}, got {value[index].item():.9g}"
             )
     if hasattr(env, "_parkour_actual_physics"):
-        if any(
-            not torch.equal(value, env._parkour_actual_physics[key])
-            for key, value in actual.items()
-        ):
-            raise ValueError("Native dynamics changed after initialization")
+        for key, value in actual.items():
+            if not torch.equal(value, env._parkour_actual_physics[key]):
+                raise ValueError(f"Native dynamics changed after initialization: {key}")
     else:
         env._parkour_actual_physics = {
             key: value.clone() for key, value in actual.items()
