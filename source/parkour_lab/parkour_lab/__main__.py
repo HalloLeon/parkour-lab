@@ -259,6 +259,9 @@ def main(argv=None, *, standalone=False):
             yaml.dump(cfg.to_dict(), sort_keys=False)
         )
         env = LocomotionEnv(cfg=cfg)
+        from parkour_lab.environments.rewards import reward_recipe
+
+        report["reward_recipe"] = reward_recipe(env)
         if args.operation == "train":
             from parkour_lab.experiment import train
 

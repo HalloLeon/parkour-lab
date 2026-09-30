@@ -35,8 +35,12 @@ class TaskConfig:
     angular_tracking_std: float = 0.5  # rad/s; same kernel for body-z yaw
     dynamics: str = "randomized"
     bank_profile: str | None = None
+    rewards: dict = field(default_factory=dict)
 
     def __post_init__(self):
+        from parkour_lab.environments.rewards import validate_rewards
+
+        object.__setattr__(self, "rewards", validate_rewards(self.rewards))
         if self.terrain not in ("flat", "procedural", "steps", "traversal"):
             raise ValueError("terrain must be flat, procedural, steps or traversal")
         if self.difficulty_range is None:
@@ -110,7 +114,7 @@ class MethodConfig:
 
 @dataclass(frozen=True)
 class ExperimentConfig:
-    task: TaskConfig = TaskConfig()
+    task: TaskConfig = field(default_factory=TaskConfig)
     method: MethodConfig = field(default_factory=MethodConfig)
     updates: int = 1000
     save_interval: int = 100

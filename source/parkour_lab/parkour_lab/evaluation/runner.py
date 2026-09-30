@@ -10,6 +10,7 @@ import numpy as np
 import torch
 
 from parkour_lab.provenance import file_sha256
+from parkour_lab.runtime.metrics import TransitionMetrics
 from parkour_lab.control.command_tape import TapeBuilder, validate_tape, write_tape
 from parkour_lab.runtime.native import (
     NativeControllerSession,
@@ -79,9 +80,12 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
     noise_trace = []
     motion_trace = []
     previous_capture = env.capture_motion
+    previous_diagnostics = env.capture_diagnostics
+    metrics = TransitionMetrics(env)
     initial = motion_state(env)
     origins = env.scene.env_origins.detach().cpu().numpy().copy()
     env.capture_motion = True
+    env.capture_diagnostics = True
     error = None
     try:
         for step, command in enumerate(commands):
@@ -110,8 +114,17 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
                     reset.cpu().numpy(),
                 )
             action = host.motor.encode(targets)
-            _, _, terminated, timed_out, extras = env.step(action)
+            _, reward, terminated, timed_out, extras = env.step(action)
             host.motor.verify_delivery(terminated, timed_out)
+            metrics.add(
+                "evaluation",
+                applied,
+                reward,
+                env.reward_manager._step_reward,
+                extras["diagnostic_state"],
+                terminated,
+                timed_out,
+            )
             motion = extras["motion_state"]
             if motion is None:
                 raise RuntimeError(
@@ -146,6 +159,7 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
             terminated_rows=terminated_count,
             timeout_rows=timeout_count,
             motor_delivery=host.motor.progress(),
+            task_metrics=metrics.drain(),
         )
         after = controller.state_sha256()
         if before != after:
@@ -171,6 +185,7 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
         raise
     finally:
         env.capture_motion = previous_capture
+        env.capture_diagnostics = previous_diagnostics
         report["sensor_noise"] = sensor_noise_report(env)
         write_tape(
             Path(output) / "commands.json",

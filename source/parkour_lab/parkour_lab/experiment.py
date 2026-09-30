@@ -66,6 +66,7 @@ def train(env, app, config, output, report, *, checkpoint=None):
         for index in range(config.updates):
             metrics = dict(method.advance())
             metrics.update(
+                task_metrics=host.metrics.drain(),
                 environment_transitions=host.steps * env.num_envs,
                 training_wall_seconds=time.monotonic() - started,
             )

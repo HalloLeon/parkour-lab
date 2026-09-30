@@ -59,22 +59,73 @@ the report and dependency identity always describe the method actually executed.
 All commands create separate run directories under `--output-parent`.
 Checkpoint and actor outputs refuse to overwrite existing files.
 
-The task fields `linear_tracking_std` (m/s) and `angular_tracking_std` (rad/s)
-set the existing exponential tracking reward widths; both default to `0.5`.
-The kernels are `exp(-squared_error / std**2)`, using root-COM body-frame xy
-velocity and body-z yaw respectively. Smaller widths penalize the same tracking
-error more strongly, but can weaken the learning signal far from the target.
-For a controlled continuation, a task-only file can specify:
+### Reward configuration and diagnostics
+
+`task.rewards` overrides only named weights and the numeric parameters below.
+Omitted terms keep their defaults; weight `0` disables computation of a term.
+Positive rewards cannot become penalties or vice versa. Unknown names, unsupported
+parameters, booleans and nonfinite numbers are rejected before simulation starts.
+
+| Term | Default weight | Meaning before weighting |
+| --- | ---: | --- |
+| `track_lin_vel_xy_exp` | 1.5 | Exponential body-frame root-COM xy tracking |
+| `track_ang_vel_z_exp` | 0.75 | Exponential body-z yaw tracking |
+| `lin_vel_z_l2` | −2 | Squared vertical COM velocity |
+| `ang_vel_xy_l2` | −0.05 | Squared roll/pitch angular velocity |
+| `dof_torques_l2` | −0.0002 | Sum of squared applied joint torques |
+| `dof_acc_l2` | −2.5e−7 | Sum of squared joint accelerations |
+| `action_rate_l2` | −0.01 | Squared change in raw joint actions |
+| `feet_air_time` | 0.01 | First-contact air time minus threshold; only when commanded xy speed >0.1 m/s |
+| `flat_orientation_l2` | −2.5 | Squared projected-gravity xy components |
+| `dof_pos_limits` | −10 | Joint excursion beyond soft limits |
+| `joint_posture` | 0 | Optional unsquared joint deviation from the default pose |
+
+The new posture term follows [Unitree's Go2 reward](https://github.com/unitreerobotics/unitree_rl_lab/blob/4960b84732b0c2ec593dccbfe963fda1bcd7b1e3/source/unitree_rl_lab/unitree_rl_lab/tasks/locomotion/mdp/rewards.py).
+Its multiplier is `stand_still_scale` (default 5, minimum 1) only when the complete
+`[vx, vy, yaw_rate]` command is zero and measured planar COM speed is at most
+`velocity_threshold` (default 0.3 m/s, minimum 0). A pure pivot is not a stop.
+`feet_air_time.params.threshold` defaults to 0.5 s and must be nonnegative;
+short swings can contribute negatively even with a positive weight.
+
+`task.linear_tracking_std` (m/s) and `task.angular_tracking_std` (rad/s) are the
+only tracking-width settings; both default to 0.5. Their kernels are
+`exp(-squared_error / std**2)`. Do not put `std` under reward overrides.
+For example, this task-only file changes two weights and disables one penalty:
 
 ```json
-{"task": {"linear_tracking_std": 0.25, "angular_tracking_std": 0.25}}
+{
+  "task": {
+    "rewards": {
+      "feet_air_time": {"weight": 0.25},
+      "joint_posture": {"weight": -0.7, "params": {"stand_still_scale": 5}},
+      "action_rate_l2": {"weight": 0}
+    }
+  }
+}
 ```
 
-This changes the training objective, not the command distribution, motor limits,
-observation contract or evaluation thresholds. Keep an equal-budget unchanged-width
-control from the same checkpoint/seed. Judge frozen causal behavior, not reward
-totals across different objectives. A narrower reward is an experiment, not an
-accepted baseline or a guarantee of improved gait.
+This is a configuration example, not a recommended trained baseline. When loading
+an artifact, omitting `task.rewards` retains its overrides; supplying it replaces
+the entire override map. Use `"rewards": {}` to restore defaults. Other task fields
+and the learner remain unchanged. Weights and tracking widths change the training
+objective, not motor limits, commands, observations or evaluation thresholds.
+
+Every native report includes the actual manager's `reward_recipe`: weights,
+functions, formulas, parameters and control timestep. Native rewards are the
+signed sum of `weight * term * dt`, without clipping. `metrics.jsonl` adds
+`task_metrics`, grouped by learning phase and outgoing command regime. Initial
+stops are distinguished from stops after any movement command in the same episode;
+reset starts that history again. Counts and simulated seconds sum across robot
+instances, not wall-clock time. Each term records a weighted rate mean and its
+dt-weighted contribution sum; contributions reconcile with the native reward.
+Physical means use post-physics, pre-reset truth for xy/yaw tracking, height above
+the surface beneath the base, joint-posture deviation and tilt. Termination and
+timeout counts remain separate, including overlaps. PPO and student-history
+metrics are not mixed; optimizer/auxiliary losses remain method-owned. Evaluation
+reports the same diagnostics separately from its first-attempt behavioral scores.
+
+Compare frozen causal behavior, not total reward across different objectives.
+Training diagnostics do not establish a passing locomotion policy.
 
 Evaluation/play accept either `--tape FILE` or `--command VX VY WZ --steps N`.
 The latter includes a final one-second stop (all stop when N <= 50).

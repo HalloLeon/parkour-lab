@@ -10,6 +10,7 @@ from parkour_lab.runtime.motor import (
     NativeJointTargetBridge,
     _runtime_motor_binding,
 )
+from parkour_lab.runtime.metrics import TransitionMetrics
 
 
 class TrainingHost:
@@ -41,6 +42,8 @@ class TrainingHost:
         self.first_causal_sample = None
         self.resets = self.partial_reset_steps = self.steps = 0
         self.phase_counts = {}
+        self.metrics = TransitionMetrics(env)
+        env.capture_diagnostics = True
         if env.step_dt != 0.02 or env.physics_dt != 0.005 or env.cfg.decimation != 4:
             raise ValueError("Require native 50Hz control / 200Hz physics")
 
@@ -106,6 +109,7 @@ class TrainingHost:
     def reset(self, *, seed=None, command=None):
         native, _ = self.env.reset(**({"seed": seed} if seed is not None else {}))
         self.previous.zero_()
+        self.metrics.reset()
         first = torch.ones(self.env.num_envs, dtype=torch.bool, device=self.env.device)
         return self.observations(native, first, command), first
 
@@ -113,12 +117,22 @@ class TrainingHost:
         if not self.app.is_running():
             raise RuntimeError("Simulation application stopped during training")
         raw = raw.detach().clone()
+        command = self.env.command_manager.get_command("base_velocity").clone()
         delivered = self.bridge.encode(
             JointTargets(self.bridge.joint_names, self.bridge.default + 0.25 * raw, raw)
         )
         with torch.no_grad():
             native, reward, terminated, truncated, extras = self.env.step(delivered)
         self.bridge.verify_delivery(terminated, truncated)
+        self.metrics.add(
+            phase,
+            command,
+            reward,
+            self.env.reward_manager._step_reward,
+            extras["diagnostic_state"],
+            terminated,
+            truncated,
+        )
         done = terminated | truncated
         ids, final = extras["final_env_ids"], extras["final_observation"]
         if not torch.equal(ids, done.nonzero(as_tuple=False).flatten()):

@@ -90,11 +90,9 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
         "y": (-0.2, 0.2),
         "yaw": (-math.pi, math.pi),
     }
-    cfg.rewards.dof_pos_limits.weight = -10.0
-    cfg.rewards.flat_orientation_l2.weight = -2.5
-    cfg.rewards.feet_air_time.weight = 0.01
-    cfg.rewards.track_lin_vel_xy_exp.params["std"] = task.linear_tracking_std
-    cfg.rewards.track_ang_vel_z_exp.params["std"] = task.angular_tracking_std
+    from .rewards import configure_rewards
+
+    configure_rewards(cfg, task)
 
     if task.terrain != "flat":
         cfg.scene.terrain.terrain_type = "generator"

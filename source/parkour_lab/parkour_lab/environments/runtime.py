@@ -24,7 +24,8 @@ class LocomotionEnv(ManagerBasedRLEnv):
         self._capturing = False
         self._final = None
         self.capture_motion = False
-        self._final_motion = None
+        self.capture_diagnostics = False
+        self._final_physics = None
         self.transition_counts = dict(
             control_steps=0,
             terminated_rows=0,
@@ -62,14 +63,20 @@ class LocomotionEnv(ManagerBasedRLEnv):
                         "Observation history, modifiers and stateful noise belong in the method adapter"
                     )
 
+    def _capture_physics(self):
+        from parkour_lab.runtime.native import motion_state
+        from parkour_lab.runtime.metrics import diagnostic_state
+
+        state = motion_state(self) if self.capture_motion else {}
+        if self.capture_diagnostics:
+            state["diagnostic_state"] = diagnostic_state(self)
+        return state
+
     def _reset_idx(self, env_ids):
         if self._capturing:
-            if self.capture_motion:
-                from parkour_lab.runtime.native import motion_state
-
-                self._final_motion = {
-                    name: value[env_ids] for name, value in motion_state(self).items()
-                }
+            self._final_physics = {
+                name: value[env_ids] for name, value in self._capture_physics().items()
+            }
             # Only ending episodes need a final sample. Isolate that additional
             # noise draw from the normal reset/survivor observation RNG stream.
             device = torch.device(self.device)
@@ -88,7 +95,7 @@ class LocomotionEnv(ManagerBasedRLEnv):
 
     def step(self, action):
         self._final = None
-        self._final_motion = None
+        self._final_physics = None
         self._capturing = True
         try:
             observations, reward, terminated, truncated, extras = super().step(action)
@@ -100,18 +107,13 @@ class LocomotionEnv(ManagerBasedRLEnv):
                         "Automatic reset did not supply matching final observations"
                     )
                 final = self._final[1]
-            motion = None
-            if self.capture_motion:
-                from parkour_lab.runtime.native import motion_state
-
-                # Current tasks have no interval state perturbations. Adding any
-                # requires revisiting survivor sampling after the SDK step.
-                motion = motion_state(self)
-                if len(ids):
-                    if self._final_motion is None:
-                        raise RuntimeError("Missing pre-reset motion capture")
-                    for name, value in motion.items():
-                        value[ids] = self._final_motion[name]
+            # Tasks have no interval state perturbations; adding any requires
+            # revisiting survivor sampling after the SDK step.
+            physics = self._capture_physics()
+            if len(ids):
+                for name, value in physics.items():
+                    value[ids] = self._final_physics[name]
+            diagnostics = physics.pop("diagnostic_state", None)
             self.transition_counts["control_steps"] += 1
             self.transition_counts["terminated_rows"] += int(terminated.sum())
             self.transition_counts["truncated_rows"] += int(truncated.sum())
@@ -128,10 +130,11 @@ class LocomotionEnv(ManagerBasedRLEnv):
                     **extras,
                     "final_env_ids": ids.clone(),
                     "final_observation": final,
-                    "motion_state": motion,
+                    "motion_state": physics if self.capture_motion else None,
+                    "diagnostic_state": diagnostics,
                 },
             )
         finally:
             self._capturing = False
             self._final = None
-            self._final_motion = None
+            self._final_physics = None

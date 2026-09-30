@@ -71,6 +71,32 @@ def _pass_counts(passed, total):
     )
 
 
+def _same_values(actual, expected, tolerance):
+    """Allow bounded floating-point arithmetic drift, never identity/type changes."""
+    if isinstance(actual, (float, np.floating)) and isinstance(
+        expected, (float, np.floating)
+    ):
+        return (
+            math.isfinite(actual)
+            and math.isfinite(expected)
+            and abs(actual - expected)
+            <= tolerance * max(1.0, abs(actual), abs(expected))
+        )
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _same_values(actual[key], value, tolerance)
+            for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _same_values(left, right, tolerance)
+            for left, right in zip(actual, expected)
+        )
+    return actual == expected
+
+
 def summarize_development_profile(profile, trials, manifest):
     """Keep the original 100 IDs and denominator, including unresolved evidence.
 
@@ -79,7 +105,9 @@ def summarize_development_profile(profile, trials, manifest):
     """
     from parkour_lab.environments.randomization import development_manifest
 
-    if profile not in PROFILES or manifest != development_manifest(profile):
+    if profile not in PROFILES or not _same_values(
+        manifest, development_manifest(profile), 32 * np.finfo(np.float64).eps
+    ):
         raise ValueError("Development manifest differs from its canonical 100-ID draws")
     attempts = manifest["attempts"]
     indexed = {}
@@ -159,10 +187,8 @@ def score_development_profile(trace, profile, manifest):
     return result
 
 
-def aggregate_development_bank(profile_results):
+def aggregate_development_bank(profile_results, manifests):
     """Recompute counts for one controller; callers verify the trace artifacts."""
-    from parkour_lab.environments.randomization import development_manifest
-
     groups = {}
     controllers = set()
     for result in profile_results:
@@ -200,7 +226,7 @@ def aggregate_development_bank(profile_results):
         recomputed = summarize_development_profile(
             profile,
             [row for row in trials if row["attempt_index"] not in missing_ids],
-            development_manifest(profile),
+            manifests.get(profile),
         )
         if any(result.get(key) != value for key, value in recomputed.items()):
             raise ValueError("Development group counts or evidence metadata changed")
@@ -226,7 +252,7 @@ def analyze_development_bank(root):
     root = Path(root)
     if not root.is_dir():
         raise ValueError("Flat-bank analysis requires a directory of evaluation runs")
-    results, receipts, profiles = [], [], set()
+    results, receipts, manifests = [], [], {}
     shared = None
     for path in sorted(root.rglob("report.json")):
         report = json.loads(path.read_text())
@@ -240,10 +266,9 @@ def analyze_development_bank(root):
                 raise ValueError(f"{path}: {reason}")
 
         require(
-            profile in PROFILES and profile not in profiles,
+            profile in PROFILES and profile not in manifests,
             "unknown or repeated group; recovery is not automatic",
         )
-        profiles.add(profile)
         require(
             report.get("status") == "EVALUATION_COMPLETE_NOT_QUALIFIED"
             and report.get("policy_unchanged") is True
@@ -310,6 +335,7 @@ def analyze_development_bank(root):
             "recorded commands differ from the profile",
         )
         manifest = json.loads((path.parent / "manifest.json").read_text())
+        manifests[profile] = manifest
         with np.load(path.parent / "motion.npz", allow_pickle=False) as archive:
             result = score_development_profile(dict(archive), profile, manifest)
         with np.load(path.parent / "tracking.npz", allow_pickle=False) as archive:
@@ -365,8 +391,15 @@ def analyze_development_bank(root):
                 "first causal input does not contain the recorded additive noise",
             )
         stored = report.get("flat_development", {})
+        # Native traces are float32; NumPy scalar promotion/reductions can differ
+        # by a few ULPs. Pass/failure decisions and thresholds must still be exact.
         require(
-            all(stored.get(key) == value for key, value in result.items()),
+            all(
+                _same_values(stored.get(key), value, 8 * np.finfo(np.float32).eps)
+                if key == "trials"
+                else stored.get(key) == value
+                for key, value in result.items()
+            ),
             "stored development outcome differs from rescored evidence",
         )
         result["controller_state_sha256"] = stored.get("controller_state_sha256")
@@ -390,7 +423,7 @@ def analyze_development_bank(root):
                 sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
             )
         )
-    summary = aggregate_development_bank(results)
+    summary = aggregate_development_bank(results, manifests)
     summary.update(actor_sha256=None if shared is None else shared[0], reports=receipts)
     return summary
 
