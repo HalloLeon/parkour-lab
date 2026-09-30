@@ -4,6 +4,7 @@ import torch
 
 from parkour_lab.control.controller import JointTargets
 from parkour_lab.control.motor_contract import make_motor_contract
+from parkour_lab.control.proprioception import ACTION_SLICE, CONTACT_SLICE, FRAME_DIM
 from parkour_lab.runtime.motor import (
     NATIVE_RAW_ACTION_MEANING,
     NativeJointTargetBridge,
@@ -14,7 +15,7 @@ from parkour_lab.runtime.motor import (
 class TrainingHost:
     """Deliver named observations and verified raw joint actions without an RL API.
 
-    Native groups: proprio = causal 45D, policy = clean privileged 48D,
+    Native groups: proprio = causal 49D, policy = clean privileged 52D,
     terrain = privileged 264D. The historical native group name ``policy`` does
     NOT grant it causal access. Final rows use the same native group schema.
     """
@@ -66,9 +67,14 @@ class TrainingHost:
         expected = self.previous.clone()
         expected[reset] = 0
         if (
-            frame.shape != (self.env.num_envs, 45)
-            or clean.shape != (self.env.num_envs, 48)
-            or not torch.equal(frame[:, -12:], expected)
+            frame.shape != (self.env.num_envs, FRAME_DIM)
+            or clean.shape != (self.env.num_envs, FRAME_DIM + 3)
+            or not torch.equal(frame[:, ACTION_SLICE], expected)
+            or not torch.equal(frame[:, CONTACT_SLICE], clean[:, -4:])
+            or not (
+                (frame[:, CONTACT_SLICE] == 0) | (frame[:, CONTACT_SLICE] == 1)
+            ).all()
+            or (frame[reset, CONTACT_SLICE] != 0).any()
             or not torch.equal(
                 frame[:, 6:9], self.env.command_manager.get_command("base_velocity")
             )
@@ -77,7 +83,7 @@ class TrainingHost:
             )
         ):
             raise ValueError(
-                "Pre-action sensor, command, COM-velocity or previous-action alignment failed"
+                "Pre-action sensor, contact, command, COM-velocity or previous-action alignment failed"
             )
         return {**native, "proprio": frame.clone(), "policy": clean.clone()}
 
@@ -102,7 +108,8 @@ class TrainingHost:
         if not torch.equal(ids, done.nonzero(as_tuple=False).flatten()):
             raise ValueError("Final observation rows do not match episode endings")
         if len(ids) and (
-            final is None or not torch.equal(final["proprio"][:, -12:], delivered[ids])
+            final is None
+            or not torch.equal(final["proprio"][:, ACTION_SLICE], delivered[ids])
         ):
             raise ValueError("Final observations must precede the action-buffer reset")
         self.previous = delivered.clone()

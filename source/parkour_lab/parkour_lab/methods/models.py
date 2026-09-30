@@ -46,61 +46,26 @@ class PrivilegedScanEncoder(nn.Module):
         return self.network(terrain_scan)
 
 
-class StockTerrainInput(nn.Module):
-    """Terrain conditioning without changing the stock first-layer arithmetic.
+class TerrainConditionedInput(nn.Module):
+    """Add a privileged 132-height/132-validity scan to a critic preactivation."""
 
-    Inputs are the original 48 motor values followed by 132 heights and their
-    132 validity bits. A zero-initialized projection adds the scan encoding to
-    the first hidden preactivation. Initially the motor is exactly unchanged,
-    even for nonzero terrain inputs; after learning this is one conditioned
-    motor, not an action blend or a policy switch. This is a teacher input:
-    the original simulator-velocity values are still privileged.
-    """
-
-    def __init__(self, reference: nn.Linear, *, critic_task_dim: int = 0) -> None:
+    def __init__(self, reference: nn.Linear) -> None:
         super().__init__()
-        if not isinstance(reference, nn.Linear) or (
-            reference.in_features,
-            reference.out_features,
-        ) != (48, 128):
-            raise ValueError("Terrain conditioning requires a 48-to-128 layer.")
-        if type(critic_task_dim) is not int or critic_task_dim not in (0, 4):
-            raise ValueError(
-                "Only the explicit four-value critic task schema is supported."
-            )
-        self.critic_task_dim = critic_task_dim
+        if not isinstance(reference, nn.Linear):
+            raise ValueError("Terrain conditioning requires a linear state input.")
         self.reference = reference
         self.encoder = PrivilegedScanEncoder(264)
-        self.projection = nn.Linear(DEFAULT_TERRAIN_LATENT_DIM, 128, bias=False)
+        self.projection = nn.Linear(
+            DEFAULT_TERRAIN_LATENT_DIM, reference.out_features, bias=False
+        )
         nn.init.zeros_(self.projection.weight)
         self.encoder.to(reference.weight)
         self.projection.to(reference.weight)
-        if critic_task_dim:
-            # Critic-only task state must not change any existing initialization
-            # or the subsequent rollout RNG stream (including on CUDA).
-            device = reference.weight.device
-            with torch.random.fork_rng(
-                devices=[device] if device.type == "cuda" else []
-            ):
-                self.task_projection = nn.Linear(
-                    critic_task_dim,
-                    128,
-                    bias=False,
-                    device=device,
-                    dtype=reference.weight.dtype,
-                )
-                nn.init.zeros_(self.task_projection.weight)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        if observations.shape[-1] != 312 + self.critic_task_dim:
-            raise ValueError(
-                "Expected 48 stock + 264 terrain values and the declared critic task schema."
-            )
-        # Preserve the original contiguous 48-column GEMM, not a wider GEMM
-        # whose reduction order can differ despite zero additional weights.
-        state = observations[..., :48].contiguous()
-        terrain = observations[..., 48:312]
-        hidden = self.reference(state) + self.projection(self.encoder(terrain))
-        if self.critic_task_dim:
-            hidden = hidden + self.task_projection(observations[..., 312:])
-        return hidden
+        width = self.reference.in_features
+        if observations.shape[-1] != width + 264:
+            raise ValueError("Expected critic state followed by 264 terrain values.")
+        state = observations[..., :width].contiguous()
+        terrain = observations[..., width:]
+        return self.reference(state) + self.projection(self.encoder(terrain))

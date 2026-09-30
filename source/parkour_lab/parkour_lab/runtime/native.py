@@ -12,12 +12,38 @@ from __future__ import annotations
 import torch
 
 from parkour_lab.control.controller import ControllerSession, Sample, finite_tensor
-from parkour_lab.control.proprioception import NATIVE_SENSORS
+from parkour_lab.control.proprioception import (
+    CONTACT_THRESHOLD_N,
+    FOOT_NAMES,
+    NATIVE_SENSORS,
+)
 
 
 from parkour_lab.runtime.motor import (
     NativeJointTargetBridge,
 )
+
+
+def foot_contact_forces(env):
+    """Latest native net normal forces in named FR/FL/RR/RL order, world axes."""
+    sensor = env.scene["contact_forces"]
+    if any(sensor.body_names.count(name) != 1 for name in FOOT_NAMES):
+        raise ValueError("Contact sensor must contain each named foot exactly once")
+    ids = [sensor.body_names.index(name) for name in FOOT_NAMES]
+    forces = sensor.data.net_forces_w[:, ids]
+    finite_tensor(forces, (env.num_envs, 4, 3))
+    return forces
+
+
+def foot_contacts(env):
+    """Binary net-force flags; no force history, wrench torque or friction added.
+
+    The sensor updates at every physics step. Reset buffers may still expose the
+    previous PhysX sample, so rows without a post-reset step report four zeros.
+    """
+    forces = foot_contact_forces(env)
+    flags = torch.linalg.vector_norm(forces, dim=-1) > CONTACT_THRESHOLD_N
+    return (flags & (env.episode_length_buf[:, None] > 0)).to(forces.dtype)
 
 
 def configure_external_command(command, *, command_class=None):
@@ -121,6 +147,8 @@ class NativeControllerSession:
                 "joint_velocity": robot.joint_vel,
                 "stock_previous_raw_action": env.action_manager.action,
             }
+            if "foot_contacts" in self.controller.spec.sensors:
+                values["foot_contacts"] = foot_contacts(env)
             if (
                 not isinstance(reset_mask, torch.Tensor)
                 or reset_mask.shape != (env.num_envs,)

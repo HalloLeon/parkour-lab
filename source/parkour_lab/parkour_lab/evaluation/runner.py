@@ -10,7 +10,11 @@ import numpy as np
 import torch
 
 from parkour_lab.control.command_tape import TapeBuilder, validate_tape, write_tape
-from parkour_lab.runtime.native import NativeControllerSession
+from parkour_lab.runtime.native import (
+    NativeControllerSession,
+    foot_contacts,
+    foot_contact_forces,
+)
 
 
 def command_sequence(*, tape=None, command=(0.3, 0.0, 0.0), steps=900):
@@ -46,6 +50,7 @@ def evaluate(env, app, loaded, commands, output, report):
     squared_error = torch.zeros(3, device=env.device)
     terminated_count = timeout_count = 0
     trace = []
+    contact_trace, force_trace, reset_trace = [], [], []
     error = None
     try:
         for step, command in enumerate(commands):
@@ -63,6 +68,14 @@ def evaluate(env, app, loaded, commands, output, report):
             if not torch.isfinite(actual).all():
                 raise RuntimeError("Nonfinite tracking measurement")
             targets = host.act(applied, time_s=step * env.step_dt, reset_mask=reset)
+            contact_sample = None
+            if "foot_contacts" in controller.spec.sensors:
+                # Same pre-action physics sample; raw forces are diagnostics only.
+                contact_sample = (
+                    foot_contacts(env).cpu().numpy(),
+                    foot_contact_forces(env).cpu().numpy(),
+                    reset.cpu().numpy(),
+                )
             action = host.motor.encode(targets)
             _, _, terminated, timed_out, _ = env.step(action)
             host.motor.verify_delivery(terminated, timed_out)
@@ -72,6 +85,10 @@ def evaluate(env, app, loaded, commands, output, report):
             timeout_count += int((timed_out & ~terminated).sum())
             reset = terminated | timed_out
             trace.append(actual.cpu().numpy())
+            if contact_sample is not None:
+                contact_trace.append(contact_sample[0])
+                force_trace.append(contact_sample[1])
+                reset_trace.append(contact_sample[2])
         report.update(
             status="EVALUATION_COMPLETE_NOT_QUALIFIED",
             control_steps=len(commands),
@@ -97,6 +114,15 @@ def evaluate(env, app, loaded, commands, output, report):
             recorder.finish(completed=error is None, error=error),
         )
         if trace:
+            sensors = {}
+            if contact_trace:
+                sensors = dict(
+                    foot_contacts=np.stack(contact_trace),
+                    foot_net_forces_w=np.stack(force_trace),
+                    reset_mask=np.stack(reset_trace),
+                )
             np.savez_compressed(
-                Path(output) / "tracking.npz", root_com_velocity=np.stack(trace)
+                Path(output) / "tracking.npz",
+                root_com_velocity=np.stack(trace),
+                **sensors,
             )

@@ -154,10 +154,55 @@ Commit new executable files before server runs: the Git receipt includes tracked
 changes but does not archive untracked file contents. No test/documentation files
 need to be synced to run the package commands.
 
-The model uses 45-D proprioceptive frames. The optional/default-on contact
-conditioning is twelve privileged teacher force labels, **not** causal foot-contact
-indicators. The sensing requirements in `ACCEPTANCE.md` are qualification targets,
-not a description of this observation format.
+The current `.plab` format is `parkour_lab_method_v2`. Earlier 45-D artifacts are
+not compatible: start a fresh 49-D baseline, without loading or converting old weights.
+
+## Default ROA recipe
+
+The causal frame has 49 values: angular velocity, projected gravity, applied
+command, relative joint positions, joint velocities, previous raw action, then
+four binary foot contacts in **FR, FL, RR, RL** order. Each flag is
+`norm(net_forces_w[foot]) > 1.5 N`, using the latest completed 200 Hz physics sample
+at the 50 Hz action boundary. This is a native net-normal-force vector, not a
+six-axis wrench or the sum of individual contact magnitudes. Contact flags have
+no noise/filter/delay and remain zero until the first completed post-reset step.
+Reset history repeats that cleared frame; surviving rows keep their own history.
+The deployment controller uses the same detector. Evaluation's `tracking.npz`
+also records ordered force vectors, flags and reset masks for auditing; raw
+forces are diagnostics, not student inputs.
+
+| Setting | Go2 default and rationale |
+| --- | --- |
+| Actor/history | 49 values, 25 frames including the current frame (0.48 s span); longer context retained for the velocity estimator |
+| Learning cycle | 24 privileged PPO steps; every fifth update adds 64 causal steps and 4×4 supervised minibatches; frequent fitting of the evolving teacher |
+| Optimizers | PPO Adam `2e-4`, five epochs/four minibatches; supervised Adam `1e-3` |
+| Regularization | `0.1 * clip((completed_updates - 3000) / 7000, 0, 1)`; warms up before aligning the teacher to the student |
+| Latents/supervision | Eight-dimensional dynamics latent, separately directed unsquared L2 alignment, plus supervised three-dimensional COM-velocity estimation |
+| Networks | Motor ELU MLP 128/128/128 with additive latent projection; estimator 128/64; asymmetric terrain-conditioned critic |
+| Exploration | Learned action standard deviation initialized at 1.0; entropy coefficient 0.01, no minimum-std clamp |
+| Control | Stock Go2 motors; `q_target = default_q + 0.25 * raw_action`, no action clipping; 50/200 Hz control/physics |
+
+The regularization endpoints follow the **non-resume branch**, not the enabled
+resume branch, of the [pinned author configuration](https://github.com/MarkFzp/Deep-Whole-Body-Control/blob/8159e4ed8695b2d3f62a40d2ab8d88205ac5021a/legged_gym/legged_gym/envs/widowGo1/widowGo1_config.py).
+`regularization_start_update` and `regularization_end_update` are configurable;
+both zero selects a constant coefficient. Continuation derives the coefficient
+from the restored total update count, so it does not restart the ramp.
+
+This is an **ROA-like Go2 port, not an exact reproduction**. The
+[ROA supplement](https://proceedings.mlr.press/v205/fu23a/fu23a-supp.pdf) uses ten
+history frames, interval 20 and a different 0→1 ramp. This port instead retains
+additional history-collection blocks, explicit velocity supervision, a default-on
+12-D privileged force extension (`contact_conditioned`), an asymmetric terrain
+critic, and Go2-specific networks, rewards, noise, resets and action scaling.
+Both actor routes use estimated rather than true COM velocity. Student inputs
+remain causal; teacher force labels are separate from the four binary contacts.
+No observation normalization is learned. The entropy/noise settings also differ
+from upstream. Equal update numbers do not imply equal samples or training effort.
+
+Flat training samples forward/reverse/lateral commands and yaw/hold/restart
+sequences with the task's recorded startup mass/friction randomization. It is not
+yet the complete acceptance DR distribution or flat-command scorer. Use periodic
+checkpoints to assess the learning curve; diagnostic playback is not a pass gate.
 
 ## Acceptance
 

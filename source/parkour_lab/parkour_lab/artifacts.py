@@ -16,7 +16,7 @@ from parkour_lab.config import ExperimentConfig
 from parkour_lab.control.motor_contract import validate_motor_contract
 from parkour_lab.methods import get_backend
 
-FORMAT = "parkour_lab_method_v1"
+FORMAT = "parkour_lab_method_v2"
 
 
 def file_sha256(path):

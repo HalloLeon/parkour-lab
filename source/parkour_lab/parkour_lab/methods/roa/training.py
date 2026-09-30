@@ -31,7 +31,8 @@ class ROATrainingMethod:
         adaptation_batches,
         adaptation_learning_rate,
         history_interval=1,
-        regularization_schedule=None,
+        regularization_start_update=0,
+        regularization_end_update=0,
         **ppo_options,
     ):
         for name, value in (
@@ -52,21 +53,12 @@ class ROATrainingMethod:
             or adaptation_learning_rate <= 0
         ):
             raise ValueError("Adaptation learning rate must be finite and positive")
-        if regularization_schedule is not None:
-            if (
-                not isinstance(regularization_schedule, (list, tuple))
-                or not regularization_schedule
-            ):
-                raise ValueError("Regularization schedule must be a nonempty sequence")
-            if len(regularization_schedule) % history_interval:
-                raise ValueError(
-                    "Regularization schedule must end at an adaptation boundary"
-                )
-            for coefficient in regularization_schedule:
-                self._validate_coefficient(
-                    coefficient, ppo_options.get("causal", False)
-                )
-            regularization_schedule = tuple(regularization_schedule)
+        if (
+            type(regularization_start_update) is not int
+            or type(regularization_end_update) is not int
+            or not 0 <= regularization_start_update <= regularization_end_update
+        ):
+            raise ValueError("Regularization updates must satisfy 0 <= start <= end")
         self._validate_coefficient(
             ppo_options.get("regularization_coef", 0.1),
             ppo_options.get("causal", False),
@@ -74,7 +66,9 @@ class ROATrainingMethod:
         self.policy = policy
         self.rollout_steps = rollout_steps
         self.history_interval = history_interval
-        self.regularization_schedule = regularization_schedule
+        self.regularization_start_update = regularization_start_update
+        self.regularization_end_update = regularization_end_update
+        self.regularization_coef = ppo_options.get("regularization_coef", 0.1)
         self.updates = 0
         self.adaptation_optimizer_steps = 0
         self._advance_in_progress = False
@@ -118,12 +112,11 @@ class ROATrainingMethod:
         """Run one PPO update and any history block due at its update boundary."""
         if self._advance_in_progress:
             raise RuntimeError("Cannot continue an interrupted or reentrant ROA update")
-        if self.regularization_schedule is not None:
-            if self.updates >= len(self.regularization_schedule):
-                raise ValueError("Regularization schedule is complete")
-            self.algorithm.regularization_coef = self.regularization_schedule[
-                self.updates
-            ]
+        start, end = self.regularization_start_update, self.regularization_end_update
+        fraction = min(max((self.updates - start) / max(end - start, 1), 0), 1)
+        if start == end:
+            fraction = float(self.updates >= end)
+        self.algorithm.regularization_coef = self.regularization_coef * fraction
         self._validate_coefficient(
             self.algorithm.regularization_coef, self.algorithm.causal
         )
@@ -238,10 +231,6 @@ class ROATrainingMethod:
         for name in ("updates", "adaptation_optimizer_steps"):
             if type(state[name]) is not int or state[name] < 0:
                 raise ValueError("ROA schedule counters must be nonnegative integers")
-        if self.regularization_schedule is not None and state["updates"] > len(
-            self.regularization_schedule
-        ):
-            raise ValueError("Learning state exceeds the configured schedule")
         parameters = state["policy_state"]
         std = parameters.get("std")
         if (

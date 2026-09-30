@@ -15,11 +15,13 @@ class ROAConfig:
     adaptation_epochs: int = 4
     adaptation_batches: int = 4
     adaptation_learning_rate: float = 0.001
-    learning_rate: float = 0.001
+    learning_rate: float = 0.0002
     num_learning_epochs: int = 5
     num_mini_batches: int = 4
     entropy_coef: float = 0.01
     regularization_coef: float = 0.1
+    regularization_start_update: int = 3000
+    regularization_end_update: int = 10000
     initial_action_std: float = 1.0
     contact_conditioned: bool = True
 
@@ -42,6 +44,14 @@ class ROAConfig:
                 raise ValueError(f"{name} must be finite and nonnegative")
         if type(self.contact_conditioned) is not bool:
             raise ValueError("contact_conditioned must be boolean")
+        if (
+            type(self.regularization_start_update) is not int
+            or type(self.regularization_end_update) is not int
+            or not 0
+            <= self.regularization_start_update
+            <= self.regularization_end_update
+        ):
+            raise ValueError("Regularization updates must satisfy 0 <= start <= end")
 
 
 def configure(options):

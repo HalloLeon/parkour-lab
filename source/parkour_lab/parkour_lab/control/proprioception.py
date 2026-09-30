@@ -1,15 +1,15 @@
-"""Shared 45-D Go2 frame packing; history and reset state belong to each method.
-
-These are the existing sensor semantics, not a new contact-input schema. Packing
-performs no filtering, scaling or validation; each caller retains its own checks.
-"""
+"""Shared contact-aware Go2 frame; history and reset state belong to each method."""
 
 import torch
 
 from .controller import SensorSpec
 
 
-FRAME_DIM = 45
+FRAME_DIM = 49
+ACTION_SLICE = slice(33, 45)
+CONTACT_SLICE = slice(45, 49)
+FOOT_NAMES = ("FR_foot", "FL_foot", "RR_foot", "RL_foot")
+CONTACT_THRESHOLD_N = 1.5
 FRAME_TERMS = (
     ("base_ang_vel", 3),
     ("projected_gravity", 3),
@@ -17,6 +17,7 @@ FRAME_TERMS = (
     ("joint_pos", 12),
     ("joint_vel", 12),
     ("actions", 12),
+    ("foot_contacts", 4),
 )
 
 # Trusted native sensor semantics, not metadata supplied by a backbone. No
@@ -28,11 +29,12 @@ NATIVE_SENSORS = {
     "joint_position": ((12,), "rad", "joint"),
     "joint_velocity": ((12,), "rad/s", "joint"),
     "stock_previous_raw_action": ((12,), "unitless", "joint"),
+    "foot_contacts": ((4,), "binary", "FR_FL_RR_RL"),
 }
 
 
 def proprioceptive_sensor_specs():
-    """Return a fresh declaration of the existing five causal sensor fields."""
+    """Return a fresh declaration of the six causal sensor fields."""
     return {
         name: SensorSpec(*NATIVE_SENSORS[name], max_age_s=0.02)
         for name in (
@@ -41,6 +43,7 @@ def proprioceptive_sensor_specs():
             "joint_position_relative_default",
             "joint_velocity",
             "stock_previous_raw_action",
+            "foot_contacts",
         )
     }
 
@@ -52,6 +55,7 @@ def pack_proprioception(
     joint_position_relative_default,
     joint_velocity,
     previous_raw_action,
+    foot_contacts,
 ):
     return torch.cat(
         (
@@ -61,6 +65,7 @@ def pack_proprioception(
             joint_position_relative_default,
             joint_velocity,
             previous_raw_action,
+            foot_contacts,
         ),
         dim=-1,
     )

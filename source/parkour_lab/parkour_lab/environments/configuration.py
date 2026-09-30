@@ -1,10 +1,9 @@
 """Fresh Go2 task construction, with no checkpoint or experiment reconstruction.
 
 The installed stock Go2 flat task supplies motors, root-COM velocity terms and
-modest startup randomization. The explicit overrides below retain the current
-45-D proprioceptive acquisition task. Terrain promotion, contact observations
-and acceptance criteria are separate work; steps/traversal are diagnostic
-geometries, not an approved behavioral gate.
+modest startup randomization. The actor receives 49 causal values, including four
+noiseless foot-contact flags. Steps/traversal are diagnostic geometries, not an
+approved behavioral gate.
 """
 
 from __future__ import annotations
@@ -59,12 +58,14 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
         procedural_workspace,
     )
     from .terrain import BORDER_WIDTH, ENVELOPES, make_operator_terrain_generator
+    from parkour_lab.runtime.native import foot_contacts
 
     cfg = UnitreeGo2FlatEnvCfg()
     cfg.scene.num_envs = task.num_envs
     cfg.seed = task.seed
     cfg.sim.device = task.device
     cfg.episode_length_s = task.episode_length_s
+    cfg.scene.contact_forces.update_period = cfg.sim.dt
     cfg.curriculum.terrain_levels = None
     if cfg.scene.robot.soft_joint_pos_limit_factor != 0.9:
         raise ValueError(
@@ -163,6 +164,7 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
 
     # Copy sensor noise before making privileged clean state noiseless. The actor
     # retains the native term order minus the three oracle linear velocities.
+    cfg.observations.policy.foot_contacts = ObservationTermCfg(func=foot_contacts)
     cfg.observations.proprio = copy.deepcopy(cfg.observations.policy)
     cfg.observations.proprio.base_lin_vel = None
     cfg.observations.policy.enable_corruption = False

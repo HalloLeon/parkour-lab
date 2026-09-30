@@ -35,8 +35,10 @@ def _batch(value, width, reference=None):
 
 def _stock_motor(motor):
     if not isinstance(motor, nn.Sequential) or len(motor) != 7:
-        raise ValueError("Require the stock 48→128→128→128→12 ELU motor")
-    for index, shape in enumerate(((48, 128), (128, 128), (128, 128), (128, 12))):
+        raise ValueError("Require the 52→128→128→128→12 ELU motor")
+    for index, shape in enumerate(
+        ((FRAME_DIM + 3, 128), (128, 128), (128, 128), (128, 12))
+    ):
         layer = motor[index * 2]
         if (
             type(layer) is not nn.Linear
@@ -62,7 +64,7 @@ def _stock_motor(motor):
 
 
 class LatentMotor(nn.Module):
-    """Keep the stock 48-column GEMM; condition its first hidden preactivation."""
+    """Condition the velocity/proprioception motor's first hidden preactivation."""
 
     def __init__(self, stock_motor):
         super().__init__()
@@ -353,14 +355,14 @@ def build_policy(
 ):
     """Build the ROA actor/asymmetric critic from fresh weights."""
     from rsl_rl.modules import ActorCritic
-    from parkour_lab.methods.models import StockTerrainInput
+    from parkour_lab.methods.models import TerrainConditionedInput
 
     policy_obs = observations["policy"]
     _batch(policy_obs, FRAME_DIM)
     if policy_obs.dtype != torch.float32:
         raise ValueError("ROA observations require float32")
     for name, width in (
-        ("critic_state", 48),
+        ("critic_state", FRAME_DIM + 3),
         ("dynamics", DYNAMICS_DIM),
         ("terrain", 264),
         ("history", HISTORY_LENGTH * FRAME_DIM),
@@ -392,7 +394,7 @@ def build_policy(
         raise ValueError("Stock action noise must be positive")
     policy = copy.deepcopy(reference)
     policy.actor = ROAActor(policy.actor, contact_conditioned=contact_conditioned)
-    policy.critic[0] = StockTerrainInput(policy.critic[0])
+    policy.critic[0] = TerrainConditionedInput(policy.critic[0])
     policy.obs_groups = {
         "policy": policy.actor.privileged_obs_groups,
         "critic": ["critic_state", "terrain"],

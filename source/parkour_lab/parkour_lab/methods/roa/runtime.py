@@ -17,6 +17,10 @@ from torch import nn
 
 from parkour_lab.control.controller import ControllerSpec, JointTargets, finite_tensor
 from parkour_lab.control.proprioception import (
+    CONTACT_SLICE,
+    CONTACT_THRESHOLD_N,
+    FOOT_NAMES,
+    FRAME_TERMS,
     pack_proprioception,
     proprioceptive_sensor_specs,
 )
@@ -28,7 +32,7 @@ from .model import (
     LatentMotor,
 )
 
-PREPROCESSING_VERSION = "go2_operator_roa_causal_history_v1"
+PREPROCESSING_VERSION = "go2_operator_roa_causal_history_v2"
 RAW_ACTION_MEANING = (
     "stock unscaled action; q_target = default_q + 0.25 * raw_action; no clip"
 )
@@ -88,12 +92,16 @@ def _validate_modules(motor, estimator):
         or len(estimator) != 5
     ):
         raise ValueError("Require only the fixed ROA motor and causal estimator")
-    _linear(motor.stock_first, 48, 128)
+    _linear(motor.stock_first, FRAME_DIM + 3, 128)
     _linear(motor.latent_projection, 8, 128, bias=False)
     for index, shape in ((1, (128, 128)), (3, (128, 128)), (5, (128, 12))):
         _linear(motor.tail[index], *shape)
         _elu(motor.tail[index - 1])
-    for index, shape in ((0, (1125, 128)), (2, (128, 64)), (4, (64, 11))):
+    for index, shape in (
+        (0, (HISTORY_LENGTH * FRAME_DIM, 128)),
+        (2, (128, 64)),
+        (4, (64, 11)),
+    ):
         _linear(estimator[index], *shape)
         if index:
             _elu(estimator[index - 1])
@@ -159,17 +167,16 @@ class ROAHistoryController:
                 "frame_dim": FRAME_DIM,
                 "history_length": HISTORY_LENGTH,
                 "history_order": "oldest to newest; includes current delivered frame",
-                "input_order": [
-                    "base_ang_vel",
-                    "projected_gravity",
-                    "velocity_commands",
-                    "joint_pos",
-                    "joint_vel",
-                    "actions",
-                ],
-                "estimator": "1125 -> ELU MLP(128,64) -> velocity3, tanh(latent8)",
-                "motor": "[velocity3,frame45] -> ELU MLP(128,128,128) -> 12; latent8 -> first preactivation",
-                "reset": "repeat current reset frame 25 times; previous delivered raw action must be zero",
+                "input_order": [name for name, _ in FRAME_TERMS],
+                "foot_contacts": {
+                    "names": list(FOOT_NAMES),
+                    "threshold_N": CONTACT_THRESHOLD_N,
+                    "measurement": "norm(net normal force vector) > threshold; binary; no noise/filter",
+                    "timing": "latest completed 200Hz physics sample; zero until first post-reset step",
+                },
+                "estimator": "1225 -> ELU MLP(128,64) -> velocity3, tanh(latent8)",
+                "motor": "[velocity3,frame49] -> ELU MLP(128,128,128) -> 12; latent8 -> first preactivation",
+                "reset": "repeat current reset frame 25 times; previous action and contact flags must be zero",
                 "privileged_encoder_exported": False,
                 "privileged_critic_exported": False,
             },
@@ -193,6 +200,9 @@ class ROAHistoryController:
             raise ValueError("Require a nonempty causal frame batch")
         finite_tensor(frame, (len(frame), FRAME_DIM), self.default_position_rad)
         finite_tensor(history, (len(frame), HISTORY_LENGTH, FRAME_DIM), frame)
+        contacts = history[:, :, CONTACT_SLICE]
+        if not ((contacts == 0) | (contacts == 1)).all():
+            raise ValueError("Foot contacts must be binary")
         if not torch.equal(frame, history[:, -1]):
             raise ValueError(
                 "Newest history frame must equal the delivered current frame"
@@ -232,7 +242,7 @@ class ROAHistoryController:
             raise ValueError("Call reset before each causal action")
         batch = len(self._reset_mask)
         if set(inputs.sensors) != set(self.spec.sensors):
-            raise ValueError("Require exactly the five causal ROA sensor fields")
+            raise ValueError("Require exactly the six causal ROA sensor fields")
         for name, spec in self.spec.sensors.items():
             finite_tensor(
                 inputs.sensors[name].value,
@@ -241,8 +251,11 @@ class ROAHistoryController:
             )
         finite_tensor(inputs.command, (batch, 3), self.default_position_rad)
         previous = inputs.sensors["stock_previous_raw_action"].value
+        contacts = inputs.sensors["foot_contacts"].value
         if torch.any(previous[self._reset_mask] != 0):
             raise ValueError("Previous delivered raw action must be zero after reset")
+        if torch.any(contacts[self._reset_mask] != 0):
+            raise ValueError("Foot contacts must be zero after reset")
         frame = pack_proprioception(
             inputs.sensors["base_ang_vel"].value,
             inputs.sensors["projected_gravity"].value,
@@ -250,6 +263,7 @@ class ROAHistoryController:
             inputs.sensors["joint_position_relative_default"].value,
             inputs.sensors["joint_velocity"].value,
             previous,
+            contacts,
         )
         history = self._history.push(frame, self._reset_mask)
         action, self._last_estimate = self.infer(frame, history)
@@ -262,7 +276,7 @@ class ROAHistoryController:
 def _fixed_modules():
     factory = {"device": "cpu", "dtype": torch.float32}
     stock = nn.Sequential(
-        nn.Linear(48, 128, **factory),
+        nn.Linear(FRAME_DIM + 3, 128, **factory),
         nn.ELU(),
         nn.Linear(128, 128, **factory),
         nn.ELU(),
@@ -271,7 +285,7 @@ def _fixed_modules():
         nn.Linear(128, 12, **factory),
     )
     estimator = nn.Sequential(
-        nn.Linear(1125, 128, **factory),
+        nn.Linear(HISTORY_LENGTH * FRAME_DIM, 128, **factory),
         nn.ELU(),
         nn.Linear(128, 64, **factory),
         nn.ELU(),
