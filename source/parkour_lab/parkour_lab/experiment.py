@@ -60,6 +60,22 @@ def train(env, app, config, output, report, *, checkpoint=None):
         }
     report["initial_updates"] = method.updates
     report["dependencies"] = backend.dependencies()
+    # Preserve backend-owned model/optimizer state, not simulator or RNG state.
+    # Payload hashes identify bytes; differing serializers may encode equal values.
+    initial = Path(output) / "initial_learning_state.payload"
+    payload = backend.dump(
+        method.state_dict(), "training", config.method.options, method.updates
+    )
+    with initial.open("xb") as stream:
+        stream.write(payload)
+    report["initial_learning_state"] = {
+        "path": initial.name,
+        "updates": method.updates,
+        "sha256": file_sha256(initial),
+    }
+    report.setdefault("evidence_sha256", {})[initial.name] = report[
+        "initial_learning_state"
+    ]["sha256"]
     started = time.monotonic()
     write_json(Path(output) / "report.json", report)
     with (Path(output) / "metrics.jsonl").open("x") as stream:

@@ -48,6 +48,11 @@ Traversal is evaluation-only. Current step fixtures use their measured three-row
 range; procedural settings expose difficulty range and one, three or five rows.
 
 Training produces `checkpoint_NNNNNN.plab` and streaming `metrics.jsonl`.
+It also saves `initial_learning_state.payload` before the first update, after any
+checkpoint restoration. This is the selected backend's model/optimizer payload,
+not an executable model or a simulator/RNG snapshot. The report records its path,
+update count and SHA-256. Matching payload hashes establish identical bytes;
+different device/library encodings can require comparing decoded state values.
 `train --checkpoint FILE --updates N` restores method-owned learning state and
 performs N additional collection/update cycles. It starts a fresh simulator,
 episode memory and seeded RNG; it is not exact interrupted-rollout resumption.
