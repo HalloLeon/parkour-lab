@@ -14,6 +14,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
+def file_sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
 def write_json(path, data):
     path.write_text(json.dumps(data, indent=2, allow_nan=False) + "\n")
 

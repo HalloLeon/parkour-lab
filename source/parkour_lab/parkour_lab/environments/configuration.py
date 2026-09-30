@@ -1,7 +1,8 @@
 """Fresh Go2 task construction, with no checkpoint or experiment reconstruction.
 
-The installed stock Go2 flat task supplies motors, root-COM velocity terms and
-modest startup randomization. The actor receives 49 causal values, including four
+The installed stock Go2 flat task supplies motors and root-COM velocity terms.
+Flat tasks use independently seeded commands, starts and bounded dynamics.
+The actor receives 49 causal values, including four
 noiseless foot-contact flags. Steps/traversal are diagnostic geometries, not an
 approved behavioral gate.
 """
@@ -17,8 +18,8 @@ from parkour_lab.config import TaskConfig
 def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
     """Construct a native config after AppLauncher; importing this module is inert.
 
-    Evaluation changes command ownership and disables actor sensor corruption,
-    not physical randomization or reward arithmetic. Flat uses a real privileged
+    Flat sensor noise is applied at the shared causal-input boundary, not here.
+    Evaluation changes command ownership, not reward arithmetic. Flat uses a real privileged
     plane scan with the same 264-D schema as procedural terrain. Traversal has a
     fixed diagnostic layout and must be externally commanded during evaluation.
     """
@@ -52,7 +53,7 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
 
     from . import observations
     from .commands import (
-        OperatorReversalSequenceCommand,
+        FlatVelocityCommand,
         ProceduralTerrainCommand,
         procedural_physical_failure,
         procedural_workspace,
@@ -82,9 +83,7 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
     command.resampling_time_range = (2.0, 12.0)
     command.debug_vis = False
     command.class_type = (
-        OperatorReversalSequenceCommand
-        if task.terrain == "flat"
-        else ProceduralTerrainCommand
+        FlatVelocityCommand if task.terrain == "flat" else ProceduralTerrainCommand
     )
     cfg.events.reset_base.params["pose_range"] = {
         "x": (-0.2, 0.2),
@@ -94,6 +93,8 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
     cfg.rewards.dof_pos_limits.weight = -10.0
     cfg.rewards.flat_orientation_l2.weight = -2.5
     cfg.rewards.feet_air_time.weight = 0.01
+    cfg.rewards.track_lin_vel_xy_exp.params["std"] = task.linear_tracking_std
+    cfg.rewards.track_ang_vel_z_exp.params["std"] = task.angular_tracking_std
 
     if task.terrain != "flat":
         cfg.scene.terrain.terrain_type = "generator"
@@ -168,6 +169,15 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
     cfg.observations.proprio = copy.deepcopy(cfg.observations.policy)
     cfg.observations.proprio.base_lin_vel = None
     cfg.observations.policy.enable_corruption = False
+
+    if task.terrain == "flat":
+        from .dynamics import configure_dynamics
+
+        configure_dynamics(cfg, task, evaluation=evaluation)
+        command.ranges.lin_vel_x = (-0.2, 0.5)
+        command.ranges.ang_vel_z = (-0.5, 0.5)
+        command.resampling_time_range = (4.0, 4.0)
+        cfg.observations.proprio.enable_corruption = False
 
     if task.terrain == "steps":
         from .step_field import configure

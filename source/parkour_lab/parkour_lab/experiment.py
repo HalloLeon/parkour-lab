@@ -20,6 +20,22 @@ def train(env, app, config, output, report, *, checkpoint=None):
     host = TrainingHost(env, app)
     backend = get_backend(config.method.name)
     method = backend.create(host, config.method.options, config.task.seed)
+    if getattr(env, "parkour_randomization", None) is not None:
+        from parkour_lab.environments.dynamics import dynamics_report, start_report
+        import numpy as np
+
+        write_json(Path(output) / "manifest.json", env.parkour_randomization.manifest())
+        np.savez_compressed(
+            Path(output) / "initial_inputs.npz", **host.first_causal_sample
+        )
+        report["task_realization"] = dynamics_report(env)
+        report["initial_state"] = start_report(env)
+        report["motor_verification"] = host.bridge.motor_verification
+        report["learner_sampling"] = {"backend": "torch", "seed": config.task.seed}
+        report["evidence_sha256"] = {
+            name: file_sha256(Path(output) / name)
+            for name in ("manifest.json", "initial_inputs.npz")
+        }
     if checkpoint is not None:
         previous = load_artifact(checkpoint, kind="training")
         if ExperimentConfig.from_dict(previous["config"]).method != config.method:
@@ -78,5 +94,13 @@ def train(env, app, config, output, report, *, checkpoint=None):
                 write_json(Path(output) / "report.json", report)
             print(f"Update {method.updates}: {metrics}", flush=True)
     report["motor_delivery"] = host.bridge.progress()
+    from parkour_lab.runtime.native import sensor_noise_report
+
+    report["sensor_noise"] = sensor_noise_report(env)
+    if config.task.terrain == "flat":
+        report["command_sampling"] = getattr(
+            env.command_manager.get_term("base_velocity"), "sampling_report", None
+        )
+        report["task_realization"] = dynamics_report(env)
     report["status"] = "TRAINING_COMPLETE_NOT_QUALIFIED"
     # Evaluation/export are explicit operations, never inferred from training loss.

@@ -15,12 +15,9 @@ from zipfile import ZipFile
 from parkour_lab.config import ExperimentConfig
 from parkour_lab.control.motor_contract import validate_motor_contract
 from parkour_lab.methods import get_backend
+from parkour_lab.provenance import file_sha256
 
-FORMAT = "parkour_lab_method_v2"
-
-
-def file_sha256(path):
-    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+FORMAT = "parkour_lab_method_v3"
 
 
 def _validate(metadata, kind):

@@ -9,12 +9,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from parkour_lab.provenance import file_sha256
 from parkour_lab.control.command_tape import TapeBuilder, validate_tape, write_tape
 from parkour_lab.runtime.native import (
     NativeControllerSession,
     foot_contacts,
     foot_contact_forces,
     motion_state,
+    sensor_noise_report,
 )
 
 
@@ -51,12 +53,30 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
     controller = loaded.controller
     before = controller.state_sha256()
     recorder = TapeBuilder({"seed": env.cfg.seed, "controller_sha256": before})
+    randomization = getattr(env, "parkour_randomization", None)
+    if randomization is not None:
+        randomization.begin_attempts()
+        for name in ("_causal_noise_digest", "_causal_noise_decisions"):
+            if hasattr(env, name):
+                delattr(env, name)
     _, _ = env.reset(seed=env.cfg.seed)
+    manifest = None
+    if randomization is not None:
+        from parkour_lab.environments.dynamics import dynamics_report, start_report
+        from parkour_lab.provenance import write_json
+
+        manifest = randomization.manifest()
+        write_json(Path(output) / "manifest.json", manifest)
+        report["manifest_sha256"] = file_sha256(Path(output) / "manifest.json")
+        report["task_realization"] = dynamics_report(env)
+        report["initial_state"] = start_report(env)
+        report["motor_verification"] = host.motor_verification
     reset = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
     squared_error = torch.zeros(3, device=env.device)
     terminated_count = timeout_count = 0
     trace = []
     contact_trace, force_trace, reset_trace = [], [], []
+    noise_trace = []
     motion_trace = []
     previous_capture = env.capture_motion
     initial = motion_state(env)
@@ -79,6 +99,8 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
             if not torch.isfinite(actual).all():
                 raise RuntimeError("Nonfinite tracking measurement")
             targets = host.act(applied, time_s=step * env.step_dt, reset_mask=reset)
+            if host.last_sensor_noise is not None:
+                noise_trace.append(host.last_sensor_noise.cpu().numpy())
             contact_sample = None
             if "foot_contacts" in controller.spec.sensors:
                 # Same pre-action physics sample; raw forces are diagnostics only.
@@ -135,11 +157,21 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
             report["flat_diagnostic"] = score_flat_profile(
                 _motion_arrays(motion_trace, initial, origins), profile
             )
+            if getattr(env.cfg, "parkour_task", {}).get("bank_profile") is not None:
+                from .flat import score_development_profile
+
+                report["flat_development"] = score_development_profile(
+                    _motion_arrays(motion_trace, initial, origins), profile, manifest
+                )
+                report["flat_development"]["controller_state_sha256"] = before
+        if randomization is not None:
+            report["task_realization"] = dynamics_report(env)
     except BaseException as exc:
         error = repr(exc)
         raise
     finally:
         env.capture_motion = previous_capture
+        report["sensor_noise"] = sensor_noise_report(env)
         write_tape(
             Path(output) / "commands.json",
             recorder.finish(completed=error is None, error=error),
@@ -155,6 +187,14 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
             np.savez_compressed(
                 Path(output) / "tracking.npz",
                 root_com_velocity=np.stack(trace),
+                **(
+                    {
+                        "causal_sensor_noise": np.stack(noise_trace),
+                        **host.first_sensor_sample,
+                    }
+                    if noise_trace
+                    else {}
+                ),
                 **sensors,
             )
         if motion_trace:
@@ -162,6 +202,11 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
                 Path(output) / "motion.npz",
                 **_motion_arrays(motion_trace, initial, origins),
             )
+        report["evidence_sha256"] = {
+            name: file_sha256(Path(output) / name)
+            for name in ("commands.json", "tracking.npz", "motion.npz")
+            if (Path(output) / name).is_file()
+        }
 
 
 def _motion_arrays(rows, initial, origins):

@@ -1,9 +1,4 @@
-"""Lossless batch normalization of the archived native motor binding.
-
-Only identical repeated actuator rows may be collapsed. No tolerances, gain
-overrides, joint reordering or inference from configuration defaults. This is
-the recorded simulator motor contract, not a complete robot/physics certificate.
-"""
+"""Portable nominal motor identity and bounded, verifiable runtime variation."""
 
 from __future__ import annotations
 
@@ -11,8 +6,12 @@ import copy
 import hashlib
 import json
 import math
+import struct
 
-VERSION = "native_operator_motor_contract_v1"
+VERSION = "native_operator_motor_contract_v2"
+RANDOMIZATION_RANGES = {
+    name: [0.9, 1.1] for name in ("stiffness", "damping", "motor_strength")
+}
 PARAMETERS = (
     "stiffness",
     "damping",
@@ -42,8 +41,53 @@ def _numbers(row, size):
         raise ValueError("Invalid finite motor-parameter row")
 
 
+def _float32(value):
+    return struct.unpack("f", struct.pack("f", value))[0]
+
+
+def _nominalize(binding):
+    """Verify realized gains, then replace only the declared varying fields."""
+    binding = copy.deepcopy(binding)
+    for actuator in binding["actuators"].values():
+        if "randomization" not in actuator:
+            continue
+        variation = actuator["randomization"]
+        if (
+            type(variation) is not dict
+            or set(variation) != {"ranges", "nominal_gains", "scales"}
+            or variation["ranges"] != RANDOMIZATION_RANGES
+            or set(variation["nominal_gains"]) != {"stiffness", "damping"}
+            or set(variation["scales"]) != set(RANDOMIZATION_RANGES)
+        ):
+            raise ValueError("Invalid declared motor randomization")
+        size = len(actuator["joint_names"])
+        count = len(actuator["resolved_parameters"]["stiffness"])
+        for name, rows in variation["scales"].items():
+            if type(rows) is not list or len(rows) != count:
+                raise ValueError("Motor scale batch dimensions differ")
+            for row in rows:
+                _numbers(row, size)
+                if any(not _float32(0.9) <= value <= _float32(1.1) for value in row):
+                    raise ValueError("Motor scale outside the declared bounds")
+            if name != "motor_strength":
+                nominal = variation["nominal_gains"][name]
+                _numbers(nominal, size)
+                actual = actuator["resolved_parameters"][name]
+                expected = [
+                    [_float32(n * s) for n, s in zip(nominal, row, strict=True)]
+                    for row in rows
+                ]
+                if actual != expected:
+                    raise ValueError(
+                        "Realized PD gains do not match nominal gains and scales"
+                    )
+                actuator["resolved_parameters"][name] = [nominal.copy() for _ in rows]
+            variation["scales"][name] = [[1.0] * size]
+    return binding
+
+
 def _collapse(binding):
-    """Preserve every field except provably redundant batch rows."""
+    """Normalize batch size after validating permitted runtime variation."""
     try:
         if type(binding) is not dict or set(binding) != {
             "joint_names",
@@ -55,6 +99,7 @@ def _collapse(binding):
             "decimation",
         }:
             raise ValueError("Unknown native motor binding schema")
+        binding = _nominalize(binding)
         names = binding["joint_names"]
         if (
             type(names) is not list
@@ -84,7 +129,7 @@ def _collapse(binding):
                 type(name) is not str
                 or not name
                 or type(actuator) is not dict
-                or set(actuator)
+                or set(actuator) - {"randomization"}
                 != {
                     "joint_names",
                     "configuration",
@@ -123,8 +168,12 @@ def _collapse(binding):
             raise ValueError("Actuators must cover every joint exactly once")
         _encoded(compact)
         return compact, count
-    except (KeyError, TypeError, OverflowError) as error:
+    except (AttributeError, KeyError, TypeError, OverflowError) as error:
         raise ValueError("Malformed native motor binding") from error
+
+
+def nominal_binding_sha256(binding):
+    return binding_sha256(_collapse(binding)[0])
 
 
 def _source_hash(profile):
@@ -137,14 +186,14 @@ def _source_hash(profile):
 
 
 def make_motor_contract(binding, actuator_profile):
-    if binding_sha256(binding) != _source_hash(actuator_profile):
+    if nominal_binding_sha256(binding) != _source_hash(actuator_profile):
         raise ValueError("Source motor binding does not match the checkpoint")
     compact, count = _collapse(binding)
     return {"version": VERSION, "source_num_envs": count, "binding": compact}
 
 
 def validate_motor_contract(contract, manifest):
-    """Expand the compact receipt and verify the original archive hash exactly."""
+    """Verify the nominal identity; sampled dynamics are runtime evidence only."""
     try:
         if type(contract) is not dict or set(contract) != {
             "version",
@@ -167,13 +216,9 @@ def validate_motor_contract(contract, manifest):
             or compact["step_dt_s"] != manifest["period_s"]
         ):
             raise ValueError("Motor contract differs from the actor interface")
-        expanded = copy.deepcopy(compact)
-        for actuator in expanded["actuators"].values():
-            for name, values in actuator["resolved_parameters"].items():
-                actuator["resolved_parameters"][name] = values * count
-        if binding_sha256(expanded) != _source_hash(manifest["actuator_profile"]):
+        if binding_sha256(compact) != _source_hash(manifest["actuator_profile"]):
             raise ValueError(
-                "Compact motor receipt does not reproduce the archived identity"
+                "Nominal motor receipt does not reproduce the archived identity"
             )
         return compact
     except (KeyError, TypeError) as error:
@@ -195,5 +240,10 @@ def verify_runtime_motor(contract, manifest, runtime_binding):
         ),
         "source_num_envs": contract["source_num_envs"],
         "runtime_num_envs": count,
-        "scope": "exact archived motor fields; only identical repeated batch rows collapsed",
+        "scope": "exact nominal motor fields and physical limits; verified declared gain/strength variation",
+        "realized_randomization": {
+            name: actuator["randomization"]
+            for name, actuator in runtime_binding["actuators"].items()
+            if "randomization" in actuator
+        },
     }

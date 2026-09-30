@@ -9,13 +9,14 @@ exact documented native hint. The caller owns a frozen simulator configuration.
 
 from __future__ import annotations
 
-import hashlib
-import json
-
 import torch
 
 from parkour_lab.control.controller import JointTargets, finite_tensor
-from parkour_lab.control.motor_contract import verify_runtime_motor
+from parkour_lab.control.motor_contract import (
+    RANDOMIZATION_RANGES,
+    nominal_binding_sha256,
+    verify_runtime_motor,
+)
 
 
 VERSION = "native_joint_target_bridge_v1"
@@ -95,6 +96,36 @@ def _runtime_motor_binding(env):
             "configuration": actuator.cfg.to_dict(),
             "resolved_parameters": parameters,
         }
+        if hasattr(actuator, "motor_strength"):
+            nominal = {}
+            scales = {}
+            for parameter in RANDOMIZATION_RANGES:
+                value = (
+                    getattr(actuator, parameter + "_scale")
+                    if parameter != "motor_strength"
+                    else actuator.motor_strength
+                )
+                _named_finite(
+                    value, (env.num_envs, len(actuator.joint_names)), parameter
+                )
+                scales[parameter] = value.detach().cpu().tolist()
+                if parameter != "motor_strength":
+                    value = getattr(actuator, "nominal_" + parameter)
+                    _named_finite(
+                        value, (env.num_envs, len(actuator.joint_names)), parameter
+                    )
+                    if not torch.equal(value, value[0].expand_as(value)):
+                        raise ValueError(
+                            "Nominal gains must be shared by all environments"
+                        )
+                    nominal[parameter] = value[0].detach().cpu().tolist()
+            actuators[name]["randomization"] = {
+                "ranges": {
+                    key: value.copy() for key, value in RANDOMIZATION_RANGES.items()
+                },
+                "nominal_gains": nominal,
+                "scales": scales,
+            }
     if sorted(covered) != sorted(joints):
         raise ValueError("Native actuators must cover each motor joint exactly once")
     binding = {
@@ -106,10 +137,7 @@ def _runtime_motor_binding(env):
         "physics_dt_s": env.physics_dt,
         "decimation": env.cfg.decimation,
     }
-    digest = hashlib.sha256(
-        json.dumps(binding, sort_keys=True, allow_nan=False).encode()
-    ).hexdigest()
-    return binding, digest
+    return binding, nominal_binding_sha256(binding)
 
 
 class NativeJointTargetBridge:

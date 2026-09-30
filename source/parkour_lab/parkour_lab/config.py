@@ -31,6 +31,10 @@ class TaskConfig:
     num_rows: int | None = None
     episode_length_s: float = 20.0
     traversal_layout: str = "standard"
+    linear_tracking_std: float = 0.5  # m/s; exp(-squared xy error / std**2)
+    angular_tracking_std: float = 0.5  # rad/s; same kernel for body-z yaw
+    dynamics: str = "randomized"
+    bank_profile: str | None = None
 
     def __post_init__(self):
         if self.terrain not in ("flat", "procedural", "steps", "traversal"):
@@ -48,6 +52,8 @@ class TaskConfig:
         positive(self.num_envs, "num_envs", integer=True)
         positive(self.num_rows, "num_rows", integer=True)
         positive(self.episode_length_s, "episode_length_s")
+        positive(self.linear_tracking_std, "linear_tracking_std")
+        positive(self.angular_tracking_std, "angular_tracking_std")
         if (
             type(self.seed) is not int
             or not 0 <= self.seed < 2**32
@@ -66,6 +72,25 @@ class TaskConfig:
         object.__setattr__(self, "difficulty_range", tuple(bounds))
         if self.traversal_layout not in ("standard", "step_ladder"):
             raise ValueError("Unknown traversal layout")
+        if self.dynamics not in ("nominal", "randomized"):
+            raise ValueError("dynamics must be nominal or randomized")
+        if self.terrain != "flat" and self.dynamics != "randomized":
+            raise ValueError(
+                "Nominal dynamics selection is supported only for flat tasks"
+            )
+        if self.bank_profile is not None:
+            from parkour_lab.evaluation.flat import PROFILES
+
+            if (
+                not isinstance(self.bank_profile, str)
+                or self.bank_profile not in PROFILES
+                or self.terrain != "flat"
+                or self.num_envs != 100
+                or self.episode_length_s <= 11
+            ):
+                raise ValueError(
+                    "A flat development profile requires 100 rows and an episode longer than 11 s"
+                )
 
 
 @dataclass(frozen=True)
@@ -101,6 +126,10 @@ class ExperimentConfig:
     def validate_training(self):
         from parkour_lab.methods import get_backend
 
+        if self.task.bank_profile is not None:
+            raise ValueError("Development bank attempts cannot be used for training")
+        if self.task.terrain == "flat" and self.task.dynamics != "randomized":
+            raise ValueError("Flat baseline training requires randomized dynamics")
         get_backend(self.method.name).validate_training(
             self.method.options, self.task.num_envs
         )

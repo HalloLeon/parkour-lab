@@ -25,7 +25,7 @@ exact-wheel admission gate. Select the device explicitly.
 | `python -m parkour_lab export CHECKPOINT ACTOR` | Export only the method's causal inference state |
 | `python -m parkour_lab evaluate ACTOR` | Frozen headless command playback and diagnostic tracking |
 | `python -m parkour_lab play ACTOR` | The same playback with a visible simulator, one environment by default |
-| `python -m parkour_lab analyze RUN` | Print a run's recorded result; no automatic qualification |
+| `python -m parkour_lab analyze RUN` | Print a run's result; `--flat-bank` verifies and aggregates development groups |
 
 `--config FILE` accepts explicit settings, not an old experiment manifest.
 Unknown fields are errors. CLI overrides include `--device`, `--num-envs`,
@@ -59,6 +59,23 @@ the report and dependency identity always describe the method actually executed.
 All commands create separate run directories under `--output-parent`.
 Checkpoint and actor outputs refuse to overwrite existing files.
 
+The task fields `linear_tracking_std` (m/s) and `angular_tracking_std` (rad/s)
+set the existing exponential tracking reward widths; both default to `0.5`.
+The kernels are `exp(-squared_error / std**2)`, using root-COM body-frame xy
+velocity and body-z yaw respectively. Smaller widths penalize the same tracking
+error more strongly, but can weaken the learning signal far from the target.
+For a controlled continuation, a task-only file can specify:
+
+```json
+{"task": {"linear_tracking_std": 0.25, "angular_tracking_std": 0.25}}
+```
+
+This changes the training objective, not the command distribution, motor limits,
+observation contract or evaluation thresholds. Keep an equal-budget unchanged-width
+control from the same checkpoint/seed. Judge frozen causal behavior, not reward
+totals across different objectives. A narrower reward is an experiment, not an
+accepted baseline or a guarantee of improved gait.
+
 Evaluation/play accept either `--tape FILE` or `--command VX VY WZ --steps N`.
 The latter includes a final one-second stop (all stop when N <= 50).
 Successful playback records the commands actually delivered in `commands.json`;
@@ -86,12 +103,24 @@ contact force, with initial pose anchors, environment origins, commands and nati
 ending flags. It is evaluator-only truth. Existing `tracking.npz` keeps its
 pre-action tracking/contact semantics. Motion capture is disabled during training.
 
-These are **development diagnostics, not the acceptance bank**. They retain the
-task's existing starts and startup distribution; causal inference has no artificial
-observation noise. Independently seeded attempts, the prescribed nominal/randomized
-strata and full motor-strength randomization remain unimplemented. Domain checks
-use root/body-link centres in a local ±6 m square, not collision-volume extents.
-Reports always set `qualified=false` and `qualification_eligible=false`.
+`--profile` is a diagnostic using the configured batch and seed. For a frozen
+development group, use `--bank-profile NAME` instead. It fixes 100 independent
+attempt IDs: 50 nominal and 50 randomized, with stratified world headings in each
+subset. Do not supply `--seed` or `--num-envs`. Every group records `manifest.json`
+with full SHA256-derived PCG64 stream identities, starts and dynamics. Geometry,
+start, dynamics, command and observation-noise streams are separate from learning.
+
+Run each of the ten groups once with the same actor and code, placing the outputs
+under one directory, then run `python -m parkour_lab analyze DIRECTORY --flat-bank`.
+Analysis checks saved evidence hashes, canonical manifests, command tapes, sensor
+noise and motion before recomputing scores. Each group needs ≥90/100 overall and
+≥45/50 in each stratum. Missing groups remain nonpasses; duplicate groups are
+rejected rather than selecting the best retry. Later reset episodes cannot replace
+a failed first attempt. This is **development evidence, not held-out qualification**.
+Native verification of the corrected task is still pending.
+
+Domain checks use root/body-link centres in a local ±6 m square, not collision-volume
+extents. Reports always retain `qualified=false` and `qualification_eligible=false`.
 
 ## Ownership and boundaries
 
@@ -117,8 +146,9 @@ pre-reset observation rows. Final samples retain the outgoing command: capture
 precedes reset, command resampling and interval events. They never replace the
 next-action reset observations. Native observation terms must be stateless;
 history, filters and stateful preprocessing belong in the learner adapter.
-An additional terminal noise sample is isolated from the ordinary Torch RNG
-stream so it does not change reset or survivor noise draws.
+Flat native groups remain clean: noise is applied once at the shared causal-input
+boundary. Terminal-only reads do not consume that stream. Other diagnostic terrains
+retain isolated native observation noise; they are not yet acceptance-aligned tasks.
 
 ROA uses the final clean state/terrain only for timeout value bootstrapping;
 this does not add privileged student inputs or push causal history twice.
@@ -182,8 +212,10 @@ Commit new executable files before server runs: the Git receipt includes tracked
 changes but does not archive untracked file contents. No test/documentation files
 need to be synced to run the package commands.
 
-The current `.plab` format is `parkour_lab_method_v2`. Earlier 45-D artifacts are
-not compatible: start a fresh 49-D baseline, without loading or converting old weights.
+The current `.plab` format is `parkour_lab_method_v3`, with a nominal motor identity
+independent of bounded realized gains/strength. Earlier artifacts, including 49-D
+v2 files, are unsupported. Start fresh; do not convert archived weights or mix
+older runs into matched reward comparisons.
 
 ## Default ROA recipe
 
@@ -227,14 +259,34 @@ remain causal; teacher force labels are separate from the four binary contacts.
 No observation normalization is learned. The entropy/noise settings also differ
 from upstream. Equal update numbers do not imply equal samples or training effort.
 
-Flat training samples forward/reverse/lateral commands and yaw/hold/restart
-sequences with the task's recorded startup mass/friction randomization. It is not
-yet the complete acceptance command/DR distribution. Use the flat profiles above
-to assess saved checkpoints; diagnostic results are not a pass gate.
+Flat training draws independent uniform body twists every exactly 200 control
+ticks (4 s): vx ∈ [−0.2,0.5] m/s, vy ∈ [−0.2,0.2] m/s and yaw ∈ [−0.5,0.5] rad/s.
+Ten percent of draws become exact stops; no heading controller changes the packet.
+
+Flat training uses randomized dynamics. Per robot, added base mass is U[−1,3] kg
+with the stock mass-scaled inertia rule; static friction is U[0.6,1.0] and dynamic
+friction is 0.75 times static. Ground coefficients are 1/1 with multiply combination.
+Independent per-joint strength, Kp and Kd factors are U[0.9,1.1], drawn once and
+fixed across resets. Strength scales generated torque **before unchanged physical
+torque/speed limits**. Reports verify native mass/material/inertia/gain readbacks
+and retain the nominal motor contract separately from realized values.
+
+Both flat evaluation strata use bounded starts and causal sensor noise. Starts
+have local xy ±0.05 m, yaw ±0.03 rad around the prescribed heading, joints ±0.05 rad,
+zero velocities and level attitude. Noise amplitudes are angular velocity ±0.2 rad/s,
+gravity ±0.05, joint position ±0.01 rad and joint velocity ±1.5 rad/s. Commands,
+previous actions and binary contacts stay uncorrupted. `initial_inputs.npz` records
+training's first raw/delivered frame; evaluation's `tracking.npz` records noise draws
+and the first raw/delivered sensor sample. Replaying the same manifest resets these
+streams, not the physics engine's numerical nondeterminism.
+
+For ordinary flat diagnostics, `task.dynamics` can select `nominal` or `randomized`;
+the development bank always supplies its fixed 50/50 split. These corrections
+currently apply only to flat tasks. Rewards and learner settings are unchanged.
 
 ## Acceptance
 
-[ACCEPTANCE.md](ACCEPTANCE.md) freezes v2 revision 5: stairs with realized risers
+[ACCEPTANCE.md](ACCEPTANCE.md) freezes v2 revision 6: stairs with realized risers
 4/8/12/16 cm, ramps/hills at 10/15/20 degrees, multiscale unevenness over both,
 and one causal policy satisfying traversal and flat-command thresholds. No gaps,
 steep backward traversal or sim-to-real qualification is required.

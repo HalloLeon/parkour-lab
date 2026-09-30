@@ -8,7 +8,7 @@ packet timestamp or wall clock. Scene/motor configuration must remain frozen.
 
 from __future__ import annotations
 
-
+import hashlib
 import torch
 
 from parkour_lab.control.controller import ControllerSession, Sample, finite_tensor
@@ -22,6 +22,37 @@ from parkour_lab.control.proprioception import (
 from parkour_lab.runtime.motor import (
     NativeJointTargetBridge,
 )
+
+
+def causal_sensor_noise(env):
+    """Draw only when a causal frame is consumed, never on privileged/terminal reads."""
+    if not getattr(env.cfg, "parkour_task", None):
+        return None
+    randomization = env.parkour_randomization
+    noise = randomization.uniform(None, 30, "observation-noise", low=-1.0, high=1.0)
+    noise *= [0.2] * 3 + [0.05] * 3 + [0.01] * 12 + [1.5] * 12
+    noise = noise.astype("float32")
+    if not hasattr(env, "_causal_noise_digest"):
+        env._causal_noise_digest = hashlib.sha256()
+        env._causal_noise_decisions = 0
+    env._causal_noise_digest.update(noise.tobytes())
+    env._causal_noise_decisions += 1
+    return torch.as_tensor(noise, dtype=torch.float32, device=env.device)
+
+
+def sensor_noise_report(env):
+    if not hasattr(env, "_causal_noise_digest"):
+        return None
+    return {
+        "version": "causal_uniform_noise_v1",
+        "generated_frames": env._causal_noise_decisions,
+        "draw_sha256": env._causal_noise_digest.hexdigest(),
+        "order": ["angular_velocity", "gravity", "joint_position", "joint_velocity"],
+        "widths": [3, 3, 12, 12],
+        "amplitudes": [0.2, 0.05, 0.01, 1.5],
+        "commands_actions_contacts_noiseless": True,
+        "scope": "prepared causal frames (training includes one next frame); privileged and terminal-only reads do not draw noise",
+    }
 
 
 def foot_contact_forces(env):
@@ -119,6 +150,8 @@ class NativeControllerSession:
     ):
         self.env = env
         self.failed = False
+        self.last_sensor_noise = None
+        self.first_sensor_sample = None
         self.controller = controller
         self.motor = NativeJointTargetBridge(
             env,
@@ -168,6 +201,34 @@ class NativeControllerSession:
             }
             if "foot_contacts" in self.controller.spec.sensors:
                 values["foot_contacts"] = foot_contacts(env)
+            self.last_sensor_noise = causal_sensor_noise(env)
+            if self.last_sensor_noise is not None:
+                names = (
+                    "base_ang_vel",
+                    "projected_gravity",
+                    "joint_position_relative_default",
+                    "joint_velocity",
+                )
+                raw = torch.cat([values[name] for name in names], dim=-1)
+                for name, perturbation in zip(
+                    names,
+                    self.last_sensor_noise.split((3, 3, 12, 12), dim=-1),
+                    strict=True,
+                ):
+                    values[name] = values[name] + perturbation
+                values["joint_position"] = (
+                    values["joint_position"] + self.last_sensor_noise[:, 6:18]
+                )
+                if self.first_sensor_sample is None:
+                    self.first_sensor_sample = {
+                        "initial_raw_sensors": raw.cpu().numpy().copy(),
+                        "initial_noisy_sensors": torch.cat(
+                            [values[name] for name in names], dim=-1
+                        )
+                        .cpu()
+                        .numpy()
+                        .copy(),
+                    }
             if (
                 not isinstance(reset_mask, torch.Tensor)
                 or reset_mask.shape != (env.num_envs,)

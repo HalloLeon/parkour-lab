@@ -1,13 +1,15 @@
-"""Fixed flat-command diagnostics and first-attempt kinematics, independent of RL.
+"""Flat first-attempt kinematics and balanced development-bank summaries.
 
-These tapes use the required command profiles, but do not implement the independently
-seeded starts, noise and dynamics strata of the acceptance bank. A diagnostic pass
-cannot qualify a policy. Positions/headings include the pre-command onset sample;
-velocities and termination flags are post-physics, before automatic reset.
+Ordinary diagnostics remain distinct from the independently seeded, noisy bank.
+Neither is final qualification. Positions/headings include the pre-command onset
+sample; velocities and termination flags are post-physics, before automatic reset.
 """
 
 from dataclasses import asdict, dataclass
+import hashlib
+import json
 import math
+from pathlib import Path
 
 import numpy as np
 
@@ -48,6 +50,349 @@ def profile_commands(profile):
     if profile not in PROFILES:
         raise ValueError(f"Unknown flat profile: {profile}")
     return [(0.0, 0.0, 0.0)] * 100 + [PROFILES[profile]] * 300 + [(0.0, 0.0, 0.0)] * 150
+
+
+def _pass_counts(passed, total):
+    """Observed counts with a Wilson 95% interval; the interval is not a gate."""
+    z = 1.959963984540054
+    fraction = passed / total
+    denominator = 1 + z * z / total
+    center = (fraction + z * z / (2 * total)) / denominator
+    radius = (
+        z
+        * math.sqrt(fraction * (1 - fraction) / total + z * z / (4 * total**2))
+        / denominator
+    )
+    return dict(
+        passed=passed,
+        total=total,
+        fraction=fraction,
+        wilson_95=[max(0.0, center - radius), min(1.0, center + radius)],
+    )
+
+
+def summarize_development_profile(profile, trials, manifest):
+    """Keep the original 100 IDs and denominator, including unresolved evidence.
+
+    Duplicate IDs are rejected, never selected among. Recovery needs an external
+    record of a verified infrastructure fault; this scorer cannot authorize it.
+    """
+    from parkour_lab.environments.randomization import development_manifest
+
+    if profile not in PROFILES or manifest != development_manifest(profile):
+        raise ValueError("Development manifest differs from its canonical 100-ID draws")
+    attempts = manifest["attempts"]
+    indexed = {}
+    for trial in trials:
+        index = trial.get("attempt_index")
+        if type(index) is not int or not 0 <= index < 100 or index in indexed:
+            raise ValueError(
+                "Require unique assigned attempt IDs; do not select among reruns"
+            )
+        if type(trial.get("passed")) is not bool:
+            raise ValueError("Each recorded outcome must declare a boolean pass")
+        indexed[index] = dict(trial, stratum=attempts[index]["stratum"])
+    missing = sorted(set(range(100)) - set(indexed))
+    rows = [
+        indexed.get(
+            index,
+            dict(
+                attempt_index=index,
+                stratum=attempts[index]["stratum"],
+                passed=False,
+                failures=["unresolved missing evidence"],
+            ),
+        )
+        for index in range(100)
+    ]
+    strata = {
+        name: _pass_counts(sum(row["passed"] for row in rows[start : start + 50]), 50)
+        for name, start in (("nominal", 0), ("randomized", 50))
+    }
+    overall = _pass_counts(sum(row["passed"] for row in rows), 100)
+    return dict(
+        version="flat_development_bank_v1",
+        namespace=manifest["namespace"],
+        group_id=f"flat/{profile}",
+        manifest_content_sha256=hashlib.sha256(
+            json.dumps(
+                manifest, sort_keys=True, separators=(",", ":"), allow_nan=False
+            ).encode()
+        ).hexdigest(),
+        qualified=False,
+        qualification_eligible=False,
+        complete=not missing,
+        missing_attempt_ids=missing,
+        trials=rows,
+        overall=overall,
+        strata=strata,
+        group_passed=not missing
+        and overall["passed"] >= 90
+        and all(value["passed"] >= 45 for value in strata.values()),
+    )
+
+
+def score_development_profile(trace, profile, manifest):
+    """Apply unchanged kinematics to all prospective rows of one noisy flat group."""
+    diagnostic = score_flat_profile(trace, profile)
+    if diagnostic["total"] != 100:
+        raise ValueError("A development profile requires all 100 assigned rows")
+    trials = [
+        dict(row, attempt_index=row["env_id"], passed=row["diagnostic_passed"])
+        for row in diagnostic["trials"]
+    ]
+    result = summarize_development_profile(profile, trials, manifest)
+    starts = [row["start"] for row in manifest["attempts"]]
+    xy = trace["initial_position_w"][:, :2] - trace["env_origins"][:, :2]
+    roll, pitch, yaw = _angles(trace["initial_quaternion_w"])
+    difference = yaw - np.array([row["start_yaw"] for row in starts])
+    if (
+        not np.allclose(xy, [row["start_xy"] for row in starts], atol=1e-4, rtol=0)
+        or not np.allclose(roll, 0, atol=1e-4, rtol=0)
+        or not np.allclose(pitch, 0, atol=1e-4, rtol=0)
+        or not np.allclose(
+            np.arctan2(np.sin(difference), np.cos(difference)), 0, atol=1e-4, rtol=0
+        )
+    ):
+        raise ValueError("Initial native root poses differ from the frozen manifest")
+    result["thresholds"] = diagnostic["thresholds"]
+    return result
+
+
+def aggregate_development_bank(profile_results):
+    """Recompute counts for one controller; callers verify the trace artifacts."""
+    from parkour_lab.environments.randomization import development_manifest
+
+    groups = {}
+    controllers = set()
+    for result in profile_results:
+        group = result.get("group_id")
+        if group not in {f"flat/{profile}" for profile in PROFILES} or group in groups:
+            raise ValueError("Require unique known flat development groups")
+        if result.get("version") != "flat_development_bank_v1":
+            raise ValueError(
+                "Ordinary diagnostics cannot be promoted to development evidence"
+            )
+        controller = result.get("controller_state_sha256", "")
+        if (
+            not isinstance(controller, str)
+            or len(controller) != 64
+            or any(char not in "0123456789abcdef" for char in controller)
+        ):
+            raise ValueError("Require each group's verified controller-state identity")
+        controllers.add(controller)
+        if len(controllers) != 1:
+            raise ValueError(
+                "All development groups must use the same frozen controller"
+            )
+        trials = result.get("trials", [])
+        missing_ids = result.get("missing_attempt_ids", [])
+        if (
+            len(trials) != 100
+            or [row.get("attempt_index") for row in trials] != list(range(100))
+            or any(type(i) is not int or not 0 <= i < 100 for i in missing_ids)
+            or len(set(missing_ids)) != len(missing_ids)
+        ):
+            raise ValueError(
+                "Development group does not preserve its assigned attempt IDs"
+            )
+        profile = group.removeprefix("flat/")
+        recomputed = summarize_development_profile(
+            profile,
+            [row for row in trials if row["attempt_index"] not in missing_ids],
+            development_manifest(profile),
+        )
+        if any(result.get(key) != value for key, value in recomputed.items()):
+            raise ValueError("Development group counts or evidence metadata changed")
+        groups[group] = result
+    missing = sorted({f"flat/{profile}" for profile in PROFILES} - groups.keys())
+    complete = not missing and all(row["complete"] for row in groups.values())
+    return dict(
+        version="flat_development_bank_v1",
+        controller_state_sha256=next(iter(controllers), None),
+        qualified=False,
+        complete=complete,
+        missing_groups=missing,
+        groups=groups,
+        bank_passed=complete and all(row["group_passed"] for row in groups.values()),
+    )
+
+
+def analyze_development_bank(root):
+    """Read and rescore a single frozen actor's saved bank; never run or retry jobs."""
+    from parkour_lab.control.command_tape import load_tape
+    from parkour_lab.environments.randomization import TaskRandomization
+
+    root = Path(root)
+    if not root.is_dir():
+        raise ValueError("Flat-bank analysis requires a directory of evaluation runs")
+    results, receipts, profiles = [], [], set()
+    shared = None
+    for path in sorted(root.rglob("report.json")):
+        report = json.loads(path.read_text())
+        task = report.get("config", {}).get("task", {})
+        profile = task.get("bank_profile")
+        if profile is None:
+            continue
+
+        def require(condition, reason):
+            if not condition:
+                raise ValueError(f"{path}: {reason}")
+
+        require(
+            profile in PROFILES and profile not in profiles,
+            "unknown or repeated group; recovery is not automatic",
+        )
+        profiles.add(profile)
+        require(
+            report.get("status") == "EVALUATION_COMPLETE_NOT_QUALIFIED"
+            and report.get("policy_unchanged") is True
+            and report.get("control_steps") == STEPS
+            and report.get("environment_transitions") == STEPS * 100
+            and task.get("terrain") == "flat"
+            and task.get("num_envs") == 100
+            and report.get("cleanup")
+            == {"environment": "complete", "application": "complete"},
+            "require a complete, frozen 100-row evaluation and successful cleanup",
+        )
+        identity = (report.get("actor_sha256"), report.get("package_sources"))
+        require(
+            isinstance(identity[0], str)
+            and len(identity[0]) == 64
+            and all(char in "0123456789abcdef" for char in identity[0])
+            and isinstance(identity[1], dict)
+            and bool(identity[1]),
+            "missing actor or executed-source identity",
+        )
+        require(
+            shared is None or shared == identity,
+            "actor or executed sources changed across groups",
+        )
+        shared = identity
+        motor = report.get("motor_delivery", {})
+        require(
+            all(
+                motor.get(key) == STEPS
+                for key in (
+                    "encoded_steps",
+                    "verified_delivery_steps",
+                    "native_step_returns",
+                )
+            )
+            and motor.get("faulted") is False
+            and motor.get("pending_delivery") is False
+            and motor.get("native_verified_rows", -1)
+            + motor.get("excluded_terminal_rows", -1)
+            == STEPS * 100,
+            "incomplete or invalid native motor delivery",
+        )
+        for name, digest in {
+            "manifest.json": report.get("manifest_sha256"),
+            **{
+                name: report.get("evidence_sha256", {}).get(name)
+                for name in ("commands.json", "tracking.npz", "motion.npz")
+            },
+        }.items():
+            evidence = path.parent / name
+            require(
+                evidence.is_file()
+                and hashlib.sha256(evidence.read_bytes()).hexdigest() == digest,
+                f"missing or changed evidence: {name}",
+            )
+        tape = load_tape(path.parent / "commands.json")
+        commands = [
+            segment["command"]
+            for segment in tape["segments"]
+            for _ in range(segment["start_step"], segment["end_step_exclusive"])
+        ]
+        require(
+            commands == [list(command) for command in profile_commands(profile)],
+            "recorded commands differ from the profile",
+        )
+        manifest = json.loads((path.parent / "manifest.json").read_text())
+        with np.load(path.parent / "motion.npz", allow_pickle=False) as archive:
+            result = score_development_profile(dict(archive), profile, manifest)
+        with np.load(path.parent / "tracking.npz", allow_pickle=False) as archive:
+            require(
+                {
+                    "causal_sensor_noise",
+                    "initial_raw_sensors",
+                    "initial_noisy_sensors",
+                    "root_com_velocity",
+                }.issubset(archive.files),
+                "incomplete tracking/input evidence",
+            )
+            require(
+                archive["root_com_velocity"].shape == (STEPS, 100, 3)
+                and all(np.isfinite(archive[key]).all() for key in archive.files),
+                "incomplete or nonfinite tracking/input evidence",
+            )
+            noise = archive["causal_sensor_noise"]
+            amplitudes = np.array([0.2] * 3 + [0.05] * 3 + [0.01] * 12 + [1.5] * 12)
+            require(
+                noise.shape == (STEPS, 100, 30)
+                and noise.dtype == np.float32
+                and np.isfinite(noise).all()
+                and (np.abs(noise) <= amplitudes + 1e-7).all(),
+                "missing, malformed or out-of-bounds causal noise",
+            )
+            noise_report = report.get("sensor_noise", {})
+            require(
+                noise_report.get("generated_frames") == STEPS
+                and noise_report.get("draw_sha256")
+                == hashlib.sha256(noise.tobytes()).hexdigest(),
+                "causal noise digest or frame count changed",
+            )
+            draws = TaskRandomization(
+                dict(num_envs=100, seed=0, bank_profile=profile), evaluation=True
+            )
+            for sample in noise:
+                expected = (
+                    draws.uniform(None, 30, "observation-noise", -1, 1) * amplitudes
+                ).astype(np.float32)
+                require(
+                    np.array_equal(sample, expected),
+                    "noise differs from the assigned stream",
+                )
+            raw, noisy = (
+                archive["initial_raw_sensors"],
+                archive["initial_noisy_sensors"],
+            )
+            require(
+                raw.shape == noisy.shape == (100, 30)
+                and np.isfinite(raw).all()
+                and np.allclose(raw + noise[0], noisy, atol=1e-6, rtol=0),
+                "first causal input does not contain the recorded additive noise",
+            )
+        stored = report.get("flat_development", {})
+        require(
+            all(stored.get(key) == value for key, value in result.items()),
+            "stored development outcome differs from rescored evidence",
+        )
+        result["controller_state_sha256"] = stored.get("controller_state_sha256")
+        require(
+            tape["metadata"].get("controller_sha256")
+            == result["controller_state_sha256"],
+            "command tape and score identify different controllers",
+        )
+        process = path.parent.parent / "process_exit.json"
+        if process.exists():
+            status = json.loads(process.read_text())
+            require(
+                status.get("returncode") == 0 and not status.get("interrupted", False),
+                "external process did not exit successfully",
+            )
+        results.append(result)
+        receipts.append(
+            dict(
+                profile=profile,
+                report=str(path),
+                sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            )
+        )
+    summary = aggregate_development_bank(results)
+    summary.update(actor_sha256=None if shared is None else shared[0], reports=receipts)
+    return summary
 
 
 def score_command_phase(command, velocity, body_yaw, world_yaw, position, heading):

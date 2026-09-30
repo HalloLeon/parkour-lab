@@ -65,6 +65,11 @@ def parse_args(argv=None):
                     choices=tuple(PROFILES),
                     help="Fixed 11 s flat command diagnostic; not the acceptance bank",
                 )
+                source.add_argument(
+                    "--bank-profile",
+                    choices=tuple(PROFILES),
+                    help="Frozen flat development group: 100 independent attempts, balanced dynamics",
+                )
             command.add_argument(
                 "--steps", type=int, help="Command playback length (default: 900)"
             )
@@ -73,13 +78,26 @@ def parse_args(argv=None):
     export.add_argument("destination", type=Path)
     analyze = commands.add_parser("analyze")
     analyze.add_argument("run", type=Path)
+    analyze.add_argument(
+        "--flat-bank",
+        action="store_true",
+        help="Verify and aggregate flat development profile reports",
+    )
     args = parser.parse_args(argv)
     if hasattr(args, "cpu_threads") and args.cpu_threads < 1:
         parser.error("cpu-threads must be positive")
     if hasattr(args, "command") and not all(math.isfinite(x) for x in args.command):
         parser.error("Commands must be finite")
-    if getattr(args, "profile", None) is not None and args.steps is not None:
-        parser.error("--profile fixes the tape length; omit --steps")
+    if (
+        getattr(args, "profile", None) or getattr(args, "bank_profile", None)
+    ) and args.steps is not None:
+        parser.error("A profile fixes the tape length; omit --steps")
+    if getattr(args, "bank_profile", None) and (
+        args.num_envs is not None or args.seed is not None
+    ):
+        parser.error(
+            "A development bank fixes attempt IDs/count/seeds; omit --num-envs and --seed"
+        )
     return args
 
 
@@ -112,6 +130,10 @@ def resolve_config(args):
     }
     if args.operation == "play" and args.num_envs is None:
         overrides["num_envs"] = 1
+    if getattr(args, "bank_profile", None):
+        overrides.update(
+            bank_profile=args.bank_profile, num_envs=100, terrain="flat", seed=0
+        )
     config = replace(config, task=replace(config.task, **overrides))
     if getattr(args, "updates", None) is not None:
         config = replace(config, updates=args.updates)
@@ -120,6 +142,13 @@ def resolve_config(args):
             raise ValueError(
                 "Flat profiles require flat terrain and an episode longer than 11 s"
             )
+    if config.task.bank_profile is not None and (
+        args.operation != "evaluate"
+        or getattr(args, "bank_profile", None) != config.task.bank_profile
+    ):
+        raise ValueError(
+            "Use --bank-profile explicitly to execute a development manifest"
+        )
     return config
 
 
@@ -127,6 +156,15 @@ def main(argv=None, *, standalone=False):
     """Run a command; only the standalone native CLI owns process termination."""
     args = parse_args(argv)
     if args.operation == "analyze":
+        if args.flat_bank:
+            from parkour_lab.evaluation.flat import analyze_development_bank
+
+            print(
+                json.dumps(
+                    analyze_development_bank(args.run), indent=2, allow_nan=False
+                )
+            )
+            return 0
         report = args.run / "report.json" if args.run.is_dir() else args.run
         print(json.dumps(json.loads(report.read_text()), indent=2, allow_nan=False))
         return 0
@@ -153,10 +191,10 @@ def main(argv=None, *, standalone=False):
         from parkour_lab.control.command_tape import load_tape
         from parkour_lab.evaluation.runner import command_sequence
 
-        if getattr(args, "profile", None) is not None:
+        if getattr(args, "profile", None) or getattr(args, "bank_profile", None):
             from parkour_lab.evaluation.flat import profile_commands
 
-            commands = profile_commands(args.profile)
+            commands = profile_commands(args.profile or args.bank_profile)
         else:
             commands = command_sequence(
                 tape=load_tape(args.tape) if args.tape else None,
@@ -238,7 +276,8 @@ def main(argv=None, *, standalone=False):
                 commands,
                 output,
                 report,
-                profile=getattr(args, "profile", None),
+                profile=getattr(args, "profile", None)
+                or getattr(args, "bank_profile", None),
             )
         report["transition_observations"] = dict(env.transition_counts)
         code = 0

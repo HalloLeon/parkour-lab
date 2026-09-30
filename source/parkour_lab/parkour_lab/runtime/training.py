@@ -17,7 +17,8 @@ class TrainingHost:
 
     Native groups: proprio = causal 49D, policy = clean privileged 52D,
     terrain = privileged 264D. The historical native group name ``policy`` does
-    NOT grant it causal access. Final rows use the same native group schema.
+    NOT grant it causal access. Flat causal noise is added at consumption here.
+    Final rows stay clean for critic-only bootstrap; they are not actor decisions.
     """
 
     def __init__(self, env, app):
@@ -37,6 +38,7 @@ class TrainingHost:
             env, self.motor_contract, self.manifest, preserve_native_raw=True
         )
         self.previous = torch.zeros((env.num_envs, 12), device=env.device)
+        self.first_causal_sample = None
         self.resets = self.partial_reset_steps = self.steps = 0
         self.phase_counts = {}
         if env.step_dt != 0.02 or env.physics_dt != 0.005 or env.cfg.decimation != 4:
@@ -85,7 +87,21 @@ class TrainingHost:
             raise ValueError(
                 "Pre-action sensor, contact, command, COM-velocity or previous-action alignment failed"
             )
-        return {**native, "proprio": frame.clone(), "policy": clean.clone()}
+        from parkour_lab.runtime.native import causal_sensor_noise
+
+        frame = frame.clone()
+        noise = causal_sensor_noise(self.env)
+        if noise is not None:
+            raw = frame.clone() if self.first_causal_sample is None else None
+            frame[:, :6] += noise[:, :6]
+            frame[:, 9:33] += noise[:, 6:]
+            if raw is not None:
+                self.first_causal_sample = {
+                    "raw": raw.cpu().numpy(),
+                    "delivered": frame.cpu().numpy().copy(),
+                    "noise": noise.cpu().numpy(),
+                }
+        return {**native, "proprio": frame, "policy": clean.clone()}
 
     def reset(self, *, seed=None, command=None):
         native, _ = self.env.reset(**({"seed": seed} if seed is not None else {}))

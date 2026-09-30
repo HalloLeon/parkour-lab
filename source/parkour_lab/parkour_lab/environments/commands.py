@@ -8,6 +8,71 @@ from .sampling import OperatorCommandSampler
 from .sequences import ReversalSequencePlan
 
 
+class FlatVelocityCommand(UniformVelocityCommand):
+    """Independent uniform body twists every four seconds, with 10% exact stops."""
+
+    def __init__(self, cfg, env):
+        if cfg.heading_command or cfg.rel_heading_envs or cfg.rel_standing_envs:
+            raise ValueError(
+                "Flat command sampling owns stops; disable heading overrides"
+            )
+        super().__init__(cfg, env)
+        from .dynamics import get_randomization
+
+        self.randomization = get_randomization(env)
+        self.remaining_ticks = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.sampling_report = {
+            "version": "flat_uniform_twist_v1",
+            "period_steps": 200,
+            "samples": 0,
+            "stops": 0,
+        }
+
+    def compute(self, dt):
+        if dt != 0.02:
+            raise ValueError("Flat commands require 50 Hz control")
+        self._update_metrics()
+        # Same-step autoreset rows have not executed their new command yet.
+        sampled = torch.isfinite(self.time_left)
+        self.remaining_ticks -= (sampled & (self._env.episode_length_buf > 0)).long()
+        self._resample((sampled & (self.remaining_ticks <= 0)).nonzero().flatten())
+        self.time_left[sampled] = self.remaining_ticks[sampled] * dt
+        self._update_command()
+
+    def _resample(self, env_ids):
+        # Avoid even an unused SDK timer draw from the learner's global RNG.
+        if isinstance(env_ids, slice):
+            env_ids = torch.arange(self.num_envs, device=self.device)[env_ids]
+        if len(env_ids):
+            self.remaining_ticks[env_ids] = 200
+            self.time_left[env_ids] = 4.0
+            self._resample_command(env_ids)
+            self.command_counter[env_ids] += 1
+
+    def _resample_command(self, env_ids):
+        ids = (
+            env_ids.detach().cpu().numpy()
+            if isinstance(env_ids, torch.Tensor)
+            else env_ids
+        )
+        draws = self.randomization.uniform(ids, 4, "commands")
+        values = torch.as_tensor(
+            draws, device=self.device, dtype=self.vel_command_b.dtype
+        )
+        command = values[:, :3] * values.new_tensor(
+            (0.7, 0.4, 1.0)
+        ) + values.new_tensor((-0.2, -0.2, -0.5))
+        stops = values[:, 3] < 0.1
+        command[stops] = 0
+        self.vel_command_b[env_ids] = command
+        self.is_heading_env[env_ids] = False
+        self.is_standing_env[env_ids] = stops
+        self.sampling_report["samples"] += len(env_ids)
+        self.sampling_report["stops"] += int(stops.sum())
+
+
 class OperatorVelocityCommand(UniformVelocityCommand):
     """Retain the stock 3-D command interface, changing only its sampling law."""
 
