@@ -65,6 +65,34 @@ Successful playback records the commands actually delivered in `commands.json`;
 replay preserves their sequence, not stochastic physics. Physical keyboard,
 joystick and Unitree transport belong in the deployment application.
 
+### Flat command diagnostics
+
+`evaluate ACTOR --profile NAME` runs a fixed 11 s profile: 2 s stop, 6 s motion,
+3 s stop. `stand` is scored as one uninterrupted stop. Names are `stand`,
+`forward-02`, `forward-05`, `reverse-02`, `left-02`, `right-02`, `pivot-left`,
+`pivot-right`, `arc-left`, and `arc-right`. The actor's resolved task must be flat,
+with an episode longer than 11 s. Profiles cannot be combined with `--tape`,
+`--command` or `--steps`; they use the same causal inference/motor path as playback.
+
+`report.json` contains per-row, per-phase `flat_diagnostic` results. Tracking
+uses 0.4 s blocks, including the acquisition block ending at 1 s; good episode
+averages cannot hide a failed command. Both body-z and world-up yaw, initial/final
+stops, posture, stationary excursion and drift are checked. Only the original
+attempt counts: a native termination/timeout remains a failure after auto-reset.
+
+All evaluation also writes `motion.npz`: post-physics, **pre-reset** root pose,
+root-body COM velocity, body/world angular velocity, body-link positions and base
+contact force, with initial pose anchors, environment origins, commands and native
+ending flags. It is evaluator-only truth. Existing `tracking.npz` keeps its
+pre-action tracking/contact semantics. Motion capture is disabled during training.
+
+These are **development diagnostics, not the acceptance bank**. They retain the
+task's existing starts and startup distribution; causal inference has no artificial
+observation noise. Independently seeded attempts, the prescribed nominal/randomized
+strata and full motor-strength randomization remain unimplemented. Domain checks
+use root/body-link centres in a local ±6 m square, not collision-volume extents.
+Reports always set `qualified=false` and `qualification_eligible=false`.
+
 ## Ownership and boundaries
 
 | Package/module | Responsibility |
@@ -201,8 +229,8 @@ from upstream. Equal update numbers do not imply equal samples or training effor
 
 Flat training samples forward/reverse/lateral commands and yaw/hold/restart
 sequences with the task's recorded startup mass/friction randomization. It is not
-yet the complete acceptance DR distribution or flat-command scorer. Use periodic
-checkpoints to assess the learning curve; diagnostic playback is not a pass gate.
+yet the complete acceptance command/DR distribution. Use the flat profiles above
+to assess saved checkpoints; diagnostic results are not a pass gate.
 
 ## Acceptance
 

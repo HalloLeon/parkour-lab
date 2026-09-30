@@ -57,7 +57,17 @@ def parse_args(argv=None):
                 metavar=("VX", "VY", "WZ"),
                 help="Body twist followed by a final 1 s stop; steps <= 50 means all stop",
             )
-            command.add_argument("--steps", type=int, default=900)
+            if name == "evaluate":
+                from parkour_lab.evaluation.flat import PROFILES
+
+                source.add_argument(
+                    "--profile",
+                    choices=tuple(PROFILES),
+                    help="Fixed 11 s flat command diagnostic; not the acceptance bank",
+                )
+            command.add_argument(
+                "--steps", type=int, help="Command playback length (default: 900)"
+            )
     export = commands.add_parser("export")
     export.add_argument("checkpoint", type=Path)
     export.add_argument("destination", type=Path)
@@ -68,6 +78,8 @@ def parse_args(argv=None):
         parser.error("cpu-threads must be positive")
     if hasattr(args, "command") and not all(math.isfinite(x) for x in args.command):
         parser.error("Commands must be finite")
+    if getattr(args, "profile", None) is not None and args.steps is not None:
+        parser.error("--profile fixes the tape length; omit --steps")
     return args
 
 
@@ -103,6 +115,11 @@ def resolve_config(args):
     config = replace(config, task=replace(config.task, **overrides))
     if getattr(args, "updates", None) is not None:
         config = replace(config, updates=args.updates)
+    if getattr(args, "profile", None) is not None:
+        if config.task.terrain != "flat" or config.task.episode_length_s <= 11:
+            raise ValueError(
+                "Flat profiles require flat terrain and an episode longer than 11 s"
+            )
     return config
 
 
@@ -136,11 +153,16 @@ def main(argv=None, *, standalone=False):
         from parkour_lab.control.command_tape import load_tape
         from parkour_lab.evaluation.runner import command_sequence
 
-        commands = command_sequence(
-            tape=load_tape(args.tape) if args.tape else None,
-            command=args.command,
-            steps=args.steps,
-        )
+        if getattr(args, "profile", None) is not None:
+            from parkour_lab.evaluation.flat import profile_commands
+
+            commands = profile_commands(args.profile)
+        else:
+            commands = command_sequence(
+                tape=load_tape(args.tape) if args.tape else None,
+                command=args.command,
+                steps=args.steps if args.steps is not None else 900,
+            )
     args.output_parent.mkdir(parents=True, exist_ok=True)
     output = Path(
         tempfile.mkdtemp(prefix=f"{args.operation}_", dir=args.output_parent)
@@ -209,7 +231,15 @@ def main(argv=None, *, standalone=False):
 
             loaded = load_actor(args.actor, device=config.task.device)
             report["actor_sha256"] = file_sha256(args.actor)
-            evaluate(env, app, loaded, commands, output, report)
+            evaluate(
+                env,
+                app,
+                loaded,
+                commands,
+                output,
+                report,
+                profile=getattr(args, "profile", None),
+            )
         report["transition_observations"] = dict(env.transition_counts)
         code = 0
     except BaseException as error:

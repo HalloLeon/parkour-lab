@@ -14,6 +14,7 @@ from parkour_lab.runtime.native import (
     NativeControllerSession,
     foot_contacts,
     foot_contact_forces,
+    motion_state,
 )
 
 
@@ -36,9 +37,14 @@ def command_sequence(*, tape=None, command=(0.3, 0.0, 0.0), steps=900):
 
 
 @torch.no_grad()
-def evaluate(env, app, loaded, commands, output, report):
+def evaluate(env, app, loaded, commands, output, report, *, profile=None):
     if not commands:
         raise ValueError("Evaluation requires a nonempty command sequence")
+    if profile is not None:
+        from .flat import profile_commands
+
+        if commands != profile_commands(profile) or env.step_dt != 0.02:
+            raise ValueError("Flat diagnostic requires its complete 50 Hz profile")
     host = NativeControllerSession(
         env, loaded.controller, loaded.motor_contract, preserve_native_raw=True
     )
@@ -51,6 +57,11 @@ def evaluate(env, app, loaded, commands, output, report):
     terminated_count = timeout_count = 0
     trace = []
     contact_trace, force_trace, reset_trace = [], [], []
+    motion_trace = []
+    previous_capture = env.capture_motion
+    initial = motion_state(env)
+    origins = env.scene.env_origins.detach().cpu().numpy().copy()
+    env.capture_motion = True
     error = None
     try:
         for step, command in enumerate(commands):
@@ -77,8 +88,21 @@ def evaluate(env, app, loaded, commands, output, report):
                     reset.cpu().numpy(),
                 )
             action = host.motor.encode(targets)
-            _, _, terminated, timed_out, _ = env.step(action)
+            _, _, terminated, timed_out, extras = env.step(action)
             host.motor.verify_delivery(terminated, timed_out)
+            motion = extras["motion_state"]
+            if motion is None:
+                raise RuntimeError(
+                    "Native evaluation requires pre-reset motion evidence"
+                )
+            motion_trace.append(
+                {
+                    **{key: value.cpu().numpy() for key, value in motion.items()},
+                    "command": applied.cpu().numpy(),
+                    "terminated": terminated.cpu().numpy(),
+                    "truncated": timed_out.cpu().numpy(),
+                }
+            )
             recorder.append(step, command)
             squared_error += (actual - applied).square().sum(dim=0)
             terminated_count += int(terminated.sum())
@@ -105,10 +129,17 @@ def evaluate(env, app, loaded, commands, output, report):
         if before != after:
             raise RuntimeError("Frozen evaluation changed controller weights")
         report["policy_unchanged"] = True
+        if profile is not None:
+            from .flat import score_flat_profile
+
+            report["flat_diagnostic"] = score_flat_profile(
+                _motion_arrays(motion_trace, initial, origins), profile
+            )
     except BaseException as exc:
         error = repr(exc)
         raise
     finally:
+        env.capture_motion = previous_capture
         write_tape(
             Path(output) / "commands.json",
             recorder.finish(completed=error is None, error=error),
@@ -126,3 +157,17 @@ def evaluate(env, app, loaded, commands, output, report):
                 root_com_velocity=np.stack(trace),
                 **sensors,
             )
+        if motion_trace:
+            np.savez_compressed(
+                Path(output) / "motion.npz",
+                **_motion_arrays(motion_trace, initial, origins),
+            )
+
+
+def _motion_arrays(rows, initial, origins):
+    return {
+        **{key: np.stack([row[key] for row in rows]) for key in rows[0]},
+        "initial_position_w": initial["position_w"].cpu().numpy(),
+        "initial_quaternion_w": initial["quaternion_w"].cpu().numpy(),
+        "env_origins": origins,
+    }

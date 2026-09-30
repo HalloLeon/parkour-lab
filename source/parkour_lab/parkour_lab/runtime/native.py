@@ -46,6 +46,25 @@ def foot_contacts(env):
     return (flags & (env.episode_length_buf[:, None] > 0)).to(forces.dtype)
 
 
+def motion_state(env):
+    """Owned simulator truth for evaluation only; never part of actor sensing."""
+    robot, sensor = env.scene["robot"].data, env.scene["contact_forces"]
+    if sensor.body_names.count("base") != 1:
+        raise ValueError("Motion capture requires exactly one named base contact link")
+    state = {
+        "position_w": robot.root_pos_w,
+        "quaternion_w": robot.root_quat_w,
+        "linear_velocity_b": robot.root_lin_vel_b,
+        "angular_velocity_b": robot.root_ang_vel_b,
+        "angular_velocity_w": robot.root_ang_vel_w,
+        "base_contact_force_w": sensor.data.net_forces_w[
+            :, sensor.body_names.index("base")
+        ],
+        "body_position_w": robot.body_pos_w,
+    }
+    return {name: value.detach().clone() for name, value in state.items()}
+
+
 def configure_external_command(command, *, command_class=None):
     """Zero on native reset; the host owns every applied body-twist command.
 
