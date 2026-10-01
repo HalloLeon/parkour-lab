@@ -73,6 +73,15 @@ def parse_args(argv=None):
             command.add_argument(
                 "--steps", type=int, help="Command playback length (default: 900)"
             )
+    geometry = commands.add_parser(
+        "geometry",
+        help="Validate native rough-structure mesh import; no robot or learning",
+    )
+    geometry.add_argument("--device", default="cuda:0")
+    geometry.add_argument("--cpu-threads", type=int, default=2)
+    geometry.add_argument(
+        "--output-parent", type=Path, default=Path("logs/parkour_lab")
+    )
     export = commands.add_parser("export")
     export.add_argument("checkpoint", type=Path)
     export.add_argument("destination", type=Path)
@@ -173,21 +182,30 @@ def main(argv=None, *, standalone=False):
 
         print(json.dumps(export_actor(args.checkpoint, args.destination), indent=2))
         return 0
-    config = resolve_config(args)
-    if args.operation == "train":
-        config.validate_training()
-    from parkour_lab.methods import get_backend
+    is_geometry = args.operation == "geometry"
+    if is_geometry:
+        config_data = {"device": args.device, "cpu_threads": args.cpu_threads}
+        device = args.device
+        dependencies = {}
+    else:
+        config = resolve_config(args)
+        if args.operation == "train":
+            config.validate_training()
+        from parkour_lab.methods import get_backend
 
-    dependencies = get_backend(config.method.name).dependencies()
+        dependencies = get_backend(config.method.name).dependencies()
+        config_data = config.to_dict()
+        device = config.task.device
     import numpy as np
     import torch
 
     torch.set_num_threads(args.cpu_threads)
-    random.seed(config.task.seed)
-    np.random.seed(config.task.seed)
-    torch.manual_seed(config.task.seed)
+    if not is_geometry:
+        random.seed(config.task.seed)
+        np.random.seed(config.task.seed)
+        torch.manual_seed(config.task.seed)
     commands = None
-    if args.operation != "train":
+    if args.operation not in ("train", "geometry"):
         from parkour_lab.control.command_tape import load_tape
         from parkour_lab.evaluation.runner import command_sequence
 
@@ -218,7 +236,7 @@ def main(argv=None, *, standalone=False):
         "qualified": False,
         "exit_allowed": False,
         "operation": args.operation,
-        "config": config.to_dict(),
+        "config": config_data,
         "dependencies": dependencies,
         "package_sources": package_source_identity(),
     }
@@ -230,7 +248,7 @@ def main(argv=None, *, standalone=False):
     code = 2
     started = time.monotonic()
     try:
-        write_json(output / "config.json", config.to_dict())
+        write_json(output / "config.json", config_data)
         try:
             write_run_provenance(output, __file__)
         except RuntimeError as error:
@@ -243,46 +261,52 @@ def main(argv=None, *, standalone=False):
         # close() must return so we can publish cleanup and preserve the exit status.
         app = AppLauncher(
             headless=args.operation != "play",
-            device=config.task.device,
+            device=device,
             fast_shutdown=False,
         ).app
-        from parkour_lab.environments.configuration import build_environment_config
-        from parkour_lab.environments.runtime import LocomotionEnv
+        if is_geometry:
+            from parkour_lab.runtime.geometry import GeometryScene
 
-        cfg = build_environment_config(
-            config.task, evaluation=args.operation != "train"
-        )
-        cfg.validate()
-        import yaml
-
-        (output / "resolved_env.yaml").write_text(
-            yaml.dump(cfg.to_dict(), sort_keys=False)
-        )
-        env = LocomotionEnv(cfg=cfg)
-        from parkour_lab.environments.rewards import reward_recipe
-
-        report["reward_recipe"] = reward_recipe(env)
-        if args.operation == "train":
-            from parkour_lab.experiment import train
-
-            train(env, app, config, output, report, checkpoint=args.checkpoint)
+            env = GeometryScene(device)
+            env.validate(output, report)
         else:
-            from parkour_lab.artifacts import load_actor, file_sha256
-            from parkour_lab.evaluation.runner import evaluate
+            from parkour_lab.environments.configuration import build_environment_config
+            from parkour_lab.environments.runtime import LocomotionEnv
 
-            loaded = load_actor(args.actor, device=config.task.device)
-            report["actor_sha256"] = file_sha256(args.actor)
-            evaluate(
-                env,
-                app,
-                loaded,
-                commands,
-                output,
-                report,
-                profile=getattr(args, "profile", None)
-                or getattr(args, "bank_profile", None),
+            cfg = build_environment_config(
+                config.task, evaluation=args.operation != "train"
             )
-        report["transition_observations"] = dict(env.transition_counts)
+            cfg.validate()
+            import yaml
+
+            (output / "resolved_env.yaml").write_text(
+                yaml.dump(cfg.to_dict(), sort_keys=False)
+            )
+            env = LocomotionEnv(cfg=cfg)
+            from parkour_lab.environments.rewards import reward_recipe
+
+            report["reward_recipe"] = reward_recipe(env)
+            if args.operation == "train":
+                from parkour_lab.experiment import train
+
+                train(env, app, config, output, report, checkpoint=args.checkpoint)
+            else:
+                from parkour_lab.artifacts import load_actor, file_sha256
+                from parkour_lab.evaluation.runner import evaluate
+
+                loaded = load_actor(args.actor, device=config.task.device)
+                report["actor_sha256"] = file_sha256(args.actor)
+                evaluate(
+                    env,
+                    app,
+                    loaded,
+                    commands,
+                    output,
+                    report,
+                    profile=getattr(args, "profile", None)
+                    or getattr(args, "bank_profile", None),
+                )
+            report["transition_observations"] = dict(env.transition_counts)
         code = 0
     except BaseException as error:
         report.update(status="ERROR", error=repr(error))

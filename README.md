@@ -25,9 +25,11 @@ exact-wheel admission gate. Select the device explicitly.
 | `python -m parkour_lab export CHECKPOINT ACTOR` | Export only the method's causal inference state |
 | `python -m parkour_lab evaluate ACTOR` | Frozen headless command playback and diagnostic tracking |
 | `python -m parkour_lab play ACTOR` | The same playback with a visible simulator, one environment by default |
+| `python -m parkour_lab geometry` | Import and measure fixed rough-structure USD triangle colliders; no robot or learning |
 | `python -m parkour_lab analyze RUN` | Print a run's result; `--flat-bank` verifies and aggregates development groups |
 
-`--config FILE` accepts explicit settings, not an old experiment manifest.
+For training and playback, `--config FILE` accepts explicit settings, not an old
+experiment manifest.
 Unknown fields are errors. CLI overrides include `--device`, `--num-envs`,
 `--seed`, and training `--updates`. For example:
 
@@ -115,8 +117,8 @@ the entire override map. Use `"rewards": {}` to restore defaults. Other task fie
 and the learner remain unchanged. Weights and tracking widths change the training
 objective, not motor limits, commands, observations or evaluation thresholds.
 
-Every native report includes the actual manager's `reward_recipe`: weights,
-functions, formulas, parameters and control timestep. Native rewards are the
+Every native locomotion report includes the actual manager's `reward_recipe`:
+weights, functions, formulas, parameters and control timestep. Native rewards are the
 signed sum of `weight * term * dt`, without clipping. `metrics.jsonl` adds
 `task_metrics`, grouped by learning phase and outgoing command regime. Initial
 stops are distinguished from stops after any movement command in the same episode;
@@ -178,17 +180,38 @@ Native verification of the corrected task is still pending.
 Domain checks use root/body-link centres in a local ±6 m square, not collision-volume
 extents. Reports always retain `qualified=false` and `qualification_eligible=false`.
 
+### Native geometry diagnostics
+
+```bash
+python -m parkour_lab geometry --device cuda:0 --output-parent logs/parkour_lab
+```
+
+This headless check imports 22 fixed stair, ramp, hill and rough-level fixtures,
+resets the simulation, steps once, and reads back the USD triangle colliders. It checks
+exact float32 source conversion, topology, transforms and collider settings, then
+measures spacing, supporting slopes, risers, treads and roughness residuals against
+the declared bounds. Separate coarse/fine RMS values remain source witnesses with
+conversion-error bounds, not independently measured layers in the summed mesh.
+
+The report records each fixture and a hashed `mesh_NN.npz` containing source and
+imported arrays. Success is `NATIVE_GEOMETRY_VALIDATED_NOT_QUALIFIED`, with both
+cleanup entries `complete` and process exit 0. The check fails closed on conversion
+overflow; it does not rescale, relax limits or select replacement seeds. It does
+not verify PhysX cooked/contact behavior, connected mixed worlds, traversal or
+robot qualification. No checkpoint or task/learner configuration is required;
+existing locomotion terrain routes remain unchanged.
+
 ## Ownership and boundaries
 
 | Package/module | Responsibility |
 | --- | --- |
-| `config.py`, `__main__.py`, `experiment.py` | Typed settings, five public commands, lifecycle and training orchestration |
+| `config.py`, `__main__.py`, `experiment.py` | Typed settings, public commands, lifecycle and training orchestration |
 | `environments/` | Explicit native configuration, terrain, observations, command sampling and physical termination |
 | `methods/roa/` | ROA observation adapter, teacher/student model, PPO/history-fitting schedule/state, numerical serialization and causal controller |
 | `methods/base.py`, `methods/__init__.py` | Small backend/learner contracts and named plugin loading |
 | `methods/models.py` | Torch neural components used by ROA; not required by other frameworks |
 | `control/` | Portable command tapes, sensor/action contracts and controller session semantics |
-| `runtime/` | Shared training ticks, native sensor/motor binding and cleanup |
+| `runtime/` | Shared training ticks, native sensor/motor binding, geometry import diagnostics and cleanup |
 | `artifacts.py`, `provenance.py` | Method-neutral artifact envelope and source/dependency/run receipts |
 | `evaluation/` | Frozen command playback and diagnostic metrics |
 | `tests/` | Component-organized regression, contract, geometry and CPU integration checks; see [tests/README.md](tests/README.md) |
