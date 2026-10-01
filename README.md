@@ -25,7 +25,6 @@ exact-wheel admission gate. Select the device explicitly.
 | `python -m parkour_lab export CHECKPOINT ACTOR` | Export only the method's causal inference state |
 | `python -m parkour_lab evaluate ACTOR` | Frozen headless command playback and diagnostic tracking |
 | `python -m parkour_lab play ACTOR` | The same playback with a visible simulator, one environment by default |
-| `python -m parkour_lab geometry` | Import and measure diagnostic USD colliders: 22 local strips by default, or one connected `--world-case`; no robot or learning |
 | `python -m parkour_lab analyze RUN` | Print a run's result; `--flat-bank` verifies and aggregates development groups |
 
 For training and playback, `--config FILE` accepts explicit settings, not an old
@@ -180,53 +179,6 @@ Native verification of the corrected task is still pending.
 Domain checks use root/body-link centres in a local ±6 m square, not collision-volume
 extents. Reports always retain `qualified=false` and `qualification_eligible=false`.
 
-### Native geometry diagnostics
-
-```bash
-python -m parkour_lab geometry --device cuda:0 --output-parent logs/parkour_lab
-```
-
-This headless check imports 22 fixed stair, ramp, hill and rough-level fixtures,
-resets the simulation, steps once, and reads back the USD triangle colliders. It checks
-exact float32 source conversion, topology, transforms and collider settings, then
-measures spacing, supporting slopes, risers, treads and roughness residuals against
-the declared bounds. Separate coarse/fine RMS values remain source witnesses with
-conversion-error bounds, not independently measured layers in the summed mesh.
-
-The report records each fixture and a hashed `mesh_NN.npz` containing source and
-imported arrays. Success is `NATIVE_GEOMETRY_VALIDATED_NOT_QUALIFIED`, with both
-cleanup entries `complete` and process exit 0. Small angle rounding is accepted;
-other bounds remain unchanged. Failures do not trigger rescaling or new seeds. It does
-not verify PhysX cooked/contact behavior, connected mixed worlds, traversal or
-robot qualification. No checkpoint or task/learner configuration is required;
-existing locomotion terrain routes remain unchanged.
-Flushed `[geometry]` messages identify context creation, each mesh import,
-physics reset/step, readback and cleanup, including when native work is pending.
-
-For the connected-world import diagnostic, run one case per process:
-
-```bash
-python -m parkour_lab geometry --world-case ramp-up --device cuda:0 --output-parent logs/parkour_lab
-```
-
-The fixed public cases are `stairs-up`, `stairs-down`, `ramp-up`, `ramp-down`,
-`hill-up` and `hill-down`. Each contains all three structures plus rough connecting
-ground; the name selects the assigned maximum-tier encounter. Seeds are 17/23,
-yaw is +0.37 rad for up cases and −0.61 rad for down cases. Stair cases exercise
-six risers with 0.31 m treads / five risers with 0.5 m treads; ramp cases use 2 m / 3 m
-inclines. These are diagnostic inputs, not a development or qualification bank.
-
-The world check compares actual returned points, topology and rigid transform
-with the already-validated source, and reads the collider and bound physics
-material (friction 1/1, restitution 0, multiply combination). Exact mesh identity
-preserves the source's geometry checks without repeating them in the importer.
-`world.npz` archives source and imported data, with its hash, source checks and
-import results in `report.json`. Success is
-`NATIVE_WORLD_GEOMETRY_VALIDATED_NOT_QUALIFIED`, both cleanup entries `complete`,
-and process exit 0. Run and inspect `ramp-up` first before the other five cases.
-This remains USD-import evidence: one physics step without controlled bodies
-does not validate contacts, cooked topology, robot traversal or training readiness.
-
 ### Connected source geometry
 
 The simulator-free `environments.worlds.build_world` API constructs a single
@@ -256,9 +208,9 @@ Vertices use local coordinates. `world_yaw` records a rigid column-vector
 local-to-world transform and rotates the annotated start pose; it does not bake
 rotation into the mesh. The nominal motion envelope is a construction check,
 not a guarantee about robot trajectories or collision-volume clearance. Local
-float32 diagnostics are not native USD/PhysX evidence. The native `geometry
---world-case` route separately checks the imported connected world; training and
-evaluation terrain paths remain unchanged.
+float32 diagnostics are not native USD/PhysX evidence. Native checks are separate
+server commands supplied when needed, not permanent diagnostic-only runtime
+modules. Training and evaluation terrain paths remain unchanged.
 The world builder reuses analytical common roughness scaling at 25°, quietly
 accepting small angle rounding. Height caps and layer-RMS floors remain strict;
 failures do not redraw noise. No exact floating-point search is needed.
@@ -279,7 +231,7 @@ checked separately. These checks still do not establish native collider behavior
 | `methods/base.py`, `methods/__init__.py` | Small backend/learner contracts and named plugin loading |
 | `methods/models.py` | Torch neural components used by ROA; not required by other frameworks |
 | `control/` | Portable command tapes, sensor/action contracts and controller session semantics |
-| `runtime/` | Shared training ticks, native sensor/motor binding, geometry import diagnostics and cleanup |
+| `runtime/` | Shared training ticks, native sensor/motor binding and cleanup |
 | `artifacts.py`, `provenance.py` | Method-neutral artifact envelope and source/dependency/run receipts |
 | `evaluation/` | Frozen command playback and diagnostic metrics |
 | `tests/` | Component-organized regression, contract, geometry and CPU integration checks; see [tests/README.md](tests/README.md) |

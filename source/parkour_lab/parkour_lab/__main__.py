@@ -14,8 +14,6 @@ from parkour_lab.config import ExperimentConfig
 
 
 def parse_args(argv=None):
-    from parkour_lab.runtime.geometry import WORLD_CASES
-
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="operation", required=True)
     for name in ("train", "evaluate", "play"):
@@ -60,35 +58,17 @@ def parse_args(argv=None):
                 help="Body twist followed by a final 1 s stop; steps <= 50 means all stop",
             )
             if name == "evaluate":
-                from parkour_lab.evaluation.flat import PROFILES
-
                 source.add_argument(
                     "--profile",
-                    choices=tuple(PROFILES),
                     help="Fixed 11 s flat command diagnostic; not the acceptance bank",
                 )
                 source.add_argument(
                     "--bank-profile",
-                    choices=tuple(PROFILES),
                     help="Frozen flat development group: 100 independent attempts, balanced dynamics",
                 )
             command.add_argument(
                 "--steps", type=int, help="Command playback length (default: 900)"
             )
-    geometry = commands.add_parser(
-        "geometry",
-        help="Validate native diagnostic mesh import; no robot or learning",
-    )
-    geometry.add_argument(
-        "--world-case",
-        choices=tuple(WORLD_CASES),
-        help="Import one fixed connected-world diagnostic; omitted runs 22 local strips",
-    )
-    geometry.add_argument("--device", default="cuda:0")
-    geometry.add_argument("--cpu-threads", type=int, default=2)
-    geometry.add_argument(
-        "--output-parent", type=Path, default=Path("logs/parkour_lab")
-    )
     export = commands.add_parser("export")
     export.add_argument("checkpoint", type=Path)
     export.add_argument("destination", type=Path)
@@ -104,6 +84,16 @@ def parse_args(argv=None):
         parser.error("cpu-threads must be positive")
     if hasattr(args, "command") and not all(math.isfinite(x) for x in args.command):
         parser.error("Commands must be finite")
+    profile = getattr(args, "profile", None)
+    if profile is None:
+        profile = getattr(args, "bank_profile", None)
+    if profile is not None:
+        from parkour_lab.evaluation.flat import PROFILES
+
+        if profile not in PROFILES:
+            parser.error(
+                f"Unknown flat profile {profile!r}; choose from {', '.join(PROFILES)}"
+            )
     if (
         getattr(args, "profile", None) or getattr(args, "bank_profile", None)
     ) and args.steps is not None:
@@ -189,37 +179,22 @@ def main(argv=None, *, standalone=False):
 
         print(json.dumps(export_actor(args.checkpoint, args.destination), indent=2))
         return 0
-    is_geometry = args.operation == "geometry"
-    if is_geometry:
-        config_data = {"device": args.device, "cpu_threads": args.cpu_threads}
-        if args.world_case is not None:
-            from parkour_lab.runtime.geometry import world_fixture
+    config = resolve_config(args)
+    if args.operation == "train":
+        config.validate_training()
+    from parkour_lab.methods import get_backend
 
-            config_data.update(
-                world_case=args.world_case,
-                world_fixture=world_fixture(args.world_case),
-            )
-        device = args.device
-        dependencies = {}
-    else:
-        config = resolve_config(args)
-        if args.operation == "train":
-            config.validate_training()
-        from parkour_lab.methods import get_backend
-
-        dependencies = get_backend(config.method.name).dependencies()
-        config_data = config.to_dict()
-        device = config.task.device
+    dependencies = get_backend(config.method.name).dependencies()
+    config_data = config.to_dict()
     import numpy as np
     import torch
 
     torch.set_num_threads(args.cpu_threads)
-    if not is_geometry:
-        random.seed(config.task.seed)
-        np.random.seed(config.task.seed)
-        torch.manual_seed(config.task.seed)
+    random.seed(config.task.seed)
+    np.random.seed(config.task.seed)
+    torch.manual_seed(config.task.seed)
     commands = None
-    if args.operation not in ("train", "geometry"):
+    if args.operation != "train":
         from parkour_lab.control.command_tape import load_tape
         from parkour_lab.evaluation.runner import command_sequence
 
@@ -275,55 +250,46 @@ def main(argv=None, *, standalone=False):
         # close() must return so we can publish cleanup and preserve the exit status.
         app = AppLauncher(
             headless=args.operation != "play",
-            device=device,
+            device=config.task.device,
             fast_shutdown=False,
         ).app
-        if is_geometry:
-            from parkour_lab.runtime.geometry import GeometryScene
+        from parkour_lab.environments.configuration import build_environment_config
+        from parkour_lab.environments.runtime import LocomotionEnv
 
-            env = GeometryScene(device)
-            if args.world_case is None:
-                env.validate(output, report)
-            else:
-                env.validate(output, report, world_case=args.world_case)
+        cfg = build_environment_config(
+            config.task, evaluation=args.operation != "train"
+        )
+        cfg.validate()
+        import yaml
+
+        (output / "resolved_env.yaml").write_text(
+            yaml.dump(cfg.to_dict(), sort_keys=False)
+        )
+        env = LocomotionEnv(cfg=cfg)
+        from parkour_lab.environments.rewards import reward_recipe
+
+        report["reward_recipe"] = reward_recipe(env)
+        if args.operation == "train":
+            from parkour_lab.experiment import train
+
+            train(env, app, config, output, report, checkpoint=args.checkpoint)
         else:
-            from parkour_lab.environments.configuration import build_environment_config
-            from parkour_lab.environments.runtime import LocomotionEnv
+            from parkour_lab.artifacts import load_actor, file_sha256
+            from parkour_lab.evaluation.runner import evaluate
 
-            cfg = build_environment_config(
-                config.task, evaluation=args.operation != "train"
+            loaded = load_actor(args.actor, device=config.task.device)
+            report["actor_sha256"] = file_sha256(args.actor)
+            evaluate(
+                env,
+                app,
+                loaded,
+                commands,
+                output,
+                report,
+                profile=getattr(args, "profile", None)
+                or getattr(args, "bank_profile", None),
             )
-            cfg.validate()
-            import yaml
-
-            (output / "resolved_env.yaml").write_text(
-                yaml.dump(cfg.to_dict(), sort_keys=False)
-            )
-            env = LocomotionEnv(cfg=cfg)
-            from parkour_lab.environments.rewards import reward_recipe
-
-            report["reward_recipe"] = reward_recipe(env)
-            if args.operation == "train":
-                from parkour_lab.experiment import train
-
-                train(env, app, config, output, report, checkpoint=args.checkpoint)
-            else:
-                from parkour_lab.artifacts import load_actor, file_sha256
-                from parkour_lab.evaluation.runner import evaluate
-
-                loaded = load_actor(args.actor, device=config.task.device)
-                report["actor_sha256"] = file_sha256(args.actor)
-                evaluate(
-                    env,
-                    app,
-                    loaded,
-                    commands,
-                    output,
-                    report,
-                    profile=getattr(args, "profile", None)
-                    or getattr(args, "bank_profile", None),
-                )
-            report["transition_observations"] = dict(env.transition_counts)
+        report["transition_observations"] = dict(env.transition_counts)
         code = 0
     except BaseException as error:
         report.update(status="ERROR", error=repr(error))
