@@ -14,6 +14,8 @@ from parkour_lab.config import ExperimentConfig
 
 
 def parse_args(argv=None):
+    from parkour_lab.runtime.geometry import WORLD_CASES
+
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="operation", required=True)
     for name in ("train", "evaluate", "play"):
@@ -75,7 +77,12 @@ def parse_args(argv=None):
             )
     geometry = commands.add_parser(
         "geometry",
-        help="Validate native rough-structure mesh import; no robot or learning",
+        help="Validate native diagnostic mesh import; no robot or learning",
+    )
+    geometry.add_argument(
+        "--world-case",
+        choices=tuple(WORLD_CASES),
+        help="Import one fixed connected-world diagnostic; omitted runs 22 local strips",
     )
     geometry.add_argument("--device", default="cuda:0")
     geometry.add_argument("--cpu-threads", type=int, default=2)
@@ -185,6 +192,13 @@ def main(argv=None, *, standalone=False):
     is_geometry = args.operation == "geometry"
     if is_geometry:
         config_data = {"device": args.device, "cpu_threads": args.cpu_threads}
+        if args.world_case is not None:
+            from parkour_lab.runtime.geometry import world_fixture
+
+            config_data.update(
+                world_case=args.world_case,
+                world_fixture=world_fixture(args.world_case),
+            )
         device = args.device
         dependencies = {}
     else:
@@ -268,7 +282,10 @@ def main(argv=None, *, standalone=False):
             from parkour_lab.runtime.geometry import GeometryScene
 
             env = GeometryScene(device)
-            env.validate(output, report)
+            if args.world_case is None:
+                env.validate(output, report)
+            else:
+                env.validate(output, report, world_case=args.world_case)
         else:
             from parkour_lab.environments.configuration import build_environment_config
             from parkour_lab.environments.runtime import LocomotionEnv

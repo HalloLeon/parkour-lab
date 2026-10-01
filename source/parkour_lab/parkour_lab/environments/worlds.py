@@ -19,12 +19,68 @@ from .structures import (
     _apply_roughness,
     _axis,
     _carrier_profile,
-    _gradients,
     _grid_mesh,
     _normals,
     _positive,
     _roughness_layers,
 )
+
+
+def _stair_lips(entry, tread, risers):
+    """Keep legal lips; otherwise realize a constant common-lattice tread.
+
+    A binary32 lattice spanning the flight permits exactly equal authored and
+    converted treads. Choose the nearest legal lattice tread and nearest lattice
+    entry, with ties to even. Entry movement is at most half that lattice spacing;
+    this is coordinate representation, not a search for a different layout.
+    """
+    lips = entry + np.arange(risers) * tread
+
+    def legal(values):
+        converted = values.astype(np.float32).astype(np.float64)
+        return np.isfinite(converted).all() and all(
+            ((np.diff(v) >= 0.31) & (np.diff(v) <= 0.5)).all()
+            for v in (values, converted)
+        )
+
+    receipt = {
+        "requested_entry_m": float(entry),
+        "requested_tread_m": float(tread),
+        "realized_entry_m": float(entry),
+        "realized_tread_m": float(tread),
+        "coordinate_headroom_applied": False,
+        "coordinate_lattice_m": None,
+    }
+    if legal(lips):
+        return lips, receipt
+    spacing = float(np.spacing(np.float32(lips[-1])))
+    for _ in range(4):
+        if not math.isfinite(spacing) or spacing <= 0:
+            break
+        minimum, maximum = math.ceil(0.31 / spacing), math.floor(0.5 / spacing)
+        if minimum > maximum:
+            break
+        step = min(max(round(tread / spacing), minimum), maximum) * spacing
+        origin = round(entry / spacing) * spacing
+        candidate = origin + np.arange(risers) * step
+        needed = float(np.spacing(np.float32(candidate[-1])))
+        if needed > spacing:
+            spacing = needed
+            continue
+        if (
+            not legal(candidate)
+            or abs(origin - entry) > spacing / 2
+            or not np.array_equal(candidate, candidate.astype(np.float32))
+        ):
+            break
+        receipt.update(
+            realized_entry_m=float(origin),
+            realized_tread_m=float(step),
+            coordinate_headroom_applied=True,
+            coordinate_lattice_m=spacing,
+        )
+        return candidate, receipt
+    raise ValueError("Cannot represent constant in-envelope source/float32 treads")
 
 
 def _inside(points, bounds):
@@ -169,6 +225,10 @@ def build_world(
     The assigned family uses ``tier``; surrounding stairs/ramp/hill use 8 cm,
     10 degrees and 10 degrees. Hill reversal reflects its unequal flanks while
     travelling +x; stairs/ramp reversal instead changes the supported start side.
+    Legal requested stair coordinates are preserved. If binary32 conversion would
+    violate a tread bound, realize the flight on a common binary32 lattice before
+    authoring the carrier/noise, and report requested versus realized coordinates.
+    Shared roughness scaling targets 25 degrees; small rounding errors are accepted.
     Vertices stay local. The recorded rigid transform rotates mesh and start
     together; arbitrary independent feature rotations are intentionally unsupported.
     """
@@ -232,7 +292,8 @@ def build_world(
     ramp_tier = float(tier) if target_family == "ramp" else 10.0
     hill_tier = float(tier) if target_family == "hill" else 10.0
     hill_reverse = reverse and target_family == "hill"
-    lips = stair_entry + np.arange(risers) * tread
+    lips, stair_coordinates = _stair_lips(stair_entry, tread, risers)
+    stair_entry = float(lips[0])
     ramp_grade = math.tan(math.radians(9.9))
     target_ramp_grade = math.tan(math.radians(ramp_tier - 0.1))
     ramp_core = np.array([ramp_route_x - 1.5, ramp_route_x + 1.5])
@@ -251,6 +312,7 @@ def build_world(
     hill_exit = hill_entry + 2.9
     features = {
         "stairs": {
+            **stair_coordinates,
             "tier": stair_tier,
             "axis": 0,
             "entry": np.array([stair_entry, stair_route_y]),
@@ -345,6 +407,14 @@ def build_world(
             )
     x = np.sort(np.concatenate((_axis(x_knots, resolution), lips)))
     y = _axis(y_knots, resolution)
+    axis_spacing = float(max(np.diff(x).max(), np.diff(y).max()))
+    float32_spacing = float(
+        max(
+            np.diff(axis.astype(np.float32).astype(np.float64)).max() for axis in (x, y)
+        )
+    )
+    if axis_spacing > 0.02 or float32_spacing > 0.02:
+        raise ValueError("Source/float32 horizontal spacing exceeds 0.02 m")
     stairs = _carrier_profile(
         "stairs", stair_tier, x, stair_entry, lips, False, risers, 2.0
     )
@@ -398,6 +468,22 @@ def build_world(
         vertices[retained],
     )
     carrier = vertices[:, 2].copy()
+    converted_carrier = vertices.astype(np.float32).astype(np.float64)
+    converted_carrier_normals = _normals(converted_carrier, faces)
+    if (
+        not np.isfinite(converted_carrier).all()
+        or (np.linalg.norm(converted_carrier_normals, axis=1) == 0).any()
+        or (converted_carrier_normals[support, 2] <= 0).any()
+        or (converted_carrier_normals[~support, 2] != 0).any()
+    ):
+        raise ValueError("Invalid float32 carrier supporting/riser topology")
+    converted_carrier_grades = np.degrees(
+        np.arctan2(
+            np.linalg.norm(converted_carrier_normals[support, :2], axis=1),
+            converted_carrier_normals[support, 2],
+        )
+    )
+    del converted_carrier_normals
     taper = np.ones(len(vertices))
     riser_segments = []
     ramp_height = incline_length * ramp_grade
@@ -449,19 +535,18 @@ def build_world(
         raise ValueError("Invalid connected supporting/riser topology")
     grade = float(
         np.degrees(
-            np.arctan(
-                np.linalg.norm(_gradients(vertices, faces[support]), axis=1).max()
+            np.arctan2(
+                np.linalg.norm(normals[support, :2], axis=1), normals[support, 2]
             )
-        )
+        ).max()
     )
     rough = sum(layers)
     rms = [float(np.sqrt(np.mean(layer[untapered] ** 2))) for layer in layers]
     if (
-        grade > 25 + 1e-12
-        or (np.abs(rough) > cap + 1e-12).any()
-        or any(
-            value < lower - 1e-12 for value, lower in zip(rms, MINIMUM_RMS, strict=True)
-        )
+        not math.isfinite(grade)
+        or grade > 25.001
+        or (np.abs(rough) > cap).any()
+        or any(value < lower for value, lower in zip(rms, MINIMUM_RMS, strict=True))
     ):
         raise ValueError("World exceeds source roughness/slope limits")
     region_masks["connecting_ground"] = ~np.logical_or.reduce(
@@ -481,32 +566,83 @@ def build_world(
         feature["measured_carrier_grade_degrees"] = float(
             carrier_grades[interior].max()
         )
-        feature["usable_width_m"] = float(
-            np.diff(feature["footprint"], axis=0)[0, 1 - feature["axis"]]
+        feature["float32_carrier_grade_degrees"] = float(
+            converted_carrier_grades[interior].max()
         )
-        if (
-            family in ("ramp", "hill")
-            and not feature["tier"] - 0.2
-            <= feature["measured_carrier_grade_degrees"]
-            <= feature["tier"]
+        across = 1 - feature["axis"]
+        feature["usable_width_m"] = float(np.ptp(vertices[footprint_vertices, across]))
+        feature["float32_usable_width_m"] = float(
+            np.ptp(converted_carrier[footprint_vertices, across])
+        )
+        if min(feature["usable_width_m"], feature["float32_usable_width_m"]) < 2:
+            raise ValueError("Source/float32 feature usable width is below 2 m")
+        if family in ("ramp", "hill") and not all(
+            feature["tier"] - 0.2 <= feature[key] <= feature["tier"]
+            for key in (
+                "measured_carrier_grade_degrees",
+                "float32_carrier_grade_degrees",
+            )
         ):
-            raise ValueError("Realized feature carrier grade misses its tier")
+            raise ValueError("Source/float32 feature carrier grade misses its tier")
         if family == "stairs":
             wall = faces[~support & footprint_vertices[faces].all(axis=1)]
-            rises = np.ptp(carrier[wall], axis=1)
+            rises = np.ptp(vertices[wall, 2], axis=1)
+            converted_rises = np.ptp(
+                vertices[wall, 2].astype(np.float32).astype(np.float64), axis=1
+            )
+            converted_treads = np.diff(lips.astype(np.float32).astype(np.float64))
             feature["measured_riser_range_m"] = [float(rises.min()), float(rises.max())]
+            feature["float32_riser_range_m"] = [
+                float(converted_rises.min()),
+                float(converted_rises.max()),
+            ]
             feature["measured_treads_m"] = np.diff(lips).tolist()
+            feature["float32_treads_m"] = converted_treads.tolist()
             feature["riser_count"] = len(lips)
-            if not (
-                (rises >= feature["tier"] - 0.002).all()
-                and (rises <= feature["tier"]).all()
-            ) or not (
-                (np.diff(lips) >= 0.31 - 1e-12).all()
-                and (np.diff(lips) <= 0.5 + 1e-12).all()
+            if not all(
+                (
+                    (values >= feature["tier"] - 0.002) & (values <= feature["tier"])
+                ).all()
+                for values in (rises, converted_rises)
+            ) or not all(
+                ((values >= 0.31) & (values <= 0.5)).all()
+                for values in (np.diff(lips), converted_treads)
             ):
-                raise ValueError("Realized feature risers/treads miss their envelope")
+                raise ValueError(
+                    "Source/float32 feature risers/treads miss their envelope"
+                )
+        else:
+            axis = feature["axis"]
+            feature["measured_horizontal_length_m"] = float(
+                np.ptp(vertices[footprint_vertices, axis])
+            )
+            feature["float32_horizontal_length_m"] = float(
+                np.ptp(converted_carrier[footprint_vertices, axis])
+            )
+            boundaries = np.array([ramp_entry, ramp_entry + incline_length])
+            if family == "hill":
+                boundaries = np.array(
+                    [hill_entry, hill_entry + up, hill_entry + up + 0.4, hill_exit]
+                )
+                feature["measured_flank_crest_flank_m"] = np.diff(boundaries).tolist()
+                feature["float32_flank_crest_flank_m"] = np.diff(
+                    boundaries.astype(np.float32).astype(np.float64)
+                ).tolist()
+            converted_boundaries = boundaries.astype(np.float32).astype(np.float64)
+            feature["profile_boundaries_m"] = boundaries.tolist()
+            feature["float32_profile_boundaries_m"] = converted_boundaries.tolist()
+            feature["profile_boundary_conversion_error_m"] = (
+                converted_boundaries - boundaries
+            ).tolist()
     quantized = vertices.astype(np.float32).astype(np.float64)
     float32_normals = _normals(quantized, faces)
+    if (
+        not np.isfinite(quantized).all()
+        or (np.linalg.norm(float32_normals, axis=1) == 0).any()
+        or (float32_normals[support, 2] <= 0).any()
+        or (float32_normals[~support, 2] != 0).any()
+    ):
+        raise ValueError("Invalid float32 supporting/riser topology")
     float32_grade = float(
         np.degrees(
             np.arctan2(
@@ -515,27 +651,47 @@ def build_world(
             )
         ).max()
     )
+    conversion_bound = float(np.abs(quantized[:, 2] - vertices[:, 2]).max())
+    conservative_rms = [value - conversion_bound for value in rms]
+    if (
+        not math.isfinite(float32_grade)
+        or float32_grade > 25.001
+        or (np.abs(quantized[:, 2] - carrier) > cap).any()
+        or any(
+            value < low
+            for value, low in zip(conservative_rms, MINIMUM_RMS, strict=True)
+        )
+    ):
+        raise ValueError("World exceeds float32 roughness/slope limits")
     metadata = {
         "version": "connected_terrace_diagnostic_v1",
         "scope": "Connected source mesh and prospective nominal tape margins only; not native import, contact, robot traversal or a frozen bank",
         "size_m": size.tolist(),
         "resolution_limit_m": float(resolution),
-        "maximum_axis_spacing_m": float(max(np.diff(x).max(), np.diff(y).max())),
+        "maximum_axis_spacing_m": axis_spacing,
+        "float32_maximum_axis_spacing_m": float32_spacing,
         "coarse_seed": coarse_seed,
         "fine_seed": fine_seed,
         "roughness_lattice_spacing_m": list(SPACINGS),
         "roughness_shared_scale": scale,
         "boundary_taper": "Quintic 6t^5-15t^4+10t^3 within 0.02 m of actual risers and over 0.5 m at assigned pads",
         "roughness_rms_m": rms,
+        "source_layer_rms_minus_conversion_bound_m": conservative_rms,
+        "maximum_height_conversion_error_m": conversion_bound,
+        "maximum_float32_residual_from_source_carrier_m": float(
+            np.abs(quantized[:, 2] - carrier).max()
+        ),
         "regional_rms_descriptive_m": region_rms,
         "roughness_cap_rule": "1 cm throughout maximum-tier feature influence (including upper-envelope seams), 2 cm elsewhere; diagnostic construction choice",
         "maximum_supporting_grade_degrees": grade,
         "maximum_carrier_grade_degrees": float(
             np.degrees(np.arctan(np.linalg.norm(carrier_gradient, axis=1).max()))
         ),
+        "float32_maximum_carrier_grade_degrees": float(converted_carrier_grades.max()),
         "local_float32_supporting_grade_degrees": float32_grade,
-        "local_float32_supporting_slope_within_limit": float32_grade <= 25.0,
-        "float32_scope": "Local coordinate conversion only; overflow is recorded, not corrected or accepted as native geometry",
+        "local_float32_supporting_slope_within_limit": float32_grade <= 25.001,
+        "float32_scope": "Local coordinate conversion only; not native import, cooked collision, contact or traversal evidence",
+        "float32_topology_valid": True,
         "projected_support_area_m2": float(normals[support, 2].sum() / 2),
         "untapered_support_area_m2": float(normals[full_faces, 2].sum() / 2),
         "intentional_riser_segments_local_m": riser_segments,
@@ -555,6 +711,9 @@ def build_world(
             vertices.astype("<f8").tobytes()
         ).hexdigest(),
         "faces_int64_sha256": hashlib.sha256(faces.astype("<i8").tobytes()).hexdigest(),
+        "vertices_float32_sha256": hashlib.sha256(
+            vertices.astype("<f4").tobytes()
+        ).hexdigest(),
     }
     return {
         "vertices": vertices,

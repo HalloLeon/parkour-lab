@@ -6,15 +6,60 @@ after the CLI's AppLauncher and uses the CLI's normal provenance and cleanup.
 
 from __future__ import annotations
 
+import json
+import math
+
 import numpy as np
 
-from parkour_lab.environments.structures import MINIMUM_RMS, build_structure
+from parkour_lab.environments.structures import (
+    MINIMUM_RMS,
+    build_structure,
+)
+from parkour_lab.environments.worlds import build_world
 from parkour_lab.provenance import dependency_identity, file_sha256, write_json
 
 SCOPE = (
     "Separate diagnostic USD triangle colliders; not PhysX contact-response, "
     "connected mixed-world, traversal, or robot qualification evidence"
 )
+WORLD_SCOPE = (
+    "Connected diagnostic USD collider identity and material; geometry bounds "
+    "come from validated source construction and exact float32 readback identity; "
+    "not cooked PhysX topology, contact response, traversal or qualification evidence"
+)
+WORLD_CASES = {
+    name: dict(
+        target_family=family,
+        tier=tier,
+        reverse=reverse,
+        coarse_seed=17,
+        fine_seed=23,
+        world_yaw=-0.61 if reverse else 0.37,
+        **shape,
+    )
+    for name, family, tier, reverse, shape in (
+        ("stairs-up", "stairs", 0.16, False, {"risers": 6, "tread": 0.31}),
+        ("stairs-down", "stairs", 0.16, True, {"risers": 5, "tread": 0.5}),
+        ("ramp-up", "ramp", 20, False, {"incline_length": 2.0}),
+        ("ramp-down", "ramp", 20, True, {"incline_length": 3.0}),
+        ("hill-up", "hill", 20, False, {}),
+        ("hill-down", "hill", 20, True, {}),
+    )
+}
+WORLD_MATERIAL = dict(
+    static_friction=1.0,
+    dynamic_friction=1.0,
+    restitution=0.0,
+    friction_combine_mode="multiply",
+    restitution_combine_mode="multiply",
+)
+
+
+def world_fixture(case):
+    """Return one fixed public diagnostic input, never a held-out bank draw."""
+    if case not in WORLD_CASES:
+        raise ValueError(f"Unknown connected-world diagnostic case: {case}")
+    return WORLD_CASES[case].copy()
 
 
 def _progress(message):
@@ -39,20 +84,11 @@ def diagnostic_fixtures():
     ]
 
 
-def validate_readback(source, readback, translation):
-    """Measure actual float32 USD points; reject identity or envelope changes.
-
-    Source carrier/layer witnesses remain labelled as witnesses. Quantization
-    error bounds their relationship to the final residual; separate roughness
-    layers cannot be uniquely recovered from the summed imported heights.
-    """
+def _identity_failures(source, readback, expected_transform):
     points = np.asarray(readback["points"])
     indices = np.asarray(readback["face_indices"])
     counts = np.asarray(readback["face_counts"])
     transform = np.asarray(readback["transform"])
-    expected_transform = np.eye(4)
-    # USD/Gf uses row-vector matrices; translations occupy the last row.
-    expected_transform[3, :3] = translation
     checks = {
         "points differ from the exact float32 source conversion": (
             points.dtype == np.float32
@@ -74,13 +110,26 @@ def validate_readback(source, readback, translation):
             and readback["approximation"] == "none"
         ),
     }
-    failures = [message for message, passed in checks.items() if not passed]
+    return [message for message, passed in checks.items() if not passed]
+
+
+def validate_readback(source, readback, translation):
+    """Measure actual float32 USD points; reject identity or envelope changes.
+
+    Source carrier/layer witnesses remain labelled as witnesses. Quantization
+    error bounds their relationship to the final residual; separate roughness
+    layers cannot be uniquely recovered from the summed imported heights.
+    """
+    expected_transform = np.eye(4)
+    # USD/Gf uses row-vector matrices; translations occupy the last row.
+    expected_transform[3, :3] = translation
+    failures = _identity_failures(source, readback, expected_transform)
     result = {"valid": False, "failures": failures}
     if failures:
         return result
 
-    vertices = points.astype(np.float64)
-    triangles = vertices[indices.reshape(-1, 3)]
+    vertices = np.asarray(readback["points"]).astype(np.float64)
+    triangles = vertices[np.asarray(readback["face_indices"]).reshape(-1, 3)]
     normals = np.cross(
         triangles[:, 1] - triangles[:, 0], triangles[:, 2] - triangles[:, 0]
     )
@@ -156,7 +205,8 @@ def validate_readback(source, readback, translation):
         ),
     }
     limits = {
-        "supporting grade exceeds 25 degrees": grades.max() <= 25.0,
+        "supporting grade exceeds limit": np.isfinite(grades).all()
+        and grades.max() <= 25.001,
         "axis spacing exceeds 0.02 m": max(dx.max(), dy.max()) <= 0.02,
         "support width is below 2 m": np.ptp(y) >= 2.0,
         "roughness residual exceeds its cap": np.abs(residual).max()
@@ -187,6 +237,32 @@ def validate_readback(source, readback, translation):
     return result
 
 
+def validate_world_readback(
+    source,
+    readback,
+    expected_transform,
+    *,
+    material_path="/World/Geometry/world/physicsMaterial",
+):
+    """Check import identity against build_world's already-validated geometry.
+
+    Exact float32 points/topology and the source rigid transform preserve its
+    bounds. Carrier/layer arrays remain source witnesses, not USD measurements.
+    """
+    failures = _identity_failures(source, readback, expected_transform)
+    material = readback.get("material", {})
+    if not (
+        material.get("path") == material_path
+        and material.get("physics_api") is True
+        and material.get("physx_api") is True
+        and all(material.get(key) == value for key, value in WORLD_MATERIAL.items())
+    ):
+        failures.append(
+            "bound terrain physics material is absent or differs from the declared material"
+        )
+    return {"valid": not failures, "failures": failures, "material": material}
+
+
 class GeometryScene:
     """Own only the native simulation scene; the CLI owns the application."""
 
@@ -206,31 +282,52 @@ class GeometryScene:
             raise
         _progress("Simulation context ready")
 
-    def _import(self, path, source, translation):
+    def _import(self, path, source, translation, *, world=False):
         import trimesh
         from pxr import UsdPhysics
 
         from isaaclab.terrains.utils import create_prim_from_mesh
 
+        options = {"translation": translation}
+        if world:
+            from isaaclab.sim import RigidBodyMaterialCfg
+
+            options = {"physics_material": RigidBodyMaterialCfg(**WORLD_MATERIAL)}
         create_prim_from_mesh(
             path,
             trimesh.Trimesh(
                 vertices=source["vertices"], faces=source["faces"], process=False
             ),
-            translation=translation,
+            **options,
         )
         prim = self.sim.stage.GetPrimAtPath(path + "/mesh")
         UsdPhysics.MeshCollisionAPI.Apply(prim).CreateApproximationAttr().Set("none")
+        if world:
+            from pxr import Gf, UsdGeom
 
-    def _readback(self, path):
+            matrix = np.asarray(
+                source["metadata"]["trial"]["local_to_world_column_transform"]
+            ).T
+            parent = UsdGeom.Xformable(self.sim.stage.GetPrimAtPath(path))
+            parent.ClearXformOpOrder()
+            parent.AddTransformOp(UsdGeom.XformOp.PrecisionDouble).Set(
+                Gf.Matrix4d(*matrix.ravel().tolist())
+            )
+
+    def _readback(self, path, *, world=False):
         from pxr import UsdGeom, UsdPhysics
 
         prim = self.sim.stage.GetPrimAtPath(path + "/mesh")
         mesh = UsdGeom.Mesh(prim)
-        return {
-            "points": np.asarray(mesh.GetPointsAttr().Get()),
-            "face_indices": np.asarray(mesh.GetFaceVertexIndicesAttr().Get()),
-            "face_counts": np.asarray(mesh.GetFaceVertexCountsAttr().Get()),
+
+        def array(attribute, dtype):
+            value = attribute.Get()
+            return np.empty(0, dtype=dtype) if value is None else np.asarray(value)
+
+        result = {
+            "points": array(mesh.GetPointsAttr(), np.float32),
+            "face_indices": array(mesh.GetFaceVertexIndicesAttr(), np.int32),
+            "face_counts": array(mesh.GetFaceVertexCountsAttr(), np.int32),
             "transform": np.asarray(
                 UsdGeom.XformCache().GetLocalToWorldTransform(prim)
             ),
@@ -242,8 +339,46 @@ class GeometryScene:
                 UsdPhysics.MeshCollisionAPI(prim).GetApproximationAttr().Get()
             ),
         }
+        if world:
+            from pxr import PhysxSchema, UsdShade
 
-    def validate(self, output, report):
+            material, _ = UsdShade.MaterialBindingAPI(prim).ComputeBoundMaterial(
+                "physics"
+            )
+            values = {
+                "path": str(material.GetPath()) if material else None,
+                "physics_api": False,
+                "physx_api": False,
+            }
+            if material:
+                material_prim = material.GetPrim()
+                values.update(
+                    physics_api=bool(material_prim.HasAPI(UsdPhysics.MaterialAPI)),
+                    physx_api=bool(material_prim.HasAPI(PhysxSchema.PhysxMaterialAPI)),
+                )
+                usd = UsdPhysics.MaterialAPI(material_prim)
+                physx = PhysxSchema.PhysxMaterialAPI(material_prim)
+                for name, getter in (
+                    ("static_friction", usd.GetStaticFrictionAttr),
+                    ("dynamic_friction", usd.GetDynamicFrictionAttr),
+                    ("restitution", usd.GetRestitutionAttr),
+                ):
+                    value = getter().Get()
+                    values[name] = (
+                        value if value is None or math.isfinite(value) else str(value)
+                    )
+                values["friction_combine_mode"] = (
+                    physx.GetFrictionCombineModeAttr().Get()
+                )
+                values["restitution_combine_mode"] = (
+                    physx.GetRestitutionCombineModeAttr().Get()
+                )
+            result["material"] = values
+        return result
+
+    def validate(self, output, report, *, world_case=None):
+        if world_case is not None:
+            return self._validate_world(output, report, world_case)
         # These imports happen only after AppLauncher; no learner dependency is
         # involved in measuring the SDK importer and mesh-conversion toolchain.
         _progress("Recording native dependency identities")
@@ -306,6 +441,86 @@ class GeometryScene:
             raise ValueError("Native USD geometry failed one or more frozen limits")
         report["status"] = "NATIVE_GEOMETRY_VALIDATED_NOT_QUALIFIED"
         _progress("All fixtures validated; starting cleanup")
+
+    def _validate_world(self, output, report, case):
+        fixture = world_fixture(case)
+        path = "/World/Geometry/world"
+        report["geometry"] = {
+            "scope": WORLD_SCOPE,
+            "world_case": case,
+            "fixture_inputs": [fixture],
+            "expected_fixture_count": 1,
+            "post_reset_physics_steps": 1,
+            "native_sim_version": self.sim.get_version(),
+            "fixtures": [],
+        }
+        try:
+            _progress("Recording native dependency identities")
+            report["dependencies"] = {
+                name: dependency_identity(name, name)
+                for name in ("isaaclab", "numpy", "trimesh")
+            }
+            _progress(f"Building connected world: {case}")
+            source = build_world(**fixture)
+            _progress(
+                "Importing connected world with explicit terrain material and transform"
+            )
+            self._import(path, source, (0.0, 0.0, 0.0), world=True)
+            _progress("Connected world imported; resetting physics")
+            self.sim.reset()
+            _progress("Physics reset complete; stepping once")
+            self.sim.step(render=False)
+            _progress(
+                "Physics step complete; reading back and validating connected world"
+            )
+            readback = self._readback(path, world=True)
+            evidence = output / "world.npz"
+            payload = {
+                **{
+                    f"source_{name}": value
+                    for name, value in source.items()
+                    if name != "metadata"
+                },
+                **{
+                    f"imported_{name}": json.dumps(
+                        value, allow_nan=False, sort_keys=True
+                    )
+                    if name == "material"
+                    else value
+                    for name, value in readback.items()
+                },
+            }
+            if any(np.asarray(value).dtype.hasobject for value in payload.values()):
+                raise ValueError("USD readback cannot be archived without pickle")
+            np.savez_compressed(evidence, **payload)
+            expected = np.asarray(
+                source["metadata"]["trial"]["local_to_world_column_transform"]
+            ).T
+            receipt = {
+                "prim_path": path + "/mesh",
+                "source_geometry": source["metadata"],
+                "expected_row_transform": expected.tolist(),
+                "evidence_file": evidence.name,
+                "evidence_sha256": file_sha256(evidence),
+                **validate_world_readback(
+                    source, readback, expected, material_path=path + "/physicsMaterial"
+                ),
+            }
+            report["geometry"]["fixtures"].append(receipt)
+            write_json(output / "report.json", report)
+            _progress(
+                f"Connected world: {'valid' if receipt['valid'] else 'INVALID'}; evidence saved"
+            )
+            if not receipt["valid"]:
+                raise ValueError(
+                    "Native connected-world USD geometry failed declared checks"
+                )
+        except Exception as error:
+            report["geometry"]["failure"] = f"{type(error).__name__}: {error}"
+            write_json(output / "report.json", report)
+            raise
+        report["status"] = "NATIVE_WORLD_GEOMETRY_VALIDATED_NOT_QUALIFIED"
+        _progress("Connected world validated; starting cleanup")
 
     def close(self):
         # Match the standard native environment lifecycle. Calling stop() here

@@ -25,7 +25,7 @@ exact-wheel admission gate. Select the device explicitly.
 | `python -m parkour_lab export CHECKPOINT ACTOR` | Export only the method's causal inference state |
 | `python -m parkour_lab evaluate ACTOR` | Frozen headless command playback and diagnostic tracking |
 | `python -m parkour_lab play ACTOR` | The same playback with a visible simulator, one environment by default |
-| `python -m parkour_lab geometry` | Import and measure fixed rough-structure USD triangle colliders; no robot or learning |
+| `python -m parkour_lab geometry` | Import and measure diagnostic USD colliders: 22 local strips by default, or one connected `--world-case`; no robot or learning |
 | `python -m parkour_lab analyze RUN` | Print a run's result; `--flat-bank` verifies and aggregates development groups |
 
 For training and playback, `--config FILE` accepts explicit settings, not an old
@@ -195,13 +195,37 @@ conversion-error bounds, not independently measured layers in the summed mesh.
 
 The report records each fixture and a hashed `mesh_NN.npz` containing source and
 imported arrays. Success is `NATIVE_GEOMETRY_VALIDATED_NOT_QUALIFIED`, with both
-cleanup entries `complete` and process exit 0. The check fails closed on conversion
-overflow; it does not rescale, relax limits or select replacement seeds. It does
+cleanup entries `complete` and process exit 0. Small angle rounding is accepted;
+other bounds remain unchanged. Failures do not trigger rescaling or new seeds. It does
 not verify PhysX cooked/contact behavior, connected mixed worlds, traversal or
 robot qualification. No checkpoint or task/learner configuration is required;
 existing locomotion terrain routes remain unchanged.
 Flushed `[geometry]` messages identify context creation, each mesh import,
 physics reset/step, readback and cleanup, including when native work is pending.
+
+For the connected-world import diagnostic, run one case per process:
+
+```bash
+python -m parkour_lab geometry --world-case ramp-up --device cuda:0 --output-parent logs/parkour_lab
+```
+
+The fixed public cases are `stairs-up`, `stairs-down`, `ramp-up`, `ramp-down`,
+`hill-up` and `hill-down`. Each contains all three structures plus rough connecting
+ground; the name selects the assigned maximum-tier encounter. Seeds are 17/23,
+yaw is +0.37 rad for up cases and −0.61 rad for down cases. Stair cases exercise
+six risers with 0.31 m treads / five risers with 0.5 m treads; ramp cases use 2 m / 3 m
+inclines. These are diagnostic inputs, not a development or qualification bank.
+
+The world check compares actual returned points, topology and rigid transform
+with the already-validated source, and reads the collider and bound physics
+material (friction 1/1, restitution 0, multiply combination). Exact mesh identity
+preserves the source's geometry checks without repeating them in the importer.
+`world.npz` archives source and imported data, with its hash, source checks and
+import results in `report.json`. Success is
+`NATIVE_WORLD_GEOMETRY_VALIDATED_NOT_QUALIFIED`, both cleanup entries `complete`,
+and process exit 0. Run and inspect `ramp-up` first before the other five cases.
+This remains USD-import evidence: one physics step without controlled bodies
+does not validate contacts, cooked topology, robot traversal or training readiness.
 
 ### Connected source geometry
 
@@ -232,12 +256,18 @@ Vertices use local coordinates. `world_yaw` records a rigid column-vector
 local-to-world transform and rotates the annotated start pose; it does not bake
 rotation into the mesh. The nominal motion envelope is a construction check,
 not a guarantee about robot trajectories or collision-volume clearance. Local
-float32 diagnostics are not native USD/PhysX evidence. The native `geometry`
-command still checks the 22 separate local fixtures, not this connected world;
-training and evaluation terrain paths remain unchanged.
-Some representative connected ramps and reflected hills exceed 25° after local
-float32 conversion. Their strict conversion flags remain false; these meshes need
-conversion-safe construction before native acceptance, not relaxed limits.
+float32 diagnostics are not native USD/PhysX evidence. The native `geometry
+--world-case` route separately checks the imported connected world; training and
+evaluation terrain paths remain unchanged.
+The world builder reuses analytical common roughness scaling at 25°, quietly
+accepting small angle rounding. Height caps and layer-RMS floors remain strict;
+failures do not redraw noise. No exact floating-point search is needed.
+
+At tread-range boundaries, a flight may need a common float32 coordinate lattice
+to keep its realized treads in range. Metadata records requested and realized
+entry/tread dimensions and any correction; already legal coordinates are retained.
+Converted spacing, feature dimensions, topology and roughness witnesses are
+checked separately. These checks still do not establish native collider behavior.
 
 ## Ownership and boundaries
 
@@ -403,13 +433,13 @@ currently apply only to flat tasks. Rewards and learner settings are unchanged.
 
 ## Acceptance
 
-[ACCEPTANCE.md](ACCEPTANCE.md) freezes v2 revision 6: stairs with realized risers
+[ACCEPTANCE.md](ACCEPTANCE.md) specifies v2 revision 7: stairs with realized risers
 4/8/12/16 cm, ramps/hills at 10/15/20 degrees, multiscale unevenness over both,
 and one causal policy satisfying traversal and flat-command thresholds. No gaps,
 steep backward traversal or sim-to-real qualification is required.
 These are ROA-informed project targets, not official ROA benchmark claims.
 
-[PROJECT_STAGES.md](PROJECT_STAGES.md) records the implementation plan, evidence
-and outstanding validation. Diagnostic reward, tracking, exports and local tests
+[PROJECT_STAGES.md](PROJECT_STAGES.md) summarizes the public roadmap and outstanding
+validation. Diagnostic reward, tracking, exports and local tests
 cannot establish behavioral qualification or replace the independent overall
 score of at least 18/20.
