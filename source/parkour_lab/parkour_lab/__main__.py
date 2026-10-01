@@ -72,6 +72,12 @@ def parse_args(argv=None):
     export = commands.add_parser("export")
     export.add_argument("checkpoint", type=Path)
     export.add_argument("destination", type=Path)
+    export.add_argument(
+        "--physics-hz",
+        type=int,
+        choices=(200, 400),
+        help="Explicit new actor physics binding; unchanged weights need native revalidation (default: retain source)",
+    )
     analyze = commands.add_parser("analyze")
     analyze.add_argument("run", type=Path)
     analyze.add_argument(
@@ -110,12 +116,14 @@ def parse_args(argv=None):
 def resolve_config(args):
     artifact = getattr(args, "checkpoint", None) or getattr(args, "actor", None)
     values = {}
+    artifact_physics_hz = None
     if artifact is not None:
         from parkour_lab.artifacts import load_artifact
 
         values = load_artifact(
             artifact, kind="training" if args.operation == "train" else "actor"
         )["config"]
+        artifact_physics_hz = ExperimentConfig.from_dict(values).task.physics_hz
     if args.config is not None:
         supplied = json.loads(args.config.read_text())
         explicit = ExperimentConfig.from_dict(supplied)
@@ -129,6 +137,13 @@ def resolve_config(args):
             "task": {**values.get("task", {}), **supplied.get("task", {})},
         }
     config = ExperimentConfig.from_dict(values)
+    if (
+        artifact_physics_hz is not None
+        and config.task.physics_hz != artifact_physics_hz
+    ):
+        raise ValueError(
+            "Artifact physics rate cannot be overridden; export a new actor with --physics-hz"
+        )
     overrides = {
         key: getattr(args, key)
         for key in ("device", "seed", "num_envs")
@@ -177,7 +192,14 @@ def main(argv=None, *, standalone=False):
     if args.operation == "export":
         from parkour_lab.artifacts import export_actor
 
-        print(json.dumps(export_actor(args.checkpoint, args.destination), indent=2))
+        print(
+            json.dumps(
+                export_actor(
+                    args.checkpoint, args.destination, physics_hz=args.physics_hz
+                ),
+                indent=2,
+            )
+        )
         return 0
     config = resolve_config(args)
     if args.operation == "train":

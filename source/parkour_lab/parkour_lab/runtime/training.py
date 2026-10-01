@@ -44,8 +44,11 @@ class TrainingHost:
         self.phase_counts = {}
         self.metrics = TransitionMetrics(env)
         env.capture_diagnostics = True
-        if env.step_dt != 0.02 or env.physics_dt != 0.005 or env.cfg.decimation != 4:
-            raise ValueError("Require native 50Hz control / 200Hz physics")
+        if env.step_dt != 0.02 or (env.physics_dt, env.cfg.decimation) not in (
+            (0.005, 4),
+            (0.0025, 8),
+        ):
+            raise ValueError("Require 50Hz control and 200 or 400Hz physics")
 
     def observations(self, native, reset, command=None):
         frame, clean = native["proprio"], native["policy"]

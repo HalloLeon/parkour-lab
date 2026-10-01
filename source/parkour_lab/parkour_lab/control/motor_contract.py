@@ -111,17 +111,17 @@ def _collapse(binding):
         _numbers(binding["default_position_rad"], 12)
         if (
             type(binding["decimation"]) is not int
-            or binding["decimation"] != 4
             or type(binding["step_dt_s"]) is not float
             or binding["step_dt_s"] != 0.02
             or type(binding["physics_dt_s"]) is not float
-            or binding["physics_dt_s"] != 0.005
+            or (binding["physics_dt_s"], binding["decimation"])
+            not in ((0.005, 4), (0.0025, 8))
             or type(binding["action"]) is not dict
             or type(binding["actuators"]) is not dict
             or not binding["actuators"]
         ):
             raise ValueError(
-                "Motor contract requires the native 50 Hz/200 Hz interface"
+                "Motor contract requires 50 Hz control and 200 or 400 Hz physics"
             )
         compact, count, covered = copy.deepcopy(binding), None, []
         for name, actuator in binding["actuators"].items():

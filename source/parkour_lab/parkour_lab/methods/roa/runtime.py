@@ -172,7 +172,7 @@ class ROAHistoryController:
                     "names": list(FOOT_NAMES),
                     "threshold_N": CONTACT_THRESHOLD_N,
                     "measurement": "norm(net normal force vector) > threshold; binary; no noise/filter",
-                    "timing": "latest completed 200Hz physics sample; zero until first post-reset step",
+                    "timing": "latest completed physics sample; zero until first post-reset step",
                 },
                 "estimator": "1225 -> ELU MLP(128,64) -> velocity3, tanh(latent8)",
                 "motor": "[velocity3,frame49] -> ELU MLP(128,128,128) -> 12; latent8 -> first preactivation",

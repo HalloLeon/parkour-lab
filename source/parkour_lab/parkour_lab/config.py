@@ -27,6 +27,7 @@ class TaskConfig:
     num_envs: int = 160
     seed: int = 42
     device: str = "cuda:0"
+    physics_hz: int = 200
     difficulty_range: tuple[float, float] | None = None
     num_rows: int | None = None
     episode_length_s: float = 20.0
@@ -58,6 +59,8 @@ class TaskConfig:
         positive(self.episode_length_s, "episode_length_s")
         positive(self.linear_tracking_std, "linear_tracking_std")
         positive(self.angular_tracking_std, "angular_tracking_std")
+        if type(self.physics_hz) is not int or self.physics_hz not in (200, 400):
+            raise ValueError("physics_hz must be the integer 200 or 400")
         if (
             type(self.seed) is not int
             or not 0 <= self.seed < 2**32

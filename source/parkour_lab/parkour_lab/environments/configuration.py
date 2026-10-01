@@ -62,11 +62,16 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
     from parkour_lab.runtime.native import foot_contacts
 
     cfg = UnitreeGo2FlatEnvCfg()
+    cfg.sim.dt = 1.0 / task.physics_hz
+    cfg.decimation = task.physics_hz // 50
+    cfg.sim.render_interval = cfg.decimation
     cfg.scene.num_envs = task.num_envs
     cfg.seed = task.seed
     cfg.sim.device = task.device
     cfg.episode_length_s = task.episode_length_s
     cfg.scene.contact_forces.update_period = cfg.sim.dt
+    # Preserve the stock 10 ms oldest-to-current span, including the latest sample.
+    cfg.scene.contact_forces.history_length = task.physics_hz // 100 + 1
     cfg.curriculum.terrain_levels = None
     if cfg.scene.robot.soft_joint_pos_limit_factor != 0.9:
         raise ValueError(

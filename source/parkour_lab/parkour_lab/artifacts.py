@@ -5,7 +5,8 @@ class paths or legacy readers are accepted. Learning continuation starts a fresh
 simulator/RNG; export does not imply behavioral qualification.
 """
 
-from dataclasses import dataclass
+import copy
+from dataclasses import dataclass, replace
 import hashlib
 import io
 import json
@@ -13,7 +14,10 @@ from pathlib import Path
 from zipfile import ZipFile
 
 from parkour_lab.config import ExperimentConfig
-from parkour_lab.control.motor_contract import validate_motor_contract
+from parkour_lab.control.motor_contract import (
+    nominal_binding_sha256,
+    validate_motor_contract,
+)
 from parkour_lab.methods import get_backend
 from parkour_lab.provenance import file_sha256
 
@@ -41,7 +45,14 @@ def _validate(metadata, kind):
     config = ExperimentConfig.from_dict(metadata["config"])
     if type(metadata["updates"]) is not int or metadata["updates"] < 1:
         raise ValueError("Invalid artifact update count")
-    validate_motor_contract(metadata["motor_contract"], metadata["motor_manifest"])
+    binding = validate_motor_contract(
+        metadata["motor_contract"], metadata["motor_manifest"]
+    )
+    if (binding["physics_dt_s"], binding["decimation"]) != (
+        1 / config.task.physics_hz,
+        config.task.physics_hz // 50,
+    ):
+        raise ValueError("Artifact task physics rate disagrees with motor binding")
     return config, get_backend(config.method.name)
 
 
@@ -84,23 +95,52 @@ def load_artifact(path, *, kind):
     return {**metadata, "state": state}
 
 
-def export_actor(checkpoint, destination):
+def export_actor(checkpoint, destination, *, physics_hz=None):
+    """Export frozen inference; an explicit timing change needs new native validation."""
     data = load_artifact(checkpoint, kind="training")
     config = ExperimentConfig.from_dict(data["config"])
+    source_hz = config.task.physics_hz
+    contract = copy.deepcopy(data["motor_contract"])
+    manifest = copy.deepcopy(data["motor_manifest"])
+    if physics_hz is not None:
+        config = replace(config, task=replace(config.task, physics_hz=physics_hz))
+        contract["binding"].update(
+            physics_dt_s=1 / physics_hz, decimation=physics_hz // 50
+        )
+        manifest["actuator_profile"] = "native_motor_sha256:" + nominal_binding_sha256(
+            contract["binding"]
+        )
     state = get_backend(config.method.name).export(data["state"], config.method.options)
+    # Generate current inference metadata rather than copying training-only or
+    # stale contact-timing prose into a newly exported actor.
+    manifest = _controller(
+        {
+            **data,
+            "config": config.to_dict(),
+            "state": state,
+            "motor_contract": contract,
+            "motor_manifest": manifest,
+        }
+    ).spec.manifest()
     save_artifact(
         destination,
         kind="actor",
         config=config,
         state=state,
-        motor_contract=data["motor_contract"],
-        motor_manifest=data["motor_manifest"],
+        motor_contract=contract,
+        motor_manifest=manifest,
         updates=data["updates"],
     )
     return {
         "artifact": str(destination),
         "sha256": file_sha256(destination),
         "source_checkpoint_sha256": file_sha256(checkpoint),
+        "source_physics_hz": source_hz,
+        "physics_hz": config.task.physics_hz,
+        "source_actuator_profile": data["motor_manifest"]["actuator_profile"],
+        "actuator_profile": manifest["actuator_profile"],
+        "timing_changed": source_hz != config.task.physics_hz,
+        "timing_change_requires_validation": source_hz != config.task.physics_hz,
         "qualified": False,
     }
 

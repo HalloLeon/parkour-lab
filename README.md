@@ -65,6 +65,31 @@ the report and dependency identity always describe the method actually executed.
 All commands create separate run directories under `--output-parent`.
 Checkpoint and actor outputs refuse to overwrite existing files.
 
+### Simulation timing candidate
+
+`task.physics_hz` defaults to `200`; the only alternative is the approved `400`
+candidate. Both use 50 Hz commands/actions and the same 25-frame causal history.
+Physics uses four/eight substeps, contact sensors update each substep, and native
+collision-history lookback remains 10 ms (three/five samples). Actor contact flags
+still use only the latest sample. Rendering and height scans remain at 50 Hz.
+
+Artifacts bind their exact physics timing. A config override cannot run a 200 Hz
+actor or resume its training at 400 Hz. To evaluate unchanged weights at the new
+rate, explicitly export a **new, unvalidated candidate** from a current checkpoint:
+
+```bash
+python -m parkour_lab export CHECKPOINT.plab NEW_ACTOR.plab --physics-hz 400
+```
+
+Omit the flag to retain the checkpoint rate. Save the printed receipt: it records
+the source checkpoint, source/target timing and motor identities, and new actor
+hash. The source checkpoint is never modified. Export preserves inference weights,
+not closed-loop behavior or qualification. This setting does not configure a
+hardware servo or change the 50 Hz policy interface; changed simulated dynamics
+and contact inputs can nevertheless affect behavior and eventual sim-to-real
+transfer. The retained 200 Hz flat anchor remains the comparison baseline. No
+terrain training or production adoption is implied by candidate export.
+
 ### Reward configuration and diagnostics
 
 `task.rewards` overrides only named weights and the numeric parameters below.
@@ -321,7 +346,8 @@ older runs into matched reward comparisons.
 The causal frame has 49 values: angular velocity, projected gravity, applied
 command, relative joint positions, joint velocities, previous raw action, then
 four binary foot contacts in **FR, FL, RR, RL** order. Each flag is
-`norm(net_forces_w[foot]) > 1.5 N`, using the latest completed 200 Hz physics sample
+`norm(net_forces_w[foot]) > 1.5 N`, using the latest completed physics sample
+(200 Hz default, 400 Hz candidate)
 at the 50 Hz action boundary. This is a native net-normal-force vector, not a
 six-axis wrench or the sum of individual contact magnitudes. Contact flags have
 no noise/filter/delay and remain zero until the first completed post-reset step.
@@ -339,7 +365,7 @@ forces are diagnostics, not student inputs.
 | Latents/supervision | Eight-dimensional dynamics latent, separately directed unsquared L2 alignment, plus supervised three-dimensional COM-velocity estimation |
 | Networks | Motor ELU MLP 128/128/128 with additive latent projection; estimator 128/64; asymmetric terrain-conditioned critic |
 | Exploration | Learned action standard deviation initialized at 1.0; entropy coefficient 0.01, no minimum-std clamp |
-| Control | Stock Go2 motors; `q_target = default_q + 0.25 * raw_action`, no action clipping; 50/200 Hz control/physics |
+| Control | Stock Go2 motors; `q_target = default_q + 0.25 * raw_action`, no action clipping; 50 Hz control, 200 Hz default / 400 Hz candidate physics |
 
 The regularization endpoints follow the **non-resume branch**, not the enabled
 resume branch, of the [pinned author configuration](https://github.com/MarkFzp/Deep-Whole-Body-Control/blob/8159e4ed8695b2d3f62a40d2ab8d88205ac5021a/legged_gym/legged_gym/envs/widowGo1/widowGo1_config.py).
@@ -385,7 +411,7 @@ currently apply only to flat tasks. Rewards and learner settings are unchanged.
 
 ## Acceptance
 
-[ACCEPTANCE.md](ACCEPTANCE.md) specifies v2 revision 7: stairs with realized risers
+[ACCEPTANCE.md](ACCEPTANCE.md) specifies v2 revision 8: stairs with realized risers
 4/8/12/16 cm, ramps/hills at 10/15/20 degrees, multiscale unevenness over both,
 and one causal policy satisfying traversal and flat-command thresholds. No gaps,
 steep backward traversal or sim-to-real qualification is required.
