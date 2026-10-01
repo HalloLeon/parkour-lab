@@ -200,6 +200,8 @@ overflow; it does not rescale, relax limits or select replacement seeds. It does
 not verify PhysX cooked/contact behavior, connected mixed worlds, traversal or
 robot qualification. No checkpoint or task/learner configuration is required;
 existing locomotion terrain routes remain unchanged.
+Flushed `[geometry]` messages identify context creation, each mesh import,
+physics reset/step, readback and cleanup, including when native work is pending.
 
 ## Ownership and boundaries
 

@@ -17,6 +17,13 @@ SCOPE = (
 )
 
 
+def _progress(message):
+    try:
+        print(f"[geometry] {message}", flush=True)
+    except (OSError, ValueError):
+        pass  # Console failure must not prevent native cleanup or report writes.
+
+
 def diagnostic_fixtures():
     """Fixed public diagnostic inputs; not a development/qualification bank."""
     return [
@@ -184,6 +191,7 @@ class GeometryScene:
     """Own only the native simulation scene; the CLI owns the application."""
 
     def __init__(self, device):
+        _progress("Creating simulation context")
         from isaaclab.sim import SimulationCfg, SimulationContext
 
         try:
@@ -196,6 +204,7 @@ class GeometryScene:
                 finally:
                     SimulationContext.clear_instance()
             raise
+        _progress("Simulation context ready")
 
     def _import(self, path, source, translation):
         import trimesh
@@ -237,6 +246,7 @@ class GeometryScene:
     def validate(self, output, report):
         # These imports happen only after AppLauncher; no learner dependency is
         # involved in measuring the SDK importer and mesh-conversion toolchain.
+        _progress("Recording native dependency identities")
         report["dependencies"] = {
             name: dependency_identity(name, name)
             for name in ("isaaclab", "numpy", "trimesh")
@@ -252,13 +262,20 @@ class GeometryScene:
         }
         sources = []
         for index, fixture in enumerate(fixtures):
+            _progress(
+                f"Importing fixture {index + 1}/{len(fixtures)}: "
+                f"{fixture['family']} tier={fixture['tier']} reverse={fixture['reverse']}"
+            )
             source = build_structure(**fixture)
             path = f"/World/Geometry/fixture_{index:02d}"
             translation = (0.0, 4.0 * index, 0.0)
             self._import(path, source, translation)
             sources.append((path, translation, source))
+        _progress("All meshes imported; resetting physics")
         self.sim.reset()
+        _progress("Physics reset complete; stepping once")
         self.sim.step(render=False)
+        _progress("Physics step complete; reading back and validating meshes")
         for index, (path, translation, source) in enumerate(sources):
             readback = self._readback(path)
             evidence = output / f"mesh_{index:02d}.npz"
@@ -281,15 +298,22 @@ class GeometryScene:
             }
             report["geometry"]["fixtures"].append(receipt)
             write_json(output / "report.json", report)
+            _progress(
+                f"Fixture {index + 1}/{len(fixtures)}: "
+                f"{'valid' if receipt['valid'] else 'INVALID'}; evidence saved"
+            )
         if not all(item["valid"] for item in report["geometry"]["fixtures"]):
             raise ValueError("Native USD geometry failed one or more frozen limits")
         report["status"] = "NATIVE_GEOMETRY_VALIDATED_NOT_QUALIFIED"
+        _progress("All fixtures validated; starting cleanup")
 
     def close(self):
+        # Match the standard native environment lifecycle. Calling stop() here
+        # invokes Isaac Lab's STOP callback, which waits for playback to resume.
+        # clear_instance() unsubscribes it before the CLI closes the application.
+        _progress("Clearing simulation callbacks")
         try:
-            self.sim.stop()
+            self.sim.clear_all_callbacks()
         finally:
-            try:
-                self.sim.clear_all_callbacks()
-            finally:
-                self.sim.clear_instance()
+            self.sim.clear_instance()
+        _progress("Simulation context released; application close follows")
