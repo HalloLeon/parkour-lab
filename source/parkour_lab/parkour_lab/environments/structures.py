@@ -42,6 +42,11 @@ def _axis(knots, resolution):
 def _gradient_noise(x, y, spacing, seed):
     """Independent unit lattice gradients, corner dot products, quintic blend."""
     xx, yy = np.meshgrid(x / spacing, y / spacing, indexing="ij")
+    return _noise_points(xx, yy, seed)
+
+
+def _noise_points(xx, yy, seed):
+    """Evaluate the common noise field at lattice-scaled mesh coordinates."""
     ix, iy = np.floor(xx).astype(int), np.floor(yy).astype(int)
     tx, ty = xx - ix, yy - iy
     rng = np.random.default_rng(seed)
@@ -88,7 +93,89 @@ def _shared_scale(carrier_gradient, rough_gradient, offset, cap):
     roots[outward] = -2 * c[outward] / (b[outward] + discriminant[outward])
     roots[~outward] = (-b[~outward] + discriminant[~outward]) / (2 * a[~outward])
     peak = float(np.max(np.abs(offset)))
-    return min(1.0, cap / peak if peak else 1.0, float(roots.min(initial=1.0)))
+    if np.ndim(cap):
+        absolute = np.abs(offset)
+        height_scale = float(
+            np.divide(
+                cap, absolute, out=np.full_like(absolute, np.inf), where=absolute > 0
+            ).min()
+        )
+    else:
+        height_scale = cap / peak if peak else 1.0
+    return min(1.0, height_scale, float(roots.min(initial=1.0)))
+
+
+def _carrier_profile(family, tier, x, entry, lips, reverse, risers, incline_length):
+    """Shared one-dimensional carrier, before any world assembly or roughness."""
+    carrier = np.zeros_like(x)
+    if family == "stairs":
+        rise = float(tier) - 0.001
+        levels = np.searchsorted(lips, x, side="right")
+        for lip in lips:
+            levels[np.flatnonzero(x == lip)[0]] -= 1
+        carrier = levels * rise
+        if reverse:
+            carrier = risers * rise - carrier
+    elif family in ("ramp", "hill"):
+        grade = math.tan(math.radians(float(tier) - 0.1))
+        if family == "ramp":
+            carrier = np.clip(x - entry, 0, incline_length) * grade
+            if reverse:
+                carrier = incline_length * grade - carrier
+        else:
+            up, down = (1.5, 1.0) if reverse else (1.0, 1.5)
+            height = 2 * min(up, down) * grade / math.pi
+            rise = (1 - np.cos(math.pi * np.clip((x - entry) / up, 0, 1))) / 2
+            fall = (
+                1 + np.cos(math.pi * np.clip((x - entry - up - 0.4) / down, 0, 1))
+            ) / 2
+            carrier = height * np.minimum(rise, fall)
+    return carrier
+
+
+def _grid_mesh(x, y, carrier):
+    xx, yy = np.meshgrid(x, y, indexing="ij")
+    vertices = np.column_stack((xx.ravel(), yy.ravel(), carrier.ravel()))
+    ids = np.arange(xx.size).reshape(xx.shape)
+    a, b, c, d = ids[:-1, :-1], ids[1:, :-1], ids[:-1, 1:], ids[1:, 1:]
+    faces = np.stack((np.stack((a, b, c), -1), np.stack((b, d, c), -1)), -2).reshape(
+        -1, 3
+    )
+    return vertices, faces
+
+
+def _roughness_layers(x, y, taper, untapered, seeds, *, grid=True):
+    layers = []
+    for spacing, rms, seed in zip(SPACINGS, TARGET_RMS, seeds, strict=True):
+        layer = (
+            _gradient_noise(x, y, spacing, seed)
+            if grid
+            else _noise_points(x / spacing, y / spacing, seed)
+        )
+        layer -= layer[untapered].mean()
+        deviation = float(np.sqrt(np.mean(layer[untapered] ** 2)))
+        if deviation == 0 or not math.isfinite(deviation):
+            raise ValueError("Degenerate roughness layer")
+        layers.append(layer * (rms / deviation) * taper)
+    return layers
+
+
+def _apply_roughness(vertices, faces, support, layers, cap):
+    carrier_gradient = _gradients(vertices, faces[support])
+    rough = sum(layers)
+    rough_vertices = vertices.copy()
+    rough_vertices[:, 2] = rough.ravel()
+    rough_gradient = _gradients(rough_vertices, faces[support])
+    scale = _shared_scale(carrier_gradient, rough_gradient, rough, cap)
+    if scale < max(
+        low / target for low, target in zip(MINIMUM_RMS, TARGET_RMS, strict=True)
+    ):
+        raise ValueError(
+            "Infeasible roughness: shared slope/height scaling violates minimum RMS"
+        )
+    layers = [layer * scale for layer in layers]
+    vertices[:, 2] += sum(layers).ravel()
+    return layers, scale, carrier_gradient
 
 
 def build_structure(
@@ -190,28 +277,9 @@ def build_structure(
     if len(lips):
         x = np.sort(np.concatenate((x, lips)))
     y = _axis([0, width], resolution)
-    carrier = np.zeros_like(x)
-    if family == "stairs":
-        rise = float(tier) - 0.001
-        levels = np.searchsorted(lips, x, side="right")
-        for lip in lips:
-            levels[np.flatnonzero(x == lip)[0]] -= 1
-        carrier = levels * rise
-        if reverse:
-            carrier = risers * rise - carrier
-    elif family in ("ramp", "hill"):
-        grade = math.tan(math.radians(float(tier) - 0.1))
-        if family == "ramp":
-            carrier = np.clip(x - entry, 0, incline_length) * grade
-            if reverse:
-                carrier = incline_length * grade - carrier
-        else:
-            height = 2 * min(up, down) * grade / math.pi
-            rise = (1 - np.cos(math.pi * np.clip((x - entry) / up, 0, 1))) / 2
-            fall = (
-                1 + np.cos(math.pi * np.clip((x - entry - up - 0.4) / down, 0, 1))
-            ) / 2
-            carrier = height * np.minimum(rise, fall)
+    carrier = _carrier_profile(
+        family, tier, x, entry, lips, reverse, risers, incline_length
+    )
 
     taper = np.minimum(
         np.clip((x - pad_length) / 0.5, 0, 1),
@@ -230,42 +298,18 @@ def build_structure(
     full_rows[:-1] |= full_intervals
     full_rows[1:] |= full_intervals
     untapered = np.broadcast_to(full_rows[:, None], (len(x), len(y)))
-    layers = []
-    for spacing, rms, seed in zip(
-        SPACINGS, TARGET_RMS, (coarse_seed, fine_seed), strict=True
-    ):
-        layer = _gradient_noise(x, y, spacing, seed)
-        layer -= layer[untapered].mean()
-        deviation = float(np.sqrt(np.mean(layer[untapered] ** 2)))
-        if deviation == 0 or not math.isfinite(deviation):
-            raise ValueError("Degenerate roughness layer")
-        layers.append(layer * (rms / deviation) * taper[:, None])
-    xx, yy = np.meshgrid(x, y, indexing="ij")
-    carrier = np.broadcast_to(carrier[:, None], xx.shape).copy()
-    vertices = np.column_stack((xx.ravel(), yy.ravel(), carrier.ravel()))
-    ids = np.arange(xx.size).reshape(xx.shape)
-    a, b, c, d = ids[:-1, :-1], ids[1:, :-1], ids[:-1, 1:], ids[1:, 1:]
-    faces = np.stack((np.stack((a, b, c), -1), np.stack((b, d, c), -1)), -2).reshape(
-        -1, 3
+    layers = _roughness_layers(
+        x, y, taper[:, None], untapered, (coarse_seed, fine_seed)
     )
+    carrier = np.broadcast_to(carrier[:, None], (len(x), len(y))).copy()
+    vertices, faces = _grid_mesh(x, y, carrier)
     support = np.broadcast_to(
         (np.diff(x) > 0)[:, None, None], (len(x) - 1, len(y) - 1, 2)
     ).ravel()
-    carrier_gradient = _gradients(vertices, faces[support])
-    rough = sum(layers)
-    rough_vertices = vertices.copy()
-    rough_vertices[:, 2] = rough.ravel()
-    rough_gradient = _gradients(rough_vertices, faces[support])
     cap = float(tier) if family == "level" else (0.01 if tier in (0.16, 20) else 0.02)
-    scale = _shared_scale(carrier_gradient, rough_gradient, rough, cap)
-    if scale < max(
-        low / target for low, target in zip(MINIMUM_RMS, TARGET_RMS, strict=True)
-    ):
-        raise ValueError(
-            "Infeasible roughness: shared slope/height scaling violates minimum RMS"
-        )
-    layers = [layer * scale for layer in layers]
-    vertices[:, 2] += sum(layers).ravel()
+    layers, scale, carrier_gradient = _apply_roughness(
+        vertices, faces, support, layers, cap
+    )
     normals = _normals(vertices, faces)
     if (
         not np.isfinite(vertices).all()

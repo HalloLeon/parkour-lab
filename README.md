@@ -203,6 +203,42 @@ existing locomotion terrain routes remain unchanged.
 Flushed `[geometry]` messages identify context creation, each mesh import,
 physics reset/step, readback and cleanup, including when native work is pending.
 
+### Connected source geometry
+
+The simulator-free `environments.worlds.build_world` API constructs a single
+connected diagnostic mesh containing stairs, a perpendicular ramp, a rounded hill
+and rough connecting ground. One assigned encounter supplies prospective start,
+landing and stop regions for the fixed 30 s tape; these are geometry annotations,
+not policy goals or a frozen evaluation bank.
+
+```bash
+python - <<'PY'
+import json
+from parkour_lab.environments.worlds import build_world
+
+mesh = build_world("ramp", 20, coarse_seed=17, fine_seed=23)
+print(json.dumps(mesh["metadata"], indent=2, allow_nan=False))
+PY
+```
+
+Carrier profiles and roughness generation are shared with the local fixtures.
+Roughness is applied after assembly; start/stop pads and actual riser edges are
+the only taper regions. The returned arrays retain carrier/layer witnesses,
+support faces and regional caps. Metadata measures each full-height feature,
+source slopes, roughness and nominal start/yaw-envelope margins. Infeasible
+geometry raises before use, without changing seeds or limits.
+
+Vertices use local coordinates. `world_yaw` records a rigid column-vector
+local-to-world transform and rotates the annotated start pose; it does not bake
+rotation into the mesh. The nominal motion envelope is a construction check,
+not a guarantee about robot trajectories or collision-volume clearance. Local
+float32 diagnostics are not native USD/PhysX evidence. The native `geometry`
+command still checks the 22 separate local fixtures, not this connected world;
+training and evaluation terrain paths remain unchanged.
+Some representative connected ramps and reflected hills exceed 25° after local
+float32 conversion. Their strict conversion flags remain false; these meshes need
+conversion-safe construction before native acceptance, not relaxed limits.
+
 ## Ownership and boundaries
 
 | Package/module | Responsibility |
