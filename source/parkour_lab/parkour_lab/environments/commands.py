@@ -73,6 +73,92 @@ class FlatVelocityCommand(UniformVelocityCommand):
         self.sampling_report["stops"] += int(stops.sum())
 
 
+class RoughVelocityCommand(FlatVelocityCommand):
+    """Seeded body twists; steep curriculum rows draw forward-only packets.
+
+    The row upper bound conservatively narrows uncertain boundary rows. Terrain
+    labels only select training distributions; external packets bypass sampling.
+    """
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        self.generator = env.cfg.scene.terrain.terrain_generator
+        terrains = list(self.generator.sub_terrains.values())
+        proportions = torch.tensor(
+            [sub.proportion for sub in terrains],
+            device=self.device,
+            dtype=torch.float64,
+        )
+        # Match TerrainGenerator's curriculum column assignment, including its offset.
+        columns = (
+            torch.arange(
+                self.generator.num_cols, device=self.device, dtype=torch.float64
+            )
+            / self.generator.num_cols
+            + 0.001
+        )
+        indices = torch.searchsorted(
+            (proportions / proportions.sum()).cumsum(0), columns, right=True
+        )
+        thresholds = torch.full_like(proportions, float("inf"))
+        for index, sub in enumerate(terrains):
+            if hasattr(sub, "step_height_range"):
+                low, high = sub.step_height_range
+                thresholds[index] = (0.08 - low) / (high - low)
+            elif hasattr(sub, "grid_height_range"):
+                # Neighbors and the raised platform can differ by twice the amplitude.
+                low, high = sub.grid_height_range
+                thresholds[index] = (0.04 - low) / (high - low)
+            elif hasattr(sub, "slope_range"):
+                low, high = sub.slope_range
+                # Stock square pyramid: bound both gradient axes and one height-rounding step.
+                scale = self.generator.horizontal_scale
+                pixels = (
+                    int(self.generator.size[0] / scale)
+                    + 1
+                    - 2 * (int(sub.border_width / scale) + 1)
+                )
+                factor = pixels / (2 * (pixels // 2))
+                limit = (
+                    math.tan(math.radians(10)) / math.sqrt(2)
+                    - self.generator.vertical_scale / scale
+                ) / factor
+                thresholds[index] = (limit - low) / (high - low)
+        self.threshold_by_column = thresholds[indices]
+        self.sampling_report["version"] = "rough_uniform_twist_v1"
+        self.sampling_report["restricted_samples"] = 0
+
+    def _resample_command(self, env_ids):
+        env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        values = torch.as_tensor(
+            self.randomization.uniform(env_ids.cpu().numpy(), 4, "commands"),
+            device=self.device,
+            dtype=self.vel_command_b.dtype,
+        )
+        terrain = self._env.scene.terrain
+        low, high = self.generator.difficulty_range
+        upper = (
+            low
+            + (high - low)
+            * (terrain.terrain_levels[env_ids].to(self.threshold_by_column) + 1)
+            / self.generator.num_rows
+        )
+        restricted = upper > self.threshold_by_column[terrain.terrain_types[env_ids]]
+        command = values[:, :3] * values.new_tensor(
+            (0.7, 0.4, 1.0)
+        ) + values.new_tensor((-0.2, -0.2, -0.5))
+        command[restricted, 0] = 0.2 + 0.3 * values[restricted, 0]
+        command[restricted, 1:] = 0
+        stops = (values[:, 3] < 0.1) & ~restricted
+        command[stops] = 0
+        self.vel_command_b[env_ids] = command
+        self.is_heading_env[env_ids] = False
+        self.is_standing_env[env_ids] = stops
+        self.sampling_report["samples"] += len(env_ids)
+        self.sampling_report["stops"] += int(stops.sum())
+        self.sampling_report["restricted_samples"] += int(restricted.sum())
+
+
 class OperatorVelocityCommand(UniformVelocityCommand):
     """Retain the stock 3-D command interface, changing only its sampling law."""
 

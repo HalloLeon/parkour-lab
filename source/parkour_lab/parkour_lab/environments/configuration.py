@@ -1,7 +1,7 @@
 """Fresh Go2 task construction, with no checkpoint or experiment reconstruction.
 
-The installed stock Go2 flat task supplies motors and root-COM velocity terms.
-Flat tasks use independently seeded commands, starts and bounded dynamics.
+The installed stock Go2 tasks supply motors and root-COM velocity terms.
+Flat/rough tasks use independently seeded commands, starts and bounded dynamics.
 The actor receives 49 causal values, including four
 noiseless foot-contact flags. Steps/traversal are diagnostic geometries, not an
 approved behavioral gate.
@@ -52,18 +52,22 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
     from isaaclab_tasks.manager_based.locomotion.velocity.config.go2.flat_env_cfg import (
         UnitreeGo2FlatEnvCfg,
     )
+    from isaaclab_tasks.manager_based.locomotion.velocity.config.go2.rough_env_cfg import (
+        UnitreeGo2RoughEnvCfg,
+    )
 
     from . import observations
     from .commands import (
         FlatVelocityCommand,
         ProceduralTerrainCommand,
+        RoughVelocityCommand,
         procedural_physical_failure,
         procedural_workspace,
     )
     from .terrain import BORDER_WIDTH, ENVELOPES, make_operator_terrain_generator
     from parkour_lab.runtime.native import foot_contacts
 
-    cfg = UnitreeGo2FlatEnvCfg()
+    cfg = UnitreeGo2RoughEnvCfg() if task.terrain == "rough" else UnitreeGo2FlatEnvCfg()
     cfg.sim.dt = 1.0 / task.physics_hz
     cfg.decimation = task.physics_hz // 50
     cfg.sim.render_interval = cfg.decimation
@@ -74,7 +78,8 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
     cfg.scene.contact_forces.update_period = cfg.sim.dt
     # Preserve the stock 10 ms oldest-to-current span, including the latest sample.
     cfg.scene.contact_forces.history_length = task.physics_hz // 100 + 1
-    cfg.curriculum.terrain_levels = None
+    if task.terrain != "rough" or evaluation:
+        cfg.curriculum.terrain_levels = None
     if cfg.scene.robot.soft_joint_pos_limit_factor != 0.9:
         raise ValueError(
             "The current acquisition task requires the stock 0.9 soft joint-limit factor"
@@ -89,9 +94,10 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
     command.ranges.ang_vel_z = (-0.8, 0.8)
     command.resampling_time_range = (2.0, 12.0)
     command.debug_vis = False
-    command.class_type = (
-        FlatVelocityCommand if task.terrain == "flat" else ProceduralTerrainCommand
-    )
+    command.class_type = {
+        "flat": FlatVelocityCommand,
+        "rough": RoughVelocityCommand,
+    }.get(task.terrain, ProceduralTerrainCommand)
     cfg.events.reset_base.params["pose_range"] = {
         "x": (-0.2, 0.2),
         "y": (-0.2, 0.2),
@@ -101,7 +107,20 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
 
     configure_rewards(cfg, task)
 
-    if task.terrain not in ("flat", "connected"):
+    if task.terrain == "rough":
+        from isaaclab.terrains import MeshPlaneTerrainCfg
+
+        generator = cfg.scene.terrain.terrain_generator
+        generator.seed = task.seed
+        generator.num_rows = task.num_rows
+        generator.num_cols = 25
+        generator.difficulty_range = task.difficulty_range
+        generator.curriculum = True
+        # Stock rough shares sum to one: adding .25 gives five of 25 plane columns.
+        generator.sub_terrains["flat"] = MeshPlaneTerrainCfg(proportion=0.25)
+        cfg.scene.terrain.max_init_terrain_level = 0
+        cfg.observations.policy.height_scan = None
+    elif task.terrain not in ("flat", "connected"):
         cfg.scene.terrain.terrain_type = "generator"
         cfg.scene.terrain.terrain_generator = make_operator_terrain_generator(
             seed=task.seed,
@@ -146,6 +165,8 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
         },
     )
     cfg.observations.terrain = terrain_observations
+    # Opposite rough stairs span +/-1.61 m in the whole grid: a neighboring
+    # surface can be 3.22 m below the current origin, so allow a -4 m floor.
     cfg.terminations.procedural_physical_failure = TerminationTermCfg(
         func=procedural_physical_failure,
         params={
@@ -155,6 +176,8 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
                 if task.terrain == "flat"
                 else -0.02
                 if task.terrain == "connected"
+                else -4.0
+                if task.terrain == "rough"
                 else -max(height for height, _ in ENVELOPES.values())
                 * task.difficulty_range[1]
             ),
@@ -164,7 +187,7 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
         time_out=False,
     )
     # Keep every physical failure before this censoring term.
-    if task.terrain not in ("flat", "connected"):
+    if task.terrain not in ("flat", "connected", "rough"):
         cfg.terminations.procedural_workspace = TerminationTermCfg(
             func=procedural_workspace,
             params={"margin_m": BORDER_WIDTH + 0.25},
@@ -178,7 +201,7 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
     cfg.observations.proprio.base_lin_vel = None
     cfg.observations.policy.enable_corruption = False
 
-    if task.terrain in ("flat", "connected"):
+    if task.terrain in ("flat", "connected", "rough"):
         from .dynamics import configure_dynamics
 
         configure_dynamics(cfg, task, evaluation=evaluation)

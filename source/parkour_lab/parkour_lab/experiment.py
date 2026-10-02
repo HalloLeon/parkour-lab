@@ -86,6 +86,14 @@ def train(env, app, config, output, report, *, checkpoint=None):
                 environment_transitions=host.steps * env.num_envs,
                 training_wall_seconds=time.monotonic() - started,
             )
+            if config.task.terrain == "rough":
+                metrics["terrain_level_counts"] = (
+                    env.scene.terrain.terrain_levels.bincount(
+                        minlength=config.task.num_rows
+                    )
+                    .cpu()
+                    .tolist()
+                )
             stream.write(json.dumps(metrics, allow_nan=False) + "\n")
             stream.flush()
             report.update(
@@ -114,7 +122,7 @@ def train(env, app, config, output, report, *, checkpoint=None):
     from parkour_lab.runtime.native import sensor_noise_report
 
     report["sensor_noise"] = sensor_noise_report(env)
-    if config.task.terrain == "flat":
+    if config.task.terrain in ("flat", "rough"):
         report["command_sampling"] = getattr(
             env.command_manager.get_term("base_velocity"), "sampling_report", None
         )

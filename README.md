@@ -43,9 +43,9 @@ Unknown fields are errors. CLI overrides include `--device`, `--num-envs`,
 
 Task defaults live in `config.py`; method defaults/validation belong to their
 backend. Every run records the resolved configuration. Terrain choices are flat,
-procedural, steps and traversal. These
+rough, procedural, steps, traversal and connected. These
 are development fixtures, **not the approved mixed-world qualification bank**.
-Traversal is evaluation-only. Current step fixtures use their measured three-row
+Traversal and connected are evaluation-only. Current step fixtures use their measured three-row
 range; procedural settings expose difficulty range and one, three or five rows.
 
 Training produces `checkpoint_NNNNNN.plab` and streaming `metrics.jsonl`.
@@ -64,6 +64,48 @@ while retaining its method/options. Explicit conflicting method settings are rej
 the report and dependency identity always describe the method actually executed.
 All commands create separate run directories under `--output-parent`.
 Checkpoint and actor outputs refuse to overwrite existing files.
+
+### Progressive rough-terrain training
+
+`task.terrain="rough"` uses Isaac Lab's Go2 rough terrain: stairs in both
+directions, slopes in both directions, boxes and uneven ground. It adds plane
+columns for 20% flat practice. Defaults are ten difficulty rows over `(0, 1)`;
+robots start on row zero and the upstream distance curriculum moves them between
+levels after episodes. Stairs, boxes and slopes grow harder with row difficulty;
+the stock uneven-ground noise stays fixed. Flat practice provides training
+coverage; the separate flat bank still measures retention.
+
+The actor keeps its 49 causal inputs and history. Terrain heights and simulator
+linear velocity remain training-only information. The mode reuses the bounded
+dynamics, sensor noise, Go2 motor law and 50 Hz control. Rewards retain the shared
+recipe and any explicit `task.rewards` overrides; selecting rough terrain does
+not silently replace the objective with upstream reward weights.
+
+Training commands change every four seconds. Moderate terrain uses uniform
+`vx ∈ [-0.2, 0.5]`, `vy ∈ [-0.2, 0.2]`, `wz ∈ [-0.5, 0.5]`, with 10% exact
+stops. Rows that can exceed an 8 cm step or a 10° carrier incline use forward-only
+`vx ∈ [0.2, 0.5]`. The step bound includes differences between neighboring box
+heights; the slope bound includes the pyramid shape and height rounding. Each
+row uses its upper difficulty bound, so boundary rows can receive the narrower
+command set early. Uneven ground retains turns and stops: its local roughness is
+distinct from the underlying carrier incline. These training distributions use
+the assigned tile, rather than measurements of the robot's current surface. External playback
+commands bypass this sampler.
+
+When transferring a flat checkpoint, supply the terrain settings explicitly;
+unspecified fields retain the checkpoint's configuration:
+
+```json
+{"task": {"terrain": "rough", "num_rows": 10, "difficulty_range": [0.0, 1.0]}}
+```
+
+Compatible continuation retains model weights, optimizers and update counters.
+The upstream curriculum uses travel distance and the final command as a progress
+proxy; it does not certify tracking or traversal, particularly during stops and
+turns. `metrics.jsonl` records the number of environments at each terrain level;
+the final report includes command sampling counts. Playback freezes level changes.
+Native rough-mode behavior remains to be validated; this training layout is
+separate from connected-world qualification.
 
 ### Simulation timing candidate
 

@@ -47,6 +47,7 @@ class TaskConfig:
         object.__setattr__(self, "rewards", validate_rewards(self.rewards))
         if self.terrain not in (
             "flat",
+            "rough",
             "procedural",
             "steps",
             "traversal",
@@ -58,13 +59,16 @@ class TaskConfig:
                 self,
                 "difficulty_range",
                 {
+                    "rough": (0.0, 1.0),
                     "steps": (0.15, 0.55),
                     "traversal": (1.0, 1.0),
                     "connected": (1.0, 1.0),
                 }.get(self.terrain, (0.05, 0.15)),
             )
         if self.num_rows is None:
-            object.__setattr__(self, "num_rows", 3 if self.terrain == "steps" else 1)
+            object.__setattr__(
+                self, "num_rows", {"rough": 10, "steps": 3}.get(self.terrain, 1)
+            )
         positive(self.num_envs, "num_envs", integer=True)
         positive(self.num_rows, "num_rows", integer=True)
         positive(self.episode_length_s, "episode_length_s")
