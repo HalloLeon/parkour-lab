@@ -235,7 +235,7 @@ rotation into the mesh. The nominal motion envelope is a construction check,
 not a guarantee about robot trajectories or collision-volume clearance. Local
 float32 diagnostics are not native USD/PhysX evidence. Native checks are separate
 server commands supplied when needed, not permanent diagnostic-only runtime
-modules. Training and evaluation terrain paths remain unchanged.
+modules. Existing terrain paths remain unchanged.
 The world builder reuses analytical common roughness scaling at 25°, quietly
 accepting small angle rounding. Height caps and layer-RMS floors remain strict;
 failures do not redraw noise. No exact floating-point search is needed.
@@ -245,6 +245,31 @@ to keep its realized treads in range. Metadata records requested and realized
 entry/tread dimensions and any correction; already legal coordinates are retained.
 Converted spacing, feature dimensions, topology and roughness witnesses are
 checked separately. These checks still do not establish native collider behavior.
+
+### Connected-world robot playback
+
+`evaluate` and `play` also accept `task.terrain="connected"` with a `task.world`
+object containing the keyword arguments to `build_world`. This initial integration
+supports **one robot**, `num_rows=1` and `difficulty_range=[1,1]`; training is
+rejected. Specify those fields explicitly in a task-only JSON when overriding an
+actor's saved flat configuration. Use the existing `--config` and `--tape` options;
+no separate diagnostic command is installed.
+
+The scene imports one connected mesh, preserves its local float32 points and rigid
+world yaw, and uses the measured flat start-pad height plus stock root clearance.
+Start jitter rotates with the assigned heading. Bounded motors, dynamics and
+causal sensor noise use the same path as flat playback; the actor must retain its
+exact physics-rate binding. No plane, steering or terrain information is added to
+the actor. Single-world operation avoids the stock ray caster's first-mesh limit.
+
+Connected playback records `world.npz` and source/native identity in `report.json`.
+`motion.npz` aligns named foot positions, net normal forces and terrain rays at
+each completed control step, preserving outgoing terminal state before reset.
+`tracking.npz` remains pre-action. Forces are the latest physics sample, not a
+substep contact history; foot link origins are not collision surfaces.
+Playback stops at the first termination or truncation, saves the consumed partial
+tape, and reports `FIRST_ATTEMPT_ENDED_NOT_QUALIFIED`. Clean completion also remains
+unqualified. This is operational integration, not a terrain bank or training release.
 
 ## Ownership and boundaries
 

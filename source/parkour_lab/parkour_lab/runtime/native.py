@@ -92,7 +92,15 @@ def motion_state(env):
             :, sensor.body_names.index("base")
         ],
         "body_position_w": robot.body_pos_w,
+        "foot_net_forces_w": foot_contact_forces(env),
+        "base_surface_hits_w": env.scene["base_height_scanner"].data.ray_hits_w,
     }
+    if getattr(env.cfg, "parkour_task", {}).get("terrain") == "connected":
+        names = env.scene["robot"].body_names
+        state["foot_position_w"] = robot.body_pos_w[
+            :, [names.index(name) for name in FOOT_NAMES]
+        ]
+        state["terrain_hits_w"] = env.scene["height_scanner"].data.ray_hits_w
     return {name: value.detach().clone() for name, value in state.items()}
 
 

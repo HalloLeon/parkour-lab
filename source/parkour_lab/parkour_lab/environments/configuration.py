@@ -39,6 +39,8 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
         raise ValueError(
             "Traversal is evaluation-only fixed geometry: one row, difficulty (1.0, 1.0)"
         )
+    if task.terrain == "connected" and not evaluation:
+        raise ValueError("Connected worlds are evaluation-only")
 
     from isaaclab.managers import (
         ObservationGroupCfg,
@@ -99,7 +101,7 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
 
     configure_rewards(cfg, task)
 
-    if task.terrain != "flat":
+    if task.terrain not in ("flat", "connected"):
         cfg.scene.terrain.terrain_type = "generator"
         cfg.scene.terrain.terrain_generator = make_operator_terrain_generator(
             seed=task.seed,
@@ -150,6 +152,8 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
             "minimum_surface_z_m": (
                 0.0
                 if task.terrain == "flat"
+                else -0.02
+                if task.terrain == "connected"
                 else -max(height for height, _ in ENVELOPES.values())
                 * task.difficulty_range[1]
             ),
@@ -159,7 +163,7 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
         time_out=False,
     )
     # Keep every physical failure before this censoring term.
-    if task.terrain != "flat":
+    if task.terrain not in ("flat", "connected"):
         cfg.terminations.procedural_workspace = TerminationTermCfg(
             func=procedural_workspace,
             params={"margin_m": BORDER_WIDTH + 0.25},
@@ -173,7 +177,7 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
     cfg.observations.proprio.base_lin_vel = None
     cfg.observations.policy.enable_corruption = False
 
-    if task.terrain == "flat":
+    if task.terrain in ("flat", "connected"):
         from .dynamics import configure_dynamics
 
         configure_dynamics(cfg, task, evaluation=evaluation)
@@ -195,6 +199,10 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
             preflight(task.seed, task.traversal_layout),
             layout=task.traversal_layout,
         )
+    elif task.terrain == "connected":
+        from .connected import configure
+
+        configure(cfg, task)
     if evaluation:
         from parkour_lab.runtime.native import configure_external_command
 

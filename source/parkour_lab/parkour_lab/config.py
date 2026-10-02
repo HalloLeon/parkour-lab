@@ -37,20 +37,29 @@ class TaskConfig:
     dynamics: str = "randomized"
     bank_profile: str | None = None
     rewards: dict = field(default_factory=dict)
+    world: dict | None = None
 
     def __post_init__(self):
         from parkour_lab.environments.rewards import validate_rewards
 
         object.__setattr__(self, "rewards", validate_rewards(self.rewards))
-        if self.terrain not in ("flat", "procedural", "steps", "traversal"):
-            raise ValueError("terrain must be flat, procedural, steps or traversal")
+        if self.terrain not in (
+            "flat",
+            "procedural",
+            "steps",
+            "traversal",
+            "connected",
+        ):
+            raise ValueError("Unknown terrain")
         if self.difficulty_range is None:
             object.__setattr__(
                 self,
                 "difficulty_range",
-                {"steps": (0.15, 0.55), "traversal": (1.0, 1.0)}.get(
-                    self.terrain, (0.05, 0.15)
-                ),
+                {
+                    "steps": (0.15, 0.55),
+                    "traversal": (1.0, 1.0),
+                    "connected": (1.0, 1.0),
+                }.get(self.terrain, (0.05, 0.15)),
             )
         if self.num_rows is None:
             object.__setattr__(self, "num_rows", 3 if self.terrain == "steps" else 1)
@@ -81,10 +90,29 @@ class TaskConfig:
             raise ValueError("Unknown traversal layout")
         if self.dynamics not in ("nominal", "randomized"):
             raise ValueError("dynamics must be nominal or randomized")
-        if self.terrain != "flat" and self.dynamics != "randomized":
+        if self.terrain not in ("flat", "connected") and self.dynamics != "randomized":
             raise ValueError(
-                "Nominal dynamics selection is supported only for flat tasks"
+                "Nominal dynamics selection is supported only for flat or connected tasks"
             )
+        if self.terrain == "connected":
+            if self.num_envs != 1 or self.num_rows != 1 or tuple(bounds) != (1.0, 1.0):
+                raise ValueError(
+                    "Connected playback requires one environment, one row and difficulty (1, 1)"
+                )
+            if not isinstance(self.world, dict):
+                raise ValueError("Connected playback requires a world object")
+            from inspect import signature
+            from parkour_lab.environments.worlds import build_world
+
+            try:
+                signature(build_world).bind(**self.world)
+            except TypeError as error:
+                raise ValueError(
+                    f"Invalid connected world settings: {error}"
+                ) from error
+            object.__setattr__(self, "world", dict(self.world))
+        elif self.world is not None:
+            raise ValueError("world settings require connected terrain")
         if self.bank_profile is not None:
             from parkour_lab.evaluation.flat import PROFILES
 
@@ -133,6 +161,8 @@ class ExperimentConfig:
     def validate_training(self):
         from parkour_lab.methods import get_backend
 
+        if self.task.terrain == "connected":
+            raise ValueError("Connected terrain is currently evaluation-only")
         if self.task.bank_profile is not None:
             raise ValueError("Development bank attempts cannot be used for training")
         if self.task.terrain == "flat" and self.task.dynamics != "randomized":

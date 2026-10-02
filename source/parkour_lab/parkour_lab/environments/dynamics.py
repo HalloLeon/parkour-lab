@@ -1,4 +1,4 @@
-"""Seeded flat-task dynamics and starts; import only after the simulator starts."""
+"""Seeded task dynamics and supported starts; import after the simulator starts."""
 
 from __future__ import annotations
 
@@ -30,7 +30,11 @@ class RandomizedDCMotor(DCMotor):
 def get_randomization(env):
     if not hasattr(env, "parkour_randomization"):
         env.parkour_randomization = TaskRandomization(
-            env.cfg.parkour_task, evaluation=env.cfg.parkour_evaluation
+            env.cfg.parkour_task,
+            evaluation=env.cfg.parkour_evaluation,
+            nominal_heading=getattr(
+                getattr(env.scene, "terrain", None), "start_heading", None
+            ),
         )
     return env.parkour_randomization
 
@@ -104,7 +108,7 @@ def initialize_dynamics(env, env_ids=None):
     env._parkour_material_modes = _material_combine_modes(env)
     for actuator in robot.actuators.values():
         if not isinstance(actuator, RandomizedDCMotor):
-            raise ValueError("Flat dynamics require the bounded native DC motor")
+            raise ValueError("Seeded dynamics require the bounded native DC motor")
         joints = [robot.joint_names.index(name) for name in actuator.joint_names]
         for parameter, key in (("stiffness", "kp_scale"), ("damping", "kd_scale")):
             scale = getattr(actuator, parameter + "_scale")
@@ -127,6 +131,9 @@ def reset_state(env, env_ids):
     )
     root = robot.data.default_root_state[ids].clone()
     root[:, :3] += env.scene.env_origins[ids]
+    terrain = getattr(env.scene, "terrain", None)
+    if hasattr(terrain, "start_position"):
+        root[:, :3] += _tensor(terrain.start_position, root)
     root[:, :2] += _tensor(draw["start_xy"], root)
     yaw = _tensor(draw["start_yaw"], root)
     root[:, 3:7] = 0.0
@@ -149,6 +156,9 @@ def start_report(env):
     if any(row is None for row in starts):
         raise ValueError("A first start must be sampled for every environment")
     position = data.default_root_state[:, :3] + env.scene.env_origins
+    terrain = getattr(env.scene, "terrain", None)
+    if hasattr(terrain, "start_position"):
+        position += _tensor(terrain.start_position, position)
     position[:, :2] += _tensor([row["start_xy"] for row in starts], position)
     yaw = _tensor([row["start_yaw"] for row in starts], position)
     orientation = torch.zeros(

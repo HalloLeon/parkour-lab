@@ -25,7 +25,7 @@ class TaskRandomization:
     own streams. No NumPy, torch, learner, or simulator global RNG is consumed.
     """
 
-    def __init__(self, task, *, evaluation=False):
+    def __init__(self, task, *, evaluation=False, nominal_heading=None):
         def setting(name, default=None):
             return (
                 task.get(name, default)
@@ -78,6 +78,12 @@ class TaskRandomization:
         self._starts = [None] * self.count
         self._physical = None
         self._heading = np.zeros(self.count)
+        if nominal_heading is not None:
+            if profile is not None or not np.isfinite(nominal_heading):
+                raise ValueError(
+                    "Require a finite nominal heading outside the flat bank"
+                )
+            self._heading.fill(nominal_heading)
         if profile is not None:
             offset = self.uniform(np.arange(self.count), 1, "geometry")[:, 0]
             self._heading = (

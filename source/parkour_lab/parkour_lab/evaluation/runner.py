@@ -51,6 +51,28 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
     host = NativeControllerSession(
         env, loaded.controller, loaded.motor_contract, preserve_native_raw=True
     )
+    connected = getattr(env.cfg, "parkour_task", {}).get("terrain") == "connected"
+    if connected:
+        terrain = env.scene.terrain
+        np.savez_compressed(
+            Path(output) / "world.npz",
+            **{
+                name: value
+                for name, value in terrain.world.items()
+                if name != "metadata"
+            },
+        )
+        from parkour_lab.control.proprioception import FOOT_NAMES
+
+        report["connected_world"] = {
+            "source": terrain.metadata,
+            "native": terrain.native_receipt,
+            "world_sha256": file_sha256(Path(output) / "world.npz"),
+            "foot_names": list(FOOT_NAMES),
+            "trace_phase": "motion.npz: post-control-step, outgoing state before auto-reset; tracking.npz: pre-action",
+            "contact_scope": "Latest physics-sample net normal forces (N), not substep history; initial raw forces may be stale after reset (actor flags are zero); foot link positions are not collision surfaces",
+            "first_attempt_only": True,
+        }
     controller = loaded.controller
     before = controller.state_sha256()
     recorder = TapeBuilder({"seed": env.cfg.seed, "controller_sha256": before})
@@ -87,6 +109,7 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
     env.capture_motion = True
     env.capture_diagnostics = True
     error = None
+    first_attempt_ended = False
     try:
         for step, command in enumerate(commands):
             if not app.is_running():
@@ -148,11 +171,21 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
                 contact_trace.append(contact_sample[0])
                 force_trace.append(contact_sample[1])
                 reset_trace.append(contact_sample[2])
+            if connected and reset.any():
+                # The SDK already reset this row; never execute a replacement attempt.
+                first_attempt_ended = True
+                break
+        completed_steps = len(trace)
         report.update(
-            status="EVALUATION_COMPLETE_NOT_QUALIFIED",
-            control_steps=len(commands),
-            environment_transitions=len(commands) * env.num_envs,
-            tracking_rmse=(squared_error / (len(commands) * env.num_envs))
+            status=(
+                "FIRST_ATTEMPT_ENDED_NOT_QUALIFIED"
+                if first_attempt_ended
+                else "EVALUATION_COMPLETE_NOT_QUALIFIED"
+            ),
+            requested_control_steps=len(commands),
+            control_steps=completed_steps,
+            environment_transitions=completed_steps * env.num_envs,
+            tracking_rmse=(squared_error / (completed_steps * env.num_envs))
             .sqrt()
             .cpu()
             .tolist(),
@@ -189,7 +222,9 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
         report["sensor_noise"] = sensor_noise_report(env)
         write_tape(
             Path(output) / "commands.json",
-            recorder.finish(completed=error is None, error=error),
+            recorder.finish(
+                completed=error is None and not first_attempt_ended, error=error
+            ),
         )
         if trace:
             sensors = {}
@@ -219,7 +254,7 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
             )
         report["evidence_sha256"] = {
             name: file_sha256(Path(output) / name)
-            for name in ("commands.json", "tracking.npz", "motion.npz")
+            for name in ("commands.json", "tracking.npz", "motion.npz", "world.npz")
             if (Path(output) / name).is_file()
         }
 
@@ -227,7 +262,6 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
 def _motion_arrays(rows, initial, origins):
     return {
         **{key: np.stack([row[key] for row in rows]) for key in rows[0]},
-        "initial_position_w": initial["position_w"].cpu().numpy(),
-        "initial_quaternion_w": initial["quaternion_w"].cpu().numpy(),
+        **{f"initial_{key}": value.cpu().numpy() for key, value in initial.items()},
         "env_origins": origins,
     }
