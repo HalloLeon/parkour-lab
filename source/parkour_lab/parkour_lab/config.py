@@ -34,8 +34,10 @@ class TaskConfig:
     traversal_layout: str = "standard"
     linear_tracking_std: float = 0.5  # m/s; exp(-squared xy error / std**2)
     angular_tracking_std: float = 0.5  # rad/s; same kernel for body-z yaw
-    dynamics: str = "randomized"
+    dynamics: str | None = None
     bank_profile: str | None = None
+    terrain_group: str | None = None
+    terrain_attempt_index: int | None = None
     rewards: dict = field(default_factory=dict)
     world: dict | None = None
 
@@ -88,6 +90,30 @@ class TaskConfig:
         object.__setattr__(self, "difficulty_range", tuple(bounds))
         if self.traversal_layout not in ("standard", "step_ladder"):
             raise ValueError("Unknown traversal layout")
+        if self.terrain_group is not None or self.terrain_attempt_index is not None:
+            from parkour_lab.environments.randomization import (
+                terrain_development_attempt,
+            )
+
+            assignment = terrain_development_attempt(
+                self.terrain_group, self.terrain_attempt_index
+            )
+            if (
+                self.terrain != "connected"
+                or self.bank_profile is not None
+                or self.episode_length_s <= 30
+            ):
+                raise ValueError(
+                    "A terrain development attempt requires connected playback, no flat profile and an episode longer than 30 s"
+                )
+            if self.world is not None and self.world != assignment["world"]:
+                raise ValueError("World differs from the canonical terrain assignment")
+            if self.dynamics is not None and self.dynamics != assignment["stratum"]:
+                raise ValueError("Dynamics conflict with the terrain attempt stratum")
+            object.__setattr__(self, "world", dict(assignment["world"]))
+            object.__setattr__(self, "dynamics", assignment["stratum"])
+        elif self.dynamics is None:
+            object.__setattr__(self, "dynamics", "randomized")
         if self.dynamics not in ("nominal", "randomized"):
             raise ValueError("dynamics must be nominal or randomized")
         if self.terrain not in ("flat", "connected") and self.dynamics != "randomized":

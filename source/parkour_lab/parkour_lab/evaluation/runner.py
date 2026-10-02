@@ -6,6 +6,7 @@ Tracking metrics alone do not establish terrain traversal or qualification.
 
 from pathlib import Path
 import json
+import hashlib
 
 import numpy as np
 import torch
@@ -44,6 +45,35 @@ def command_sequence(*, tape=None, command=(0.3, 0.0, 0.0), steps=900):
 def evaluate(env, app, loaded, commands, output, report, *, profile=None):
     if not commands:
         raise ValueError("Evaluation requires a nonempty command sequence")
+    task = getattr(env.cfg, "parkour_task", {})
+    assignment = None
+    if (
+        task.get("terrain_group") is not None
+        or task.get("terrain_attempt_index") is not None
+    ):
+        from parkour_lab.environments.randomization import terrain_development_attempt
+
+        assignment = terrain_development_attempt(
+            task.get("terrain_group"), task.get("terrain_attempt_index")
+        )
+        prescribed = [
+            command
+            for duration, command in assignment["command_phases"]
+            for _ in range(round(duration * assignment["control_hz"]))
+        ]
+        if (
+            task.get("terrain") != "connected"
+            or env.num_envs != 1
+            or task.get("world") != assignment["world"]
+            or task.get("dynamics") != assignment["stratum"]
+            or commands != prescribed
+            or env.step_dt != 0.02
+            or profile is not None
+        ):
+            raise ValueError(
+                "Terrain development playback differs from its assigned world, stratum or tape"
+            )
+        report["terrain_assignment"] = assignment
     if profile is not None:
         from .flat import profile_commands
 
@@ -78,6 +108,10 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
     before = controller.state_sha256()
     recorder = TapeBuilder({"seed": env.cfg.seed, "controller_sha256": before})
     randomization = getattr(env, "parkour_randomization", None)
+    if assignment is not None and randomization is None:
+        raise ValueError(
+            "Terrain development playback requires its native randomization"
+        )
     if randomization is not None:
         randomization.begin_attempts()
         for name in ("_causal_noise_digest", "_causal_noise_decisions"):
@@ -90,6 +124,18 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
         from parkour_lab.provenance import write_json
 
         manifest = randomization.manifest()
+        if assignment is not None and (
+            manifest["namespace"] != assignment["namespace"]
+            or manifest["group_id"] != assignment["group_id"]
+            or len(manifest["attempts"]) != 1
+            or any(
+                manifest["attempts"][0][key] != assignment[key]
+                for key in ("attempt_index", "stratum", "streams")
+            )
+        ):
+            raise ValueError(
+                "Native randomization differs from the selected terrain assignment"
+            )
         write_json(Path(output) / "manifest.json", manifest)
         report["manifest_sha256"] = file_sha256(Path(output) / "manifest.json")
         report["task_realization"] = dynamics_report(env)
@@ -425,6 +471,23 @@ def analyze_terrain_attempt(run):
             all(np.isfinite(value).all() for value in archive.values()),
             "nonfinite tracking evidence",
         )
+        tracking = dict(archive)
+
+    identity = {}
+    if (
+        task.get("terrain_group") is not None
+        or task.get("terrain_attempt_index") is not None
+        or report.get("terrain_assignment") is not None
+    ):
+        try:
+            with np.load(path.parent / "world.npz", allow_pickle=False) as archive:
+                mesh = dict(archive)
+            manifest = json.loads((path.parent / "manifest.json").read_text())
+            identity = _verify_terrain_binding(report, manifest, mesh, motion, tracking)
+        except (KeyError, IndexError, TypeError) as error:
+            raise ValueError(
+                f"{path}: incomplete terrain development binding"
+            ) from error
 
     # The short diagnostic can share a valid prefix, but cannot become a 30 s trial.
     prescribed = requested == 1500
@@ -441,7 +504,296 @@ def analyze_terrain_attempt(run):
         "report": str(path.resolve()),
         "actor_sha256": actor,
         "executed_package_sources": report["package_sources"],
+        **identity,
         "qualified": False,
         "qualification_eligible": False,
         "scope": "Single-attempt recorded kinematics and archive integrity only; not layout/dynamics-bank validation, cooked-contact certification or qualification.",
     }
+
+
+def _verify_terrain_binding(report, manifest, mesh, motion, tracking):
+    """Reconstruct the assigned ID and consumed draws without rebuilding terrain."""
+    from parkour_lab.config import TaskConfig
+    from parkour_lab.environments.randomization import (
+        TaskRandomization,
+        terrain_development_attempt,
+    )
+
+    task = TaskConfig(**report["config"]["task"])
+    assignment = terrain_development_attempt(
+        task.terrain_group, task.terrain_attempt_index
+    )
+    world = report["connected_world"]
+    source, native = world["source"], world["native"]
+
+    def require(condition, message):
+        if not condition:
+            raise ValueError(f"Terrain development binding: {message}")
+
+    require(report["terrain_assignment"] == assignment, "selected assignment changed")
+    require(
+        native["requested_world"] == assignment["world"], "native world request changed"
+    )
+    require(report["requested_control_steps"] == 1500, "requested tape changed")
+    phases = assignment["command_phases"]
+    commands = np.asarray(
+        [
+            command
+            for duration, command in phases
+            for _ in range(round(duration * assignment["control_hz"]))
+        ],
+        dtype=np.float32,
+    )
+    steps = report["control_steps"]
+    require(
+        np.array_equal(motion["command"][:, 0], commands[:steps]),
+        "consumed tape changed",
+    )
+    requested = assignment["world"]
+    family, direction, _ = task.terrain_group.split("/")
+    local_heading = (
+        (-np.pi / 2 if direction == "down" else np.pi / 2)
+        if family == "ramp"
+        else (np.pi if direction == "down" else 0.0)
+    )
+    heading = local_heading + requested["world_yaw"]
+    require(
+        source["coarse_seed"] == requested["coarse_seed"]
+        and source["fine_seed"] == requested["fine_seed"]
+        and source["size_m"] == requested["size"]
+        and source["resolution_limit_m"] == requested["resolution"]
+        and source["trial"]["family"] == family
+        and source["trial"]["orientation"] == direction
+        and abs(source["trial"]["heading_world_rad"] - heading) <= 1e-12
+        and abs(native["start_heading_rad"] - heading) <= 1e-12,
+        "source layout, roughness seeds or supported heading changed",
+    )
+    for key, name, dtype in (
+        ("vertices_float32_sha256", "vertices", "<f4"),
+        ("faces_int64_sha256", "faces", "<i8"),
+    ):
+        digest = hashlib.sha256(mesh[name].astype(dtype).tobytes()).hexdigest()
+        require(
+            digest == source[key] == native[key], "source/native mesh identity changed"
+        )
+    transform = np.eye(4)
+    cosine, sine = np.cos(requested["world_yaw"]), np.sin(requested["world_yaw"])
+    transform[:2, :2] = [[cosine, -sine], [sine, cosine]]
+    require(
+        source["trial"]["local_to_world_column_transform"]
+        == native["local_to_world_column_transform"]
+        and np.allclose(
+            native["local_to_world_column_transform"], transform, rtol=0, atol=1e-12
+        )
+        and native["material"]
+        == dict(
+            static_friction=1.0,
+            dynamic_friction=1.0,
+            restitution=0.0,
+            friction_combine_mode="multiply",
+            restitution_combine_mode="multiply",
+        ),
+        "source/native rigid transform or material changed",
+    )
+    sampler = TaskRandomization(task, evaluation=True, nominal_heading=heading)
+    sampler.dynamics()
+    sampler.sample_start(None)
+    expected = sampler.manifest()
+    require(manifest == expected, "global ID, streams, first start or dynamics changed")
+    require(
+        report["task_realization"]["randomization"] == expected,
+        "applied randomization differs",
+    )
+    _verify_saved_dynamics(
+        report["task_realization"],
+        report["motor_verification"],
+        expected["attempts"][0]["dynamics"],
+    )
+    noise = sampler.uniform(None, steps * 30, "observation-noise", -1.0, 1.0).reshape(
+        steps, 1, 30
+    )
+    noise = (noise * ([0.2] * 3 + [0.05] * 3 + [0.01] * 12 + [1.5] * 12)).astype(
+        np.float32
+    )
+    require(
+        np.array_equal(tracking["causal_sensor_noise"], noise),
+        "consumed causal noise changed",
+    )
+    require(
+        report["sensor_noise"]["generated_frames"] == steps
+        and report["sensor_noise"]["draw_sha256"]
+        == hashlib.sha256(noise.tobytes()).hexdigest(),
+        "causal noise receipt changed",
+    )
+    start = expected["attempts"][0]["start"]
+    initial = report["initial_state"]
+    quaternion = np.array(
+        [[np.cos(start["start_yaw"] / 2), 0, 0, np.sin(start["start_yaw"] / 2)]]
+    )
+    require(
+        np.allclose(
+            motion["initial_position_w"], initial["root_position"], rtol=0, atol=2e-6
+        )
+        and np.allclose(
+            motion["initial_position_w"][0, :2],
+            np.asarray(native["start_position_m"][:2]) + start["start_xy"],
+            rtol=0,
+            atol=2e-6,
+        )
+        and np.allclose(
+            tracking["initial_raw_sensors"][0, 6:18],
+            start["joint_offset"],
+            rtol=0,
+            atol=2e-6,
+        )
+        and np.allclose(
+            tracking["initial_noisy_sensors"],
+            tracking["initial_raw_sensors"] + noise[0],
+            rtol=0,
+            atol=2e-6,
+        ),
+        "initial native state or causal inputs differ from the assigned start",
+    )
+    require(
+        np.allclose(
+            motion["initial_quaternion_w"],
+            initial["root_orientation"],
+            rtol=0,
+            atol=2e-6,
+        )
+        and min(
+            np.max(np.abs(motion["initial_quaternion_w"] - quaternion)),
+            np.max(np.abs(motion["initial_quaternion_w"] + quaternion)),
+        )
+        <= 2e-6
+        and not np.any(initial["root_velocity"])
+        and not np.any(initial["joint_velocity"])
+        and not np.any(motion["initial_linear_velocity_b"])
+        and not np.any(motion["initial_angular_velocity_b"]),
+        "initial attitude or zero-velocity state changed",
+    )
+    return {
+        "terrain_development": {
+            "namespace": assignment["namespace"],
+            "group_id": assignment["group_id"],
+            "attempt_index": assignment["attempt_index"],
+            "stratum": assignment["stratum"],
+            "binding_verified": True,
+            "scope": "Selected development ID and archived source/native identity, reset/dynamics declarations and consumed causal draws; not bank qualification or cooked-contact certification",
+        }
+    }
+
+
+def _verify_saved_dynamics(realized, verification, draw):
+    """Cross-check archived physical readbacks and joint-wise sampled motor scales."""
+
+    def require(condition, message):
+        if not condition:
+            raise ValueError(f"Terrain development dynamics: {message}")
+
+    bodies, joints = realized["body_names"], realized["joint_names"]
+    require(
+        isinstance(bodies, list)
+        and len(set(bodies)) == len(bodies)
+        and bodies.count("base") == 1
+        and isinstance(joints, list)
+        and len(set(joints)) == len(joints) == 12,
+        "invalid body/joint identities",
+    )
+    shapes = {
+        "masses": (1, len(bodies)),
+        "inertias": (1, len(bodies), 9),
+        "coms": (1, len(bodies), 7),
+        "joint_limits": (1, 12, 2),
+    }
+    requested, actual = realized["requested_physics"], realized["physical_readback"]
+    for key in ("masses", "inertias", "coms", "materials", "joint_limits"):
+        expected, value = np.asarray(requested[key]), np.asarray(actual[key])
+        require(
+            expected.shape == value.shape
+            and expected.size > 0
+            and np.isfinite(expected).all()
+            and np.isfinite(value).all(),
+            "missing or invalid physical readback",
+        )
+        if key in shapes:
+            require(value.shape == shapes[key], "invalid physical readback shape")
+        if key == "coms":
+            expected, value = expected[..., :3], value[..., :3]
+        require(
+            np.allclose(value, expected, rtol=1e-6, atol=1e-7)
+            if key in ("masses", "inertias")
+            else np.array_equal(value, expected),
+            f"{key} readback differs from requested physics",
+        )
+    masses = np.asarray(realized["default_masses"], dtype=np.float32)
+    require(
+        masses.shape == (1, len(bodies))
+        and np.isfinite(masses).all()
+        and (masses > 0).all(),
+        "missing default mass baseline",
+    )
+    masses[0, bodies.index("base")] += np.float32(draw["added_mass"])
+    require(
+        np.allclose(requested["masses"], masses, rtol=1e-6, atol=1e-7),
+        "assigned added mass was not applied",
+    )
+    materials = np.asarray(actual["materials"])
+    require(
+        materials.ndim == 3
+        and materials.shape[0] == 1
+        and materials.shape[2] == 3
+        and np.all(materials[..., 0] == np.float32(draw["static_friction"]))
+        and np.all(materials[..., 1] == np.float32(draw["dynamic_friction"]))
+        and not np.any(materials[..., 2]),
+        "assigned friction/restitution was not applied",
+    )
+    require(
+        all(
+            mode in ("average", "min", "multiply")
+            for mode in realized["robot_material_combine_modes"].values()
+        ),
+        "robot material overrides terrain multiply",
+    )
+    motors = realized["motors"]
+    scales = verification["realized_randomization"]
+    require(
+        bool(motors)
+        and set(motors) == set(scales)
+        and verification["runtime_num_envs"] == 1,
+        "missing motor realization",
+    )
+    covered = []
+    for name, motor in motors.items():
+        covered.extend(motor["joint_names"])
+        indices = [joints.index(joint) for joint in motor["joint_names"]]
+        receipt = scales[name]
+        for parameter, key in (
+            ("stiffness", "kp_scale"),
+            ("damping", "kd_scale"),
+            ("motor_strength", "motor_strength"),
+        ):
+            scale = np.asarray(draw[key], dtype=np.float32)[None, indices]
+            require(
+                np.array_equal(receipt["scales"][parameter], scale),
+                "motor scale differs from the assigned joint draw",
+            )
+            value = (
+                scale
+                if parameter == "motor_strength"
+                else scale
+                * np.asarray(receipt["nominal_gains"][parameter], dtype=np.float32)
+            )
+            require(
+                np.array_equal(motor[parameter], value),
+                "applied PD gain/strength differs from assigned scale",
+            )
+        for key in ("effort_limit", "velocity_limit"):
+            value = np.asarray(motor[key])
+            require(
+                value.shape == (1, len(indices))
+                and np.isfinite(value).all()
+                and (value > 0).all(),
+                "invalid physical motor limits",
+            )
+    require(sorted(covered) == sorted(joints), "motors do not cover each joint once")

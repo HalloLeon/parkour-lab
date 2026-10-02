@@ -300,6 +300,52 @@ are separate requirements. `--terrain` and `--flat-bank` are mutually exclusive.
 Inspect `diagnostic_passed` and `failures`: a successful analysis process can
 correctly report a failed robot attempt.
 
+### Prospective terrain development assignments
+
+`environments.randomization.terrain_development_assignments()` returns the
+requested cases for all 20 terrain groups, with 100 fixed IDs per group. Passing
+a canonical group ID, such as `ramp/down/10deg`, returns just that group's same
+100 assignments. There is no candidate seed or qualification-namespace option.
+
+Each 50-attempt dynamics subset has balanced target dimensions and stratified
+world yaw; stair treads use independently shuffled 50-bin Latin hypercubes. Six
+full-SHA seed mappings separate geometry, coarse/fine roughness, starts, dynamics
+and observation noise. A common local placement offset of up to 0.25 m varies
+feature centres; it does not independently rearrange the surrounding structures.
+Roughness seeds retain all 256 bits, rather than using the task's uint32 run seed.
+
+These are **prospective assignments, not a validated bank**. Generating them does
+not build meshes, apply dynamics or run the policy. One assignment can now be
+selected explicitly through the existing connected evaluator:
+
+```bash
+python -m parkour_lab evaluate ACTOR.plab \
+  --terrain-group ramp/down/10deg --attempt-index 50 --device cuda:0
+```
+
+Run this only for an unstarted development ID with the source and actor frozen.
+The selector fixes the canonical world, one robot, global attempt ID, dynamics
+stratum and independent full-entropy streams. IDs 0–49 are nominal; 50–99 are
+randomized. The run seed cannot substitute for the assigned stream seeds. The
+actor's physics rate remains exact; selecting terrain does not rebind it.
+
+The command tape is always 2 seconds stopped, 25 seconds body-forward at 0.35 m/s,
+then 3 seconds stopped, at 50 Hz. Custom commands/tapes/lengths, seeds, batch counts,
+flat profiles and conflicting world/dynamics settings are rejected. Configuration
+records derive the world/stratum and round-trip, but execution also requires the
+explicit evaluate selectors. Training and play cannot execute development IDs.
+
+The evaluator archives the selected assignment, actual source/native mesh identity,
+supported first reset, physical readback and consumed causal noise. It stops at
+the first native ending and retains the partial tape; a reset supplies no retry.
+`analyze RUN_DIRECTORY --terrain` checks the canonical binding, saved physical
+receipts and noise before returning the assigned group/index alongside kinematic
+results. This does not qualify a complete bank or certify cooked contacts.
+
+Native validation of assigned cases, aggregation and retention remain pending.
+Keep the generated assignment file and its source identity when preparing a bank;
+do not replace cases after observing robot outcomes.
+
 ## Ownership and boundaries
 
 | Package/module | Responsibility |

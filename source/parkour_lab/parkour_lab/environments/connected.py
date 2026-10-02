@@ -109,6 +109,7 @@ def _readback(importer, path):
     return {
         "scope": "Exact builder float32 mesh, rigid transform and USD collider/material identity; not cooked contact or traversal",
         "mesh_path": str(prim.GetPath()),
+        "requested_world": dict(importer.cfg.world),
         "vertices_float32_sha256": importer.metadata["vertices_float32_sha256"],
         "faces_int64_sha256": importer.metadata["faces_int64_sha256"],
         "local_to_world_column_transform": matrix.tolist(),

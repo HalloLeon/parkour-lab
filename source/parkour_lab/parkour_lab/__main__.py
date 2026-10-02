@@ -53,7 +53,7 @@ def parse_args(argv=None):
                 "--command",
                 nargs=3,
                 type=float,
-                default=(0.3, 0.0, 0.0),
+                default=None,
                 metavar=("VX", "VY", "WZ"),
                 help="Body twist followed by a final 1 s stop; steps <= 50 means all stop",
             )
@@ -66,6 +66,11 @@ def parse_args(argv=None):
                     "--bank-profile",
                     help="Frozen flat development group: 100 independent attempts, balanced dynamics",
                 )
+                source.add_argument(
+                    "--terrain-group",
+                    help="One canonical terrain development attempt, paired with --attempt-index",
+                )
+                command.add_argument("--attempt-index", type=int)
             command.add_argument(
                 "--steps", type=int, help="Command playback length (default: 900)"
             )
@@ -94,7 +99,9 @@ def parse_args(argv=None):
     args = parser.parse_args(argv)
     if hasattr(args, "cpu_threads") and args.cpu_threads < 1:
         parser.error("cpu-threads must be positive")
-    if hasattr(args, "command") and not all(math.isfinite(x) for x in args.command):
+    if getattr(args, "command", None) is not None and not all(
+        math.isfinite(x) for x in args.command
+    ):
         parser.error("Commands must be finite")
     profile = getattr(args, "profile", None)
     if profile is None:
@@ -116,6 +123,21 @@ def parse_args(argv=None):
         parser.error(
             "A development bank fixes attempt IDs/count/seeds; omit --num-envs and --seed"
         )
+    group, index = (
+        getattr(args, "terrain_group", None),
+        getattr(args, "attempt_index", None),
+    )
+    if group is not None or index is not None:
+        from parkour_lab.environments.randomization import TERRAIN_GROUPS
+
+        if group not in TERRAIN_GROUPS or index is None or not 0 <= index < 100:
+            parser.error(
+                "Require a canonical --terrain-group and --attempt-index in [0, 99]"
+            )
+        if args.steps is not None or args.num_envs is not None or args.seed is not None:
+            parser.error(
+                "A terrain attempt fixes its tape/count/seeds; omit --steps, --num-envs and --seed"
+            )
     return args
 
 
@@ -161,6 +183,42 @@ def resolve_config(args):
         overrides.update(
             bank_profile=args.bank_profile, num_envs=100, terrain="flat", seed=0
         )
+    if getattr(args, "terrain_group", None) is not None:
+        from parkour_lab.environments.randomization import terrain_development_attempt
+
+        assignment = terrain_development_attempt(args.terrain_group, args.attempt_index)
+        supplied_task = supplied.get("task", {}) if args.config is not None else {}
+        if (
+            supplied_task.get("terrain_group") is not None
+            and supplied_task["terrain_group"] != args.terrain_group
+        ) or (
+            supplied_task.get("terrain_attempt_index") is not None
+            and supplied_task["terrain_attempt_index"] != args.attempt_index
+        ):
+            raise ValueError("Explicit terrain identity conflicts with the selector")
+        if (
+            supplied_task.get("world") is not None
+            and supplied_task["world"] != assignment["world"]
+        ) or (
+            supplied_task.get("dynamics") is not None
+            and supplied_task["dynamics"] != assignment["stratum"]
+        ):
+            raise ValueError(
+                "Explicit world/dynamics conflict with the terrain assignment"
+            )
+        overrides.update(
+            terrain="connected",
+            num_envs=1,
+            num_rows=1,
+            difficulty_range=(1.0, 1.0),
+            seed=0,
+            episode_length_s=31.0,
+            bank_profile=None,
+            world=None,
+            dynamics=None,
+            terrain_group=args.terrain_group,
+            terrain_attempt_index=args.attempt_index,
+        )
     config = replace(config, task=replace(config.task, **overrides))
     if getattr(args, "updates", None) is not None:
         config = replace(config, updates=args.updates)
@@ -175,6 +233,14 @@ def resolve_config(args):
     ):
         raise ValueError(
             "Use --bank-profile explicitly to execute a development manifest"
+        )
+    if config.task.terrain_group is not None and (
+        args.operation != "evaluate"
+        or getattr(args, "terrain_group", None) != config.task.terrain_group
+        or getattr(args, "attempt_index", None) != config.task.terrain_attempt_index
+    ):
+        raise ValueError(
+            "Use --terrain-group and --attempt-index explicitly to execute a terrain assignment"
         )
     return config
 
@@ -237,10 +303,23 @@ def main(argv=None, *, standalone=False):
             from parkour_lab.evaluation.flat import profile_commands
 
             commands = profile_commands(args.profile or args.bank_profile)
+        elif config.task.terrain_group is not None:
+            from parkour_lab.environments.randomization import (
+                terrain_development_attempt,
+            )
+
+            phases = terrain_development_attempt(
+                config.task.terrain_group, config.task.terrain_attempt_index
+            )["command_phases"]
+            commands = [
+                command
+                for duration, command in phases
+                for _ in range(round(duration * 50))
+            ]
         else:
             commands = command_sequence(
                 tape=load_tape(args.tape) if args.tape else None,
-                command=args.command,
+                command=args.command if args.command is not None else (0.3, 0.0, 0.0),
                 steps=args.steps if args.steps is not None else 900,
             )
     args.output_parent.mkdir(parents=True, exist_ok=True)

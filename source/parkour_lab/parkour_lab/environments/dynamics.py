@@ -258,17 +258,23 @@ def dynamics_report(env):
                 "Native motor strength differs from the declared fixed draw"
             )
         motors[name] = {
-            key: getattr(actuator, key).detach().cpu().tolist()
-            for key in (
-                "stiffness",
-                "damping",
-                "motor_strength",
-                "effort_limit",
-                "velocity_limit",
-            )
+            "joint_names": list(actuator.joint_names),
+            **{
+                key: getattr(actuator, key).detach().cpu().tolist()
+                for key in (
+                    "stiffness",
+                    "damping",
+                    "motor_strength",
+                    "effort_limit",
+                    "velocity_limit",
+                )
+            },
         }
     return {
         "randomization": get_randomization(env).manifest(),
+        "body_names": list(robot.body_names),
+        "joint_names": list(robot.joint_names),
+        "default_masses": robot.data.default_mass.detach().cpu().tolist(),
         "physical_readback": {
             key: value.detach().cpu().tolist() for key, value in actual.items()
         },
