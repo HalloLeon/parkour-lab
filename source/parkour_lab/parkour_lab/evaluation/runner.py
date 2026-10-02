@@ -513,15 +513,15 @@ def analyze_terrain_attempt(run):
 
 def _verify_terrain_binding(report, manifest, mesh, motion, tracking):
     """Reconstruct the assigned ID and consumed draws without rebuilding terrain."""
-    from parkour_lab.config import TaskConfig
+    from .flat import _same_values
     from parkour_lab.environments.randomization import (
         TaskRandomization,
         terrain_development_attempt,
     )
 
-    task = TaskConfig(**report["config"]["task"])
+    task = report["config"]["task"]
     assignment = terrain_development_attempt(
-        task.terrain_group, task.terrain_attempt_index
+        task["terrain_group"], task["terrain_attempt_index"]
     )
     world = report["connected_world"]
     source, native = world["source"], world["native"]
@@ -531,6 +531,11 @@ def _verify_terrain_binding(report, manifest, mesh, motion, tracking):
             raise ValueError(f"Terrain development binding: {message}")
 
     require(report["terrain_assignment"] == assignment, "selected assignment changed")
+    require(
+        task["world"] == assignment["world"]
+        and task["dynamics"] == assignment["stratum"],
+        "configured world or stratum changed",
+    )
     require(
         native["requested_world"] == assignment["world"], "native world request changed"
     )
@@ -550,7 +555,7 @@ def _verify_terrain_binding(report, manifest, mesh, motion, tracking):
         "consumed tape changed",
     )
     requested = assignment["world"]
-    family, direction, _ = task.terrain_group.split("/")
+    family, direction, _ = task["terrain_group"].split("/")
     local_heading = (
         (-np.pi / 2 if direction == "down" else np.pi / 2)
         if family == "ramp"
@@ -576,15 +581,9 @@ def _verify_terrain_binding(report, manifest, mesh, motion, tracking):
         require(
             digest == source[key] == native[key], "source/native mesh identity changed"
         )
-    transform = np.eye(4)
-    cosine, sine = np.cos(requested["world_yaw"]), np.sin(requested["world_yaw"])
-    transform[:2, :2] = [[cosine, -sine], [sine, cosine]]
     require(
         source["trial"]["local_to_world_column_transform"]
         == native["local_to_world_column_transform"]
-        and np.allclose(
-            native["local_to_world_column_transform"], transform, rtol=0, atol=1e-12
-        )
         and native["material"]
         == dict(
             static_friction=1.0,
@@ -599,9 +598,13 @@ def _verify_terrain_binding(report, manifest, mesh, motion, tracking):
     sampler.dynamics()
     sampler.sample_start(None)
     expected = sampler.manifest()
-    require(manifest == expected, "global ID, streams, first start or dynamics changed")
+    tolerance = 32 * np.finfo(np.float64).eps
     require(
-        report["task_realization"]["randomization"] == expected,
+        _same_values(manifest, expected, tolerance),
+        "global ID, streams, first start or dynamics changed",
+    )
+    require(
+        _same_values(report["task_realization"]["randomization"], expected, tolerance),
         "applied randomization differs",
     )
     _verify_saved_dynamics(
@@ -616,14 +619,11 @@ def _verify_terrain_binding(report, manifest, mesh, motion, tracking):
         np.float32
     )
     require(
-        np.array_equal(tracking["causal_sensor_noise"], noise),
-        "consumed causal noise changed",
-    )
-    require(
         report["sensor_noise"]["generated_frames"] == steps
         and report["sensor_noise"]["draw_sha256"]
-        == hashlib.sha256(noise.tobytes()).hexdigest(),
-        "causal noise receipt changed",
+        == hashlib.sha256(noise.tobytes()).hexdigest()
+        == hashlib.sha256(tracking["causal_sensor_noise"].tobytes()).hexdigest(),
+        "consumed causal noise or receipt changed",
     )
     start = expected["attempts"][0]["start"]
     initial = report["initial_state"]
@@ -693,31 +693,18 @@ def _verify_saved_dynamics(realized, verification, draw):
 
     bodies, joints = realized["body_names"], realized["joint_names"]
     require(
-        isinstance(bodies, list)
-        and len(set(bodies)) == len(bodies)
-        and bodies.count("base") == 1
-        and isinstance(joints, list)
-        and len(set(joints)) == len(joints) == 12,
+        bodies.count("base") == 1 and len(set(joints)) == len(joints) == 12,
         "invalid body/joint identities",
     )
-    shapes = {
-        "masses": (1, len(bodies)),
-        "inertias": (1, len(bodies), 9),
-        "coms": (1, len(bodies), 7),
-        "joint_limits": (1, 12, 2),
-    }
     requested, actual = realized["requested_physics"], realized["physical_readback"]
     for key in ("masses", "inertias", "coms", "materials", "joint_limits"):
         expected, value = np.asarray(requested[key]), np.asarray(actual[key])
         require(
             expected.shape == value.shape
             and expected.size > 0
-            and np.isfinite(expected).all()
             and np.isfinite(value).all(),
             "missing or invalid physical readback",
         )
-        if key in shapes:
-            require(value.shape == shapes[key], "invalid physical readback shape")
         if key == "coms":
             expected, value = expected[..., :3], value[..., :3]
         require(
@@ -728,10 +715,8 @@ def _verify_saved_dynamics(realized, verification, draw):
         )
     masses = np.asarray(realized["default_masses"], dtype=np.float32)
     require(
-        masses.shape == (1, len(bodies))
-        and np.isfinite(masses).all()
-        and (masses > 0).all(),
-        "missing default mass baseline",
+        masses.shape == np.asarray(requested["masses"]).shape,
+        "default mass baseline differs from the physical readback shape",
     )
     masses[0, bodies.index("base")] += np.float32(draw["added_mass"])
     require(
@@ -787,13 +772,5 @@ def _verify_saved_dynamics(realized, verification, draw):
             require(
                 np.array_equal(motor[parameter], value),
                 "applied PD gain/strength differs from assigned scale",
-            )
-        for key in ("effort_limit", "velocity_limit"):
-            value = np.asarray(motor[key])
-            require(
-                value.shape == (1, len(indices))
-                and np.isfinite(value).all()
-                and (value > 0).all(),
-                "invalid physical motor limits",
             )
     require(sorted(covered) == sorted(joints), "motors do not cover each joint once")

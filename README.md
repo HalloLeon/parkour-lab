@@ -199,7 +199,8 @@ noise and motion before recomputing scores. Each group needs ≥90/100 overall a
 ≥45/50 in each stratum. Missing groups remain nonpasses; duplicate groups are
 rejected rather than selecting the best retry. Later reset episodes cannot replace
 a failed first attempt. This is **development evidence, not held-out qualification**.
-Native verification of the corrected task is still pending.
+The retained 200 Hz anchor and its same-weight 400 Hz export pass the development
+flat bank; terrain acceptance remains open.
 
 Domain checks use root/body-link centres in a local ±6 m square, not collision-volume
 extents. Reports always retain `qualified=false` and `qualification_eligible=false`.
@@ -334,6 +335,10 @@ then 3 seconds stopped, at 50 Hz. Custom commands/tapes/lengths, seeds, batch co
 flat profiles and conflicting world/dynamics settings are rejected. Configuration
 records derive the world/stratum and round-trip, but execution also requires the
 explicit evaluate selectors. Training and play cannot execute development IDs.
+There are no turn commands in this tape: one obstacle is tested at a time. Rotating
+the world/start heading does not command a turn. Pivot and arc profiles cover
+turning separately in the flat bank; an observed heading change with zero yaw
+command is tracking drift.
 
 The evaluator archives the selected assignment, actual source/native mesh identity,
 supported first reset, physical readback and consumed causal noise. It stops at
@@ -342,7 +347,10 @@ the first native ending and retains the partial tape; a reset supplies no retry.
 receipts and noise before returning the assigned group/index alongside kinematic
 results. This does not qualify a complete bank or certify cooked contacts.
 
-Native validation of assigned cases, aggregation and retention remain pending.
+The first assigned native case, `ramp/down/10deg` index 50, has a valid capture and
+binding, but terminates at 10.82 s with 45.03° tilt before clearing the ramp or
+reaching the final stop. Clean process exit means the capture completed, not that
+the robot passed. Broader native coverage, aggregation and retention remain open.
 Keep the generated assignment file and its source identity when preparing a bank;
 do not replace cases after observing robot outcomes.
 
@@ -511,13 +519,19 @@ currently apply only to flat tasks. Rewards and learner settings are unchanged.
 
 ## Acceptance
 
-[ACCEPTANCE.md](ACCEPTANCE.md) specifies v2 revision 8: stairs with realized risers
-4/8/12/16 cm, ramps/hills at 10/15/20 degrees, multiscale unevenness over both,
-and one causal policy satisfying traversal and flat-command thresholds. No gaps,
-steep backward traversal or sim-to-real qualification is required.
+Project targets are stairs with realized risers 4/8/12/16 cm, ramps/hills at
+10/15/20 degrees, and multiscale unevenness on structures and connecting ground.
+One causal policy must cross the assigned obstacle, track commands and stop
+stably. Each of 20 terrain and 10 flat groups has 100 first attempts, balanced between
+nominal and randomized dynamics; every group needs ≥90/100 overall and ≥45/50
+in each subset. Later candidates must also retain flat performance: at most 5
+percentage points pass loss and 0.02 m/s planar RMSE increase per profile.
+No gaps, steep backward traversal or sim-to-real qualification is required.
 These are ROA-informed project targets, not official ROA benchmark claims.
 
-[PROJECT_STAGES.md](PROJECT_STAGES.md) summarizes the public roadmap and outstanding
-validation. Diagnostic reward, tracking, exports and local tests
-cannot establish behavioral qualification or replace the independent overall
-score of at least 18/20.
+The causal flat anchor is accepted; connected terrain contacts, traversal and
+complete-bank coverage remain unresolved. Terrain learning and held-out
+qualification are not cleared. Diagnostic tracking, exports and local tests
+cannot replace the empirical gates or independent overall score of at least 18/20.
+Detailed requirements and research history are maintained locally under ignored
+`.agent/`; they are not needed to run the package.
