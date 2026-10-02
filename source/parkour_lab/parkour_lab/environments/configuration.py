@@ -123,7 +123,8 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
         ),
         mesh_prim_paths=[cfg.scene.terrain.prim_path],
         max_distance=25.0,
-        update_period=0.02,
+        # Lazy reads cast at control boundaries; invalidate each tick to avoid clock drift.
+        update_period=0.0,
         debug_vis=False,
     )
     cfg.scene.base_height_scanner = cfg.scene.height_scanner.replace(
