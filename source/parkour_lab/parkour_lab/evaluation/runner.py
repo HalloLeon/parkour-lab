@@ -5,6 +5,7 @@ Tracking metrics alone do not establish terrain traversal or qualification.
 """
 
 from pathlib import Path
+import json
 
 import numpy as np
 import torch
@@ -264,4 +265,183 @@ def _motion_arrays(rows, initial, origins):
         **{key: np.stack([row[key] for row in rows]) for key in rows[0]},
         **{f"initial_{key}": value.cpu().numpy() for key, value in initial.items()},
         "env_origins": origins,
+    }
+
+
+def analyze_terrain_attempt(run):
+    """Verify saved evidence and score one attempt; never execute or replace it.
+
+    This is single-attempt kinematics, not a frozen terrain bank, independently
+    validated layout/randomization, cooked-contact certification or qualification.
+    """
+    from .terrain import score_terrain_attempt
+    from parkour_lab.control.proprioception import FOOT_NAMES
+
+    path = Path(run)
+    path = path / "report.json" if path.is_dir() else path
+    report = json.loads(path.read_text())
+    task = report.get("config", {}).get("task", {})
+    world = report.get("connected_world", {})
+    steps = report.get("control_steps")
+
+    def require(condition, message):
+        if not condition:
+            raise ValueError(f"{path}: {message}")
+
+    require(
+        task.get("terrain") == "connected"
+        and task.get("num_envs") == 1
+        and world.get("first_attempt_only") is True
+        and world.get("foot_names") == list(FOOT_NAMES),
+        "require a single connected-world attempt with named feet",
+    )
+    require(
+        report.get("status")
+        in {"EVALUATION_COMPLETE_NOT_QUALIFIED", "FIRST_ATTEMPT_ENDED_NOT_QUALIFIED"}
+        and report.get("policy_unchanged") is True
+        and report.get("cleanup")
+        == {"environment": "complete", "application": "complete"}
+        and type(steps) is int
+        and 0 < steps <= 30000
+        and report.get("environment_transitions") == steps,
+        "require recorded steps, frozen policy and complete native cleanup",
+    )
+    actor = report.get("actor_sha256", "")
+    require(
+        isinstance(actor, str)
+        and len(actor) == 64
+        and all(c in "0123456789abcdef" for c in actor)
+        and isinstance(report.get("package_sources"), dict)
+        and bool(report["package_sources"]),
+        "missing actor or executed-source identity",
+    )
+    for name, digest in {
+        "manifest.json": report.get("manifest_sha256"),
+        **{
+            name: report.get("evidence_sha256", {}).get(name)
+            for name in ("commands.json", "motion.npz", "tracking.npz", "world.npz")
+        },
+    }.items():
+        evidence = path.parent / name
+        require(
+            evidence.is_file() and file_sha256(evidence) == digest,
+            f"missing or changed evidence: {name}",
+        )
+
+    tape = validate_tape(
+        json.loads((path.parent / "commands.json").read_text()), require_complete=False
+    )
+    require(
+        tape["steps"] == steps and tape["error"] is None, "inconsistent consumed tape"
+    )
+    commands = np.asarray(
+        [
+            segment["command"]
+            for segment in tape["segments"]
+            for _ in range(segment["start_step"], segment["end_step_exclusive"])
+        ]
+    )
+    with np.load(path.parent / "motion.npz", allow_pickle=False) as archive:
+        motion = dict(archive)
+    require(
+        all(np.isfinite(value).all() for value in motion.values()),
+        "nonfinite motion evidence",
+    )
+    result = score_terrain_attempt(motion, world["source"])
+    require(
+        motion["command"].shape == (steps, 1, 3)
+        and np.allclose(motion["command"][:, 0], commands, rtol=0, atol=1e-6),
+        "motion and consumed tape disagree",
+    )
+    ended = motion["terminated"] | motion["truncated"]
+    endings = np.flatnonzero(ended[:, 0])
+    require(
+        not len(endings) or endings.tolist() == [steps - 1],
+        "trace continues after its first ending",
+    )
+    first_ended = report["status"] == "FIRST_ATTEMPT_ENDED_NOT_QUALIFIED"
+    requested = report.get("requested_control_steps")
+    require(
+        type(requested) is int
+        and steps <= requested <= 30000
+        and first_ended == bool(len(endings))
+        and tape["complete"] == (not first_ended)
+        and (first_ended or steps == requested)
+        and report.get("terminated_rows") == int(motion["terminated"].sum())
+        and report.get("timeout_rows")
+        == int((motion["truncated"] & ~motion["terminated"]).sum()),
+        "inconsistent first-ending, completion or requested-step receipts",
+    )
+    motor = report.get("motor_delivery", {})
+    require(
+        all(
+            motor.get(key) == steps
+            for key in (
+                "encoded_steps",
+                "verified_delivery_steps",
+                "native_step_returns",
+            )
+        )
+        and motor.get("faulted") is False
+        and motor.get("pending_delivery") is False
+        and motor.get("excluded_terminal_rows") == len(endings)
+        and motor.get("native_verified_rows") == steps - len(endings),
+        "incomplete or invalid native motor delivery",
+    )
+    with np.load(path.parent / "tracking.npz", allow_pickle=False) as archive:
+        shapes = {
+            "root_com_velocity": (steps, 1, 3),
+            "causal_sensor_noise": (steps, 1, 30),
+            "initial_raw_sensors": (1, 30),
+            "initial_noisy_sensors": (1, 30),
+            "foot_contacts": (steps, 1, 4),
+            "foot_net_forces_w": (steps, 1, 4, 3),
+            "reset_mask": (steps, 1),
+        }
+        require(
+            all(
+                name in archive and archive[name].shape == shape
+                for name, shape in shapes.items()
+            ),
+            "incomplete tracking/input evidence",
+        )
+        reset = archive["reset_mask"]
+        require(
+            reset.shape == (steps, 1)
+            and reset.dtype == np.bool_
+            and reset[0, 0]
+            and not reset[1:].any(),
+            "missing initial reset or replacement attempt",
+        )
+        require(
+            all(
+                value.shape[0] == steps
+                for name, value in archive.items()
+                if not name.startswith("initial_")
+            ),
+            "incomplete tracking trace",
+        )
+        require(
+            all(np.isfinite(value).all() for value in archive.values()),
+            "nonfinite tracking evidence",
+        )
+
+    # The short diagnostic can share a valid prefix, but cannot become a 30 s trial.
+    prescribed = requested == 1500
+    failures = list(result["failures"])
+    if not prescribed:
+        failures.append("requested tape is not the prescribed 30 s terrain trial")
+    return {
+        **result,
+        "diagnostic_passed": result["kinematic_passed"] and prescribed,
+        "failures": failures,
+        "requested_control_steps": requested,
+        "prescribed_duration": prescribed,
+        "evidence_verified": True,
+        "report": str(path.resolve()),
+        "actor_sha256": actor,
+        "executed_package_sources": report["package_sources"],
+        "qualified": False,
+        "qualification_eligible": False,
+        "scope": "Single-attempt recorded kinematics and archive integrity only; not layout/dynamics-bank validation, cooked-contact certification or qualification.",
     }

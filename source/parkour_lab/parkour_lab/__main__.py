@@ -80,10 +80,16 @@ def parse_args(argv=None):
     )
     analyze = commands.add_parser("analyze")
     analyze.add_argument("run", type=Path)
-    analyze.add_argument(
+    analysis_kind = analyze.add_mutually_exclusive_group()
+    analysis_kind.add_argument(
         "--flat-bank",
         action="store_true",
         help="Verify and aggregate flat development profile reports",
+    )
+    analysis_kind.add_argument(
+        "--terrain",
+        action="store_true",
+        help="Verify and score one saved connected-world attempt without simulation",
     )
     args = parser.parse_args(argv)
     if hasattr(args, "cpu_threads") and args.cpu_threads < 1:
@@ -177,6 +183,13 @@ def main(argv=None, *, standalone=False):
     """Run a command; only the standalone native CLI owns process termination."""
     args = parse_args(argv)
     if args.operation == "analyze":
+        if args.terrain:
+            from parkour_lab.evaluation.runner import analyze_terrain_attempt
+
+            print(
+                json.dumps(analyze_terrain_attempt(args.run), indent=2, allow_nan=False)
+            )
+            return 0
         if args.flat_bank:
             from parkour_lab.evaluation.flat import analyze_development_bank
 

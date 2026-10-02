@@ -25,7 +25,7 @@ exact-wheel admission gate. Select the device explicitly.
 | `python -m parkour_lab export CHECKPOINT ACTOR` | Export only the method's causal inference state |
 | `python -m parkour_lab evaluate ACTOR` | Frozen headless command playback and diagnostic tracking |
 | `python -m parkour_lab play ACTOR` | The same playback with a visible simulator, one environment by default |
-| `python -m parkour_lab analyze RUN` | Print a run's result; `--flat-bank` verifies and aggregates development groups |
+| `python -m parkour_lab analyze RUN` | Print a run's result; `--flat-bank` aggregates development groups; `--terrain` scores one saved connected-world attempt |
 
 For training and playback, `--config FILE` accepts explicit settings, not an old
 experiment manifest.
@@ -267,9 +267,38 @@ Connected playback records `world.npz` and source/native identity in `report.jso
 each completed control step, preserving outgoing terminal state before reset.
 `tracking.npz` remains pre-action. Forces are the latest physics sample, not a
 substep contact history; foot link origins are not collision surfaces.
+Both ray sensors use lazy updates with period zero: physics invalidates the cache,
+and the first control-boundary read refreshes it. Repeated reads reuse that sample;
+this avoids accumulated float32 timestamp drift skipping nominal 20 ms updates.
 Playback stops at the first termination or truncation, saves the consumed partial
 tape, and reports `FIRST_ATTEMPT_ENDED_NOT_QUALIFIED`. Clean completion also remains
 unqualified. This is operational integration, not a terrain bank or training release.
+
+The first native run, `robot_world_PR8px3`, settled on the elevated pad but ended
+at 11.12 s with 45.79° tilt after accelerating down the ramp. Shutdown completed;
+the failed first attempt remains preserved. It also exposed 78 stale ray frames
+after 8 s, motivating the lazy-update correction above. The terminal ray was fresh,
+so this sampling defect does not excuse the tilt failure. The same-input
+`ray_refresh_W0XdIg` verification now has fresh rays at all 556 control samples,
+including all 156 after 8 s. Non-ray motion and all tracking arrays are identical
+to the original: the robot still terminates at 11.12 s. This verifies sampling on
+that trace, not full-horizon terrain capability; terrain learning is not released.
+
+Score saved connected-world evidence without starting the simulator:
+
+```bash
+python -m parkour_lab analyze RUN --terrain
+```
+
+This read-only analysis checks artifact hashes, fixed-policy/delivery/cleanup
+receipts and first-attempt consistency, then scores approach-side entry, crossing,
+tracking, falls, stalls, map bounds and the final stop. A pass requires the full
+prescribed 30 s terrain tape; short technical checks remain explicit nonpasses.
+Crossing uses base/foot-link centres, not reconstructed contacts. The result always
+remains unqualified: independently assigned layout/dynamics banks and retention
+are separate requirements. `--terrain` and `--flat-bank` are mutually exclusive.
+Inspect `diagnostic_passed` and `failures`: a successful analysis process can
+correctly report a failed robot attempt.
 
 ## Ownership and boundaries
 
