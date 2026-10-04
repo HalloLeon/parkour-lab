@@ -34,6 +34,7 @@ class TaskConfig:
     traversal_layout: str = "standard"
     linear_tracking_std: float = 0.5  # m/s; exp(-squared xy error / std**2)
     angular_tracking_std: float = 0.5  # rad/s; same kernel for body-z yaw
+    rough_pivot_fraction: float = 0.0
     dynamics: str | None = None
     bank_profile: str | None = None
     terrain_group: str | None = None
@@ -74,6 +75,14 @@ class TaskConfig:
         positive(self.episode_length_s, "episode_length_s")
         positive(self.linear_tracking_std, "linear_tracking_std")
         positive(self.angular_tracking_std, "angular_tracking_std")
+        if (
+            type(self.rough_pivot_fraction) not in (int, float)
+            or not math.isfinite(self.rough_pivot_fraction)
+            or not 0 <= self.rough_pivot_fraction <= 0.9
+        ):
+            raise ValueError(
+                "rough_pivot_fraction must be finite in [0, 0.9]"
+            )
         if type(self.physics_hz) is not int or self.physics_hz not in (200, 400):
             raise ValueError("physics_hz must be the integer 200 or 400")
         if (

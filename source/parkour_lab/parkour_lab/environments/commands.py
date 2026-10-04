@@ -78,11 +78,13 @@ class RoughVelocityCommand(FlatVelocityCommand):
 
     The row upper bound conservatively narrows uncertain boundary rows. Terrain
     labels only select training distributions; external packets bypass sampling.
+    Opt-in pivots share the existing unrestricted packet and RNG draws.
     """
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
         self.generator = env.cfg.scene.terrain.terrain_generator
+        self.pivot_fraction = env.cfg.parkour_task["rough_pivot_fraction"]
         terrains = list(self.generator.sub_terrains.values())
         proportions = torch.tensor(
             [sub.proportion for sub in terrains],
@@ -127,6 +129,7 @@ class RoughVelocityCommand(FlatVelocityCommand):
         self.threshold_by_column = thresholds[indices]
         self.sampling_report["version"] = "rough_uniform_twist_v1"
         self.sampling_report["restricted_samples"] = 0
+        self.sampling_report["pivots"] = 0
 
     def _resample_command(self, env_ids):
         env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
@@ -151,12 +154,25 @@ class RoughVelocityCommand(FlatVelocityCommand):
         command[restricted, 1:] = 0
         stops = (values[:, 3] < 0.1) & ~restricted
         command[stops] = 0
+        pivots = (
+            (values[:, 3] >= 0.1)
+            & (values[:, 3] < 0.1 + self.pivot_fraction)
+            & ~restricted
+        )
+        yaw_draw = values[pivots, 2]
+        command[pivots, :2] = 0
+        command[pivots, 2] = torch.where(
+            yaw_draw < 0.5,
+            -0.3 - 0.4 * yaw_draw,
+            0.3 + 0.4 * (yaw_draw - 0.5),
+        )
         self.vel_command_b[env_ids] = command
         self.is_heading_env[env_ids] = False
         self.is_standing_env[env_ids] = stops
         self.sampling_report["samples"] += len(env_ids)
         self.sampling_report["stops"] += int(stops.sum())
         self.sampling_report["restricted_samples"] += int(restricted.sum())
+        self.sampling_report["pivots"] += int(pivots.sum())
 
 
 class OperatorVelocityCommand(UniformVelocityCommand):

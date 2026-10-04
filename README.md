@@ -69,9 +69,11 @@ Checkpoint and actor outputs refuse to overwrite existing files.
 
 `task.terrain="rough"` uses Isaac Lab's Go2 rough terrain: stairs in both
 directions, slopes in both directions, boxes and uneven ground. It adds plane
-columns for 20% flat practice. Defaults are ten difficulty rows over `(0, 1)`;
-robots start on row zero and the upstream distance curriculum moves them between
-levels after episodes. Stairs, boxes and slopes grow harder with row difficulty;
+columns for 20% flat practice. Defaults are ten difficulty rows over `(0, 1)` and
+initial row zero. The recorded native training run actually began on row one,
+consistent with curriculum processing during the initial reset; that initialization
+mismatch remains to be corrected. Playback starts on row zero. The upstream
+distance curriculum moves robots between levels. Stairs, boxes and slopes grow harder with row difficulty;
 the stock uneven-ground noise stays fixed. Flat practice provides training
 coverage; the separate flat bank still measures retention.
 
@@ -92,7 +94,20 @@ distinct from the underlying carrier incline. These training distributions use
 the assigned tile, rather than measurements of the robot's current surface. External playback
 commands bypass this sampler.
 
-When transferring a flat checkpoint, supply the terrain settings explicitly;
+`task.rough_pivot_fraction` optionally replaces part of the moderate-terrain
+mixed draws with exact turns in place. It defaults to `0.0`, preserving the
+original distribution. At `0.2`, eligible draws are 10% stops, 20% pure pivots
+and 70% mixed twists; pivots use both yaw signs with magnitude 0.3–0.5 rad/s.
+Restricted forward-only assignments and the four-second interval are unchanged.
+This setting is used only by the rough training sampler. Its `pivots` count is
+included in the existing command-sampling report; external playback remains
+independent of the training mixture.
+
+Training starts from fresh initialization or this project's own checkpoint
+lineage. Never initialize or continue training from another project's checkpoint;
+external checkpoints may be used for frozen evaluation references only.
+
+When transferring our own flat checkpoint, supply the terrain settings explicitly;
 unspecified fields retain the checkpoint's configuration:
 
 ```json
@@ -104,8 +119,15 @@ The upstream curriculum uses travel distance and the final command as a progress
 proxy; it does not certify tracking or traversal, particularly during stops and
 turns. `metrics.jsonl` records the number of environments at each terrain level;
 the final report includes command sampling counts. Playback freezes level changes.
-Native rough-mode behavior remains to be validated; this training layout is
-separate from connected-world qualification.
+The native `fresh_flat_rough_oLzXNt` comparison completed 20k fresh flat updates
+and 20k rough updates. First-episode rough physical failures fell from 63/160 to
+5/160, but flat forward passes fell from 98/100 to 40/100 and pivot-left from
+84/100 to 0/100. Matched posture penalties of −0.1 and −0.2 reduce rough physical
+failures to zero and improve flat forward passes to 66/100 and 76/100, but pivots
+pass only 0/100 and 4/100. Posture and terrain progress improve while turning in
+place remains unresolved. Explicit pivot practice is the next unrun comparison;
+the recipe is not a validated default. This training layout remains separate
+from connected-world qualification.
 
 ### Simulation timing candidate
 
