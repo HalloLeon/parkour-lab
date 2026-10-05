@@ -148,6 +148,7 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
     contact_trace, force_trace, reset_trace = [], [], []
     noise_trace = []
     motion_trace = []
+    estimate_trace, linear_velocity_trace = [], []
     previous_capture = env.capture_motion
     previous_diagnostics = env.capture_diagnostics
     metrics = TransitionMetrics(env)
@@ -167,12 +168,16 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
                 command, dtype=torch.float32, device=env.device
             ).expand(env.num_envs, 3)
             robot = env.scene["robot"].data
+            linear_velocity = robot.root_lin_vel_b.clone()
             actual = torch.cat(
-                (robot.root_lin_vel_b[:, :2], robot.root_ang_vel_b[:, 2:3]), dim=-1
+                (linear_velocity[:, :2], robot.root_ang_vel_b[:, 2:3]), dim=-1
             )
             if not torch.isfinite(actual).all():
                 raise RuntimeError("Nonfinite tracking measurement")
             targets = host.act(applied, time_s=step * env.step_dt, reset_mask=reset)
+            estimate = getattr(controller, "last_estimate", None)
+            if estimate is not None:
+                estimate = estimate[:, :3].detach().cpu().numpy().copy()
             if host.last_sensor_noise is not None:
                 noise_trace.append(host.last_sensor_noise.cpu().numpy())
             contact_sample = None
@@ -214,6 +219,8 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
             timeout_count += int((timed_out & ~terminated).sum())
             reset = terminated | timed_out
             trace.append(actual.cpu().numpy())
+            estimate_trace.append(estimate)
+            linear_velocity_trace.append(linear_velocity.cpu().numpy())
             if contact_sample is not None:
                 contact_trace.append(contact_sample[0])
                 force_trace.append(contact_sample[1])
@@ -280,6 +287,18 @@ def evaluate(env, app, loaded, commands, output, report, *, profile=None):
                     foot_contacts=np.stack(contact_trace),
                     foot_net_forces_w=np.stack(force_trace),
                     reset_mask=np.stack(reset_trace),
+                )
+            if any(value is not None for value in estimate_trace):
+                sensors.update(
+                    estimated_linear_velocity_b=np.stack(
+                        [
+                            value
+                            if value is not None
+                            else np.full_like(linear_velocity_trace[0], np.nan)
+                            for value in estimate_trace
+                        ]
+                    ),
+                    root_com_linear_velocity_b=np.stack(linear_velocity_trace),
                 )
             np.savez_compressed(
                 Path(output) / "tracking.npz",

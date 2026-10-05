@@ -249,6 +249,13 @@ contact force, with initial pose anchors, environment origins, commands and nati
 ending flags. It is evaluator-only truth. Existing `tracking.npz` keeps its
 pre-action tracking/contact semantics. Motion capture is disabled during training.
 
+For ROA, `tracking.npz` also records `estimated_linear_velocity_b` and
+`root_com_linear_velocity_b`: aligned body-frame COM velocity estimate and truth
+in m/s, shaped `(control, environment, 3)` with components `(vx, vy, vz)`.
+The estimate is the one used to choose that control's action; truth is sampled
+before the physics step and is never supplied to the actor. The existing
+`root_com_velocity` field remains `(vx, vy, yaw_rate)`.
+
 `--profile` is a diagnostic using the configured batch and seed. For a frozen
 development group, use `--bank-profile NAME` instead. It fixes 100 independent
 attempt IDs: 50 nominal and 50 randomized, with stratified world headings in each
