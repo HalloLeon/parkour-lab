@@ -131,6 +131,11 @@ class Learner:
     def load_state_dict(self, state):
         self.method.load_state_dict(state)
 
+    def diagnostics(self, output, report):
+        from .diagnostics import NumericalCapture
+
+        return NumericalCapture(output, self.method, report)
+
 
 def _validate(state, kind, options, updates):
     import torch

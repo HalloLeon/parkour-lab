@@ -72,6 +72,7 @@ class ROATrainingMethod:
         self.updates = 0
         self.adaptation_optimizer_steps = 0
         self._advance_in_progress = False
+        self.diagnostic = None
         self.history_options = {
             "history_steps": history_steps,
             "epochs": adaptation_epochs,
@@ -126,7 +127,9 @@ class ROATrainingMethod:
         observations = self.collect(
             environment, observations, before_step=before_step, after_step=after_step
         )
-        losses = self.update(observations, observer=observer)
+        losses = self.update(
+            observations, observer=self.diagnostic if observer is None else observer
+        )
         if state_sha256(self.policy.actor.estimator) != estimator_before:
             raise RuntimeError("ROA PPO changed the frozen history estimator")
         if (
@@ -174,9 +177,13 @@ class ROATrainingMethod:
                 if after_step is not None
                 else None
             )
-            observations, reward, done, extras = environment.step(
-                action, algorithm.phase + "_ppo"
-            )
+            phase = algorithm.phase + "_ppo"
+            if self.diagnostic is None:
+                observations, reward, done, extras = environment.step(action, phase)
+            else:
+                observations, reward, done, extras = self.diagnostic.step(
+                    environment, observations, action, phase
+                )
             if after_step is not None:
                 after_step(done, command)
             algorithm.process_env_step(observations, reward, done.long(), extras)
@@ -198,6 +205,7 @@ class ROATrainingMethod:
             record,
             report,
             **self.history_options,
+            diagnostic=self.diagnostic,
             **options,
         )
 
@@ -268,6 +276,7 @@ def adapt_history(
     minibatches,
     observe=None,
     after_step=None,
+    diagnostic=None,
 ):
     """Collect with fixed causal weights, then fit only the history estimator."""
     actor, env = policy.actor, host.env
@@ -304,7 +313,12 @@ def adapt_history(
             samples.append(sample)
             action = actor.history_action(obs["policy"], frames(obs))
             command = obs["policy"][:, 6:9].clone() if after_step is not None else None
-            obs, _, done, _ = host.step(action, "history_adaptation")
+            if diagnostic is None:
+                obs, _, done, _ = host.step(action, "history_adaptation")
+            else:
+                obs, _, done, _ = diagnostic.step(
+                    host, obs, action, "history_adaptation"
+                )
             if after_step is not None:
                 after_step(done, command)
     record["estimator_unchanged_during_history_collection"] = (

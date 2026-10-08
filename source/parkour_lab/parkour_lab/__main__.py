@@ -34,6 +34,11 @@ def parse_args(argv=None):
         )
         if name == "train":
             command.add_argument(
+                "--diagnose-training",
+                action="store_true",
+                help="Capture the first extreme ROA action and any training exception; learning is unchanged",
+            )
+            command.add_argument(
                 "--updates",
                 type=int,
                 help="Additional method-owned collection/update cycles; not equal compute or a time guarantee",
@@ -165,6 +170,8 @@ def resolve_config(args):
             "task": {**values.get("task", {}), **supplied.get("task", {})},
         }
     config = ExperimentConfig.from_dict(values)
+    if getattr(args, "diagnose_training", False) and config.method.name != "roa":
+        raise ValueError("--diagnose-training currently captures the ROA learning path")
     if (
         artifact_physics_hz is not None
         and config.task.physics_hz != artifact_physics_hz
@@ -386,7 +393,10 @@ def main(argv=None, *, standalone=False):
         if args.operation == "train":
             from parkour_lab.experiment import train
 
-            train(env, app, config, output, report, checkpoint=args.checkpoint)
+            train(
+                env, app, config, output, report, checkpoint=args.checkpoint,
+                diagnose_training=args.diagnose_training,
+            )
         else:
             from parkour_lab.artifacts import load_actor, file_sha256
             from parkour_lab.evaluation.runner import evaluate

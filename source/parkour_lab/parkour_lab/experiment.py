@@ -4,13 +4,14 @@ The host manages run lifecycle; each method owns learning and persistence.
 """
 
 import json
-from pathlib import Path
 import time
+from contextlib import ExitStack
+from pathlib import Path
 
 from parkour_lab.provenance import write_json
 
 
-def train(env, app, config, output, report, *, checkpoint=None):
+def train(env, app, config, output, report, *, checkpoint=None, diagnose_training=False):
     from parkour_lab.artifacts import file_sha256, load_artifact, save_artifact
     from parkour_lab.config import ExperimentConfig
     from parkour_lab.methods import get_backend
@@ -78,7 +79,9 @@ def train(env, app, config, output, report, *, checkpoint=None):
     ]["sha256"]
     started = time.monotonic()
     write_json(Path(output) / "report.json", report)
-    with (Path(output) / "metrics.jsonl").open("x") as stream:
+    with ExitStack() as stack, (Path(output) / "metrics.jsonl").open("x") as stream:
+        if diagnose_training:
+            stack.enter_context(method.diagnostics(output, report))
         for index in range(config.updates):
             metrics = dict(method.advance())
             metrics.update(
