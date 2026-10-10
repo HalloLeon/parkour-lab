@@ -80,9 +80,7 @@ class TaskConfig:
             or not math.isfinite(self.rough_pivot_fraction)
             or not 0 <= self.rough_pivot_fraction <= 0.9
         ):
-            raise ValueError(
-                "rough_pivot_fraction must be finite in [0, 0.9]"
-            )
+            raise ValueError("rough_pivot_fraction must be finite in [0, 0.9]")
         if type(self.physics_hz) is not int or self.physics_hz not in (200, 400):
             raise ValueError("physics_hz must be the integer 200 or 400")
         if (
@@ -188,6 +186,7 @@ class ExperimentConfig:
     method: MethodConfig = field(default_factory=MethodConfig)
     updates: int = 1000
     save_interval: int = 100
+    action_mode: str = "unbounded"
 
     def __post_init__(self):
         if not isinstance(self.task, TaskConfig) or not isinstance(
@@ -196,6 +195,8 @@ class ExperimentConfig:
             raise ValueError("Require typed task and method settings")
         positive(self.updates, "updates", integer=True)
         positive(self.save_interval, "save_interval", integer=True)
+        if self.action_mode not in ("unbounded", "joint_limits_v1"):
+            raise ValueError("Unknown action_mode")
 
     def validate_training(self):
         from parkour_lab.methods import get_backend

@@ -23,6 +23,7 @@ exact-wheel admission gate. Select the device explicitly.
 | --- | --- |
 | `python -m parkour_lab train` | Train the configured method; optionally continue a current learning snapshot |
 | `python -m parkour_lab export CHECKPOINT ACTOR` | Export only the method's causal inference state |
+| `python -m parkour_lab bound-actions CHECKPOINT COPY --report REPORT` | Copy a learner with explicit joint-target bounds derived from native readback; preserve its learning payload |
 | `python -m parkour_lab evaluate ACTOR` | Frozen headless command playback and diagnostic tracking |
 | `python -m parkour_lab play ACTOR` | The same playback with a visible simulator, one environment by default |
 | `python -m parkour_lab analyze RUN` | Print a run's result; `--flat-bank` aggregates development groups; `--terrain` scores one saved connected-world attempt |
@@ -64,6 +65,34 @@ while retaining its method/options. Explicit conflicting method settings are rej
 the report and dependency identity always describe the method actually executed.
 All commands create separate run directories under `--output-parent`.
 Checkpoint and actor outputs refuse to overwrite existing files.
+
+### Bounded action delivery
+
+`action_mode="joint_limits_v1"` bounds targets to the robot's existing 90% soft
+joint range. Training and frozen inference share this transform. The native
+action buffer, previous-action observations and action-rate reward all use the
+delivered encoding; PPO keeps its original Gaussian samples and likelihoods.
+This prevents extreme requests from becoming enormous targets and action-rate
+penalties. It does not prove that the policy's raw outputs or gait are healthy.
+
+Existing artifacts retain their unbounded behavior. To revise one explicitly:
+
+```bash
+python -m parkour_lab bound-actions checkpoint.plab bounded_learner.plab --report training/report.json
+python -m parkour_lab export bounded_learner.plab bounded_actor.plab
+```
+
+The conversion preserves the learning payload byte for byte, including optimizer
+state and update counters, and records source/report hashes in its JSON receipt.
+Its new motor contract stores the target limits; startup compares them with the
+native soft limits. Evaluate the frozen actor before continuing from the revised
+learner. Action mode cannot be silently overridden through evaluation or resume
+configuration. Reports include raw-request maxima and saturation counts under
+`motor_delivery.action_boundary`.
+
+ROA gradient clipping accumulates norms in float64 so large finite float32
+gradients can be clipped without a false infinite norm. The clipping limit and
+rejection of genuinely nonfinite gradients remain unchanged.
 
 ### Progressive rough-terrain training
 
@@ -523,7 +552,7 @@ older runs into matched reward comparisons.
 ## Default ROA recipe
 
 The causal frame has 49 values: angular velocity, projected gravity, applied
-command, relative joint positions, joint velocities, previous raw action, then
+command, relative joint positions, joint velocities, previous delivered action, then
 four binary foot contacts in **FR, FL, RR, RL** order. Each flag is
 `norm(net_forces_w[foot]) > 1.5 N`, using the latest completed physics sample
 (200 Hz default, 400 Hz candidate)
@@ -544,7 +573,7 @@ forces are diagnostics, not student inputs.
 | Latents/supervision | Eight-dimensional dynamics latent, separately directed unsquared L2 alignment, plus supervised three-dimensional COM-velocity estimation |
 | Networks | Motor ELU MLP 128/128/128 with additive latent projection; estimator 128/64; asymmetric terrain-conditioned critic |
 | Exploration | Learned action standard deviation initialized at 1.0; entropy coefficient 0.01, no minimum-std clamp |
-| Control | Stock Go2 motors; `q_target = default_q + 0.25 * raw_action`, no action clipping; 50 Hz control, 200 Hz default / 400 Hz candidate physics |
+| Control | Stock Go2 motors; `q_target = default_q + 0.25 * delivered_action`; default/old artifacts are unbounded, explicit `joint_limits_v1` revisions bound delivery; 50 Hz control, 200 Hz default / 400 Hz candidate physics |
 
 The regularization endpoints follow the **non-resume branch**, not the enabled
 resume branch, of the [pinned author configuration](https://github.com/MarkFzp/Deep-Whole-Body-Control/blob/8159e4ed8695b2d3f62a40d2ab8d88205ac5021a/legged_gym/legged_gym/envs/widowGo1/widowGo1_config.py).

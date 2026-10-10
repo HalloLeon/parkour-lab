@@ -9,6 +9,7 @@ import math
 import struct
 
 VERSION = "native_operator_motor_contract_v2"
+BOUNDED_VERSION = "native_operator_motor_contract_v3"
 RANDOMIZATION_RANGES = {
     name: [0.9, 1.1] for name in ("stiffness", "damping", "motor_strength")
 }
@@ -185,30 +186,55 @@ def _source_hash(profile):
     return digest
 
 
-def make_motor_contract(binding, actuator_profile):
+def make_motor_contract(binding, actuator_profile, *, target_limits_rad=None):
     if nominal_binding_sha256(binding) != _source_hash(actuator_profile):
         raise ValueError("Source motor binding does not match the checkpoint")
     compact, count = _collapse(binding)
-    return {"version": VERSION, "source_num_envs": count, "binding": compact}
+    contract = {"version": VERSION, "source_num_envs": count, "binding": compact}
+    if target_limits_rad is not None:
+        contract.update(
+            version=BOUNDED_VERSION, target_limits_rad=copy.deepcopy(target_limits_rad)
+        )
+    return contract
 
 
 def validate_motor_contract(contract, manifest):
     """Verify the nominal identity; sampled dynamics are runtime evidence only."""
     try:
+        bounded = (
+            isinstance(contract, dict) and contract.get("version") == BOUNDED_VERSION
+        )
         if type(contract) is not dict or set(contract) != {
             "version",
             "source_num_envs",
             "binding",
-        }:
+        } | ({"target_limits_rad"} if bounded else set()):
             raise ValueError("Invalid motor contract schema")
         count = contract["source_num_envs"]
         if (
-            contract["version"] != VERSION
+            contract["version"] not in (VERSION, BOUNDED_VERSION)
             or type(count) is not int
             or not 1 <= count <= 5120
         ):
             raise ValueError("Invalid motor contract version or source batch size")
         compact, rows = _collapse(contract["binding"])
+        clip = manifest["configuration"].get("action_clip")
+        if bounded:
+            limits = contract["target_limits_rad"]
+            if type(limits) is not list or len(limits) != 12:
+                raise ValueError("Require twelve joint target limits")
+            for pair, default in zip(
+                limits, compact["default_position_rad"], strict=True
+            ):
+                _numbers(pair, 2)
+                if not pair[0] < pair[1] or not pair[0] <= default <= pair[1]:
+                    raise ValueError(
+                        "Joint target limits must contain the default pose"
+                    )
+            if clip != {"version": "joint_limits_v1", "target_limits_rad": limits}:
+                raise ValueError("Actor action boundary differs from motor contract")
+        elif clip is not None:
+            raise ValueError("Unbounded motor contract cannot declare action clipping")
         if rows != 1 or (
             compact["joint_names"] != manifest["joint_names"]
             or compact["default_position_rad"]
@@ -232,11 +258,19 @@ def verify_runtime_motor(contract, manifest, runtime_binding):
     if _encoded(actual) != _encoded(expected):
         raise ValueError("Runtime motor contract differs from the exported actor")
     return {
-        "version": VERSION,
+        "version": contract["version"],
         "source_motor_binding_sha256": _source_hash(manifest["actuator_profile"]),
         "runtime_motor_binding_sha256": binding_sha256(runtime_binding),
         "portable_motor_sha256": binding_sha256(
-            {"version": VERSION, "binding": expected}
+            {
+                "version": contract["version"],
+                "binding": expected,
+                **(
+                    {"target_limits_rad": contract["target_limits_rad"]}
+                    if "target_limits_rad" in contract
+                    else {}
+                ),
+            }
         ),
         "source_num_envs": contract["source_num_envs"],
         "runtime_num_envs": count,

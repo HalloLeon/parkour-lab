@@ -88,6 +88,15 @@ def parse_args(argv=None):
         choices=(200, 400),
         help="Explicit new actor physics binding; unchanged weights need native revalidation (default: retain source)",
     )
+    bounded = commands.add_parser("bound-actions")
+    bounded.add_argument("checkpoint", type=Path)
+    bounded.add_argument("destination", type=Path)
+    bounded.add_argument(
+        "--report",
+        type=Path,
+        required=True,
+        help="Native training report containing joint-limit readback; copies learning payload unchanged",
+    )
     analyze = commands.add_parser("analyze")
     analyze.add_argument("run", type=Path)
     analysis_kind = analyze.add_mutually_exclusive_group()
@@ -150,6 +159,7 @@ def resolve_config(args):
     artifact = getattr(args, "checkpoint", None) or getattr(args, "actor", None)
     values = {}
     artifact_physics_hz = None
+    artifact_action_mode = None
     if artifact is not None:
         from parkour_lab.artifacts import load_artifact
 
@@ -157,6 +167,7 @@ def resolve_config(args):
             artifact, kind="training" if args.operation == "train" else "actor"
         )["config"]
         artifact_physics_hz = ExperimentConfig.from_dict(values).task.physics_hz
+        artifact_action_mode = ExperimentConfig.from_dict(values).action_mode
     if args.config is not None:
         supplied = json.loads(args.config.read_text())
         explicit = ExperimentConfig.from_dict(supplied)
@@ -170,6 +181,8 @@ def resolve_config(args):
             "task": {**values.get("task", {}), **supplied.get("task", {})},
         }
     config = ExperimentConfig.from_dict(values)
+    if artifact_action_mode is not None and config.action_mode != artifact_action_mode:
+        raise ValueError("Artifact action mode cannot be overridden; use bound-actions")
     if getattr(args, "diagnose_training", False) and config.method.name != "roa":
         raise ValueError("--diagnose-training currently captures the ROA learning path")
     if (
@@ -255,6 +268,16 @@ def resolve_config(args):
 def main(argv=None, *, standalone=False):
     """Run a command; only the standalone native CLI owns process termination."""
     args = parse_args(argv)
+    if args.operation == "bound-actions":
+        from parkour_lab.artifacts import bound_actions
+
+        print(
+            json.dumps(
+                bound_actions(args.checkpoint, args.destination, report=args.report),
+                indent=2,
+            )
+        )
+        return 0
     if args.operation == "analyze":
         if args.terrain:
             from parkour_lab.evaluation.runner import analyze_terrain_attempt
@@ -394,7 +417,12 @@ def main(argv=None, *, standalone=False):
             from parkour_lab.experiment import train
 
             train(
-                env, app, config, output, report, checkpoint=args.checkpoint,
+                env,
+                app,
+                config,
+                output,
+                report,
+                checkpoint=args.checkpoint,
                 diagnose_training=args.diagnose_training,
             )
         else:

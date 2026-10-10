@@ -16,6 +16,11 @@ import torch
 from torch import nn
 
 from parkour_lab.control.controller import ControllerSpec, JointTargets, finite_tensor
+from parkour_lab.control.action import (
+    BOUNDED_MODE,
+    BOUNDED_RAW_ACTION_MEANING,
+    JointActionTransform,
+)
 from parkour_lab.control.proprioception import (
     CONTACT_SLICE,
     CONTACT_THRESHOLD_N,
@@ -122,6 +127,7 @@ class ROAHistoryController:
         default_position_rad,
         artifact_sha256,
         actuator_profile,
+        target_limits_rad=None,
     ):
         _validate_modules(motor, estimator)
         if (
@@ -148,22 +154,40 @@ class ROAHistoryController:
         self.motor = copy.deepcopy(motor).eval().requires_grad_(False)
         self.estimator = copy.deepcopy(estimator).eval().requires_grad_(False)
         self.default_position_rad = default_position_rad.detach().clone()
+        self.action_transform = JointActionTransform(
+            self.default_position_rad, target_limits_rad
+        )
         self._history = CausalHistory()
         self._reset_mask = None
         self._last_estimate = None
         self.spec = ControllerSpec(
             name="roa_operator_causal_history",
             artifact_sha256=artifact_sha256,
-            preprocessing_version=PREPROCESSING_VERSION,
+            preprocessing_version=(
+                PREPROCESSING_VERSION
+                if target_limits_rad is None
+                else PREPROCESSING_VERSION + "_bounded_targets_v1"
+            ),
             joint_names=tuple(joint_names),
             period_s=0.02,
             actuator_profile=actuator_profile,
             sensors=proprioceptive_sensor_specs(),
-            raw_action_meaning=RAW_ACTION_MEANING,
+            raw_action_meaning=(
+                RAW_ACTION_MEANING
+                if target_limits_rad is None
+                else BOUNDED_RAW_ACTION_MEANING
+            ),
             configuration={
                 "default_position_rad": default_position_rad.tolist(),
                 "action_scale": 0.25,
-                "action_clip": None,
+                "action_clip": (
+                    None
+                    if target_limits_rad is None
+                    else {
+                        "version": BOUNDED_MODE,
+                        "target_limits_rad": target_limits_rad,
+                    }
+                ),
                 "frame_dim": FRAME_DIM,
                 "history_length": HISTORY_LENGTH,
                 "history_order": "oldest to newest; includes current delivered frame",
@@ -267,7 +291,7 @@ class ROAHistoryController:
         )
         history = self._history.push(frame, self._reset_mask)
         action, self._last_estimate = self.infer(frame, history)
-        position = self.default_position_rad + 0.25 * action
+        _, position = self.action_transform(action)
         finite_tensor(position, (batch, 12), self.default_position_rad)
         self._reset_mask = None
         return JointTargets(self.spec.joint_names, position, action)

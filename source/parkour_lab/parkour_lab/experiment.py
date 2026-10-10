@@ -11,14 +11,16 @@ from pathlib import Path
 from parkour_lab.provenance import write_json
 
 
-def train(env, app, config, output, report, *, checkpoint=None, diagnose_training=False):
+def train(
+    env, app, config, output, report, *, checkpoint=None, diagnose_training=False
+):
     from parkour_lab.artifacts import file_sha256, load_artifact, save_artifact
     from parkour_lab.config import ExperimentConfig
     from parkour_lab.methods import get_backend
     from parkour_lab.runtime.training import TrainingHost
 
     config.validate_training()
-    host = TrainingHost(env, app)
+    host = TrainingHost(env, app, action_mode=config.action_mode)
     backend = get_backend(config.method.name)
     method = backend.create(host, config.method.options, config.task.seed)
     if getattr(env, "parkour_randomization", None) is not None:
@@ -41,6 +43,13 @@ def train(env, app, config, output, report, *, checkpoint=None, diagnose_trainin
         previous = load_artifact(checkpoint, kind="training")
         if ExperimentConfig.from_dict(previous["config"]).method != config.method:
             raise ValueError("Continuing learning requires unchanged method settings")
+        if (
+            ExperimentConfig.from_dict(previous["config"]).action_mode
+            != config.action_mode
+        ):
+            raise ValueError(
+                "Change action semantics with bound-actions before continuation"
+            )
         from parkour_lab.runtime.motor import NativeJointTargetBridge
 
         NativeJointTargetBridge(

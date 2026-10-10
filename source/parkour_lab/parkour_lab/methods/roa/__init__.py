@@ -298,6 +298,9 @@ def controller(state, options, manifest, device):
         ),
         artifact_sha256=roa_tensor_sha256(motor, estimator),
         actuator_profile=manifest["actuator_profile"],
+        target_limits_rad=(manifest["configuration"].get("action_clip") or {}).get(
+            "target_limits_rad"
+        ),
     )
 
 

@@ -3,6 +3,7 @@
 import torch
 
 from parkour_lab.control.controller import JointTargets
+from parkour_lab.control.action import BOUNDED_MODE, BOUNDED_RAW_ACTION_MEANING
 from parkour_lab.control.motor_contract import make_motor_contract
 from parkour_lab.control.proprioception import ACTION_SLICE, CONTACT_SLICE, FRAME_DIM
 from parkour_lab.runtime.motor import (
@@ -22,9 +23,19 @@ class TrainingHost:
     Final rows stay clean for critic-only bootstrap; they are not actor decisions.
     """
 
-    def __init__(self, env, app):
+    def __init__(self, env, app, *, action_mode="unbounded"):
         self.env, self.app = env, app
         binding, digest = _runtime_motor_binding(env)
+        limits = None
+        if action_mode == BOUNDED_MODE:
+            native_limits = env.scene["robot"].data.soft_joint_pos_limits
+            if not torch.equal(
+                native_limits, native_limits[0].expand_as(native_limits)
+            ):
+                raise ValueError("Require shared native joint target limits")
+            limits = native_limits[0].cpu().tolist()
+        elif action_mode != "unbounded":
+            raise ValueError("Unknown action mode")
         self.manifest = {
             "joint_names": binding["joint_names"],
             "period_s": 0.02,
@@ -32,8 +43,14 @@ class TrainingHost:
             "actuator_profile": "native_motor_sha256:" + digest,
             "raw_action_meaning": NATIVE_RAW_ACTION_MEANING,
         }
+        if limits is not None:
+            self.manifest["configuration"]["action_clip"] = {
+                "version": BOUNDED_MODE,
+                "target_limits_rad": limits,
+            }
+            self.manifest["raw_action_meaning"] = BOUNDED_RAW_ACTION_MEANING
         self.motor_contract = make_motor_contract(
-            binding, self.manifest["actuator_profile"]
+            binding, self.manifest["actuator_profile"], target_limits_rad=limits
         )
         self.bridge = NativeJointTargetBridge(
             env, self.motor_contract, self.manifest, preserve_native_raw=True
@@ -121,8 +138,9 @@ class TrainingHost:
             raise RuntimeError("Simulation application stopped during training")
         raw = raw.detach().clone()
         command = self.env.command_manager.get_command("base_velocity").clone()
+        _, target = self.bridge.action_transform(raw)
         delivered = self.bridge.encode(
-            JointTargets(self.bridge.joint_names, self.bridge.default + 0.25 * raw, raw)
+            JointTargets(self.bridge.joint_names, target, raw)
         )
         with torch.no_grad():
             native, reward, terminated, truncated, extras = self.env.step(delivered)

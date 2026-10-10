@@ -292,7 +292,9 @@ def state_sha256(module):
 def gradient_norms(actor):
     def norm(parameters):
         values = [
-            p.grad.detach().square().sum() for p in parameters if p.grad is not None
+            p.grad.detach().double().square().sum()
+            for p in parameters
+            if p.grad is not None
         ]
         return float(torch.stack(values).sum().sqrt()) if values else None
 

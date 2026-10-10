@@ -22,7 +22,10 @@ TERMS = {
     "ang_vel_xy_l2": (-0.05, "sum(root_angular_velocity_b_xy^2)"),
     "dof_torques_l2": (-0.0002, "sum(applied_joint_torque^2)"),
     "dof_acc_l2": (-2.5e-7, "sum(joint_acceleration^2)"),
-    "action_rate_l2": (-0.01, "sum((raw_action - previous_raw_action)^2)"),
+    "action_rate_l2": (
+        -0.01,
+        "sum((delivered_native_action - previous_delivered_native_action)^2)",
+    ),
     "feet_air_time": (
         0.01,
         "sum((last_air_time_s - threshold) * first_contact) * (norm(command_xy) > 0.1)",

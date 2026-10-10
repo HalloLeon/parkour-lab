@@ -15,6 +15,7 @@ from zipfile import ZipFile
 
 from parkour_lab.config import ExperimentConfig
 from parkour_lab.control.motor_contract import (
+    BOUNDED_VERSION,
     nominal_binding_sha256,
     validate_motor_contract,
 )
@@ -48,6 +49,10 @@ def _validate(metadata, kind):
     binding = validate_motor_contract(
         metadata["motor_contract"], metadata["motor_manifest"]
     )
+    if (metadata["motor_contract"]["version"] == BOUNDED_VERSION) != (
+        config.action_mode == "joint_limits_v1"
+    ):
+        raise ValueError("Artifact action mode disagrees with motor contract")
     if (binding["physics_dt_s"], binding["decimation"]) != (
         1 / config.task.physics_hz,
         config.task.physics_hz // 50,
@@ -74,12 +79,83 @@ def save_artifact(
     _validate(metadata, kind)
     if kind == "actor":
         _controller({**metadata, "state": state})
+    _write_artifact(path, metadata, payload)
+
+
+def _write_artifact(path, metadata, payload):
     buffer = io.BytesIO()
     with ZipFile(buffer, "w") as archive:
         archive.writestr("metadata.json", json.dumps(metadata, allow_nan=False))
         archive.writestr("payload", payload)
     with Path(path).open("xb") as stream:
         stream.write(buffer.getvalue())
+
+
+def bound_actions(checkpoint, destination, *, report):
+    """Copy a learner with explicit bounded semantics and byte-identical payload.
+
+    The report provides actual native joint limits; the new runtime must match
+    their 90% soft interval. No network, optimizer, reward or counter is changed.
+    """
+    import torch
+    from parkour_lab.control.action import BOUNDED_MODE, BOUNDED_RAW_ACTION_MEANING
+
+    data = load_artifact(checkpoint, kind="training")
+    config = ExperimentConfig.from_dict(data["config"])
+    if config.action_mode != "unbounded":
+        raise ValueError("bound-actions requires an original unbounded checkpoint")
+    realization = json.loads(Path(report).read_text())["task_realization"]
+    binding = data["motor_contract"]["binding"]
+    if realization["joint_names"] != binding["joint_names"]:
+        raise ValueError("Native limit joint order differs from checkpoint")
+    limits = torch.tensor(
+        realization["physical_readback"]["joint_limits"], dtype=torch.float32
+    )
+    if (
+        limits.ndim != 3
+        or limits.shape[1:] != (12, 2)
+        or len(limits) < 1
+        or not torch.isfinite(limits).all()
+        or not torch.equal(limits, limits[0].expand_as(limits))
+        or not (limits[:, :, 0] < limits[:, :, 1]).all()
+    ):
+        raise ValueError("Require shared finite native mechanical joint limits")
+    # Same float32 expression as Isaac Lab's Articulation soft limits, factor 0.9.
+    center = (limits[0, :, 0] + limits[0, :, 1]) / 2
+    half_range = 0.5 * (limits[0, :, 1] - limits[0, :, 0]) * 0.9
+    targets = torch.stack((center - half_range, center + half_range), dim=-1).tolist()
+    metadata = {
+        key: copy.deepcopy(value) for key, value in data.items() if key != "state"
+    }
+    metadata["config"] = replace(config, action_mode=BOUNDED_MODE).to_dict()
+    metadata["motor_contract"].update(
+        version=BOUNDED_VERSION, target_limits_rad=targets
+    )
+    metadata["motor_manifest"]["configuration"]["action_clip"] = {
+        "version": BOUNDED_MODE,
+        "target_limits_rad": targets,
+    }
+    metadata["motor_manifest"]["raw_action_meaning"] = BOUNDED_RAW_ACTION_MEANING
+    if "preprocessing_version" in metadata["motor_manifest"]:
+        metadata["motor_manifest"]["preprocessing_version"] += "_bounded_targets_v1"
+    _validate(metadata, "training")
+    with ZipFile(checkpoint) as archive:
+        payload = archive.read("payload")
+    _write_artifact(destination, metadata, payload)
+    return {
+        "artifact": str(destination),
+        "sha256": file_sha256(destination),
+        "source_checkpoint_sha256": file_sha256(checkpoint),
+        "source_limits_report_sha256": file_sha256(report),
+        "payload_sha256": metadata["payload_sha256"],
+        "learning_payload_unchanged": True,
+        "updates": data["updates"],
+        "action_mode": BOUNDED_MODE,
+        "target_limits_rad": targets,
+        "soft_joint_pos_limit_factor": 0.9,
+        "requires_native_validation": True,
+        "qualified": False,
+    }
 
 
 def load_artifact(path, *, kind):

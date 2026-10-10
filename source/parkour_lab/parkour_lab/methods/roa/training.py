@@ -3,9 +3,9 @@
 import math
 
 import torch
-from torch import nn
 from rsl_rl.algorithms import PPO
 
+from .gradients import clip_grad_norm_
 from .model import (
     FRAME_DIM,
     HISTORY_LENGTH,
@@ -351,7 +351,7 @@ def adapt_history(
             if not torch.isfinite(loss):
                 raise RuntimeError("Nonfinite ROA adaptation loss")
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(trainable, 1.0, error_if_nonfinite=True)
+            clip_grad_norm_(trainable, 1.0)
             optimizer.step()
             report["adaptation_optimizer_steps"] += 1
     with torch.no_grad():
@@ -648,9 +648,7 @@ class ROAPPO(PPO):
                 if value is None or not math.isfinite(value):
                     raise RuntimeError("Missing or nonfinite ROA branch gradient")
                 gradient_max[name + "_max"] = max(gradient_max[name + "_max"], value)
-            nn.utils.clip_grad_norm_(
-                self.ppo_parameters, self.max_grad_norm, error_if_nonfinite=True
-            )
+            clip_grad_norm_(self.ppo_parameters, self.max_grad_norm)
             self.optimizer.step()
             self.check_fixed_action_std()
             if (
