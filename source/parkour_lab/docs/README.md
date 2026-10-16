@@ -1,10 +1,11 @@
 # Parkour Lab
 
-An Isaac Lab / Unitree Go2 locomotion research package with an optional ROA-like
-teacher and causal history student. This page covers installation, package
-responsibilities and verification. The repository [README](../../../README.md)
-contains the command, control and diagnostic reference. Command diagnostics are
-not a standardized benchmark; successful execution does not qualify a robot.
+A learner-independent Isaac Lab / Unitree Go2 task package with blind controller
+inputs and a separate training-information contract. This page covers the public
+task API, installation and verification. The repository [README](../../../README.md)
+contains the retained ROA-like learner and artifact-command reference. Its command
+diagnostics are not a standardized benchmark; successful execution does not
+qualify a robot.
 
 ## Installation
 
@@ -32,12 +33,159 @@ for recorded task metrics. `train --diagnose-training` captures extreme-action
 transitions, subsequent PPO rollouts and exceptions without changing learning.
 These tensor captures omit optimizer and simulator state and cannot resume a run.
 
+## Public task API
+
+`Go2-Flat-v1` is implemented. `Go2-Uneven-v1`, `Go2-Slopes-v1`, `Go2-Stairs-v1`,
+`Go2-Hills-v1` and `Go2-Mixed-v1` are declared definitions that currently raise
+`NotImplementedError`. They are not executable terrain coverage or a calibrated
+benchmark suite.
+
+After starting `AppLauncher`, an independent consuming project can use:
+
+```python
+import torch
+from parkour_lab.benchmark import Go2Config, build_config, make
+
+options = Go2Config(num_envs=4, seed=42, device="cuda:0")
+native_cfg = build_config(options, training=True)
+task = make(native_cfg)
+try:
+    observation, info = task.reset(seed=options.seed)
+    action = torch.zeros(task.num_envs, 12, device=task.device)
+    observation, reward, terminated, truncated, info = task.step(action)
+finally:
+    task.close()
+```
+
+The caller owns the application and closes it after the task. The complete runnable
+[consumer/check script](../../../scripts/check_public_task.py) handles ordered
+environment/application cleanup and standalone native process exit. No
+`MethodBackend`, RSL-RL, learner implementation or `.plab` file is needed.
+
+The common task uses 200 Hz physics, 50 Hz actions, a 20 s episode horizon,
+the native Go2 rough-task reward and stock physical termination rules. Training
+commands come from the common sampler. Flat has no terrain curriculum; continuation
+currently rejects non-null curriculum state. With `training=False`, call
+`task.set_command(command)` after reset with an `(N, 3)` body-twist tensor
+`[vx, vy, yaw_rate]` in m/s, m/s and rad/s. It returns the actor observation with
+that command applied, retaining the existing sensor-noise draw and episode memory.
+
+Actions have shape `(N, 12)` in the published motor joint order. They are encoded,
+unitless raw coordinates, not radians. The native target is
+`default_position + 0.25 * clamped_action`; clamping uses the encoded bounds in
+`single_action_space` to respect the robot's 90% soft joint range. Previous-action
+sensor values use the delivered encoding. `observation_space`/`action_space`
+describe the batch; `single_observation_space`/`single_action_space` describe one
+robot. Tensor conversion, history, replay and optimizers belong to the consumer.
+
+### Actor and training information
+
+Every observation has `actor`, a float32 `(N, 49)` causal frame: angular velocity,
+projected gravity, applied command, relative joint positions, joint velocities,
+previous delivered action and four binary foot contacts in FR, FL, RR, RL order.
+This is blind with idealized contact sensing; it is not strictly IMU/joint-only.
+
+Training additionally exposes `training`, a dictionary with the following fixed
+`go2_training_physics_v1` fields. Shapes exclude the batch; all values are float32
+except the Boolean validity fields. All methods have the same available packet;
+declare the subset used by a critic, teacher or training supervision. Inference
+and its history, estimator or recurrent/world-model state use causal inputs only.
+
+| Field | Shape | Units / meaning |
+| --- | --- | --- |
+| `root_com_linear_velocity_b` | `(3,)` | m/s; root rigid-body COM velocity in root-link axes, not whole-robot COM |
+| `root_angular_velocity_b` | `(3,)` | rad/s; root-link axes |
+| `projected_gravity_b` | `(3,)` | Unit gravity direction in root-link axes |
+| `joint_position_relative_default` | `(12,)` | rad |
+| `joint_velocity` | `(12,)` | rad/s |
+| `foot_net_forces_b` | `(4, 3)` | N; summed normal forces in root-link axes, FR/FL/RR/RL, excluding tangential forces |
+| `foot_force_valid` | `(1,)` | Boolean; false with zero forces before the first post-reset physics sample |
+| `base_mass` | `(1,)` | kg; realized base-link mass |
+| `base_com_offset_b` | `(3,)` | m; COM offset in base-link axes |
+| `material_friction` | `(2,)` | Robot static/dynamic coefficients; not effective contact-pair friction |
+| `joint_stiffness` | `(12,)` | N·m/rad; realized explicit actuator gains |
+| `joint_damping` | `(12,)` | N·m·s/rad; realized explicit actuator gains |
+| `motor_strength` | `(12,)` | Effort multiplier before the motor limiter |
+| `terrain_height` | `(132,)` | m; `clip(root_link_z - 0.3 - hit_z, -0.5, 0.5)` |
+| `terrain_valid` | `(132,)` | Boolean; all coordinates of the ray hit are finite |
+
+The 352 values are clean, detached copies at the current control boundary. Contact
+forces use the latest completed physics sample. Verified startup mass/material/COM
+and motor parameters remain fixed across episode resets. The terrain scan uses
+12 x positions from −0.825 to +0.825 m and 11 y positions from −0.75 to +0.75 m,
+both at 0.15 m spacing, with x varying fastest. It follows root yaw, with x forward
+and y left; rays point vertically downward from a 20 m offset, with 25 m maximum
+range. Missing hits use +0.5 m with validity false; finite clipped hits remain valid.
+`task.metadata["training_information"]` provides exact field order, joint/foot
+names, coordinates and interpretation. The packet contains no global pose, case
+IDs, seeds, future commands, fault schedule or environment handles. Evaluation
+observations and metadata omit the training packet/schema entirely.
+
+### Endings, accounting and continuation
+
+`step` returns the Gym-style five-tuple. Same-step automatic reset supplies the
+next-action reset observation for ending rows. `info` contains only
+`final_env_ids`, `final_observation` and `interactions`. Final observations are
+owned compact outgoing rows, including separately aligned training GT when
+enabled. They cannot be replaced by next-episode GT or successful reset episodes.
+Both ending flags remain available; a physical termination takes precedence over
+a simultaneous timeout when deciding value bootstrapping. Process final states
+with outgoing recurrent memory, then reset memory only for ending rows.
+
+GT never samples actor noise. Causal final observations preview their rows' next
+noise draw without advancing the ordinary observation stream; they remain separate
+from clean GT. Reading or ignoring final observations does not change the sensor
+stream used for subsequent actions.
+
+`interactions` reports session, cumulative and uncertain robot transitions. A
+completed step with 160 replicas charges 160 interactions, including discarded
+or warm-up collection. Explicit episode reset does not refund the total. The
+counter is not a crash-proof journal. `reset(seed=...)` only checks the fixed
+construction seed; it does not reseed the learner's global Torch RNG or rewind
+the task's private sampler streams.
+
+The consuming trainer owns its full checkpoints, including optimizer, replay,
+normalization, memory/RNG and method-specific state. At its checkpoint barrier,
+save `task.progress(run_id=..., checkpoint_id=..., milestones=...)` alongside the
+learner checkpoint it identifies. In a new process, rebuild the identical task,
+restore the learner separately and call `task.restore(record, checkpoint_id=...)`
+before the first explicit reset. Task progress restores accounting and shared
+sampler progress, then starts fresh physical episodes; it is not an exact
+interrupted-trajectory snapshot. To retain later known or conservatively charged
+spend, `charged_interactions` means the latest known **total**, while
+`uncertain_interactions` is an **additional** conservative charge; supply an
+explicit `reason`. Treat recreation as a fresh actor-memory/replay-sequence boundary.
+Rollback must not erase collection. The consumer owns its save cadence;
+the task does not write learner checkpoints or enforce an optimizer schedule.
+
+### Reward customization
+
+Only rewards may be changed in the native configuration; other protocol sections
+remain fixed. Modify a native term's weight/parameters, set weight zero to disable
+its computation, or add a native `RewardTermCfg` with an ordinary callable:
+
+```python
+from isaaclab.managers import RewardTermCfg
+
+def speed_squared(env):
+    return env.scene["robot"].data.root_com_lin_vel_b.square().sum(-1)
+
+native_cfg.rewards.track_ang_vel_z_exp.weight = 1.0
+native_cfg.rewards.extra_speed = RewardTermCfg(func=speed_squared, weight=-0.01)
+```
+
+Apply changes before `make(native_cfg)`. This example defines a custom objective,
+not a recommended baseline. Native rewards sum `weight * term * control_dt`;
+metadata identifies the realized recipe. Custom objectives must be identified
+separately from a common-reward method comparison.
+
 ## Architecture
 
 The environment, inference controller and learner are separate responsibilities.
 
 | Owner | Responsibility |
 | --- | --- |
+| `benchmark/` | Learner-independent task configuration/facade, role-specific observations, fixed GT schema, spaces and checkpoint-linked progress. |
 | `config.py` | Validated task and training settings. |
 | `artifacts.py` | Data-only learning/controller artifacts and motor contracts. |
 | `provenance.py` | Package hashes, source-owned dependency identity and Git evidence. |
@@ -53,6 +201,7 @@ The environment, inference controller and learner are separate responsibilities.
 | `experiment.py` | Training orchestration and learner checkpoint continuation. |
 | `tests/` | Behavioral contracts, package boundaries, CPU learning and analytic geometry checks. |
 | `scripts/smoke_native.py` | Bounded native construction, stepping, final-observation, reset and shutdown checks. |
+| `scripts/check_public_task.py` | Runnable public-task consumer and bounded training/evaluation/continuation contract check. |
 
 `control.Controller` and `runtime.NativeControllerSession` accept a loaded causal
 controller independently of a learner. The CLI artifact workflow uses
@@ -82,6 +231,7 @@ isort --check-only source/parkour_lab tests scripts
 flake8 source/parkour_lab tests scripts
 python -m parkour_lab --help
 python scripts/smoke_native.py --help
+python scripts/check_public_task.py --help
 ```
 
 Formatting tools match `.pre-commit-config.yaml`. Formatting uses 88 columns;
@@ -125,11 +275,13 @@ trips and data-only payload loading.
 ### Native checks
 
 Use the configured Isaac Lab interpreter from the repository root. Activate it or
-export `PLAB_PY` with its Python executable path. Each fresh process creates one
-task, runs 32 zero-action control steps, forces one row to timeout, checks owned
-final observations, resets one row and closes the environment before the
-application. Connected terrain has one replica, so its explicit reset is a full
-single-replica reset. Zero actions check plumbing, not locomotion ability.
+export `PLAB_PY` with its Python executable path. Each invocation below launches a
+fresh process, creates the public Flat task, runs 32 near-default action steps,
+forces row zero to timeout and explicitly resets row zero. It checks physical
+action delivery, role-specific observations, owned final rows and exact
+interaction accounting. Training additionally compares selected GT with direct
+native readbacks captured before reset. Those private host checks never supply
+native handles or truth to the example controller.
 
 ```bash
 bash <<'BASH'
@@ -137,27 +289,39 @@ set -uo pipefail
 PLAB_PY=${PLAB_PY:-python}
 export PYTHONPATH="$PWD/source/parkour_lab${PYTHONPATH:+:$PYTHONPATH}"
 mkdir -p logs/parkour_lab || exit 1
-RUN=$(mktemp -d logs/parkour_lab/native_smoke_XXXXXX) || exit 1
-for terrain in flat rough procedural steps traversal connected; do
-    "$PLAB_PY" -u scripts/smoke_native.py --terrain "$terrain" --device cuda:0 \
-        --output "$RUN/$terrain" > "$RUN/$terrain.log" 2>&1
+RUN=$(mktemp -d logs/parkour_lab/public_task_XXXXXX) || exit 1
+trap 'status=$?; printf "{\"returncode\": %d}\n" "$status" > "$RUN/process_exit.json"; echo "Results: $PWD/$RUN"' EXIT
+run_check() {
+    local name=$1
+    shift
+    "$PLAB_PY" -u scripts/check_public_task.py --device cuda:0 --num-envs 4 \
+        --seed 1077 --output "$RUN/$name" "$@" > "$RUN/$name.log" 2>&1
     code=$?
-    printf '{"returncode": %d}\n' "$code" > "$RUN/${terrain}_process_exit.json"
-    if (( code != 0 )); then
-        echo "Failed: $terrain. Results: $PWD/$RUN"
-        exit "$code"
-    fi
-done
-echo "Results: $PWD/$RUN"
+    printf '{"returncode": %d}\n' "$code" > "$RUN/${name}_process_exit.json"
+    return "$code"
+}
+run_check train --role train || exit "$?"
+run_check eval --role eval || exit "$?"
+run_check resume --role train --resume "$RUN/train/progress.json" \
+    --checkpoint-id no-learner-contract-fixture || exit "$?"
 BASH
 ```
 
-Every process must exit zero and report `SMOKE_PASSED` with both cleanup fields
+The first training and evaluation processes each charge 128 interactions. The
+fresh resumed process restores 128 and finishes at cumulative 256, with session
+128. Its opaque checkpoint token is a contract-test fixture: **no learner model,
+weights or optimizer are loaded or restored**. Real training must link its progress
+record to an actual full learner checkpoint.
+
+Every process must exit zero and report `TASK_CHECK_PASSED` with both cleanup fields
 `complete` in `report.json`. Review `sdk/git/` and dependency records for actual
 native source identity. An incomplete close receipt, missing identity or failed
 assertion leaves native validation incomplete. Without SDK Git metadata, resolve
 the selected source revision/diff separately; source hashes alone do not provide
-that history.
+that history. The retained terrain plumbing helper remains available as
+`scripts/smoke_native.py --terrain flat --device cuda:0 --output NEW_DIRECTORY`
+(also rough, procedural, steps, traversal and connected); it reports `SMOKE_PASSED`
+and checks the retained command workflow separately from the public task API.
 
 Successful smoke checks do not establish traversal, robot stability, benchmark
 scores or equivalence between simulators. Commands not yet run on the server are

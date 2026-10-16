@@ -29,7 +29,13 @@ setup(
     url=EXTENSION_TOML_DATA["package"]["repository"],
     license_files=[],
     python_requires=">=3.10,<3.12",
-    install_requires=["numpy<2", "torch>=2.5", "PyYAML>=6", "trimesh>=4"],
+    install_requires=[
+        "numpy<2",
+        "torch>=2.5",
+        "PyYAML>=6",
+        "trimesh>=4",
+        "gymnasium==1.2.1",
+    ],
     extras_require={"roa": ["rsl-rl-lib==3.1.2", "tensordict"]},
     classifiers=[
         "Programming Language :: Python :: 3.10",

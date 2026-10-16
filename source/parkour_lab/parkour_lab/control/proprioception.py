@@ -9,6 +9,7 @@ ACTION_SLICE = slice(33, 45)
 CONTACT_SLICE = slice(45, 49)
 FOOT_NAMES = ("FR_foot", "FL_foot", "RR_foot", "RL_foot")
 CONTACT_THRESHOLD_N = 1.5
+CAUSAL_NOISE_AMPLITUDES = (0.2,) * 3 + (0.05,) * 3 + (0.01,) * 12 + (1.5,) * 12
 FRAME_TERMS = (
     ("base_ang_vel", 3),
     ("projected_gravity", 3),

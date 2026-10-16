@@ -120,14 +120,60 @@ class RewardConfigurationTests(unittest.TestCase):
             {"name": "contact_forces", "body_names": ".*_foot"},
         )
         self.assertEqual(json.loads(json.dumps(receipt)), receipt)
-        self.assertTrue(
-            all(
-                term["function"] and term["formula"]
-                for term in receipt["terms"].values()
-            )
-        )
+        self.assertTrue(all(term["function"] for term in receipt["terms"].values()))
+        self.assertTrue(receipt["terms"]["joint_posture"]["formula"])
+        # Native configuration doubles have unrelated callable identities.
+        self.assertIsNone(receipt["terms"]["track_lin_vel_xy_exp"]["formula"])
         receipt["terms"]["track_lin_vel_xy_exp"]["params"]["std"] = 99
         self.assertEqual(actual["track_lin_vel_xy_exp"].params["std"], 0.37)
+
+
+class CustomRewardMetadataTests(unittest.TestCase):
+    def test_replacing_known_function_drops_its_original_formula_annotation(self):
+        def replacement(env):
+            return torch.zeros(env.num_envs)
+
+        term = NativeConfig(func=joint_posture, weight=-0.1, params={})
+        manager = NS(active_terms=["joint_posture"], get_term_cfg=lambda name: term)
+        env = NS(reward_manager=manager, step_dt=0.02)
+        original = reward_recipe(env)["terms"]["joint_posture"]
+        self.assertIsNotNone(original["formula"])
+
+        term.func = replacement
+        changed = reward_recipe(env)["terms"]["joint_posture"]
+        self.assertEqual(
+            changed["function"], f"{replacement.__module__}:{replacement.__qualname__}"
+        )
+        self.assertIsNone(changed["formula"])
+        self.assertIsNotNone(original["formula"])
+
+    def test_added_stateful_callable_and_native_selector_parameters_are_json_safe(self):
+        class Reward:
+            def __call__(self, env, **kwargs):
+                return torch.zeros(env.num_envs)
+
+        selector = NativeConfig(
+            "robot", body_names=["base"], body_ids=slice(None), joint_ids=[0, 1]
+        )
+        vector = torch.tensor([1.0, 2.0])
+        params = {"asset_cfg": selector, "vector": vector, "nested": ({"gain": 2},)}
+        term = NativeConfig(func=Reward(), weight=-0.1, params=params)
+        manager = NS(active_terms=["custom"], get_term_cfg=lambda name: term)
+        recipe = reward_recipe(NS(reward_manager=manager, step_dt=0.02))
+        report = recipe["terms"]["custom"]
+        self.assertTrue(report["function"].endswith(".<locals>.Reward"))
+        self.assertIsNone(report["formula"])
+        self.assertEqual(report["params"]["vector"], [1.0, 2.0])
+        self.assertEqual(
+            report["params"]["asset_cfg"]["body_ids"],
+            {"start": None, "stop": None, "step": None},
+        )
+        json.dumps(recipe, allow_nan=False)
+        report["params"]["asset_cfg"]["body_names"].append("other")
+        report["params"]["nested"][0]["gain"] = 99
+        self.assertEqual(selector.body_names, ["base"])
+        self.assertEqual(params["nested"], ({"gain": 2},))
+        torch.testing.assert_close(params["vector"], vector)
 
 
 class JointPostureTests(unittest.TestCase):

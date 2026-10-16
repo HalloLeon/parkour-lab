@@ -12,7 +12,7 @@ from __future__ import annotations
 import copy
 import math
 
-from parkour_lab.config import TaskConfig
+from .task_config import TaskConfig
 
 
 def build_environment_config(task: TaskConfig, *, evaluation: bool = False):

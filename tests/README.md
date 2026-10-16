@@ -6,6 +6,7 @@ Shared fixtures live in `support/`, never in another test module.
 
 | Location | What the checks protect |
 | --- | --- |
+| `benchmark/` | Public task/configuration, permitted actor/GT observations, spaces, real-transition accounting and checkpoint-linked continuation |
 | `control/` | Command leases and tapes, frame ordering, sensor units and motor contracts |
 | `environments/` | Command sampling/reset behavior, owned terminal observations and RNG isolation, reward configuration/formulas and scan preprocessing |
 | `environments/terrains/` | Procedural and connected terrain geometry, traversal fixtures and roughness contracts |
@@ -57,6 +58,14 @@ Most checks use real CPU tensor/mesh code with small native API doubles. Selecte
 adapter tests also load Isaac Lab 2.3.2 source from a sibling `IsaacLab2.3.2` or
 `IsaacLab` checkout. They explicitly skip when that checkout is absent; a skipped
 check is not evidence of compatibility. No test launches Isaac Sim or PhysX.
+
+The public-task checks include real tensor calculations for the fixed 352-value
+GT schema, physical frames, named motor mapping, scan validity, reset masking,
+owned values and unchanged RNG state. Facade/native API doubles establish their
+stated information, action, ending and accounting contracts. The runnable
+`scripts/check_public_task.py` separately checks training, evaluation and a fresh
+task-progress restart on the server. CPU success does not establish actual native
+readback, physical locomotion or learner-checkpoint restoration.
 
 Timing checks cover 200/400 Hz configuration with unchanged 50 Hz actions, the
 SDK's four/eight-substep sampling/reset order, exact cross-rate rejection, and

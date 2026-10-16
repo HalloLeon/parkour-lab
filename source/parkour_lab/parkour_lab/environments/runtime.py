@@ -9,6 +9,8 @@ from isaaclab.envs import ManagerBasedRLEnv
 from isaaclab.managers import ManagerTermBase
 from isaaclab.utils.noise import NoiseCfg
 
+from parkour_lab.runtime.accounting import InteractionCounter
+
 
 class LocomotionEnv(ManagerBasedRLEnv):
     """Same-step autoreset with compact final rows in ``extras``.
@@ -25,7 +27,9 @@ class LocomotionEnv(ManagerBasedRLEnv):
         self._final = None
         self.capture_motion = False
         self.capture_diagnostics = False
+        self.capture_training_information = False
         self._final_physics = None
+        self._final_information = None
         self.transition_counts = dict(
             control_steps=0,
             terminated_rows=0,
@@ -34,6 +38,7 @@ class LocomotionEnv(ManagerBasedRLEnv):
             final_observation_rows=0,
         )
         super().__init__(*args, **kwargs)
+        self.interactions = InteractionCounter(self.num_envs)
         try:
             self._validate_observations()
         except Exception:
@@ -74,6 +79,7 @@ class LocomotionEnv(ManagerBasedRLEnv):
 
     def _reset_idx(self, env_ids):
         if self._capturing:
+            self._sync_interactions()
             self._final_physics = {
                 name: value[env_ids] for name, value in self._capture_physics().items()
             }
@@ -91,14 +97,34 @@ class LocomotionEnv(ManagerBasedRLEnv):
             if any(not torch.isfinite(value).all() for value in final.values()):
                 raise ValueError("Nonfinite pre-reset observation")
             self._final = (env_ids.clone(), final)
+            if self._training_information_enabled():
+                from parkour_lab.benchmark.information import capture_information
+
+                self._final_information = {
+                    name: value[env_ids].detach().clone()
+                    for name, value in capture_information(self).items()
+                }
         super()._reset_idx(env_ids)
+
+    def _training_information_enabled(self):
+        return self.capture_training_information and getattr(
+            self.cfg, "benchmark_training", False
+        )
+
+    def _sync_interactions(self, *, failed=False):
+        self.interactions.sync(
+            self.common_step_counter, self._sim_step_counter, failed=failed
+        )
 
     def step(self, action):
         self._final = None
         self._final_physics = None
+        self._final_information = None
         self._capturing = True
+        failed = True
         try:
             observations, reward, terminated, truncated, extras = super().step(action)
+            self._sync_interactions()
             ids = (terminated | truncated).nonzero(as_tuple=False).flatten()
             final = None
             if len(ids):
@@ -121,6 +147,7 @@ class LocomotionEnv(ManagerBasedRLEnv):
                 (terminated & truncated).sum()
             )
             self.transition_counts["final_observation_rows"] += len(ids)
+            failed = False
             return (
                 observations,
                 reward,
@@ -132,9 +159,16 @@ class LocomotionEnv(ManagerBasedRLEnv):
                     "final_observation": final,
                     "motion_state": physics if self.capture_motion else None,
                     "diagnostic_state": diagnostics,
+                    **(
+                        {"final_training_information": self._final_information}
+                        if self._training_information_enabled()
+                        else {}
+                    ),
                 },
             )
         finally:
             self._capturing = False
             self._final = None
             self._final_physics = None
+            self._final_information = None
+            self._sync_interactions(failed=failed)

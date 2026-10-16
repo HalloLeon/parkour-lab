@@ -1,14 +1,17 @@
 # Parkour Lab
 
-An Isaac Lab / Unitree Go2 locomotion research framework with ROA-like
-teacher/student learning by default and interfaces for future learning methods. One workflow
-covers training, continuation, export and command playback. **Successful training or playback
-does not establish robot qualification.**
+An Isaac Lab / Unitree Go2 task package with a learner-independent public API,
+49-D blind actor inputs and a separate shared training-information packet.
+`Go2-Flat-v1` is implemented; other declared terrain families are not yet executable.
+The retained ROA-like workflow supports training, continuation, export and command
+playback. **Successful execution does not establish robot qualification.**
 
 See the [package README](source/parkour_lab/docs/README.md) for installation,
 architecture and executable verification commands. This page is the detailed
-command and diagnostic reference. The command diagnostics are not a standardized
-benchmark.
+retained learner-command and diagnostic reference. Start with the
+[public task API](source/parkour_lab/docs/README.md#public-task-api) for an
+independent trainer or the [native checks](source/parkour_lab/docs/README.md#native-checks)
+for its bounded server command. Command diagnostics are not a standardized benchmark.
 
 ## Setup and commands
 

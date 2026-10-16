@@ -14,6 +14,7 @@ import torch
 
 from parkour_lab.control.controller import ControllerSession, Sample, finite_tensor
 from parkour_lab.control.proprioception import (
+    CAUSAL_NOISE_AMPLITUDES,
     CONTACT_THRESHOLD_N,
     FOOT_NAMES,
     NATIVE_SENSORS,
@@ -29,7 +30,7 @@ def causal_sensor_noise(env):
         return None
     randomization = env.parkour_randomization
     noise = randomization.uniform(None, 30, "observation-noise", low=-1.0, high=1.0)
-    noise *= [0.2] * 3 + [0.05] * 3 + [0.01] * 12 + [1.5] * 12
+    noise *= CAUSAL_NOISE_AMPLITUDES
     noise = noise.astype("float32")
     if not hasattr(env, "_causal_noise_digest"):
         env._causal_noise_digest = hashlib.sha256()

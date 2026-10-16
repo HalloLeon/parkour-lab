@@ -185,6 +185,7 @@ class NativeTransitionTests(unittest.TestCase):
         self.assertIsNone(env._final)
         self.assertFalse(env._capturing)
         self.assertEqual(self.reads, [False, True, True])
+        self.assertEqual(env.interactions.session, 8)
 
     def test_terminal_sample_does_not_advance_reset_or_regular_observation_rng(self):
         action = torch.ones(4, 1)
@@ -199,6 +200,87 @@ class NativeTransitionTests(unittest.TestCase):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(self.reset_noise, reset_noise, rtol=0, atol=0)
         self.assertTrue(torch.equal(torch.random.get_rng_state(), state))
+
+    def test_training_information_owns_compact_outgoing_rows_before_reset(self):
+        env = self.environment()
+        env.cfg.benchmark_training = True
+        env.capture_training_information = True
+        # Return live buffers deliberately: the native hook must own its
+        # selected terminal rows before the SDK mutates them during reset.
+        with patch(
+            "parkour_lab.benchmark.information.capture_information",
+            side_effect=lambda _: {
+                "physical_state": self.state,
+                "command": self.command,
+                "episode_length": env.episode_length_buf[:, None],
+            },
+        ) as capture:
+            observations, _, terminated, truncated, info = env.step(torch.ones(4, 1))
+            final = info["final_training_information"]
+            self.assertEqual(capture.call_count, 1)
+            self.assertEqual(info["final_env_ids"].tolist(), [0, 1, 2])
+            torch.testing.assert_close(
+                final["physical_state"], torch.tensor([[4.0], [5.0], [6.0]])
+            )
+            torch.testing.assert_close(final["command"], torch.ones(3, 1))
+            torch.testing.assert_close(
+                final["episode_length"], torch.ones(3, 1, dtype=torch.long)
+            )
+            torch.testing.assert_close(
+                observations["proprio"][:3, 0], torch.full((3,), -100.0)
+            )
+            self.assertEqual(env.episode_length_buf.tolist(), [0, 0, 0, 1])
+            self.assertEqual(terminated.tolist(), [True, False, True, False])
+            self.assertEqual(truncated.tolist(), [False, True, True, False])
+            self.assertEqual(env.interactions.cumulative, 4)
+            snapshot = {name: value.clone() for name, value in final.items()}
+            self.state.fill_(500)
+            self.command.fill_(700)
+            self.terminated.zero_()
+            self.truncated.zero_()
+            following = env.step(torch.ones(4, 1))[-1]
+            self.assertIsNone(following["final_training_information"])
+            env._reset_idx(torch.arange(4))
+            self.assertEqual(capture.call_count, 1)
+        for name, value in final.items():
+            torch.testing.assert_close(value, snapshot[name], rtol=0, atol=0)
+        self.assertIsNone(env._final_information)
+        self.assertEqual(env.interactions.cumulative, 8)
+
+    def test_evaluation_cannot_enable_training_capture_with_runtime_flag(self):
+        env = self.environment()
+        env.cfg.benchmark_training = False
+        env.capture_training_information = True
+        with patch("parkour_lab.benchmark.information.capture_information") as capture:
+            info = env.step(torch.ones(4, 1))[-1]
+        capture.assert_not_called()
+        self.assertNotIn("final_training_information", info)
+        self.assertEqual(info["final_env_ids"].tolist(), [0, 1, 2])
+        self.assertEqual(env.interactions.cumulative, 4)
+
+    def test_training_capture_failure_keeps_completed_native_collection(self):
+        env = self.environment()
+        env.cfg.benchmark_training = True
+        env.capture_training_information = True
+        with patch(
+            "parkour_lab.benchmark.information.capture_information",
+            side_effect=RuntimeError("training capture failed"),
+        ) as capture:
+            with self.assertRaisesRegex(RuntimeError, "training capture failed"):
+                env.step(torch.ones(4, 1))
+            self.assertEqual(
+                env.interactions.state_dict(),
+                dict(session=4, cumulative=4, uncertain=0),
+            )
+            self.assertEqual(env.common_step_counter, 1)
+            self.assertEqual(env._sim_step_counter, 4)
+            self.assertEqual(env.transition_counts["control_steps"], 0)
+            self.assertFalse(env._capturing)
+            self.assertIsNone(env._final)
+            self.assertIsNone(env._final_information)
+            env._reset_idx(torch.arange(4))
+            self.assertEqual(capture.call_count, 1)
+            self.assertEqual(env.interactions.cumulative, 4)
 
     def test_motion_capture_retains_terminal_physics_and_is_opt_in(self):
         env = self.environment()
@@ -309,7 +391,41 @@ class NativeTransitionTests(unittest.TestCase):
         self.assertTrue(torch.equal(torch.random.get_rng_state(), state))
         self.assertFalse(env._capturing)
         self.assertIsNone(env._final)
+        self.assertEqual(
+            env.interactions.state_dict(), dict(session=4, cumulative=4, uncertain=0)
+        )
         env._reset_idx(torch.arange(4))
+        self.assertEqual(env.interactions.cumulative, 4)
+
+    def test_partial_physics_failure_charges_all_replicas_as_uncertain(self):
+        env = self.environment()
+
+        def fail(**kwargs):
+            raise RuntimeError("physics failed during its first attempted tick")
+
+        env.sim.step = fail
+        with self.assertRaisesRegex(RuntimeError, "physics failed"):
+            env.step(torch.ones(4, 1))
+        self.assertEqual(
+            env.interactions.state_dict(), dict(session=4, cumulative=4, uncertain=4)
+        )
+
+    def test_optional_survivor_capture_failure_keeps_completed_native_collection(self):
+        env = self.environment()
+        self.terminated.zero_()
+        self.truncated.zero_()
+        env.capture_motion = True
+        with (
+            patch(
+                "parkour_lab.runtime.native.motion_state",
+                side_effect=RuntimeError("capture failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "capture failed"),
+        ):
+            env.step(torch.ones(4, 1))
+        self.assertEqual(
+            env.interactions.state_dict(), dict(session=4, cumulative=4, uncertain=0)
+        )
 
     def test_stateful_observation_processing_is_rejected(self):
         original = self.initialize

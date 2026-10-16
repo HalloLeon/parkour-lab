@@ -1,8 +1,10 @@
 """Pure task sampling: seed isolation, fixed dynamics, and prospective bank IDs."""
 
 import hashlib
+import json
 import math
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -382,6 +384,77 @@ class RandomizationTests(unittest.TestCase):
             sampler(bank="stand", count=100)
         with self.assertRaises(ValueError):
             sampler(bank="stand", evaluation=True)
+
+    def test_current_stream_json_round_trip_continues_partial_rows_after_warmup(self):
+        original = sampler()
+        physical = original.dynamics()
+        original.sample_start(None)
+        original.uniform([3, 1], 30, "observation-noise")
+        original.uniform([2], 4, "commands")
+        saved = json.loads(json.dumps(original.state_dict(), allow_nan=False))
+        expected_noise = original.uniform([1, 0, 3], 30, "observation-noise", -1, 1)
+        expected_command = original.uniform([2, 0], 4, "commands")
+        expected_start = original.sample_start([3, 0])
+        restored = sampler()
+        restored.dynamics()
+        restored.sample_start(None)
+        restored.uniform(None, 30, "observation-noise")
+        restored.load_state_dict(saved)
+        self.assertTrue(
+            all(row["start"] is None for row in restored.manifest()["attempts"])
+        )
+        np.testing.assert_array_equal(
+            restored.uniform([1, 0, 3], 30, "observation-noise", -1, 1), expected_noise
+        )
+        np.testing.assert_array_equal(
+            restored.uniform([2, 0], 4, "commands"), expected_command
+        )
+        for name, value in restored.sample_start([3, 0]).items():
+            np.testing.assert_array_equal(value, expected_start[name])
+        for name, value in restored.dynamics().items():
+            np.testing.assert_array_equal(value, physical[name])
+
+    def test_noise_peek_matches_next_selected_draw_without_advancing_any_row(self):
+        draw = sampler()
+        draw.uniform([1], 30, "observation-noise")
+        before = draw.state_dict()
+        peeked = draw.uniform([3, 1], 30, "observation-noise", -1, 1, advance=False)
+        self.assertEqual(draw.state_dict(), before)
+        np.testing.assert_array_equal(
+            peeked, draw.uniform([3, 1], 30, "observation-noise", -1, 1)
+        )
+        self.assertEqual(draw.state_dict()["generators"][0], before["generators"][0])
+
+    def test_bad_late_stream_identity_or_physical_snapshot_leaves_sampler_unchanged(
+        self,
+    ):
+        draw = sampler()
+        draw.dynamics()
+        draw.sample_start(None)
+        saved = draw.state_dict()
+        invalid = []
+        item = deepcopy(saved)
+        item["identity"]["group_id"] = "training/other"
+        invalid.append(item)
+        item = deepcopy(saved)
+        item["generators"][-1]["commands"]["state"]["inc"] = 0
+        invalid.append(item)
+        item = deepcopy(saved)
+        item["generators"][-1]["commands"]["has_uint32"] = True
+        invalid.append(item)
+        item = deepcopy(saved)
+        item["physical"]["static_friction"][0] = 1.5
+        invalid.append(item)
+        item = deepcopy(saved)
+        item["generators"].pop()
+        invalid.append(item)
+        for state in invalid:
+            with self.subTest(state=state), self.assertRaises(ValueError):
+                draw.load_state_dict(state)
+            self.assertEqual(draw.state_dict(), saved)
+        detached = draw.state_dict()
+        detached["generators"][0]["commands"]["state"]["state"] = 0
+        self.assertEqual(draw.state_dict(), saved)
 
 
 if __name__ == "__main__":

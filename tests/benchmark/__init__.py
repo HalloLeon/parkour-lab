@@ -1,0 +1,1 @@
+"""Public benchmark contract checks."""

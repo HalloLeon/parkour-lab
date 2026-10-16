@@ -1,6 +1,7 @@
 """Independent, recorded random streams for each robot and first-attempt bank ID."""
 
 import hashlib
+import json
 from copy import deepcopy
 
 import numpy as np
@@ -35,6 +36,28 @@ def _stream(namespace, group_id, index, name):
         sha256=digest, initial_state=generator.bit_generator.state["state"].copy()
     )
     return generator, mapping
+
+
+def _valid_pcg64_state(state):
+    if (
+        type(state) is not dict
+        or set(state) != {"bit_generator", "state", "has_uint32", "uinteger"}
+        or state["bit_generator"] != "PCG64"
+        or type(state["state"]) is not dict
+        or set(state["state"]) != {"state", "inc"}
+    ):
+        return False
+    return (
+        all(
+            type(value) is int and 0 <= value < 2**128
+            for value in state["state"].values()
+        )
+        and state["state"]["inc"] % 2 == 1
+        and type(state["has_uint32"]) is int
+        and state["has_uint32"] in (0, 1)
+        and type(state["uinteger"]) is int
+        and 0 <= state["uinteger"] < 2**32
+    )
 
 
 class TaskRandomization:
@@ -168,6 +191,87 @@ class TaskRandomization:
                 generator = deepcopy(generator)
             values.append(generator.uniform(low, high, size=width))
         return np.asarray(values, dtype=np.float64).reshape(len(ids), width)
+
+    def _state_identity(self):
+        return dict(
+            namespace=self.namespace,
+            group_id=self.group_id,
+            count=self.count,
+            streams=list(self._streams),
+            attempt_indices=self._attempt_indices.copy(),
+            randomized=self.randomized.tolist(),
+            heading=self._heading.tolist(),
+            mapping_sha256=hashlib.sha256(
+                json.dumps(self._mappings, sort_keys=True).encode()
+            ).hexdigest(),
+        )
+
+    def state_dict(self):
+        """Detached current streams for continuation, not an in-flight episode."""
+        return dict(
+            version="go2_task_randomization_state_v1",
+            identity=self._state_identity(),
+            generators=[
+                {
+                    stream: deepcopy(self._generators[row, stream].bit_generator.state)
+                    for stream in self._streams
+                }
+                for row in range(self.count)
+            ],
+            physical=(
+                None
+                if self._physical is None
+                else {name: value.tolist() for name, value in self._physical.items()}
+            ),
+        )
+
+    def load_state_dict(self, state):
+        """Validate everything before replacing streams; next reset starts new episodes."""
+        if (
+            type(state) is not dict
+            or set(state) != {"version", "identity", "generators", "physical"}
+            or state["version"] != "go2_task_randomization_state_v1"
+            or state["identity"] != self._state_identity()
+            or type(state["generators"]) is not list
+            or len(state["generators"]) != self.count
+        ):
+            raise ValueError("Sampler continuation identity or schema differs")
+        generators = {}
+        for row, streams in enumerate(state["generators"]):
+            if type(streams) is not dict or set(streams) != set(self._streams):
+                raise ValueError("Sampler continuation stream names differ")
+            for name, saved in streams.items():
+                if not _valid_pcg64_state(saved):
+                    raise ValueError("Invalid PCG64 continuation state")
+                generator = np.random.Generator(np.random.PCG64(0))
+                generator.bit_generator.state = deepcopy(saved)
+                generators[row, name] = generator
+        physical = None
+        if state["physical"] is not None:
+            try:
+                physical = {
+                    name: np.asarray(value, dtype=np.float64)
+                    for name, value in state["physical"].items()
+                }
+                width = physical["motor_strength"].shape[1]
+                canonical = deepcopy(self)
+                canonical._physical = None
+                for row, mapping in enumerate(self._mappings):
+                    canonical._generators[row, "dynamics"] = np.random.Generator(
+                        np.random.PCG64(int(mapping["dynamics"]["sha256"], 16))
+                    )
+                expected = canonical.dynamics(width)
+                if set(physical) != set(expected) or any(
+                    not np.array_equal(value, expected[name])
+                    for name, value in physical.items()
+                ):
+                    raise ValueError("Physical draws differ from the seeded startup")
+            except (AttributeError, KeyError, IndexError, TypeError) as error:
+                raise ValueError(
+                    "Invalid physical sampler continuation state"
+                ) from error
+        self._generators, self._physical = generators, physical
+        self._starts = [None] * self.count
 
     def begin_attempts(self):
         """Discard warm-up sampling before the explicit first evaluation reset.

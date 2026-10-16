@@ -50,6 +50,27 @@ PARAMETERS = {
     },
 }
 
+# Formula annotations describe these pinned functions, not arbitrary terms that
+# happen to reuse their configuration names. Keep this lookup simulator-free.
+_FORMULA_FUNCTIONS = {
+    name: f"isaaclab.envs.mdp.rewards:{function}"
+    for name, function in (
+        ("track_lin_vel_xy_exp", "track_lin_vel_xy_exp"),
+        ("track_ang_vel_z_exp", "track_ang_vel_z_exp"),
+        ("lin_vel_z_l2", "lin_vel_z_l2"),
+        ("ang_vel_xy_l2", "ang_vel_xy_l2"),
+        ("dof_torques_l2", "joint_torques_l2"),
+        ("dof_acc_l2", "joint_acc_l2"),
+        ("action_rate_l2", "action_rate_l2"),
+        ("flat_orientation_l2", "flat_orientation_l2"),
+        ("dof_pos_limits", "joint_pos_limits"),
+    )
+}
+_FORMULA_FUNCTIONS.update(
+    feet_air_time="isaaclab_tasks.manager_based.locomotion.velocity.mdp.rewards:feet_air_time",
+    joint_posture=f"{__name__}:joint_posture",
+)
+
 
 def validate_rewards(value):
     """Validate explicit overrides, without filling omitted defaults or aliases."""
@@ -112,6 +133,41 @@ def configure_rewards(cfg, task):
     cfg.rewards.track_ang_vel_z_exp.params["std"] = task.angular_tracking_std
 
 
+def _callable_name(function):
+    """Name native functions and initialized stateful term instances alike."""
+    owner = function if hasattr(function, "__qualname__") else type(function)
+    return f"{owner.__module__}:{owner.__qualname__}"
+
+
+def _parameter_value(value):
+    """Copy native selectors and numeric parameters into JSON-compatible values."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("Reward metadata requires finite parameters")
+        return value
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("Reward parameter mapping keys must be strings")
+        return {key: _parameter_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_parameter_value(item) for item in value)
+    if isinstance(value, slice):
+        return {"start": value.start, "stop": value.stop, "step": value.step}
+    if callable(value):
+        return _callable_name(value)
+    if hasattr(value, "tolist"):
+        return _parameter_value(value.tolist())
+    if hasattr(value, "__dict__"):
+        return {
+            key: _parameter_value(item)
+            for key, item in vars(value).items()
+            if not key.startswith("_")
+        }
+    raise TypeError(f"Unsupported reward parameter metadata: {type(value).__name__}")
+
+
 def reward_recipe(env):
     """Describe the actual manager terms, including zero-weight disabled terms.
 
@@ -121,7 +177,8 @@ def reward_recipe(env):
     terms = {}
     for name in env.reward_manager.active_terms:
         term = env.reward_manager.get_term_cfg(name)
-        params = deepcopy(term.params)
+        function = _callable_name(term.func)
+        params = dict(term.params)
         if "sensor_cfg" in params:
             sensor = params["sensor_cfg"]
             params["sensor_cfg"] = {
@@ -130,9 +187,11 @@ def reward_recipe(env):
             }
         terms[name] = {
             "weight": term.weight,
-            "function": f"{term.func.__module__}:{term.func.__qualname__}",
-            "formula": TERMS[name][1],
-            "params": params,
+            "function": function,
+            "formula": (
+                TERMS[name][1] if function == _FORMULA_FUNCTIONS.get(name) else None
+            ),
+            "params": _parameter_value(params),
         }
     return {
         "terms": terms,
