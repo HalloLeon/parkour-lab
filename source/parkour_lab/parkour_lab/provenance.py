@@ -143,11 +143,13 @@ def package_source_identity():
 def dependency_identity(module_name, distribution):
     """Identify the imported dependency, including an editable pinned checkout.
 
-    This records evidence, not an exact-wheel admission gate. A wheel without
-    Git still records its version, module path and package-source hash.
+    This records evidence, not an exact-wheel admission gate. ``distribution``
+    names the requested metadata lookup; its version is null when unavailable.
+    An importable component need not have its own distribution metadata. Its
+    self-reported module version, when present, is recorded separately.
     """
     from importlib import import_module
-    from importlib.metadata import version
+    from importlib.metadata import PackageNotFoundError, version
 
     module = import_module(module_name)
     root = Path(module.__file__).resolve().parent
@@ -155,11 +157,19 @@ def dependency_identity(module_name, distribution):
     for path in sorted(root.rglob("*.py")):
         digest.update(path.relative_to(root).as_posix().encode())
         digest.update(path.read_bytes())
+    try:
+        distribution_version = version(distribution)
+    except PackageNotFoundError:
+        distribution_version = None
     receipt = {
-        "version": version(distribution),
+        "requested_distribution": distribution,
+        "version": distribution_version,
         "module_path": str(root),
         "source_sha256": digest.hexdigest(),
     }
+    module_version = getattr(module, "__version__", None)
+    if isinstance(module_version, str) and module_version:
+        receipt["module_version"] = module_version
     # SDK packages can be nested under source/<extension>/<module>, and linked
     # worktrees use a .git file. Find the nearest checkout rather than assuming
     # the imported module is immediately below its repository root.

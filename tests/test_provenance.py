@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -164,6 +165,77 @@ class RunProvenanceTests(unittest.TestCase):
         self.assertNotIn("commit", receipt)
         self.assertNotIn("dirty", receipt)
         self.assertNotIn("diff_sha256", receipt)
+
+
+class DependencyIdentityTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.path = Path(temporary.name) / "sdk" / "__init__.py"
+        self.path.parent.mkdir()
+        self.path.write_text('"""Importable component."""\n')
+        self.module = SimpleNamespace(__file__=str(self.path))
+
+    def test_distribution_and_module_versions_remain_distinct(self):
+        self.module.__version__ = "2.3.2"
+        with (
+            patch("importlib.metadata.version", return_value="2.3.2.post1"),
+            patch("importlib.import_module", return_value=self.module),
+        ):
+            receipt = provenance.dependency_identity("sdk", "sdk-distribution")
+        self.assertEqual(receipt["requested_distribution"], "sdk-distribution")
+        self.assertEqual(receipt["version"], "2.3.2.post1")
+        self.assertEqual(receipt["module_version"], "2.3.2")
+
+    def test_importable_component_without_metadata_retains_source_evidence(self):
+        self.module.__version__ = "2.3.2"
+        with (
+            patch(
+                "importlib.metadata.version", side_effect=PackageNotFoundError("sdk")
+            ) as lookup,
+            patch("importlib.import_module", return_value=self.module),
+        ):
+            receipt = provenance.dependency_identity("sdk", "sdk")
+        lookup.assert_called_once_with("sdk")
+        self.assertEqual(receipt["requested_distribution"], "sdk")
+        self.assertIsNone(receipt["version"])
+        self.assertEqual(receipt["module_version"], "2.3.2")
+        self.assertEqual(receipt["module_path"], str(self.path.resolve().parent))
+        expected = hashlib.sha256(b"__init__.py" + self.path.read_bytes()).hexdigest()
+        self.assertEqual(receipt["source_sha256"], expected)
+
+    def test_missing_or_nonstring_module_version_is_not_invented(self):
+        for module_version in (None, "", 232):
+            with self.subTest(module_version=module_version):
+                self.module.__version__ = module_version
+                with (
+                    patch(
+                        "importlib.metadata.version",
+                        side_effect=PackageNotFoundError("sdk"),
+                    ),
+                    patch("importlib.import_module", return_value=self.module),
+                ):
+                    receipt = provenance.dependency_identity("sdk", "sdk")
+                self.assertIsNone(receipt["version"])
+                self.assertNotIn("module_version", receipt)
+                json.dumps(receipt, allow_nan=False)
+
+    def test_missing_dependency_import_still_fails(self):
+        with (
+            patch("importlib.metadata.version") as lookup,
+            patch("importlib.import_module", side_effect=ModuleNotFoundError("sdk")),
+        ):
+            with self.assertRaises(ModuleNotFoundError):
+                provenance.dependency_identity("sdk", "sdk")
+        lookup.assert_not_called()
+
+    def test_unexpected_metadata_error_still_fails(self):
+        with (
+            patch("importlib.metadata.version", side_effect=OSError("unreadable")),
+            patch("importlib.import_module", return_value=self.module),
+        ):
+            with self.assertRaisesRegex(OSError, "unreadable"):
+                provenance.dependency_identity("sdk", "sdk")
 
 
 class PackageSourceIdentityTests(unittest.TestCase):
