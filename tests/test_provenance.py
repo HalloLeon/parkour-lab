@@ -1,0 +1,174 @@
+"""Real temporary Git repositories protect run identity and dirty-tree logging."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from parkour_lab import provenance
+
+
+@unittest.skipUnless(shutil.which("git"), "Git is required.")
+class RunProvenanceTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.repo = self.root / "parkour_lab"
+        self.repo.mkdir()
+        self.git("init", "-q")
+        self.git("config", "user.name", "Provenance Test")
+        self.git("config", "user.email", "provenance@example.invalid")
+        self.git("config", "commit.gpgsign", "false")
+        (self.repo / "source.py").write_text("initial = 1\n")
+        (self.repo / "binary.dat").write_bytes(b"\x00original\x00")
+        self.git("add", "source.py", "binary.dat")
+        self.git("commit", "-q", "-m", "Initial test code")
+        self.commit = self.git("rev-parse", "HEAD").decode().strip()
+
+    def git(self, *args):
+        return subprocess.check_output(
+            ["git", "-C", str(self.repo), *args], stderr=subprocess.PIPE
+        )
+
+    def test_clean_run_always_records_full_commit_and_header(self):
+        log_dir = self.root / "logs"
+        result = provenance.write_run_provenance(log_dir, self.repo / "source.py")
+        self.assertEqual(result["commit_sha"], self.commit)
+        self.assertFalse(result["dirty"])
+        self.assertFalse(result["detached_head"])
+        self.assertEqual(result["diff_sha256"], hashlib.sha256(b"").hexdigest())
+        self.assertEqual(
+            json.loads((log_dir / "git/provenance.json").read_text()), result
+        )
+        archive = (log_dir / "git/parkour_lab.diff").read_text()
+        self.assertTrue(archive.startswith(f"--- git commit ---\n{self.commit}\n"))
+        self.assertIn("--- git status ---", archive)
+        self.assertIn("--- git diff ---", archive)
+
+    def test_literal_untracked_data_directory_does_not_hide_commit(self):
+        data = self.repo / "${data}"
+        data.mkdir()
+        payload = data / "result.txt"
+        payload.write_text("must not archive arbitrary data contents")
+        result, archive = provenance.collect_run_provenance(self.repo)
+        self.assertEqual(result["commit_sha"], self.commit)
+        self.assertFalse(result["tracked_dirty"])
+        self.assertTrue(result["dirty"])
+        self.assertEqual(result["untracked_paths"], ["${data}/result.txt"])
+        self.assertNotIn(payload.read_bytes(), archive)
+        self.assertTrue(payload.exists())
+
+    def test_diff_includes_staged_unstaged_and_binary_changes(self):
+        (self.repo / "source.py").write_text("initial = 2\n")
+        self.git("add", "source.py")
+        (self.repo / "source.py").write_text("initial = 2\nunstaged = 3\n")
+        (self.repo / "binary.dat").write_bytes(b"\x00changed\x00")
+        result, archive = provenance.collect_run_provenance(self.repo)
+        self.assertTrue(result["tracked_dirty"])
+        self.assertIn(b"+initial = 2", archive)
+        self.assertIn(b"+unstaged = 3", archive)
+        self.assertIn(b"GIT binary patch", archive)
+        raw_diff = archive.split(b"--- git diff ---\n", 1)[1]
+        self.assertEqual(hashlib.sha256(raw_diff).hexdigest(), result["diff_sha256"])
+
+    def test_detached_head_keeps_identity_without_inventing_branch(self):
+        self.git("checkout", "--detach", "-q", self.commit)
+        result, _ = provenance.collect_run_provenance(self.repo)
+        self.assertEqual(result["commit_sha"], self.commit)
+        self.assertIsNone(result["branch"])
+        self.assertTrue(result["detached_head"])
+
+    def test_git_worktree_and_subdirectory_resolve_correct_root(self):
+        worktree = self.root / "linked checkout"
+        self.git("worktree", "add", "--detach", "-q", str(worktree), self.commit)
+        result, _ = provenance.collect_run_provenance(worktree / "source.py")
+        self.assertEqual(result["repository_root"], str(worktree.resolve()))
+        self.assertEqual(result["commit_sha"], self.commit)
+
+    def test_renames_and_newline_filenames_do_not_corrupt_untracked_list(self):
+        self.git("mv", "source.py", "renamed source.py")
+        (self.repo / "new\nfile.py").write_text("x\n")
+        result, _ = provenance.collect_run_provenance(self.repo)
+        self.assertTrue(result["tracked_dirty"])
+        self.assertEqual(result["untracked_paths"], ["new\nfile.py"])
+
+    def test_existing_run_provenance_is_never_overwritten(self):
+        log_dir = self.root / "logs"
+        provenance.write_run_provenance(log_dir, self.repo)
+        before = (log_dir / "git/provenance.json").read_bytes()
+        with self.assertRaises(FileExistsError):
+            provenance.write_run_provenance(log_dir, self.repo)
+        self.assertEqual(before, (log_dir / "git/provenance.json").read_bytes())
+
+    def test_existing_diff_is_not_relabelled_as_current_head(self):
+        log_dir = self.root / "partial"
+        (log_dir / "git").mkdir(parents=True)
+        existing = log_dir / "git/parkour_lab.diff"
+        existing.write_text("--- git status ---\nold run, unknown commit\n")
+        with self.assertRaises(FileExistsError):
+            provenance.write_run_provenance(log_dir, self.repo)
+        self.assertNotIn(self.commit, existing.read_text())
+        self.assertFalse((log_dir / "git/provenance.json").exists())
+
+    def test_not_a_repository_fails_instead_of_logging_unknown_identity(self):
+        with self.assertRaisesRegex(RuntimeError, "provenance"):
+            provenance.collect_run_provenance(self.root)
+
+
+class PackageSourceIdentityTests(unittest.TestCase):
+    def test_dependency_receipt_describes_imported_upstream(self):
+        from importlib.metadata import version
+        import rsl_rl
+
+        receipt = provenance.dependency_identity("rsl_rl", "rsl-rl-lib")
+        self.assertEqual(receipt["version"], version("rsl-rl-lib"))
+        self.assertEqual(
+            Path(receipt["module_path"]), Path(rsl_rl.__file__).resolve().parent
+        )
+        self.assertEqual(len(receipt["source_sha256"]), 64)
+        if (Path(receipt["module_path"]).parent / ".git").exists():
+            self.assertEqual(len(receipt["commit"]), 40)
+            self.assertIs(type(receipt["dirty"]), bool)
+
+    def test_inventory_covers_split_owners_and_is_independent_of_machine_root(self):
+        current = provenance.package_source_identity()
+        self.assertTrue(
+            {
+                "environments/configuration.py",
+                "environments/commands.py",
+                "environments/observations.py",
+                "runtime/native.py",
+                "config.py",
+                "methods/roa/training.py",
+                "provenance.py",
+            }.issubset(current)
+        )
+        self.assertEqual(list(current), sorted(current))
+        self.assertTrue(all(not Path(name).is_absolute() for name in current))
+        self.assertTrue(all(len(value) == 64 for value in current.values()))
+        with tempfile.TemporaryDirectory() as directory:
+            inventories = []
+            for machine in ("machine_a", "machine_b"):
+                root = Path(directory) / machine
+                root.mkdir()
+                (root / "provenance.py").write_text("identity = 1\n")
+                (root / "nested").mkdir()
+                (root / "nested/owner.py").write_text("value = 2\n")
+                (root / "nested/README.md").write_text("not runtime code\n")
+                with patch.object(provenance, "__file__", str(root / "provenance.py")):
+                    inventories.append(provenance.package_source_identity())
+            self.assertEqual(inventories[0], inventories[1])
+            self.assertEqual(
+                inventories[0],
+                {
+                    "nested/owner.py": hashlib.sha256(b"value = 2\n").hexdigest(),
+                    "provenance.py": hashlib.sha256(b"identity = 1\n").hexdigest(),
+                },
+            )

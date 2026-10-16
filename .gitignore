@@ -1,10 +1,31 @@
-# C++
+# Operating system
+.DS_Store
+
+# Local agent workspace
+.agent/
+
+# IDEs and editors
+**/.idea/
+**/.vscode/
+# Keep the top-level .vscode directory for shared VS Code settings.
+!.vscode
+
+# Python
+**/*.egg-info/
+**/__pycache__/
+**/.pytest_cache/
+**/*.pyc
+
+# Native builds
 **/cmake-build*/
 **/build*/
 **/*.so
-**/*.log*
 
-# Omniverse
+# Isaac Sim and Omniverse
+_isaac_sim*
+_repo
+_build
+.lastformat
 **/*.dmp
 **/.thumbs
 
@@ -14,55 +35,32 @@
 **/*.usdc
 **/*.usdz
 
-# Python
-.DS_Store
-**/*.egg-info/
-**/__pycache__/
-**/.pytest_cache/
-**/*.pyc
+# Generated files and documentation
 **/*.pb
-
-# Docker/Singularity
-**/*.sif
-docker/cluster/exports/
-docker/.container.cfg
-
-# IDE
-**/.idea/
-**/.vscode/
-# Don't ignore the top-level .vscode directory as it is
-# used to configure VS Code settings
-!.vscode
-
-# Outputs
-**/output/*
-**/outputs/*
-**/videos/*
-**/wandb/*
-**/.neptune/*
-docker/artifacts/
-*.tmp
-
-# Doc Outputs
 **/docs/_build/*
 **/generated/*
 
-# Isaac-Sim packman
-_isaac_sim*
-_repo
-_build
-.lastformat
-
-# RL-Games
+# Experiment outputs
+**/output/*
+**/outputs/*
 **/runs/*
 **/logs/*
 **/recordings/*
+**/videos/*
+**/wandb/*
+**/.neptune/*
 
-# Pre-Trained Checkpoints
+# Datasets and pretrained checkpoints
+/datasets/
 /.pretrained_checkpoints/
 
-# Teleop Recorded Dataset
-/datasets/
-
-# Docker history
+# Containers
+**/*.sif
+docker/.container.cfg
+docker/artifacts/
+docker/cluster/exports/
 .isaac-lab-docker-history
+
+# Logs and temporary files
+**/*.log*
+*.tmp
