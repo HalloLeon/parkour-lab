@@ -34,7 +34,7 @@ setup(
         "torch>=2.5",
         "PyYAML>=6",
         "trimesh>=4",
-        "gymnasium==1.2.1",
+        "gymnasium>=1.0,<2",
     ],
     extras_require={"roa": ["rsl-rl-lib==3.1.2", "tensordict"]},
     classifiers=[

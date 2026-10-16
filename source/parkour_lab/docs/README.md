@@ -9,10 +9,16 @@ qualify a robot.
 
 ## Installation
 
-Use Python 3.10 or 3.11. Install Isaac Lab 2.3.2 / Isaac Sim 5.1 separately in
-the interpreter configured for native execution; the package does not select a
-simulator or CUDA distribution. The optional `roa` extra uses RSL-RL 3.1.2.
-From the repository root:
+The portable package supports Python 3.10 and 3.11. Its
+[dependency requirements](../setup.py) allow Gymnasium 1.x, PyTorch >=2.5 and
+NumPy <2. The selected SDK and learner may impose tighter requirements.
+
+For native execution, install Isaac Lab and Isaac Sim separately and use an
+interpreter supported by that stack. The package does not select a simulator,
+CUDA distribution or SDK installation layout. The optional `roa` extra uses
+RSL-RL 3.1.2, separately from the SDK's optional learner extras.
+
+From the repository root, in the configured interpreter:
 
 ```bash
 python -m pip install -e source/parkour_lab
@@ -21,9 +27,9 @@ python -m parkour_lab --help
 
 To include the bundled learner, use
 `python -m pip install -e 'source/parkour_lab[roa]'` instead. Package imports and
-CLI help do not launch Isaac Lab. Select the native device explicitly and record
-the SDK revision and local changes actually imported; a version label alone does
-not establish compatibility.
+CLI help do not launch Isaac Lab. Select the native device explicitly. The native
+checks below establish compatibility only for their tested task and scope;
+matching version labels alone do not establish it.
 
 The CLI provides `train`, `export`, `bound-actions`, `evaluate`, `play` and
 `analyze`. See [bounded action delivery](../../../README.md#bounded-action-delivery)
@@ -240,6 +246,11 @@ ellipsis bodies. See [tests/README.md](../../../tests/README.md) for component
 commands and coverage limits. CPU doubles and skipped SDK-source checks do not
 establish native compatibility.
 
+The portable public-task contracts are checked with Gymnasium 1.0.0, 1.2.0 and
+1.2.1. This covers the declared spaces, batched observations and interface behavior;
+it does not establish native SDK compatibility for every allowed Gymnasium version.
+The selected SDK's dependency requirements still apply.
+
 ### Distribution checks
 
 Build a source archive, rebuild its wheel and install outside the checkout in a
@@ -273,6 +284,9 @@ not verify those contents. The CPU suite covers backend discovery, artifact roun
 trips and data-only payload loading.
 
 ### Native checks
+
+These checks have been run with Isaac Lab 2.3.2.post1 and Isaac Sim 5.1. Run them
+when using a different stack to establish compatibility for the supported task.
 
 Use the configured Isaac Lab interpreter from the repository root. Activate it or
 export `PLAB_PY` with its Python executable path. Each invocation below launches a
@@ -314,11 +328,13 @@ weights or optimizer are loaded or restored**. Real training must link its progr
 record to an actual full learner checkpoint.
 
 Every process must exit zero and report `TASK_CHECK_PASSED` with both cleanup fields
-`complete` in `report.json`. Review `sdk/git/` and dependency records for actual
-native source identity. An incomplete close receipt, missing identity or failed
-assertion leaves native validation incomplete. Without SDK Git metadata, resolve
-the selected source revision/diff separately; source hashes alone do not provide
-that history. The retained terrain plumbing helper remains available as
+`complete` in `report.json`. Retain actual dependency versions and imported-source
+hashes with the results. For reproduction, keep installation artifacts and their
+hashes, or source checkout revisions/diffs in `sdk/git/`. A packaged SDK does not
+require Git metadata. An incomplete close receipt, missing dependency/source
+identity or failed assertion leaves native validation incomplete.
+
+The retained terrain plumbing helper remains available as
 `scripts/smoke_native.py --terrain flat --device cuda:0 --output NEW_DIRECTORY`
 (also rough, procedural, steps, traversal and connected); it reports `SMOKE_PASSED`
 and checks the retained command workflow separately from the public task API.
