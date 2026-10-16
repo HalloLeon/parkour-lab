@@ -7,6 +7,4 @@ max-complexity = 30
 extend-ignore = E203,E402,E501,W503
 per-file-ignores =
     */__init__.py:F401
-    # Protocol declarations intentionally use an ellipsis body.
-    */methods/base.py:E704
 exclude = .git,.agent,.vscode,.venv,build,dist,logs

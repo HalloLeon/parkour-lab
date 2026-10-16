@@ -545,11 +545,30 @@ class NativeCommandResetTests(unittest.TestCase):
     def test_sequence_hook_receives_same_physical_reset_mask_and_owns_selected_rows(
         self,
     ):
+        generator = NS(
+            curriculum=True,
+            num_cols=20,
+            num_rows=3,
+            sub_terrains={
+                str(i): NS(profile=profile, proportion=0.05)
+                for i, profile in enumerate(PROFILE_BY_COLUMN)
+            },
+        )
+        env = NS(
+            num_envs=3,
+            device="cpu",
+            cfg=NS(
+                scene=NS(terrain=NS(terrain_generator=generator)),
+                curriculum=NS(terrain_levels=None),
+            ),
+            scene=NS(terrain=NS(terrain_types=torch.tensor([0, 12, 4]))),
+        )
         with native_commands() as commands:
-            command = commands.OperatorReversalSequenceCommand(
-                self.config(), NS(num_envs=3, device="cpu")
-            )
+            command = commands.ProceduralTerrainCommand(self.config(), env)
         command.command_counter[:] = torch.tensor([0, 4, 1])
+        command.category[1] = 7
+        command.vel_command_b[1] = torch.tensor([0.4, 0.0, 0.2])
+        command.time_left[1] = 8.0
         command.sampler = NS(
             sample=lambda count, **kwargs: (
                 torch.zeros(count, dtype=torch.int64),
@@ -570,11 +589,16 @@ class NativeCommandResetTests(unittest.TestCase):
 
         command.sequence_plan = NS(resample=resample)
         command._resample_command(torch.tensor([2, 0]))
+        self.assertEqual(calls[0][0].tolist(), [2, 0])
         self.assertEqual(calls[0][1].tolist(), [False, True])
-        self.assertEqual(command.category.tolist(), [2, 0, 0])
+        self.assertEqual(command.category.tolist(), [2, 7, 0])
         self.assertEqual(command.vel_command_b[0].tolist(), [0.0, 0.0, -0.5])
         self.assertFalse(command.is_standing_env[0])
         self.assertEqual(command.time_left[0], 4.0)
+        torch.testing.assert_close(
+            command.vel_command_b[1], torch.tensor([0.4, 0.0, 0.2])
+        )
+        self.assertEqual(command.time_left[1], 8.0)
 
     def test_procedural_sampler_rough_distribution_never_draws_reverse_or_lateral(self):
         generator = NS(

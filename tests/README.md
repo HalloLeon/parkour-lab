@@ -7,7 +7,7 @@ Shared fixtures live in `support/`, never in another test module.
 | Location | What the checks protect |
 | --- | --- |
 | `benchmark/` | Public task/configuration, permitted actor/GT observations, spaces, real-transition accounting and checkpoint-linked continuation |
-| `control/` | Command leases and tapes, frame ordering, sensor units and motor contracts |
+| `control/` | Command tapes, frame ordering, sensor units and motor contracts |
 | `environments/` | Command sampling/reset behavior, owned terminal observations and RNG isolation, reward configuration/formulas and scan preprocessing |
 | `environments/terrains/` | Procedural and connected terrain geometry, traversal fixtures and roughness contracts |
 | `evaluation/` | Flat profiles and terrain crossing/tracking/finish rules, first-attempt failure retention, and read-only archive-integrity checks |

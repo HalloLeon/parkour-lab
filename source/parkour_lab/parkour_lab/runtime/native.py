@@ -1,8 +1,8 @@
 """Native simulator input binding for a frozen, motor-bound actor artifact.
 
 No RSL-RL, training policy, training command sampler, GUI or hardware driver. The caller
-owns source leases and resolves them before act(), then uses the verified motor
-bridge to deliver absolute joint targets. time_s is the physics-frame clock, not a remote
+supplies applied body-velocity commands and uses the verified motor bridge to
+deliver absolute joint targets. time_s is the physics-frame clock, not a remote
 packet timestamp or wall clock. Scene/motor configuration must remain frozen.
 """
 

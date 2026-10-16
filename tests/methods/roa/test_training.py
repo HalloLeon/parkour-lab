@@ -8,8 +8,6 @@ from unittest.mock import patch
 
 import torch
 
-from parkour_lab.methods.base import TrainingMethod
-from parkour_lab.methods.roa import Learner
 from parkour_lab.methods.roa import model as roa
 from parkour_lab.methods.roa.training import ROAPPO, ROATrainingMethod
 from tests.support.roa import TensorHost, observations
@@ -335,7 +333,6 @@ class ROAMethodTests(unittest.TestCase):
     def test_advance_owns_schedule_and_runs_history_only_when_due(self):
         method = self.method()
         host = TensorHost(self.obs)
-        self.assertIsInstance(Learner(method, host, self.obs), TrainingMethod)
         estimator = roa.state_sha256(method.policy.actor.estimator)
         obs, first = method.advance(host, self.obs)
         self.assertEqual(first["update"], 1)

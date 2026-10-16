@@ -205,7 +205,7 @@ class ControllerSession:
             or not 0 <= time_s - command_time_s <= spec.period_s + 1e-9
         ):
             raise ValueError(
-                "Stale/future applied command; host must resolve the command lease"
+                "Stale/future applied command; timestamp must be within one control period"
             )
         batch = len(command)
         signature = (batch, command.device, command.dtype)

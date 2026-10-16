@@ -451,7 +451,11 @@ this does not add privileged student inputs or push causal history twice.
 True termination takes precedence over a simultaneous timeout.
 Reports count captured final rows and metrics count timeout bootstraps per run.
 
-## Method extension boundary
+## Retained CLI plugins
+
+Independent trainers use the [public task API](source/parkour_lab/docs/README.md#public-task-api)
+and own their learning loops and checkpoints. They do not need to register a CLI
+plugin. The plugin mechanism below belongs to the retained artifact workflow.
 
 ROA is the only implemented learner. The shared host provides observations, reset
 flags, owned terminal samples and motor delivery; the adapter owns learning.
@@ -461,38 +465,34 @@ and is privileged. An adapter must not expose privileged observations to its stu
 Each `.plab` file is a ZIP with JSON metadata and a checksum-bound numerical
 payload owned by the method. ROA uses Torch weights-only loading, not pickled
 Python model objects. Hashes detect changes, not trust
-or authenticity. This current format replaces ROA-only `.pt` snapshots.
+or authenticity.
 
-An external adapter implements `MethodBackend` in `methods/base.py` and registers
-an installed `parkour_lab.methods` entry point, for example in its `pyproject.toml`:
+An external CLI adapter registers an installed `parkour_lab.methods` entry point
+whose value is its backend module, for example in its `pyproject.toml`:
 
 ```toml
 [project.entry-points."parkour_lab.methods"]
 my_method = "my_adapter.backend"
 ```
 
-When adding a method, pin its upstream repository as a Git submodule, install it and its adapter, and
-select `method.name = "my_method"`. Plugin names cannot shadow built-ins. Installing
+Install the adapter and select `method.name = "my_method"`. Plugin names cannot
+shadow built-ins. Installing
 a plugin explicitly trusts its code; checkpoint metadata cannot import arbitrary
 Python paths. Dependencies must be available before native startup; receipts record
 the imported version, path, source hash and Git commit when present.
 
-The learner owns `advance()`, its schedule, memory/replay, gradients and snapshot
-state. The backend owns option validation, creation, numerical serialization,
-causal export and the controller; the host never inspects a Torch optimizer or
-PPO rollout. `Controller.state_sha256()` fingerprints trained state, including
-learned preprocessing but excluding per-episode recurrent memory.
+The backend module supplies `configure` and `validate_training` for option and
+batch validation, `create` for learner construction, `dump` and `load` for numerical
+payload serialization, `export` and `controller` for causal inference, and
+`dependencies` for dependency identity. The existing ROA backend shows these
+functions and their arguments in
+[`methods/roa/__init__.py`](source/parkour_lab/parkour_lab/methods/roa/__init__.py).
 
-For a future DreamFLEX adapter, its upstream teacher/student and adaptation
-schedule stay in the method, and its causal inference graph implements Controller.
-For Dreamer-like training, the adapter converts native tensors to its framework,
-owns sequence replay/world-model/imagination updates and persists those states.
-It uses final observations and reset flags to prevent replay sequences crossing
-episodes; its controller owns recurrent inference/reset state. These responsibilities
-are designed to avoid PPO hooks or edits to shared tasks, commands, motor delivery
-or evaluation. No DreamFLEX/Dreamer implementation or behavioral equivalence is
-claimed here. Contract tests and architecture review are not empirical proof of
-multi-learner interoperability.
+Within this CLI workflow, the learner owns `advance()`, its schedule, memory/replay,
+gradients and snapshot state. The host never inspects a Torch optimizer or PPO
+rollout. `Controller.state_sha256()` fingerprints trained state, including learned
+preprocessing but excluding per-episode recurrent memory. These CLI conventions
+do not prescribe how an independent public-task consumer trains or saves a model.
 
 ## Artifacts and provenance
 

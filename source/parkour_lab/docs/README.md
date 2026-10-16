@@ -60,7 +60,7 @@ finally:
 The caller owns the application and closes it after the task. The complete runnable
 [consumer/check script](../../../scripts/check_public_task.py) handles ordered
 environment/application cleanup and standalone native process exit. No
-`MethodBackend`, RSL-RL, learner implementation or `.plab` file is needed.
+backend registration, RSL-RL, learner implementation or `.plab` file is needed.
 
 The common task uses 200 Hz physics, 50 Hz actions, a 20 s episode horizon,
 the native Go2 rough-task reward and stock physical termination rules. Training
@@ -189,7 +189,7 @@ The environment, inference controller and learner are separate responsibilities.
 | `config.py` | Validated task and training settings. |
 | `artifacts.py` | Data-only learning/controller artifacts and motor contracts. |
 | `provenance.py` | Package hashes, source-owned dependency identity and Git evidence. |
-| `control/` | Causal sensors, controller/reset interface, command sources/tapes and motor contracts. |
+| `control/` | Causal sensors, controller/reset interface, command tapes and motor contracts. |
 | `environments/` | Native task configuration, observations, dynamics, rewards and reset semantics. Isaac Lab owns physics, managers and step/reset order. |
 | `environments/commands/` | Native command terms, training command sampling and fixed command sequences. |
 | `environments/terrains/` | Procedural and connected terrain geometry, traversal fixtures and roughness helpers. |

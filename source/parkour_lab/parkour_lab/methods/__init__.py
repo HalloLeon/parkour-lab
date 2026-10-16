@@ -1,8 +1,8 @@
 """Named learning backends, loaded only when selected.
 
 External adapters register an installed ``parkour_lab.methods`` entry point
-whose value is a module implementing MethodBackend. Installing a plugin grants
-it code execution; an artifact cannot supply an arbitrary Python import path.
+whose value is a module providing the CLI backend functions. Installing a plugin
+grants it code execution; an artifact cannot supply an arbitrary Python import path.
 """
 
 from importlib import import_module

@@ -57,10 +57,8 @@ class PackageBoundaryTests(unittest.TestCase):
     ):
         self.run_isolated(
             """
-            from parkour_lab.control.command_source import BodyTwistLease
             from parkour_lab.control.command_tape import TapeBuilder
             from parkour_lab.control.motor_contract import binding_sha256
-            assert BodyTwistLease().resolve(0).command == (0., 0., 0.)
             builder = TapeBuilder({})
             builder.append(0, (0., 0., 0.))
             assert builder.finish(completed=True)['complete']
@@ -167,7 +165,7 @@ class PackageBoundaryTests(unittest.TestCase):
                 ("torch", "parkour_lab.methods"),
             ),
             "methods": (
-                "from parkour_lab.methods import base, models\nfrom parkour_lab.methods.roa import model",
+                "from parkour_lab.methods import models\nfrom parkour_lab.methods.roa import model",
                 (),
             ),
             "inference": (
