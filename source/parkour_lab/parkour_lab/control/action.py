@@ -1,4 +1,4 @@
-"""Shared affine action delivery; PPO samples remain upstream of this transform."""
+"""Shared affine action delivery; policy samples remain upstream of this transform."""
 
 import torch
 

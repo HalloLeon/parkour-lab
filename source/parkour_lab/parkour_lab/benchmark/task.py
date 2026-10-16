@@ -5,11 +5,13 @@ import torch
 from parkour_lab.control.controller import finite_tensor
 from parkour_lab.environments.rewards import reward_recipe
 
-from .config import VERSION
+from .config import TASK_IDS, VERSION
 from .interface import (
     action_transform,
     configuration_id,
+    reset_indices,
     task_spaces,
+    terrain_metadata,
     validate_task_config,
 )
 from .observations import task_observation
@@ -24,10 +26,13 @@ class Go2Task:
     """
 
     def __init__(self, cfg, *, render_mode=None):
+        task_id = getattr(cfg, "benchmark_task_id", None)
         if (
             getattr(cfg, "benchmark_version", None) != VERSION
             or type(getattr(cfg, "benchmark_training", None)) is not bool
-            or cfg.benchmark_task_id != "Go2-Flat-v1"
+            or not isinstance(task_id, str)
+            or task_id not in TASK_IDS
+            or not TASK_IDS[task_id][1]
         ):
             raise ValueError("Use build_config to select a supported Go2 task and role")
         cfg.validate()
@@ -63,6 +68,7 @@ class Go2Task:
                 "reward_recipe": reward_recipe(self._env),
                 "motor_binding_id": binding_id,
                 "action_coordinates": "q_target = default_q + 0.25 * bounded_action",
+                "terrain": terrain_metadata(self._env),
             }
             if self.training:
                 from .schema import information_schema
@@ -111,6 +117,7 @@ class Go2Task:
         self._healthy()
         if seed is not None and (type(seed) is not int or seed != self._env.cfg.seed):
             raise ValueError("A different run seed requires a new task")
+        env_ids = reset_indices(env_ids, num_envs=self.num_envs, device=self.device)
         try:
             # The constructor seeded the task. Re-seeding the SDK here would also
             # rewind the consuming learner's global Torch RNG during continuation.

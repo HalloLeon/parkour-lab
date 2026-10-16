@@ -3,6 +3,7 @@
 import json
 from copy import deepcopy
 
+from parkour_lab.environments.terrains.families import curriculum
 from parkour_lab.runtime.accounting import nonnegative_integer
 
 VERSION = "go2_checkpoint_progress_v1"
@@ -41,19 +42,6 @@ def _milestones(values, cumulative):
     return result
 
 
-def _curriculum(env):
-    terrain = getattr(env.scene, "terrain", None)
-    levels = getattr(terrain, "terrain_levels", None)
-    types = getattr(terrain, "terrain_types", None)
-    if levels is None and types is None:
-        return None
-    if levels is None or types is None:
-        raise ValueError("Incomplete realized terrain assignments")
-    return dict(
-        levels=levels.detach().cpu().tolist(), types=types.detach().cpu().tolist()
-    )
-
-
 def capture_progress(env, *, run_id, checkpoint_id, configuration_id, milestones=()):
     """Capture at a trainer-owned checkpoint barrier, without advancing the task."""
     identity = _identity(env)
@@ -86,7 +74,7 @@ def capture_progress(env, *, run_id, checkpoint_id, configuration_id, milestones
             milestones=completed,
             sampler=env.parkour_randomization.state_dict(),
             sampling_report=getattr(command, "sampling_report", None),
-            curriculum=_curriculum(env),
+            curriculum=curriculum.curriculum_state(env),
             restart=(
                 previous["restart"]
                 if previous is not None
@@ -167,6 +155,7 @@ def _validate_record(env, record, checkpoint_id, configuration_id):
 
 
 def _validate_sampling_report(saved, current):
+    categories = ("translations", "stops", "pivots", "arcs")
     if saved is None and current is None:
         return
     if (
@@ -176,16 +165,21 @@ def _validate_sampling_report(saved, current):
     ):
         raise ValueError("Command sampling report identity differs")
     for name, value in saved.items():
-        if name in ("samples", "stops", "restricted_samples", "pivots"):
+        if name in ("samples", "restricted_samples", *categories):
             nonnegative_integer(value, name)
         elif type(value) is not type(current[name]) or value != current[name]:
             raise ValueError("Command sampling report definition differs")
     if any(
         saved[name] > saved["samples"]
-        for name in ("stops", "restricted_samples", "pivots")
+        for name in ("restricted_samples", *categories)
         if name in saved
     ):
         raise ValueError("Command category counts exceed total samples")
+    if (
+        all(name in saved for name in categories)
+        and sum(saved[name] for name in categories) != saved["samples"]
+    ):
+        raise ValueError("Exclusive command categories must sum to total samples")
 
 
 def restore_progress(
@@ -225,10 +219,7 @@ def restore_progress(
     total, unknown = floor + extra, saved["uncertain"] + extra
     if total < env.interactions.cumulative or unknown < env.interactions.uncertain:
         raise ValueError("Continuation cannot reduce already charged interactions")
-    if record["curriculum"] is not None or _curriculum(env) is not None:
-        raise NotImplementedError(
-            "Curriculum continuation needs the terrain progression binding"
-        )
+    levels = curriculum.validate_curriculum_state(env, record["curriculum"])
     sampler = env.parkour_randomization
     if (
         type(record["sampler"]) is not dict
@@ -242,6 +233,7 @@ def restore_progress(
     _validate_sampling_report(report, current_report)
     sampler.load_state_dict(record["sampler"])
     env.interactions.restore(total, uncertain=unknown)
+    curriculum.restore_curriculum_state(env, levels)
     if report is not None:
         command.sampling_report = deepcopy(report)
     record["interactions"] = env.interactions.state_dict()

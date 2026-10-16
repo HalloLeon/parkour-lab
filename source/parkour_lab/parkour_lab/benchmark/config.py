@@ -1,21 +1,22 @@
 """Public Go2 task definitions and native configuration, independent of learners."""
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 
 from parkour_lab.environments.task_config import TaskConfig, positive
+from parkour_lab.environments.terrains.families.specification import TerrainConfig
 
 VERSION = "go2-blind-v1"
 # Each definition is (families, supported). Definitions do not register native tasks.
 TASK_IDS = MappingProxyType(
     {
         "Go2-Flat-v1": (("Flat",), True),
-        "Go2-Uneven-v1": (("Uneven",), False),
-        "Go2-Slopes-v1": (("Slopes",), False),
-        "Go2-Stairs-v1": (("Stairs",), False),
-        "Go2-Hills-v1": (("Hills",), False),
-        "Go2-Mixed-v1": (("Flat", "Uneven", "Slopes", "Stairs", "Hills"), False),
+        "Go2-Uneven-v1": (("Uneven",), True),
+        "Go2-Slopes-v1": (("Slopes",), True),
+        "Go2-Stairs-v1": (("Stairs",), True),
+        "Go2-Hills-v1": (("Hills",), True),
+        "Go2-Mixed-v1": (("Flat", "Uneven", "Slopes", "Stairs", "Hills"), True),
     }
 )
 
@@ -28,6 +29,7 @@ class Go2Config:
     num_envs: int = 160
     seed: int = 42
     device: str = "cuda:0"
+    terrain: TerrainConfig = field(default_factory=TerrainConfig)
 
     def __post_init__(self):
         if not isinstance(self.task_id, str) or self.task_id not in TASK_IDS:
@@ -37,6 +39,14 @@ class Go2Config:
             raise ValueError("Require a uint32 seed")
         if not isinstance(self.device, str) or not self.device.strip():
             raise ValueError("Require an explicit device")
+        if not isinstance(self.terrain, TerrainConfig):
+            raise ValueError("Require TerrainConfig for terrain selection")
+        if self.task_id == "Go2-Mixed-v1" and self.num_envs < 10:
+            raise ValueError(
+                "Mixed terrain requires at least ten replicas for its subtypes"
+            )
+        if self.task_id == "Go2-Flat-v1" and self.terrain != TerrainConfig():
+            raise ValueError("Flat has no terrain level selection")
 
 
 def build_config(options: Go2Config, *, training=True):
@@ -55,7 +65,11 @@ def build_config(options: Go2Config, *, training=True):
         UnitreeGo2RoughEnvCfg,
     )
 
+    from parkour_lab.environments.commands.episode import EpisodeVelocityCommand
     from parkour_lab.environments.configuration import build_environment_config
+    from parkour_lab.environments.terrains.families.configuration import (
+        configure_terrain,
+    )
 
     task = TaskConfig(
         terrain="flat",
@@ -73,4 +87,14 @@ def build_config(options: Go2Config, *, training=True):
     cfg.benchmark_training = training
     cfg.benchmark_version = VERSION
     cfg.benchmark_task_id = options.task_id
+    cfg.benchmark_terrain_options = options.terrain.as_dict()
+    cfg.commands.base_velocity.class_type = EpisodeVelocityCommand
+    cfg.commands.base_velocity.resampling_time_range = (20.0, 20.0)
+    configure_terrain(
+        cfg,
+        options.terrain,
+        training=training,
+        task_id=options.task_id,
+        seed=options.seed,
+    )
     return cfg

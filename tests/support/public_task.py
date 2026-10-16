@@ -46,18 +46,20 @@ def public_configs():
 class PublicTaskFixture(TrainingEnvironmentFixture):
     """Four replicas, distinguishable outgoing/reset states and two ending flags."""
 
-    def __init__(self):
-        super().__init__(4)
+    def __init__(self, num_envs=4):
+        super().__init__(num_envs)
         self.env.scene["robot"].data.soft_joint_pos_limits = torch.tensor(
             [[-1.0, 1.0]] * 12
-        ).repeat(4, 1, 1)
-        self.env.interactions = InteractionCounter(4)
+        ).repeat(num_envs, 1, 1)
+        self.env.interactions = InteractionCounter(num_envs)
         self.env.close = lambda: setattr(self.env, "closed", True)
         self.native_step = self.step
         self.env.step = self.public_step
         self.env.reset = self.public_reset
         self.env.closed = False
-        self.env.cfg.parkour_task = dict(num_envs=4, seed=42, dynamics="randomized")
+        self.env.cfg.parkour_task = dict(
+            num_envs=num_envs, seed=42, dynamics="randomized"
+        )
         self.env.parkour_randomization = TaskRandomization(self.env.cfg.parkour_task)
         self.final_information_missing = False
 
@@ -69,7 +71,7 @@ class PublicTaskFixture(TrainingEnvironmentFixture):
     def information(self, env):
         values = {
             name: torch.full(
-                (4, *shape),
+                (env.num_envs, *shape),
                 bool(env.index) if dtype == "bool" else float(env.index),
                 dtype=torch.bool if dtype == "bool" else torch.float32,
             )
@@ -105,9 +107,18 @@ class PublicTaskFixture(TrainingEnvironmentFixture):
         return self.clean(), reward, terminated, truncated, raw
 
     @contextmanager
-    def task(self, *, training=True):
+    def task(self, *, training=True, options=None):
         def construct(*, cfg, render_mode):
             self.env.cfg = cfg
+            if cfg.benchmark_task_id != "Go2-Flat-v1":
+                self.env.scene.terrain = NS(
+                    terrain_types=torch.div(
+                        torch.arange(self.env.num_envs)
+                        * len(cfg.benchmark_terrain["columns"]),
+                        self.env.num_envs,
+                        rounding_mode="floor",
+                    )
+                )
             return self.env
 
         with (
@@ -125,7 +136,8 @@ class PublicTaskFixture(TrainingEnvironmentFixture):
             sys.modules["parkour_lab.environments.dynamics"].dynamics_report = (
                 lambda _: None
             )
-            cfg = build_config(Go2Config(num_envs=4, device="cpu"), training=training)
+            options = options or Go2Config(num_envs=self.env.num_envs, device="cpu")
+            cfg = build_config(options, training=training)
             task = make(cfg)
             try:
                 yield task

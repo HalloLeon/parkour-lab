@@ -181,6 +181,10 @@ class RoughCommand:
     pass
 
 
+class EpisodeCommand:
+    pass
+
+
 class TerrainCommand:
     pass
 
@@ -332,6 +336,7 @@ def native_config_modules(stock=None, *, rough=None):
                     "ObservationTermCfg",
                     "SceneEntityCfg",
                     "TerminationTermCfg",
+                    "CurriculumTermCfg",
                 )
             },
             "RewardTermCfg": NativeRewardTerm,
@@ -367,6 +372,9 @@ def native_config_modules(stock=None, *, rough=None):
             "ProceduralTerrainCommand": TerrainCommand,
             "procedural_physical_failure": failure,
             "procedural_workspace": workspace,
+        },
+        "parkour_lab.environments.commands.episode": {
+            "EpisodeVelocityCommand": EpisodeCommand,
         },
         "parkour_lab.environments.dynamics": {"configure_dynamics": configure_dynamics},
     }

@@ -156,7 +156,7 @@ def native_importer():
 
 class ConnectedTests(unittest.TestCase):
     def test_actual_physical_failure_accepts_descent_but_rejects_below_world(self):
-        from tests.environments.test_commands import native_commands
+        from tests.support.commands import native_commands
 
         class Scene(dict):
             env_origins = torch.zeros(3, 3)

@@ -10,7 +10,12 @@ from types import SimpleNamespace as NS
 
 import torch
 
-from parkour_lab.benchmark.config import TASK_IDS, Go2Config, build_config
+from parkour_lab.benchmark.config import (
+    TASK_IDS,
+    Go2Config,
+    TerrainConfig,
+    build_config,
+)
 from parkour_lab.config import TaskConfig as WorkflowTaskConfig
 from parkour_lab.environments.configuration import build_environment_config
 from parkour_lab.environments.rewards import reward_recipe
@@ -97,14 +102,12 @@ for name, (_, supported) in TASK_IDS.items():
         self.assertIs(WorkflowTaskConfig, TaskConfig)
         self.assertEqual(TaskConfig().terrain, "procedural")
 
-    def test_options_are_frozen_and_unsupported_definitions_are_honest(self):
+    def test_options_are_frozen_and_all_declared_families_are_available(self):
         options = Go2Config()
         with self.assertRaises(FrozenInstanceError):
             options.seed = 1
         self.assertEqual(len(TASK_IDS), 6)
-        self.assertEqual(
-            [name for name, (_, ready) in TASK_IDS.items() if ready], [options.task_id]
-        )
+        self.assertTrue(all(ready for _, ready in TASK_IDS.values()))
         for kwargs in (
             {"task_id": "missing"},
             {"task_id": []},
@@ -114,11 +117,58 @@ for name, (_, supported) in TASK_IDS.items():
             {"seed": 2**32},
             {"seed": True},
             {"device": " "},
+            {"terrain": {}},
+            {"task_id": "Go2-Mixed-v1", "num_envs": 9},
+            {"terrain": TerrainConfig(fixed_level=1)},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 Go2Config(**kwargs)
         with self.assertRaises(ValueError):
             build_config(options, training=1)
+
+    def test_every_family_reuses_the_common_native_reward_and_sensor_recipe(self):
+        rough = rough_recipe()
+        with native_config_modules(rough=rough):
+            for task_id in TASK_IDS:
+                with self.subTest(task_id=task_id):
+                    cfg = build_config(
+                        Go2Config(task_id=task_id, num_envs=20, device="cpu")
+                    )
+                    self.assertEqual(cfg.benchmark_task_id, task_id)
+                    self.assertEqual(cfg.benchmark_terrain["task_id"], task_id)
+                    self.assertIsNone(cfg.observations.policy)
+                    self.assertIsNone(cfg.observations.terrain)
+                    self.assertEqual(
+                        cfg.commands.base_velocity.resampling_time_range, (20, 20)
+                    )
+                    for name, term in vars(rough.rewards).items():
+                        actual = getattr(cfg.rewards, name)
+                        if term is None:
+                            self.assertIsNone(actual)
+                        else:
+                            self.assertEqual(actual.weight, term.weight)
+                            self.assertIs(actual.func, term.func)
+                            self.assertEqual(actual.params, term.params)
+
+    def test_evaluation_severity_is_explicit_and_has_no_runtime_progression(self):
+        with native_config_modules(rough=rough_recipe()):
+            cfg = build_config(
+                Go2Config(
+                    task_id="Go2-Stairs-v1",
+                    device="cpu",
+                    terrain=TerrainConfig(fixed_level=7),
+                ),
+                training=False,
+            )
+            self.assertEqual(cfg.benchmark_terrain["fixed_level"], 7)
+            self.assertEqual(cfg.scene.terrain.terrain_generator.num_rows, 1)
+            self.assertIsNone(cfg.curriculum.terrain_levels)
+            with self.assertRaisesRegex(ValueError, "evaluation-only"):
+                build_config(
+                    Go2Config(
+                        task_id="Go2-Stairs-v1", terrain=TerrainConfig(fixed_level=1)
+                    )
+                )
 
     def test_flat_uses_rough_native_rewards_and_only_causal_observation_group(self):
         rough = rough_recipe()
@@ -164,7 +214,7 @@ for name, (_, supported) in TASK_IDS.items():
         self.assertIsNotNone(cfg.observations.terrain)
         self.assertFalse(evaluation.benchmark_training)
         self.assertEqual(
-            evaluation.commands.base_velocity.resampling_time_range, (1e9, 1e9)
+            evaluation.commands.base_velocity.resampling_time_range, (20.0, 20.0)
         )
 
     def test_native_configuration_accepts_added_reward_and_zero_disables_computation(

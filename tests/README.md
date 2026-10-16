@@ -6,10 +6,12 @@ Shared fixtures live in `support/`, never in another test module.
 
 | Location | What the checks protect |
 | --- | --- |
-| `benchmark/` | Public task/configuration, permitted actor/GT observations, spaces, real-transition accounting and checkpoint-linked continuation |
+| `benchmark/` | Public task API, permitted actor/GT observations, spaces, accounting and continuation |
 | `control/` | Command tapes, frame ordering, sensor units and motor contracts |
-| `environments/` | Command sampling/reset behavior, owned terminal observations and RNG isolation, reward configuration/formulas and scan preprocessing |
-| `environments/terrains/` | Procedural and connected terrain geometry, traversal fixtures and roughness contracts |
+| `environments/` | Owned terminal observations and RNG isolation, reward configuration/formulas, dynamics and scan preprocessing |
+| `environments/commands/` | Episode/operator sampling, native command reset behavior and curriculum eligibility |
+| `environments/terrains/families/` | Native family mappings, physical severity, fixed-row geometry and curriculum contracts |
+| Other `environments/terrains/` tests | Procedural/connected geometry and traversal fixtures |
 | `evaluation/` | Flat profiles and terrain crossing/tracking/finish rules, first-attempt failure retention, and read-only archive-integrity checks |
 | `methods/` | Real ROA updates, causal routing, timeout semantics, optimizer state, history, export parity and installed backend discovery |
 | `runtime/` | Native sensor/action binding, signed reward accounting and pre-reset diagnostics, external command ownership and cleanup |
@@ -23,9 +25,12 @@ must never be overwritten. Those are data-safety contracts, not legacy support.
 
 ## Local execution
 
-Use a CPU Python environment with NumPy, PyTorch, TensorDict, RSL-RL and trimesh.
-Install these through `python -m pip install -e 'source/parkour_lab[roa]'` in
-Python 3.10 or 3.11. Tooling, package-build and bounded server smoke commands are
+Use a CPU Python environment with NumPy, PyTorch, TensorDict, RSL-RL, trimesh and
+SciPy for native heightfield source checks.
+Install package/learner dependencies through
+`python -m pip install -e 'source/parkour_lab[roa]'` in Python 3.10 or 3.11, then
+install the geometry-test dependency with `python -m pip install scipy`.
+Tooling, package-build and bounded server smoke commands are
 in the [package README](../source/parkour_lab/docs/README.md#verification).
 The project uses RSL-RL 3.1.2; learner tests execute real PPO and history-fitting
 updates, not mock optimizers. Git is needed for provenance tests. From the repository root:
@@ -66,6 +71,16 @@ stated information, action, ending and accounting contracts. The runnable
 `scripts/check_public_task.py` separately checks training, evaluation and a fresh
 task-progress restart on the server. CPU success does not establish actual native
 readback, physical locomotion or learner-checkpoint restoration.
+
+Benchmark geometry checks call native terrain generator source for the five
+families, explicit Uneven severity, pyramid signs and fixed evaluation rows.
+Curriculum checks protect eligible translation, stop/pivot/arc holds, stable
+family assignment, level boundaries and checkpoint-linked level restoration.
+`scripts/check_terrain.py` separately captures real collider/ray measurements,
+settled nonzero contacts and controlled native curriculum changes across fixed
+easy/medium/hard settings. Its command is in the package README. The script's
+CPU help/syntax checks do not replace those returned native captures or establish
+calibrated geometry, learnability or non-flat locomotion.
 
 Timing checks cover 200/400 Hz configuration with unchanged 50 Hz actions, the
 SDK's four/eight-substep sampling/reset order, exact cross-rate rejection, and

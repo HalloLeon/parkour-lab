@@ -13,6 +13,54 @@ from tests.support.public_task import PublicTaskFixture, public_configs
 
 
 class TaskTests(unittest.TestCase):
+    def test_mixed_facade_records_allocation_and_keeps_actor_information_boundary(self):
+        for training in (True, False):
+            with self.subTest(training=training):
+                fixture = PublicTaskFixture(num_envs=20)
+                options = Go2Config(task_id="Go2-Mixed-v1", num_envs=20, device="cpu")
+                with fixture.task(training=training, options=options) as task:
+                    observation, _ = task.reset()
+                    self.assertEqual(observation["actor"].shape, (20, 49))
+                    self.assertEqual(
+                        set(observation),
+                        {"actor", "training"} if training else {"actor"},
+                    )
+                    allocation = task.metadata["terrain"]["realized_family_counts"]
+                    self.assertEqual(
+                        allocation,
+                        dict(Flat=4, Uneven=4, Slopes=4, Stairs=4, Hills=4),
+                    )
+                    _, _, _, _, info = task.step(torch.zeros(20, 12))
+                    self.assertEqual(info["interactions"]["session"], 20)
+                    self.assertEqual(
+                        set(info),
+                        {"final_env_ids", "final_observation", "interactions"},
+                    )
+
+    def test_partial_reset_normalizes_ids_before_native_mutation(self):
+        fixture = PublicTaskFixture()
+        with fixture.task() as task:
+            task.reset()
+            task.step(torch.ones(4, 12))
+            previous = fixture.env.action_manager.action.clone()
+            with patch.object(task._env, "reset", wraps=fixture.public_reset) as reset:
+                task.reset(env_ids=[1, 3])
+                ids = reset.call_args.kwargs["env_ids"]
+                self.assertEqual(ids.dtype, torch.long)
+                self.assertEqual(ids.tolist(), [1, 3])
+                torch.testing.assert_close(
+                    fixture.env.action_manager.action[[0, 2]], previous[[0, 2]]
+                )
+                self.assertFalse(fixture.env.action_manager.action[[1, 3]].any())
+                for invalid in ([True], [0.5], [4], [-1], [1, 1], [[0]], "0"):
+                    with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                        task.reset(env_ids=invalid)
+                self.assertEqual(reset.call_count, 1)
+                task.reset(env_ids=[])
+                self.assertEqual(reset.call_args.kwargs["env_ids"].numel(), 0)
+            task.step(torch.zeros(4, 12))
+            self.assertEqual(task.interactions["session"], 8)
+
     def test_reset_seed_asserts_identity_without_rewinding_learner_rng(self):
         fixture = PublicTaskFixture()
         with fixture.task() as task:

@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+from collections import Counter
+from copy import deepcopy
 
 import gymnasium as gym
 import numpy as np
@@ -76,12 +78,55 @@ def configuration_id(cfg):
     return _identity(cfg.to_dict())
 
 
+def reset_indices(env_ids, *, num_envs, device):
+    """Normalize partial resets before native callbacks can mutate episode state."""
+    if env_ids is None:
+        return None
+    try:
+        ids = torch.as_tensor(env_ids, device=device)
+    except (TypeError, ValueError, RuntimeError) as error:
+        raise ValueError(
+            "Reset IDs require a one-dimensional integer sequence"
+        ) from error
+    if ids.ndim != 1 or (ids.numel() and ids.dtype not in (torch.int32, torch.int64)):
+        raise ValueError("Reset IDs require a one-dimensional integer sequence")
+    ids = ids.to(dtype=torch.long)
+    if ((ids < 0) | (ids >= num_envs)).any() or ids.unique().numel() != ids.numel():
+        raise ValueError("Reset IDs must be unique and within the replica batch")
+    return ids
+
+
+def terrain_metadata(env):
+    """Record static family allocation without exposing live levels to actors."""
+    specification = deepcopy(env.cfg.benchmark_terrain)
+    if env.cfg.benchmark_task_id == "Go2-Flat-v1":
+        counts = {"Flat": env.num_envs}
+    else:
+        columns = specification["columns"]
+        types = env.scene.terrain.terrain_types.detach().cpu().tolist()
+        if len(types) != env.num_envs or any(
+            type(index) is not int or not 0 <= index < len(columns) for index in types
+        ):
+            raise ValueError(
+                "Realized terrain families differ from the declared columns"
+            )
+        counts = dict(Counter(columns[index]["family"] for index in types))
+    specification["realized_family_counts"] = counts
+    return specification
+
+
 def validate_task_config(cfg):
     """Allow native reward customization while enforcing the published task preset."""
-    from .config import Go2Config, build_config
+    from .config import Go2Config, TerrainConfig, build_config
 
     reference = build_config(
-        Go2Config(num_envs=cfg.scene.num_envs, seed=cfg.seed, device=cfg.sim.device),
+        Go2Config(
+            task_id=cfg.benchmark_task_id,
+            num_envs=cfg.scene.num_envs,
+            seed=cfg.seed,
+            device=cfg.sim.device,
+            terrain=TerrainConfig(**cfg.benchmark_terrain_options),
+        ),
         training=cfg.benchmark_training,
     )
     actual, expected = cfg.to_dict(), reference.to_dict()

@@ -214,14 +214,12 @@ class ProgressTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "training environment"):
             checkpoint(source)
 
-    def test_curriculum_restore_is_explicitly_unavailable_without_progression_binding(
-        self,
-    ):
+    def test_flat_record_rejects_nonflat_curriculum_without_mutation(self):
         record = checkpoint(environment())
         record["curriculum"] = dict(levels=[2, 3], types=[0, 1])
         target = environment()
         initial = target.parkour_randomization.state_dict()
-        with self.assertRaisesRegex(NotImplementedError, "progression binding"):
+        with self.assertRaisesRegex(ValueError, "Curriculum continuation"):
             restore(target, record)
         self.assertEqual(target.interactions.cumulative, 0)
         self.assertEqual(target.parkour_randomization.state_dict(), initial)
