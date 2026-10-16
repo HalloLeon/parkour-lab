@@ -5,11 +5,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import parkour_lab.runtime.motor as motor_bridge
 import torch
+
+import parkour_lab.runtime.motor as motor_bridge
 from parkour_lab.control import motor_contract
 from parkour_lab.control.controller import JointTargets
-
 from tests.support.native import make_native_env
 
 

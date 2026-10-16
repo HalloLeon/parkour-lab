@@ -7,7 +7,8 @@ Shared fixtures live in `support/`, never in another test module.
 | Location | What the checks protect |
 | --- | --- |
 | `control/` | Command leases and tapes, frame ordering, sensor units and motor contracts |
-| `environments/` | Command sampling/reset behavior, owned terminal observations and RNG isolation, reward configuration/formulas, terrain geometry and scan preprocessing |
+| `environments/` | Command sampling/reset behavior, owned terminal observations and RNG isolation, reward configuration/formulas and scan preprocessing |
+| `environments/terrains/` | Procedural and connected terrain geometry, traversal fixtures and roughness contracts |
 | `evaluation/` | Flat profiles and terrain crossing/tracking/finish rules, first-attempt failure retention, and read-only archive-integrity checks |
 | `methods/` | Real ROA updates, causal routing, timeout semantics, optimizer state, history, export parity and installed backend discovery |
 | `runtime/` | Native sensor/action binding, signed reward accounting and pre-reset diagnostics, external command ownership and cleanup |
@@ -22,6 +23,9 @@ must never be overwritten. Those are data-safety contracts, not legacy support.
 ## Local execution
 
 Use a CPU Python environment with NumPy, PyTorch, TensorDict, RSL-RL and trimesh.
+Install these through `python -m pip install -e 'source/parkour_lab[roa]'` in
+Python 3.10 or 3.11. Tooling, package-build and bounded server smoke commands are
+in the [package README](../source/parkour_lab/docs/README.md#verification).
 The project uses RSL-RL 3.1.2; learner tests execute real PPO and history-fitting
 updates, not mock optimizers. Git is needed for provenance tests. From the repository root:
 
@@ -47,8 +51,7 @@ CLI and do not require test files.
 bounded native delivery, previous-action/reset feedback, the action-rate formula,
 frozen inference parity and explicit artifact conversion. `test_gradients.py`
 checks ordinary clipping agreement, large finite norms and true nonfinite
-rejection. These portable tests do not depend on downloaded run archives; the
-returned exceptional gradients were separately checked as local evidence.
+rejection. These portable tests do not depend on downloaded run archives.
 
 Most checks use real CPU tensor/mesh code with small native API doubles. Selected
 adapter tests also load Isaac Lab 2.3.2 source from a sibling `IsaacLab2.3.2` or

@@ -1,7 +1,7 @@
 """Independent, recorded random streams for each robot and first-attempt bank ID."""
 
-from copy import deepcopy
 import hashlib
+from copy import deepcopy
 
 import numpy as np
 

@@ -1,14 +1,14 @@
 """Small command surface for current training, inference and result inspection."""
 
 import argparse
-from dataclasses import replace
 import json
 import math
-from pathlib import Path
 import random
 import tempfile
 import time
 import traceback
+from dataclasses import replace
+from pathlib import Path
 
 from parkour_lab.config import ExperimentConfig
 
@@ -266,50 +266,86 @@ def resolve_config(args):
 
 
 def main(argv=None, *, standalone=False):
-    """Run a command; only the standalone native CLI owns process termination."""
+    """Dispatch portable operations before entering the standalone native lifecycle."""
     args = parse_args(argv)
-    if args.operation == "bound-actions":
-        from parkour_lab.artifacts import bound_actions
+    handlers = {"bound-actions": _bound_actions, "analyze": _analyze, "export": _export}
+    handler = handlers.get(args.operation)
+    if handler is not None:
+        return handler(args)
+    return _run_native(args, standalone=standalone)
 
-        print(
-            json.dumps(
-                bound_actions(args.checkpoint, args.destination, report=args.report),
-                indent=2,
-            )
+
+def _bound_actions(args):
+    from parkour_lab.artifacts import bound_actions
+
+    print(
+        json.dumps(
+            bound_actions(args.checkpoint, args.destination, report=args.report),
+            indent=2,
         )
+    )
+    return 0
+
+
+def _analyze(args):
+    if args.terrain:
+        from parkour_lab.evaluation.terrain_analysis import analyze_terrain_attempt
+
+        print(json.dumps(analyze_terrain_attempt(args.run), indent=2, allow_nan=False))
         return 0
-    if args.operation == "analyze":
-        if args.terrain:
-            from parkour_lab.evaluation.runner import analyze_terrain_attempt
+    if args.flat_bank:
+        from parkour_lab.evaluation.flat import analyze_development_bank
 
-            print(
-                json.dumps(analyze_terrain_attempt(args.run), indent=2, allow_nan=False)
-            )
-            return 0
-        if args.flat_bank:
-            from parkour_lab.evaluation.flat import analyze_development_bank
-
-            print(
-                json.dumps(
-                    analyze_development_bank(args.run), indent=2, allow_nan=False
-                )
-            )
-            return 0
-        report = args.run / "report.json" if args.run.is_dir() else args.run
-        print(json.dumps(json.loads(report.read_text()), indent=2, allow_nan=False))
+        print(json.dumps(analyze_development_bank(args.run), indent=2, allow_nan=False))
         return 0
-    if args.operation == "export":
-        from parkour_lab.artifacts import export_actor
+    report = args.run / "report.json" if args.run.is_dir() else args.run
+    print(json.dumps(json.loads(report.read_text()), indent=2, allow_nan=False))
+    return 0
 
-        print(
-            json.dumps(
-                export_actor(
-                    args.checkpoint, args.destination, physics_hz=args.physics_hz
-                ),
-                indent=2,
-            )
+
+def _export(args):
+    from parkour_lab.artifacts import export_actor
+
+    print(
+        json.dumps(
+            export_actor(args.checkpoint, args.destination, physics_hz=args.physics_hz),
+            indent=2,
         )
-        return 0
+    )
+    return 0
+
+
+def _playback_commands(args, config):
+    if args.operation == "train":
+        return None
+    from parkour_lab.control.command_tape import load_tape
+    from parkour_lab.evaluation.runner import command_sequence
+
+    if getattr(args, "profile", None) or getattr(args, "bank_profile", None):
+        from parkour_lab.evaluation.flat import profile_commands
+
+        commands = profile_commands(args.profile or args.bank_profile)
+    elif config.task.terrain_group is not None:
+        from parkour_lab.environments.randomization import (
+            terrain_development_attempt,
+        )
+
+        phases = terrain_development_attempt(
+            config.task.terrain_group, config.task.terrain_attempt_index
+        )["command_phases"]
+        commands = [
+            command for duration, command in phases for _ in range(round(duration * 50))
+        ]
+    else:
+        commands = command_sequence(
+            tape=load_tape(args.tape) if args.tape else None,
+            command=args.command if args.command is not None else (0.3, 0.0, 0.0),
+            steps=args.steps if args.steps is not None else 900,
+        )
+    return commands
+
+
+def _run_native(args, *, standalone):
     config = resolve_config(args)
     if args.operation == "train":
         config.validate_training()
@@ -324,34 +360,7 @@ def main(argv=None, *, standalone=False):
     random.seed(config.task.seed)
     np.random.seed(config.task.seed)
     torch.manual_seed(config.task.seed)
-    commands = None
-    if args.operation != "train":
-        from parkour_lab.control.command_tape import load_tape
-        from parkour_lab.evaluation.runner import command_sequence
-
-        if getattr(args, "profile", None) or getattr(args, "bank_profile", None):
-            from parkour_lab.evaluation.flat import profile_commands
-
-            commands = profile_commands(args.profile or args.bank_profile)
-        elif config.task.terrain_group is not None:
-            from parkour_lab.environments.randomization import (
-                terrain_development_attempt,
-            )
-
-            phases = terrain_development_attempt(
-                config.task.terrain_group, config.task.terrain_attempt_index
-            )["command_phases"]
-            commands = [
-                command
-                for duration, command in phases
-                for _ in range(round(duration * 50))
-            ]
-        else:
-            commands = command_sequence(
-                tape=load_tape(args.tape) if args.tape else None,
-                command=args.command if args.command is not None else (0.3, 0.0, 0.0),
-                steps=args.steps if args.steps is not None else 900,
-            )
+    commands = _playback_commands(args, config)
     args.output_parent.mkdir(parents=True, exist_ok=True)
     output = Path(
         tempfile.mkdtemp(prefix=f"{args.operation}_", dir=args.output_parent)
@@ -426,7 +435,7 @@ def main(argv=None, *, standalone=False):
                 diagnose_training=args.diagnose_training,
             )
         else:
-            from parkour_lab.artifacts import load_actor, file_sha256
+            from parkour_lab.artifacts import file_sha256, load_actor
             from parkour_lab.evaluation.runner import evaluate
 
             loaded = load_actor(args.actor, device=config.task.device)

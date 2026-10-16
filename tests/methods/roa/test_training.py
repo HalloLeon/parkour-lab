@@ -7,11 +7,11 @@ import unittest
 from unittest.mock import patch
 
 import torch
+
 from parkour_lab.methods.base import TrainingMethod
 from parkour_lab.methods.roa import Learner
 from parkour_lab.methods.roa import model as roa
 from parkour_lab.methods.roa.training import ROAPPO, ROATrainingMethod
-
 from tests.support.roa import TensorHost, observations
 
 

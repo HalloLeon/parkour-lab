@@ -4,6 +4,7 @@ import unittest
 from dataclasses import asdict
 
 import torch
+
 from parkour_lab.control.proprioception import (
     FRAME_DIM,
     FRAME_TERMS,

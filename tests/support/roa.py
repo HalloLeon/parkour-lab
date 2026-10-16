@@ -3,10 +3,11 @@
 from types import SimpleNamespace
 
 import torch
-from parkour_lab.control.controller import Sample
-from parkour_lab.control.proprioception import CONTACT_SLICE, FRAME_DIM
 from tensordict import TensorDict
 from torch import nn
+
+from parkour_lab.control.controller import Sample
+from parkour_lab.control.proprioception import CONTACT_SLICE, FRAME_DIM
 
 
 def stock_motor():

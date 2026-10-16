@@ -11,14 +11,13 @@ from __future__ import annotations
 
 import torch
 
-from parkour_lab.control.controller import JointTargets, finite_tensor
 from parkour_lab.control.action import BOUNDED_RAW_ACTION_MEANING, JointActionTransform
+from parkour_lab.control.controller import JointTargets, finite_tensor
 from parkour_lab.control.motor_contract import (
     RANDOMIZATION_RANGES,
     nominal_binding_sha256,
     verify_runtime_motor,
 )
-
 
 VERSION = "native_joint_target_bridge_v1"
 NATIVE_RAW_ACTION_MEANING = (

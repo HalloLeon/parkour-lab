@@ -2,7 +2,6 @@
 
 import torch
 
-
 REGIMES = ("initial_stop", "later_stop", "pivot", "planar", "arc")
 PHYSICAL_METRICS = (
     "planar_error_m_s",

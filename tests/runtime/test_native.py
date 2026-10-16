@@ -4,17 +4,17 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
-import parkour_lab.runtime.native as host_module
 import torch
+
+import parkour_lab.runtime.native as host_module
 from parkour_lab.control.controller import ControllerSpec, JointTargets, SensorSpec
 from parkour_lab.control.motor_contract import (
-    nominal_binding_sha256,
     make_motor_contract,
+    nominal_binding_sha256,
 )
 from parkour_lab.control.proprioception import FOOT_NAMES
 from parkour_lab.environments.randomization import TaskRandomization
 from parkour_lab.runtime.training import TrainingHost
-
 from tests.support.native import make_native_env, rebatch
 
 

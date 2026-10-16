@@ -165,9 +165,11 @@ def _trial(family, reverse, features, size, yaw):
     landing[:, axis] = sorted((exit_point[axis], finish[axis] + direction))
     return {
         "family": family,
-        "orientation": ("long-first" if reverse else "short-first")
-        if family == "hill"
-        else ("down" if reverse else "up"),
+        "orientation": (
+            ("long-first" if reverse else "short-first")
+            if family == "hill"
+            else ("down" if reverse else "up")
+        ),
         "start_xy_local_m": start.tolist(),
         "start_xy_world_m": (rotation @ start).tolist(),
         "heading_local_rad": heading,
@@ -200,38 +202,10 @@ def _trial(family, reverse, features, size, yaw):
     }
 
 
-def build_world(
-    target_family,
-    tier,
-    *,
-    coarse_seed,
-    fine_seed,
-    reverse=False,
-    risers=4,
-    tread=0.4,
-    incline_length=2.0,
-    size=(24.0, 24.0),
-    stair_entry=14.0,
-    ramp_entry=14.0,
-    stair_route_y=11.0,
-    ramp_route_x=7.0,
-    hill_entry=4.0,
-    hill_center_y=4.0,
-    world_yaw=0.0,
-    resolution=0.02,
+def _validate_world_shape(
+    target_family, tier, coarse_seed, fine_seed, reverse, risers, tread, incline_length
 ):
-    """Build one configurable connected diagnostic world, never a policy trial.
-
-    The assigned family uses ``tier``; surrounding stairs/ramp/hill use 8 cm,
-    10 degrees and 10 degrees. Hill reversal reflects its unequal flanks while
-    travelling +x; stairs/ramp reversal instead changes the supported start side.
-    Legal requested stair coordinates are preserved. If binary32 conversion would
-    violate a tread bound, realize the flight on a common binary32 lattice before
-    authoring the carrier/noise, and report requested versus realized coordinates.
-    Shared roughness scaling targets 25 degrees; small rounding errors are accepted.
-    Vertices stay local. The recorded rigid transform rotates mesh and start
-    together; arbitrary independent feature rotations are intentionally unsupported.
-    """
+    """Reject unsupported target, direction, seeds and shape overrides."""
     if target_family not in ("stairs", "ramp", "hill") or not _positive(tier):
         raise ValueError("Require a stairs, ramp or hill target and a valid tier")
     if tier not in (
@@ -259,6 +233,20 @@ def build_world(
         target_family != "ramp" and incline_length != 2.0
     ):
         raise ValueError("Shape overrides must apply to the assigned family")
+
+
+def _world_size(
+    size,
+    stair_entry,
+    ramp_entry,
+    stair_route_y,
+    ramp_route_x,
+    hill_entry,
+    hill_center_y,
+    resolution,
+    world_yaw,
+):
+    """Validate placement inputs before allocating the world grid."""
     if (
         not isinstance(size, (tuple, list))
         or len(size) != 2
@@ -288,10 +276,27 @@ def build_world(
         or not math.isfinite(world_yaw)
     ):
         raise ValueError("World yaw must be finite")
+    return size
+
+
+def _world_features(
+    target_family,
+    tier,
+    risers,
+    tread,
+    incline_length,
+    size,
+    stair_entry,
+    ramp_entry,
+    stair_route_y,
+    ramp_route_x,
+    hill_entry,
+    hill_center_y,
+):
+    """Define and validate the three structure footprints and their carrier grades."""
     stair_tier = float(tier) if target_family == "stairs" else 0.08
     ramp_tier = float(tier) if target_family == "ramp" else 10.0
     hill_tier = float(tier) if target_family == "hill" else 10.0
-    hill_reverse = reverse and target_family == "hill"
     lips, stair_coordinates = _stair_lips(stair_entry, tread, risers)
     stair_entry = float(lips[0])
     ramp_grade = math.tan(math.radians(9.9))
@@ -368,7 +373,26 @@ def build_world(
         or (features["hill"]["influence"][1] > size).any()
     ):
         raise ValueError("Hill sidebanks must lie on separate lower supporting ground")
-    trial = _trial(target_family, reverse, features, size, world_yaw)
+    return features, lips, ramp_grade, target_ramp_grade
+
+
+def _world_axes(
+    features,
+    lips,
+    risers,
+    incline_length,
+    size,
+    trial,
+    resolution,
+    hill_reverse,
+    ramp_grade,
+):
+    """Insert exact feature, intersection and pad knots before meshing."""
+    stair_tier = features["stairs"]["tier"]
+    ramp_entry = features["ramp"]["entry"][1]
+    ramp_core = features["ramp"]["core_x_m"]
+    hill_entry, hill_center_y = features["hill"]["entry"]
+    hill_exit = features["hill"]["exit"][0]
     up = 1.5 if hill_reverse else 1.0
     stair_levels = np.arange(1, risers + 1) * (stair_tier - 0.001)
     crossings = ramp_entry + stair_levels / ramp_grade
@@ -415,6 +439,29 @@ def build_world(
     )
     if axis_spacing > 0.02 or float32_spacing > 0.02:
         raise ValueError("Source/float32 horizontal spacing exceeds 0.02 m")
+    return x, y, crossings, crossing_levels, axis_spacing, float32_spacing
+
+
+def _world_carrier(
+    features,
+    x,
+    y,
+    lips,
+    risers,
+    incline_length,
+    hill_reverse,
+    ramp_grade,
+    target_ramp_grade,
+    crossings,
+    crossing_levels,
+):
+    """Join stairs, ramp shoulders and hill without changing analytic seam heights."""
+    stair_tier = features["stairs"]["tier"]
+    stair_entry = features["stairs"]["entry"][0]
+    ramp_entry = features["ramp"]["entry"][1]
+    shoulder_widths = features["ramp"]["shoulder_widths_m"]
+    hill_tier = features["hill"]["tier"]
+    hill_entry, hill_center_y = features["hill"]["entry"]
     stairs = _carrier_profile(
         "stairs", stair_tier, x, stair_entry, lips, False, risers, 2.0
     )
@@ -442,6 +489,11 @@ def build_world(
         np.maximum(stairs[:, None], ramp_factor[:, None] * ramp[None, :])
         + hill[:, None] * hill_width[None, :]
     )
+    return carrier
+
+
+def _carrier_mesh(x, y, carrier):
+    """Weld only collapsed stair risers and validate the converted carrier topology."""
     vertices, faces = _grid_mesh(x, y, carrier)
     support = np.broadcast_to(
         (np.diff(x) > 0)[:, None, None], (len(x) - 1, len(y) - 1, 2)
@@ -484,6 +536,35 @@ def build_world(
         )
     )
     del converted_carrier_normals
+    return (
+        vertices,
+        faces,
+        support,
+        carrier,
+        retained,
+        removed_faces,
+        converted_carrier,
+        converted_carrier_grades,
+    )
+
+
+def _roughen_world(
+    vertices,
+    faces,
+    support,
+    carrier,
+    features,
+    lips,
+    trial,
+    size,
+    incline_length,
+    ramp_grade,
+    coarse_seed,
+    fine_seed,
+):
+    """Taper one shared noise draw, apply regional caps and validate source roughness."""
+    stair_tier = features["stairs"]["tier"]
+    ramp_entry = features["ramp"]["entry"][1]
     taper = np.ones(len(vertices))
     riser_segments = []
     ramp_height = incline_length * ramp_grade
@@ -558,6 +639,43 @@ def build_world(
         ]
         for name, mask in region_masks.items()
     }
+    arrays = {
+        "coarse_heights": layers[0],
+        "fine_heights": layers[1],
+        "taper": taper,
+        "untapered_samples": untapered,
+        "support_faces": support,
+        "roughness_cap_m": cap,
+    }
+    measurements = {
+        "roughness_shared_scale": scale,
+        "roughness_rms_m": rms,
+        "regional_rms_descriptive_m": region_rms,
+        "maximum_supporting_grade_degrees": grade,
+        "projected_support_area_m2": float(normals[support, 2].sum() / 2),
+        "untapered_support_area_m2": float(normals[full_faces, 2].sum() / 2),
+        "intentional_riser_segments_local_m": riser_segments,
+    }
+    return arrays, measurements, carrier_gradient
+
+
+def _measure_features(
+    features,
+    vertices,
+    faces,
+    support,
+    carrier_gradient,
+    converted_carrier,
+    converted_carrier_grades,
+    lips,
+    incline_length,
+    hill_reverse,
+):
+    """Measure full-height feature footprints independently of clipped seam walls."""
+    ramp_entry = features["ramp"]["entry"][1]
+    hill_entry = features["hill"]["entry"][0]
+    hill_exit = features["hill"]["exit"][0]
+    up = 1.5 if hill_reverse else 1.0
     # Feature limits apply only to full-height footprints, not clipped seam walls.
     carrier_grades = np.degrees(np.arctan(np.linalg.norm(carrier_gradient, axis=1)))
     for family, feature in features.items():
@@ -634,6 +752,10 @@ def build_world(
             feature["profile_boundary_conversion_error_m"] = (
                 converted_boundaries - boundaries
             ).tolist()
+
+
+def _validate_float32_surface(vertices, faces, support, carrier, cap, rms):
+    """Check final converted topology, slope, caps and conservative layer RMS."""
     quantized = vertices.astype(np.float32).astype(np.float64)
     float32_normals = _normals(quantized, faces)
     if (
@@ -663,6 +785,148 @@ def build_world(
         )
     ):
         raise ValueError("World exceeds float32 roughness/slope limits")
+    return quantized, float32_grade, conversion_bound, conservative_rms
+
+
+def build_world(
+    target_family,
+    tier,
+    *,
+    coarse_seed,
+    fine_seed,
+    reverse=False,
+    risers=4,
+    tread=0.4,
+    incline_length=2.0,
+    size=(24.0, 24.0),
+    stair_entry=14.0,
+    ramp_entry=14.0,
+    stair_route_y=11.0,
+    ramp_route_x=7.0,
+    hill_entry=4.0,
+    hill_center_y=4.0,
+    world_yaw=0.0,
+    resolution=0.02,
+):
+    """Build one configurable connected diagnostic world, never a policy trial.
+
+    The assigned family uses ``tier``; surrounding stairs/ramp/hill use 8 cm,
+    10 degrees and 10 degrees. Hill reversal reflects its unequal flanks while
+    travelling +x; stairs/ramp reversal instead changes the supported start side.
+    Legal requested stair coordinates are preserved. If binary32 conversion would
+    violate a tread bound, realize the flight on a common binary32 lattice before
+    authoring the carrier/noise, and report requested versus realized coordinates.
+    Shared roughness scaling targets 25 degrees; small rounding errors are accepted.
+    Vertices stay local. The recorded rigid transform rotates mesh and start
+    together; arbitrary independent feature rotations are intentionally unsupported.
+    """
+    _validate_world_shape(
+        target_family,
+        tier,
+        coarse_seed,
+        fine_seed,
+        reverse,
+        risers,
+        tread,
+        incline_length,
+    )
+    size = _world_size(
+        size,
+        stair_entry,
+        ramp_entry,
+        stair_route_y,
+        ramp_route_x,
+        hill_entry,
+        hill_center_y,
+        resolution,
+        world_yaw,
+    )
+    features, lips, ramp_grade, target_ramp_grade = _world_features(
+        target_family,
+        tier,
+        risers,
+        tread,
+        incline_length,
+        size,
+        stair_entry,
+        ramp_entry,
+        stair_route_y,
+        ramp_route_x,
+        hill_entry,
+        hill_center_y,
+    )
+    trial = _trial(target_family, reverse, features, size, world_yaw)
+    hill_reverse = reverse and target_family == "hill"
+    x, y, crossings, crossing_levels, axis_spacing, float32_spacing = _world_axes(
+        features,
+        lips,
+        risers,
+        incline_length,
+        size,
+        trial,
+        resolution,
+        hill_reverse,
+        ramp_grade,
+    )
+    carrier = _world_carrier(
+        features,
+        x,
+        y,
+        lips,
+        risers,
+        incline_length,
+        hill_reverse,
+        ramp_grade,
+        target_ramp_grade,
+        crossings,
+        crossing_levels,
+    )
+    (
+        vertices,
+        faces,
+        support,
+        carrier,
+        retained,
+        removed_faces,
+        converted_carrier,
+        converted_carrier_grades,
+    ) = _carrier_mesh(x, y, carrier)
+    arrays, roughness, carrier_gradient = _roughen_world(
+        vertices,
+        faces,
+        support,
+        carrier,
+        features,
+        lips,
+        trial,
+        size,
+        incline_length,
+        ramp_grade,
+        coarse_seed,
+        fine_seed,
+    )
+    _measure_features(
+        features,
+        vertices,
+        faces,
+        support,
+        carrier_gradient,
+        converted_carrier,
+        converted_carrier_grades,
+        lips,
+        incline_length,
+        hill_reverse,
+    )
+    quantized, float32_grade, conversion_bound, conservative_rms = (
+        _validate_float32_surface(
+            vertices,
+            faces,
+            support,
+            carrier,
+            arrays["roughness_cap_m"],
+            roughness["roughness_rms_m"],
+        )
+    )
     metadata = {
         "version": "connected_terrace_diagnostic_v1",
         "scope": "Connected source mesh and prospective nominal tape margins only; not native import, contact, robot traversal or a frozen bank",
@@ -673,17 +937,19 @@ def build_world(
         "coarse_seed": coarse_seed,
         "fine_seed": fine_seed,
         "roughness_lattice_spacing_m": list(SPACINGS),
-        "roughness_shared_scale": scale,
+        "roughness_shared_scale": roughness["roughness_shared_scale"],
         "boundary_taper": "Quintic 6t^5-15t^4+10t^3 within 0.02 m of actual risers and over 0.5 m at assigned pads",
-        "roughness_rms_m": rms,
+        "roughness_rms_m": roughness["roughness_rms_m"],
         "source_layer_rms_minus_conversion_bound_m": conservative_rms,
         "maximum_height_conversion_error_m": conversion_bound,
         "maximum_float32_residual_from_source_carrier_m": float(
             np.abs(quantized[:, 2] - carrier).max()
         ),
-        "regional_rms_descriptive_m": region_rms,
+        "regional_rms_descriptive_m": roughness["regional_rms_descriptive_m"],
         "roughness_cap_rule": "1 cm throughout maximum-tier feature influence (including upper-envelope seams), 2 cm elsewhere; diagnostic construction choice",
-        "maximum_supporting_grade_degrees": grade,
+        "maximum_supporting_grade_degrees": roughness[
+            "maximum_supporting_grade_degrees"
+        ],
         "maximum_carrier_grade_degrees": float(
             np.degrees(np.arctan(np.linalg.norm(carrier_gradient, axis=1).max()))
         ),
@@ -692,9 +958,11 @@ def build_world(
         "local_float32_supporting_slope_within_limit": float32_grade <= 25.001,
         "float32_scope": "Local coordinate conversion only; not native import, cooked collision, contact or traversal evidence",
         "float32_topology_valid": True,
-        "projected_support_area_m2": float(normals[support, 2].sum() / 2),
-        "untapered_support_area_m2": float(normals[full_faces, 2].sum() / 2),
-        "intentional_riser_segments_local_m": riser_segments,
+        "projected_support_area_m2": roughness["projected_support_area_m2"],
+        "untapered_support_area_m2": roughness["untapered_support_area_m2"],
+        "intentional_riser_segments_local_m": roughness[
+            "intentional_riser_segments_local_m"
+        ],
         "riser_scope": "Original stair faces may be clipped where the ramp meets them; only the full-height target footprint carries the named stair tier",
         "welded_collapsed_riser_vertices": int((~retained).sum()),
         "removed_collapsed_riser_triangles": removed_faces,
@@ -719,11 +987,6 @@ def build_world(
         "vertices": vertices,
         "faces": faces,
         "carrier_heights": carrier,
-        "coarse_heights": layers[0],
-        "fine_heights": layers[1],
-        "taper": taper,
-        "untapered_samples": untapered,
-        "support_faces": support,
-        "roughness_cap_m": cap,
+        **arrays,
         "metadata": metadata,
     }

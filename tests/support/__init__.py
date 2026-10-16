@@ -1,9 +1,9 @@
 """Shared test data and paths; importing support does not import a test suite."""
 
-from pathlib import Path
-from contextlib import contextmanager
 import sys
 import tempfile
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]

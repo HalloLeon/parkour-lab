@@ -4,9 +4,9 @@ import unittest
 from unittest.mock import patch
 
 import torch
-from parkour_lab.runtime.training import TrainingHost
-from parkour_lab.methods.roa import environment
 
+from parkour_lab.methods.roa import environment
+from parkour_lab.runtime.training import TrainingHost
 from tests.support.native import TrainingEnvironmentFixture
 
 

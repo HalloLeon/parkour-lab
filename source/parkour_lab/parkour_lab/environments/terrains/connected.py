@@ -49,9 +49,8 @@ def connected_workspace(env, margin_m=0.25):
 
 def _readback(importer, path):
     """Verify native identity/material only; builder owns geometry-bound checks."""
-    from pxr import PhysxSchema, UsdGeom, UsdPhysics, UsdShade
-
     import isaaclab.sim as sim_utils
+    from pxr import PhysxSchema, UsdGeom, UsdPhysics, UsdShade
 
     prim = sim_utils.get_current_stage().GetPrimAtPath(path + "/mesh")
     mesh = UsdGeom.Mesh(prim)

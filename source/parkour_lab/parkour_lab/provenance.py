@@ -160,7 +160,26 @@ def dependency_identity(module_name, distribution):
         "module_path": str(root),
         "source_sha256": digest.hexdigest(),
     }
-    if (root.parent / ".git").exists():
-        receipt["commit"] = _git(root.parent, "rev-parse", "HEAD").decode().strip()
-        receipt["dirty"] = bool(_git(root.parent, "status", "--porcelain"))
+    # SDK packages can be nested under source/<extension>/<module>, and linked
+    # worktrees use a .git file. Find the nearest checkout rather than assuming
+    # the imported module is immediately below its repository root.
+    checkout = next(
+        (parent for parent in (root, *root.parents) if (parent / ".git").exists()),
+        None,
+    )
+    # A wheel inside <project>/.venv is not source owned by that project.
+    if (
+        checkout is not None
+        and _git(
+            checkout,
+            "ls-files",
+            "--",
+            str(Path(module.__file__).resolve().relative_to(checkout)),
+        ).strip()
+    ):
+        receipt["commit"] = _git(checkout, "rev-parse", "HEAD").decode().strip()
+        receipt["dirty"] = bool(_git(checkout, "status", "--porcelain"))
+        receipt["diff_sha256"] = hashlib.sha256(
+            _git(checkout, "diff", "--binary", "--no-ext-diff", "HEAD", "--")
+        ).hexdigest()
     return receipt

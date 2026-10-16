@@ -9,10 +9,9 @@ The lease neither observes robot state nor changes policy memory or motor action
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from numbers import Real
-
 
 ZERO = (0.0, 0.0, 0.0)
 

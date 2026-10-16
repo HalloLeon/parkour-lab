@@ -361,7 +361,7 @@ def native_config_modules(stock=None, *, rough=None):
             "HeightScanObservationCfg": NativeConfig,
             "terrain_height_scan": scan,
         },
-        "parkour_lab.environments.commands": {
+        "parkour_lab.environments.commands.native": {
             "FlatVelocityCommand": FlatCommand,
             "RoughVelocityCommand": RoughCommand,
             "ProceduralTerrainCommand": TerrainCommand,

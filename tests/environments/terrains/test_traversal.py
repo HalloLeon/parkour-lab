@@ -10,8 +10,8 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
-import parkour_lab.environments.traversal as terrain
 
+import parkour_lab.environments.terrains.traversal as terrain
 from tests.support.isaaclab import pinned_generator
 
 
@@ -253,9 +253,7 @@ class TraversalGeometryTests(unittest.TestCase):
                 nominal_height_m=(
                     1.2 * math.tan(math.radians(angle))
                     if ramp
-                    else 0.08
-                    if profile == "step_08m"
-                    else 0.16
+                    else 0.08 if profile == "step_08m" else 0.16
                 ),
                 nominal_incline_degrees=angle,
                 vertical_risers=not ramp,

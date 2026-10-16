@@ -4,7 +4,6 @@ import copy
 import unittest
 
 from parkour_lab.control import motor_contract as motor
-
 from tests.support.native import motor_binding, rebatch
 
 

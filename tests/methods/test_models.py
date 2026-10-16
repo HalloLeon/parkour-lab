@@ -4,11 +4,12 @@ import copy
 import unittest
 
 import torch
+from torch import nn
+
 from parkour_lab.methods.models import (
     PrivilegedScanEncoder,
     TerrainConditionedInput,
 )
-from torch import nn
 
 
 class ModelComponentsTests(unittest.TestCase):

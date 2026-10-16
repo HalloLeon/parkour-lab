@@ -8,11 +8,11 @@ implemented here. Privilege filtering is an API boundary, not a Python sandbox.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+import copy
 import hashlib
 import json
 import math
-import copy
+from dataclasses import asdict, dataclass, field
 from types import MappingProxyType
 from typing import Mapping, Protocol
 

@@ -16,7 +16,6 @@ import torch
 
 from parkour_lab.__main__ import main, parse_args, resolve_config
 from parkour_lab.config import ExperimentConfig, MethodConfig, TaskConfig
-
 from tests.support import installed_backends
 from tests.support.isaaclab import modules
 
@@ -150,7 +149,7 @@ class CLIConfigurationTests(unittest.TestCase):
         result = {"diagnostic_passed": False, "qualified": False}
         with (
             patch(
-                "parkour_lab.evaluation.runner.analyze_terrain_attempt",
+                "parkour_lab.evaluation.terrain_analysis.analyze_terrain_attempt",
                 return_value=result,
             ) as analyze,
             contextlib.redirect_stdout(io.StringIO()) as output,

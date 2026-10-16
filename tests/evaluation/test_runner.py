@@ -1,20 +1,20 @@
 """Connected first-attempt evidence through the existing frozen evaluator."""
 
 import json
+import tempfile
+import unittest
 from dataclasses import asdict
 from pathlib import Path
-import tempfile
 from types import SimpleNamespace as NS
-import unittest
 from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
 
-from parkour_lab.evaluation.runner import evaluate
 from parkour_lab.control.command_tape import validate_tape
-from tests.support.native import make_native_env
+from parkour_lab.evaluation.runner import evaluate
 from tests.support.isaaclab import modules
+from tests.support.native import make_native_env
 
 
 class ConnectedPlaybackTests(unittest.TestCase):
@@ -291,9 +291,11 @@ class ConnectedPlaybackTests(unittest.TestCase):
                     self.assertTrue(report["policy_unchanged"])
                     self.assertEqual(
                         report["status"],
-                        "EVALUATION_COMPLETE_NOT_QUALIFIED"
-                        if ending is None
-                        else "FIRST_ATTEMPT_ENDED_NOT_QUALIFIED",
+                        (
+                            "EVALUATION_COMPLETE_NOT_QUALIFIED"
+                            if ending is None
+                            else "FIRST_ATTEMPT_ENDED_NOT_QUALIFIED"
+                        ),
                     )
 
 

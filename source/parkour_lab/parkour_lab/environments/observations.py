@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+
 import torch
 from isaaclab.assets import Articulation
 from isaaclab.envs import ManagerBasedRLEnv
@@ -10,7 +11,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCaster
 from isaaclab.utils import configclass
 
-from .terrain import _terrain_height_components
+from .terrains.procedural import _terrain_height_components
 
 
 @configclass

@@ -5,9 +5,9 @@ import unittest
 from unittest import mock
 
 import torch
-from parkour_lab.methods.roa import model as roa
 from torch import nn
 
+from parkour_lab.methods.roa import model as roa
 from tests.support.roa import actor_input, observations, stock_motor
 
 

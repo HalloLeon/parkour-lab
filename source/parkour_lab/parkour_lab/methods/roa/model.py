@@ -94,7 +94,7 @@ class ContactEncoderInput(nn.Module):
     def __init__(self, reference):
         super().__init__()
         self.reference = reference
-        # Initialization must not perturb the matched experiment's rollout RNG.
+        # Initialization preserves the caller's rollout RNG state.
         with torch.random.fork_rng(devices=[]):
             self.contact_projection = nn.Linear(
                 CONTACT_DIM, reference.out_features, bias=False, device="cpu"
@@ -357,6 +357,7 @@ def build_policy(
 ):
     """Build the ROA actor/asymmetric critic from fresh weights."""
     from rsl_rl.modules import ActorCritic
+
     from parkour_lab.methods.models import TerrainConditionedInput
 
     policy_obs = observations["policy"]

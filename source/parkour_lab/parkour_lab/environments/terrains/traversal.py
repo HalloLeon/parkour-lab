@@ -7,13 +7,13 @@ and connected, with no gaps or flat lateral bypass. Simulator imports are lazy.
 
 from __future__ import annotations
 
-from copy import deepcopy
 import hashlib
 import math
+from copy import deepcopy
 
 import numpy as np
 
-from parkour_lab.environments.stress import RESOLUTION, TILE_SIZE, multiscale_field
+from .stress import RESOLUTION, TILE_SIZE, multiscale_field
 
 VERSION = "operator_traversal_geometry_v1"
 PROFILES = ("ramp_6deg", "ramp_12deg", "step_08m", "step_16m")
@@ -165,6 +165,7 @@ def configure(cfg, seed, expected, *, layout="standard"):
     """Install the fixed fixture and external commands; preserve sensors/motors."""
     from isaaclab.terrains import SubTerrainBaseCfg, TerrainGeneratorCfg
     from isaaclab.utils import configclass
+
     from parkour_lab.runtime.native import configure_external_command
 
     @configclass
@@ -200,9 +201,9 @@ def configure(cfg, seed, expected, *, layout="standard"):
     cfg.events.reset_base.params["pose_range"] = {
         name: (0.0, 0.0) for name in ("x", "y", "yaw")
     }
-    cfg.terminations.procedural_physical_failure.params[
-        "minimum_surface_z_m"
-    ] = -ROUGHNESS_BOUND
+    cfg.terminations.procedural_physical_failure.params["minimum_surface_z_m"] = (
+        -ROUGHNESS_BOUND
+    )
     # The archived training sampler requires its 20-column profile layout.
     # This four-column evaluation instead uses PilotEnvironment's fixed tape.
     configure_external_command(cfg.commands.base_velocity)

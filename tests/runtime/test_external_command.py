@@ -15,12 +15,12 @@ from types import ModuleType
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
-import parkour_lab.environments.traversal as terrain
-import parkour_lab.runtime.native as runtime
 import torch
-from parkour_lab.runtime.training import TrainingHost
-from parkour_lab.methods.roa.environment import ROAEnvironment
 
+import parkour_lab.environments.terrains.traversal as terrain
+import parkour_lab.runtime.native as runtime
+from parkour_lab.methods.roa.environment import ROAEnvironment
+from parkour_lab.runtime.training import TrainingHost
 from tests.support.isaaclab import pinned_source_root
 from tests.support.native import TrainingEnvironmentFixture
 

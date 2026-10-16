@@ -4,9 +4,10 @@ import copy
 from types import SimpleNamespace as NS
 
 import torch
+
 from parkour_lab.control.motor_contract import PARAMETERS
-from parkour_lab.runtime.native import foot_contacts, motion_state
 from parkour_lab.runtime.metrics import diagnostic_state
+from parkour_lab.runtime.native import foot_contacts, motion_state
 
 
 class Scene(dict):
@@ -155,9 +156,9 @@ def make_native_env(count=8):
             timed_out,
             {
                 "motion_state": motion_state(env) if env.capture_motion else None,
-                "diagnostic_state": diagnostic_state(env)
-                if env.capture_diagnostics
-                else None,
+                "diagnostic_state": (
+                    diagnostic_state(env) if env.capture_diagnostics else None
+                ),
             },
         )
 

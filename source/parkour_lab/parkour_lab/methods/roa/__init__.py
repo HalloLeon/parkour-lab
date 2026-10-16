@@ -1,8 +1,8 @@
 """ROA backend: configuration, learning lifecycle and causal export."""
 
-from dataclasses import asdict, dataclass
 import io
 import math
+from dataclasses import asdict, dataclass
 
 from parkour_lab.config import construct, positive
 
@@ -71,9 +71,9 @@ def validate_training(options, num_envs):
 
 
 def create(host, options, seed):
-    from .training import ROATrainingMethod
-    from .model import build_policy
     from .environment import ROAEnvironment
+    from .model import build_policy
+    from .training import ROATrainingMethod
 
     adapter = ROAEnvironment(host, contact_conditioned=options["contact_conditioned"])
     observations, _ = adapter.reset(seed=seed)
@@ -264,6 +264,7 @@ def export(state, options):
 
 def _actor_modules(state):
     import torch
+
     from .runtime import _fixed_modules
 
     if not isinstance(state, dict) or set(state) != {"motor", "estimator"}:
@@ -284,6 +285,7 @@ def _actor_modules(state):
 
 def controller(state, options, manifest, device):
     import torch
+
     from .runtime import ROAHistoryController, roa_tensor_sha256
 
     motor, estimator = (module.to(device) for module in _actor_modules(state))

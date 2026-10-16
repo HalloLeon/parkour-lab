@@ -10,8 +10,8 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 VERSION = "operator_applied_command_tape_v1"
 PERIOD_S = 0.02

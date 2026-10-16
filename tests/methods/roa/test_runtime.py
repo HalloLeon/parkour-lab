@@ -5,21 +5,21 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch import nn
+
 from parkour_lab.control.controller import ControllerInput, ControllerSession
 from parkour_lab.control.motor_contract import (
-    nominal_binding_sha256,
     make_motor_contract,
+    nominal_binding_sha256,
 )
+from parkour_lab.environments.randomization import TaskRandomization
 from parkour_lab.methods.roa import model as roa
 from parkour_lab.methods.roa import runtime
-from parkour_lab.environments.randomization import TaskRandomization
 from parkour_lab.methods.roa.environment import ROAEnvironment
 from parkour_lab.runtime.native import sensor_noise_report
 from parkour_lab.runtime.training import TrainingHost
-from torch import nn
-
 from tests.support.native import TrainingEnvironmentFixture, motor_binding
-from tests.support.roa import packet, stock_motor, random_frames
+from tests.support.roa import packet, random_frames, stock_motor
 
 
 class ROARuntimeTests(unittest.TestCase):

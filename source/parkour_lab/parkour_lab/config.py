@@ -4,9 +4,9 @@ Old run manifests and checkpoint recipes are intentionally not configuration
 formats. Unknown fields fail early instead of silently changing an experiment.
 """
 
-from dataclasses import asdict, dataclass, field, fields
 import json
 import math
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 
@@ -139,7 +139,8 @@ class TaskConfig:
             if not isinstance(self.world, dict):
                 raise ValueError("Connected playback requires a world object")
             from inspect import signature
-            from parkour_lab.environments.worlds import build_world
+
+            from parkour_lab.environments.terrains.worlds import build_world
 
             try:
                 signature(build_world).bind(**self.world)

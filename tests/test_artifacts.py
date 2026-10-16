@@ -2,32 +2,32 @@
 
 import contextlib
 import copy
-import io
-import tempfile
 import hashlib
+import io
 import json
 import sys
-from types import SimpleNamespace
-from zipfile import ZipFile
+import tempfile
 import unittest
 from dataclasses import replace
-from unittest.mock import Mock, patch
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+from zipfile import ZipFile
 
 import torch
+
 from parkour_lab import artifacts
 from parkour_lab.config import ExperimentConfig, MethodConfig, TaskConfig
 from parkour_lab.control.controller import ControllerSession
 from parkour_lab.control.motor_contract import (
-    nominal_binding_sha256,
     make_motor_contract,
+    nominal_binding_sha256,
 )
 from parkour_lab.methods.roa import model, runtime
 from parkour_lab.methods.roa.training import ROATrainingMethod
-
+from tests.support import installed_backends
 from tests.support.native import motor_binding
 from tests.support.roa import TensorHost, observations, packet, random_frames
-from tests.support import installed_backends
 
 
 class ArtifactTests(unittest.TestCase):

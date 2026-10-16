@@ -7,7 +7,8 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
-from parkour_lab.environments import terrain
+
+from parkour_lab.environments.terrains import procedural as terrain
 
 
 class ProceduralSurfaceTests(unittest.TestCase):

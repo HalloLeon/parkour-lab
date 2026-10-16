@@ -8,14 +8,14 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 
-import torch
 import numpy as np
+import torch
+
 from parkour_lab import artifacts, experiment
 from parkour_lab.config import ExperimentConfig, MethodConfig, TaskConfig
-from parkour_lab.evaluation.runner import command_sequence, evaluate
 from parkour_lab.evaluation.flat import profile_commands, score_flat_profile
+from parkour_lab.evaluation.runner import command_sequence, evaluate
 from parkour_lab.methods import get_backend
-
 from tests.support.native import TrainingEnvironmentFixture
 
 

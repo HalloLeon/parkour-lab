@@ -7,13 +7,13 @@
 # IDEs and editors
 **/.idea/
 **/.vscode/
-# Keep the top-level .vscode directory for shared VS Code settings.
-!.vscode
 
 # Python
 **/*.egg-info/
 **/__pycache__/
 **/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
 **/*.pyc
 
 # Native builds

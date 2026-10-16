@@ -50,7 +50,9 @@ class NumericalCapture:
                     "output": result.detach(),
                 }
 
-            self.handles.append(getattr(self.method.policy.actor, name).register_forward_hook(remember))
+            self.handles.append(
+                getattr(self.method.policy.actor, name).register_forward_hook(remember)
+            )
         return self
 
     def __exit__(self, kind, error, traceback):
@@ -109,7 +111,10 @@ class NumericalCapture:
             self.report["event_captured"] = True
             self.report["event_phase"] = phase
             self.report["event_method_updates"] = self.method.updates
-            print(f"Numerical diagnostic captured first action excursion: {self.output}", flush=True)
+            print(
+                f"Numerical diagnostic captured first action excursion: {self.output}",
+                flush=True,
+            )
         result = environment.step(action, phase)
         _, reward, done, _ = result
         current.update(
@@ -179,7 +184,9 @@ class NumericalCapture:
                     or (
                         isinstance(value, Mapping)
                         and len(value)
-                        and all(isinstance(item, torch.Tensor) for item in value.values())
+                        and all(
+                            isinstance(item, torch.Tensor) for item in value.values()
+                        )
                     )
                 }
                 frames.append(
@@ -207,7 +214,10 @@ class NumericalCapture:
                 "latest_forward": self.latest_forward,
                 "rollout": self.rollout(self.method.algorithm),
                 "gradients": gradients,
-                "gradient_norms_float64": {name: value.detach().double().norm() for name, value in gradients.items()},
+                "gradient_norms_float64": {
+                    name: value.detach().double().norm()
+                    for name, value in gradients.items()
+                },
                 "gradient_timing": "as observed at exception; may be stale if failure preceded backward",
                 "storage_timing": "only filled_steps prefix is current; returns may be unfinished if collection failed",
             },

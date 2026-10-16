@@ -9,8 +9,9 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
-import parkour_lab.environments.stress as stress
-from parkour_lab.environments import terrain as training_terrain
+
+import parkour_lab.environments.terrains.stress as stress
+from parkour_lab.environments.terrains import procedural as training_terrain
 
 
 class StressSurfaceTests(unittest.TestCase):
@@ -183,7 +184,7 @@ class StressSurfaceTests(unittest.TestCase):
         cfg.seed = 47
         native_mesh = ModuleType("trimesh")
         native_mesh.Trimesh = lambda **kwargs: SimpleNamespace(**kwargs)
-        native_module_name = "parkour_lab.environments.terrain"
+        native_module_name = "parkour_lab.environments.terrains.procedural"
         with patch.dict(
             sys.modules,
             {"trimesh": native_mesh, native_module_name: training_terrain},

@@ -5,10 +5,10 @@ Neither is final qualification. Positions/headings include the pre-command onset
 sample; velocities and termination flags are post-physics, before automatic reset.
 """
 
-from dataclasses import asdict, dataclass
 import hashlib
 import json
 import math
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -395,9 +395,11 @@ def analyze_development_bank(root):
         # by a few ULPs. Pass/failure decisions and thresholds must still be exact.
         require(
             all(
-                _same_values(stored.get(key), value, 8 * np.finfo(np.float32).eps)
-                if key == "trials"
-                else stored.get(key) == value
+                (
+                    _same_values(stored.get(key), value, 8 * np.finfo(np.float32).eps)
+                    if key == "trials"
+                    else stored.get(key) == value
+                )
                 for key, value in result.items()
             ),
             "stored development outcome differs from rescored evidence",
@@ -528,14 +530,8 @@ def _angles(quaternion):
     )
 
 
-def score_flat_profile(trace, profile):
-    """Score each original row once; all later auto-reset episodes are excluded.
-
-    Missing/malformed arrays reject the evidence. Nonfinite first-attempt state
-    fails that row. No per-group acceptance rates or dynamics strata are inferred
-    from this diagnostic's existing startup distribution.
-    """
-    schedule = np.asarray(profile_commands(profile))
+def _validate_flat_trace(trace, schedule):
+    """Validate the complete batch before any original-attempt scoring."""
     origins = np.asarray(trace["env_origins"])
     if (
         origins.ndim != 2
@@ -579,105 +575,138 @@ def score_flat_profile(trace, profile):
         raise ValueError("Termination flags must be boolean")
     if not np.allclose(trace["command"], schedule[:, None], rtol=0, atol=1e-6):
         raise ValueError("Executed commands differ from the flat profile")
+    return origins, shapes
+
+
+def _flat_physical_failures(position, quaternion, body, base_forces, origin):
+    """Check posture, domain and contact while retaining the onset heading."""
+    failures = []
+    roll, pitch, heading = _angles(quaternion)
+    if max(np.abs(roll).max(), np.abs(pitch).max()) > Thresholds().flat_attitude_rad:
+        failures.append("flat attitude exceeds 15 degrees")
+    if (np.abs(position[:, :2] - origin[:2]) > 6).any() or (
+        np.abs(body[..., :2] - origin[:2]) > 6
+    ).any():
+        failures.append("body link leaves flat domain")
+    forces = np.linalg.norm(base_forces, axis=-1)
+    if (
+        len(forces) >= 5
+        and (
+            np.convolve((forces > 20).astype(int), np.ones(5, dtype=int), mode="valid")
+            >= 5
+        ).any()
+    ):
+        failures.append("sustained base contact")
+    return heading, failures
+
+
+def _score_flat_phases(trace, row, schedule, boundaries, position, heading):
+    """Score complete phases without using samples from replacement episodes."""
+    phases, failures = [], []
+    length = len(position) - 1
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        if end > length:
+            phases.append(dict(start_s=start * PERIOD_S, complete=False))
+            failures.append("incomplete command phase")
+            continue
+        command = schedule[start]
+        phase = score_command_phase(
+            command,
+            trace["linear_velocity_b"][start:end, row, :2],
+            trace["angular_velocity_b"][start:end, row, 2],
+            trace["angular_velocity_w"][start:end, row, 2],
+            position[start : end + 1, :2],
+            heading[start : end + 1],
+        )
+        # Full 3 s displacement windows after 1 s; never along a fixed axis.
+        stalled = np.linalg.norm(command[:2]) >= 0.2 and any(
+            np.linalg.norm(position[k + 150, :2] - position[k, :2]) < 0.10
+            for k in range(start + 50, end - 150 + 1)
+        )
+        if stalled:
+            phase["failures"].append("stall")
+            phase["kinematic_passed"] = False
+        phase.update(start_s=start * PERIOD_S, complete=True)
+        failures.extend(
+            f"phase {start * PERIOD_S:g}s: {reason}" for reason in phase["failures"]
+        )
+        phases.append(phase)
+    return phases, failures
+
+
+def _score_flat_attempt(trace, row, origin, shapes, schedule, boundaries):
+    """Retain one row's first ending, state failures and command-phase results."""
+    ends = np.flatnonzero(trace["terminated"][:, row] | trace["truncated"][:, row])
+    length = int(ends[0] + 1) if len(ends) else STEPS
+    failures, phases = [], []
+    if trace["terminated"][:length, row].any():
+        failures.append("native termination")
+    if trace["truncated"][:length, row].any():
+        failures.append("unexpected timeout")
+    position = np.vstack(
+        (trace["initial_position_w"][row], trace["position_w"][:length, row])
+    ).astype(np.float64)
+    quaternion = np.vstack(
+        (trace["initial_quaternion_w"][row], trace["quaternion_w"][:length, row])
+    ).astype(np.float64)
+    body = trace["body_position_w"][:length, row]
+    finite = all(
+        np.isfinite(trace[key][:length, row]).all()
+        for key in shapes
+        if key not in ("initial_position_w", "initial_quaternion_w")
+    )
+    finite = (
+        finite
+        and np.isfinite(position).all()
+        and np.isfinite(quaternion).all()
+        and np.isfinite(body).all()
+    )
+    if not finite:
+        failures.append("nonfinite first-attempt state")
+    elif not np.allclose(np.linalg.norm(quaternion, axis=-1), 1.0, atol=1e-3, rtol=0):
+        failures.append("invalid quaternion")
+    else:
+        heading, physical_failures = _flat_physical_failures(
+            position,
+            quaternion,
+            body,
+            trace["base_contact_force_w"][:length, row],
+            origin,
+        )
+        failures.extend(physical_failures)
+        phases, phase_failures = _score_flat_phases(
+            trace, row, schedule, boundaries, position, heading
+        )
+        failures.extend(phase_failures)
+    return dict(
+        env_id=row,
+        first_attempt_steps=length,
+        diagnostic_passed=not failures,
+        failures=failures,
+        phases=phases,
+    )
+
+
+def score_flat_profile(trace, profile):
+    """Score each original row once; all later auto-reset episodes are excluded.
+
+    Missing/malformed arrays reject the evidence. Nonfinite first-attempt state
+    fails that row. No per-group acceptance rates or dynamics strata are inferred
+    from this diagnostic's existing startup distribution.
+    """
+    schedule = np.asarray(profile_commands(profile))
+    origins, shapes = _validate_flat_trace(trace, schedule)
+    count = len(origins)
     # Merge adjacent identical commands, particularly the single 11 s stand.
     boundaries = [
         0,
         *(np.flatnonzero(np.any(np.diff(schedule, axis=0), axis=1)) + 1),
         STEPS,
     ]
-    results = []
-    for row in range(count):
-        ends = np.flatnonzero(trace["terminated"][:, row] | trace["truncated"][:, row])
-        length = int(ends[0] + 1) if len(ends) else STEPS
-        failures, phases = [], []
-        if trace["terminated"][:length, row].any():
-            failures.append("native termination")
-        if trace["truncated"][:length, row].any():
-            failures.append("unexpected timeout")
-        position = np.vstack(
-            (trace["initial_position_w"][row], trace["position_w"][:length, row])
-        ).astype(np.float64)
-        quaternion = np.vstack(
-            (trace["initial_quaternion_w"][row], trace["quaternion_w"][:length, row])
-        ).astype(np.float64)
-        finite = all(
-            np.isfinite(trace[key][:length, row]).all()
-            for key in shapes
-            if key not in ("initial_position_w", "initial_quaternion_w")
-        )
-        finite = (
-            finite
-            and np.isfinite(position).all()
-            and np.isfinite(quaternion).all()
-            and np.isfinite(body[:length, row]).all()
-        )
-        if not finite:
-            failures.append("nonfinite first-attempt state")
-        elif not np.allclose(
-            np.linalg.norm(quaternion, axis=-1), 1.0, atol=1e-3, rtol=0
-        ):
-            failures.append("invalid quaternion")
-        else:
-            roll, pitch, heading = _angles(quaternion)
-            if (
-                max(np.abs(roll).max(), np.abs(pitch).max())
-                > Thresholds().flat_attitude_rad
-            ):
-                failures.append("flat attitude exceeds 15 degrees")
-            if (np.abs(position[:, :2] - origins[row, :2]) > 6).any() or (
-                np.abs(body[:length, row, :, :2] - origins[row, :2]) > 6
-            ).any():
-                failures.append("body link leaves flat domain")
-            forces = np.linalg.norm(
-                trace["base_contact_force_w"][:length, row], axis=-1
-            )
-            if (
-                length >= 5
-                and (
-                    np.convolve(
-                        (forces > 20).astype(int), np.ones(5, dtype=int), mode="valid"
-                    )
-                    >= 5
-                ).any()
-            ):
-                failures.append("sustained base contact")
-            for start, end in zip(boundaries[:-1], boundaries[1:]):
-                if end > length:
-                    phases.append(dict(start_s=start * PERIOD_S, complete=False))
-                    failures.append("incomplete command phase")
-                    continue
-                command = schedule[start]
-                phase = score_command_phase(
-                    command,
-                    trace["linear_velocity_b"][start:end, row, :2],
-                    trace["angular_velocity_b"][start:end, row, 2],
-                    trace["angular_velocity_w"][start:end, row, 2],
-                    position[start : end + 1, :2],
-                    heading[start : end + 1],
-                )
-                # Full 3 s displacement windows after 1 s; never along a fixed axis.
-                stalled = np.linalg.norm(command[:2]) >= 0.2 and any(
-                    np.linalg.norm(position[k + 150, :2] - position[k, :2]) < 0.10
-                    for k in range(start + 50, end - 150 + 1)
-                )
-                if stalled:
-                    phase["failures"].append("stall")
-                    phase["kinematic_passed"] = False
-                phase.update(start_s=start * PERIOD_S, complete=True)
-                failures.extend(
-                    f"phase {start * PERIOD_S:g}s: {reason}"
-                    for reason in phase["failures"]
-                )
-                phases.append(phase)
-        results.append(
-            dict(
-                env_id=row,
-                first_attempt_steps=length,
-                diagnostic_passed=not failures,
-                failures=failures,
-                phases=phases,
-            )
-        )
+    results = [
+        _score_flat_attempt(trace, row, origins[row], shapes, schedule, boundaries)
+        for row in range(count)
+    ]
     return dict(
         version="flat_command_diagnostic_v1",
         group_id=f"flat/{profile}",

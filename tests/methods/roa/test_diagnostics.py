@@ -3,22 +3,22 @@
 import contextlib
 import copy
 import io
-from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from parkour_lab import experiment
 from parkour_lab.config import ExperimentConfig, MethodConfig, TaskConfig
 from parkour_lab.methods.roa import Learner
 from parkour_lab.methods.roa import model as roa
 from parkour_lab.methods.roa.diagnostics import NumericalCapture
 from parkour_lab.methods.roa.training import ROATrainingMethod
-
-from tests.support.roa import TensorHost, observations
 from tests.support.native import TrainingEnvironmentFixture
+from tests.support.roa import TensorHost, observations
 
 
 class RecordingHost(TensorHost):

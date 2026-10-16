@@ -1,17 +1,18 @@
 """Bounded source/native boundary checks, not cooked PhysX contact evidence."""
 
-from contextlib import contextmanager
 import importlib.util
 import math
 import sys
-from types import ModuleType, SimpleNamespace as NS
 import unittest
+from contextlib import contextmanager
+from types import ModuleType
+from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
 
-from parkour_lab.environments import connected
+from parkour_lab.environments.terrains import connected
 from tests.support.isaaclab import modules, pinned_generator, pinned_source_root
 
 
@@ -201,9 +202,9 @@ class ConnectedTests(unittest.TestCase):
                 {name: module, "isaaclab.managers": NS(TerminationTermCfg=NS)}
             ):
                 spec.loader.exec_module(module)
-                sys.modules[
-                    "isaaclab.terrains"
-                ].TerrainImporterCfg = module.TerrainImporterCfg
+                sys.modules["isaaclab.terrains"].TerrainImporterCfg = (
+                    module.TerrainImporterCfg
+                )
                 cfg = NS(scene=NS(terrain=original), terminations=NS())
                 connected.configure(cfg, NS(world=original.world))
                 terrain_cfg = cfg.scene.terrain

@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from parkour_lab.environments import structures
+from parkour_lab.environments.terrains import structures
 
 
 def build(family="stairs", tier=0.16, **kwargs):

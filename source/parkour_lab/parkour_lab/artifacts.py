@@ -6,10 +6,10 @@ simulator/RNG; export does not imply behavioral qualification.
 """
 
 import copy
-from dataclasses import dataclass, replace
 import hashlib
 import io
 import json
+from dataclasses import dataclass, replace
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -98,6 +98,7 @@ def bound_actions(checkpoint, destination, *, report):
     their 90% soft interval. No network, optimizer, reward or counter is changed.
     """
     import torch
+
     from parkour_lab.control.action import BOUNDED_MODE, BOUNDED_RAW_ACTION_MEANING
 
     data = load_artifact(checkpoint, kind="training")

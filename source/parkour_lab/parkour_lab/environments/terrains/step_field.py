@@ -7,14 +7,14 @@ callback receipts attest generated triangles, not PhysX contact or capability.
 
 from __future__ import annotations
 
-from copy import deepcopy
 import hashlib
 import math
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
 
-from parkour_lab.environments.stress import multiscale_field
+from .stress import multiscale_field
 
 VERSION = "operator_step_field_v1"
 TILE_SIZE = (16.0, 16.0)
@@ -466,9 +466,9 @@ def verify_native_geometry(env):
     they are not a contact-dynamics or locomotion certification.
     """
     import torch
-    from pxr import UsdGeom, UsdPhysics
     from isaaclab import sim as sim_utils
     from isaaclab.utils.warp import raycast_mesh
+    from pxr import UsdGeom, UsdPhysics
 
     generated = verify_native_receipts()
     sensor = env.scene["base_height_scanner"]

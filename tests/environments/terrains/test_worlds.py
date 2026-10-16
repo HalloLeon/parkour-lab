@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from parkour_lab.environments import structures, worlds
+from parkour_lab.environments.terrains import structures, worlds
 
 
 def build(family="stairs", tier=0.16, **kwargs):
@@ -260,8 +260,13 @@ class WorldTests(unittest.TestCase):
         np.testing.assert_allclose(
             transform[:3, :3].T @ transform[:3, :3], np.eye(3), atol=1e-15
         )
-        expected = transform @ np.array([*trial["start_xy_local_m"], 0, 1])
-        np.testing.assert_array_equal(expected[:2], trial["start_xy_world_m"])
+        local_start = np.array([*trial["start_xy_local_m"], 0, 1])
+        expected = transform @ local_start
+        # The equivalent 2-D and homogeneous dot kernels need not round identically.
+        roundoff = 4 * np.finfo(expected.dtype).eps * np.abs(local_start[:2]).sum()
+        np.testing.assert_allclose(
+            expected[:2], trial["start_xy_world_m"], rtol=0, atol=roundoff
+        )
         self.assertEqual(trial["heading_world_rad"], 1.2)
         for a, b in zip(before, np.random.get_state(), strict=True):
             np.testing.assert_array_equal(a, b)

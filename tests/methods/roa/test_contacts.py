@@ -8,12 +8,12 @@ import unittest
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
-import parkour_lab.methods.roa.contacts as contacts
 import torch
-from parkour_lab.runtime.training import TrainingHost
-from parkour_lab.methods.roa.environment import ROAEnvironment
 from tensordict import TensorDict
 
+import parkour_lab.methods.roa.contacts as contacts
+from parkour_lab.methods.roa.environment import ROAEnvironment
+from parkour_lab.runtime.training import TrainingHost
 from tests.support.isaaclab import pinned_source_root
 from tests.support.native import TrainingEnvironmentFixture
 

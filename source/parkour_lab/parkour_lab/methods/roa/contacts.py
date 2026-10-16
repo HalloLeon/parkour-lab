@@ -84,32 +84,3 @@ class ContactFeatures:
             "nonzero_rows": int(self.nonzero_rows),
             "maximum_absolute_feature": float(self.maximum),
         }
-
-
-def validate_report(report, *, num_envs, steps, full_resets=4):
-    """Bind source loading to complete native collection, not only a feature flag."""
-    if not isinstance(report, dict):
-        raise ValueError("Require a teacher contact observation receipt")
-    calls, resets, nonzero = (
-        report[key]
-        for key in ("observation_calls", "reset_rows_zeroed", "nonzero_rows")
-    )
-    ids = report["contact_body_ids"]
-    if (
-        type(full_resets) is not int
-        or full_resets < 1
-        or report["recipe"] != recipe()
-        or type(report["num_envs"]) is not int
-        or report["num_envs"] != num_envs
-        or any(type(value) is not int for value in (calls, resets, nonzero))
-        or calls != steps + full_resets
-        or not full_resets * num_envs <= resets <= calls * num_envs
-        or not 0 < nonzero <= calls * num_envs - resets
-        or not isinstance(ids, list)
-        or len(ids) != 4
-        or any(type(index) is not int or index < 0 for index in ids)
-        or len(set(ids)) != 4
-        or type(report["maximum_absolute_feature"]) not in (int, float)
-        or not 0 < report["maximum_absolute_feature"] <= 1
-    ):
-        raise ValueError("Incomplete native teacher contact observation receipt")

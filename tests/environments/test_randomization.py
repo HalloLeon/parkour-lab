@@ -2,8 +2,8 @@
 
 import hashlib
 import math
-from types import SimpleNamespace
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -94,8 +94,13 @@ class RandomizationTests(unittest.TestCase):
                     np.testing.assert_array_equal(
                         start["start_xy_local"][0], values[:2]
                     )
+                    # Scalar/vector trig and dot kernels can round differently.
+                    roundoff = 4 * np.finfo(values.dtype).eps * np.abs(values[:2]).sum()
                     np.testing.assert_allclose(
-                        start["start_xy"][0], rotation @ values[:2], rtol=0, atol=1e-17
+                        start["start_xy"][0],
+                        rotation @ values[:2],
+                        rtol=0,
+                        atol=roundoff,
                     )
                     self.assertEqual(start["start_yaw"][0], heading + values[2] * 0.6)
                     self.assertEqual(start["nominal_heading"][0], heading)

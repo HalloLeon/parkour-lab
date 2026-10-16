@@ -1,17 +1,18 @@
 """Prospective development assignments; no mesh, simulator or robot execution."""
 
-from collections import Counter
-from copy import deepcopy
 import hashlib
-from inspect import signature
-from itertools import product
 import json
 import unittest
+from collections import Counter
+from copy import deepcopy
+from inspect import signature
+from itertools import product
 from unittest.mock import patch
 
 import numpy as np
 
-from parkour_lab.environments import randomization, worlds
+from parkour_lab.environments import randomization
+from parkour_lab.environments.terrains import worlds
 
 
 class TerrainAssignmentTests(unittest.TestCase):
@@ -299,9 +300,11 @@ class TerrainAssignmentTests(unittest.TestCase):
             shapes = (
                 [dict(risers=r, tread=t) for r, t in product((4, 5, 6), (0.31, 0.5))]
                 if family == "stairs"
-                else [dict(incline_length=n) for n in (2, 3)]
-                if family == "ramp"
-                else [{}]
+                else (
+                    [dict(incline_length=n) for n in (2, 3)]
+                    if family == "ramp"
+                    else [{}]
+                )
             )
             for dx, dy, shape in product((-0.25, 0.25), (-0.25, 0.25), shapes):
                 kwargs = {

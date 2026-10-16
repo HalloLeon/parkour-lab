@@ -1,19 +1,19 @@
 """Saved-attempt integrity boundary; kinematic arithmetic is tested separately."""
 
 import copy
-import json
 import hashlib
-from dataclasses import asdict
-from pathlib import Path
+import json
 import tempfile
 import unittest
+from dataclasses import asdict
+from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
 
 from parkour_lab.control.command_tape import TapeBuilder, write_tape
 from parkour_lab.control.proprioception import FOOT_NAMES
-from parkour_lab.evaluation.runner import analyze_terrain_attempt
+from parkour_lab.evaluation.terrain_analysis import analyze_terrain_attempt
 from parkour_lab.provenance import file_sha256
 
 
@@ -69,9 +69,11 @@ class TerrainAnalysisTests(unittest.TestCase):
                 "foot_names": list(FOOT_NAMES),
                 "source": {},
             },
-            "status": "FIRST_ATTEMPT_ENDED_NOT_QUALIFIED"
-            if ended
-            else "EVALUATION_COMPLETE_NOT_QUALIFIED",
+            "status": (
+                "FIRST_ATTEMPT_ENDED_NOT_QUALIFIED"
+                if ended
+                else "EVALUATION_COMPLETE_NOT_QUALIFIED"
+            ),
             "policy_unchanged": True,
             "cleanup": {"environment": "complete", "application": "complete"},
             "control_steps": steps,

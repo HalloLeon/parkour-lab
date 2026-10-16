@@ -1,9 +1,11 @@
 """Native commands and physical termination terms; no route or waypoint state."""
 
 import math
+
 import torch
 from isaaclab.envs.mdp.commands import UniformVelocityCommand
 from isaaclab.managers import SceneEntityCfg
+
 from .sampling import OperatorCommandSampler
 from .sequences import ReversalSequencePlan
 
@@ -17,7 +19,7 @@ class FlatVelocityCommand(UniformVelocityCommand):
                 "Flat command sampling owns stops; disable heading overrides"
             )
         super().__init__(cfg, env)
-        from .dynamics import get_randomization
+        from ..dynamics import get_randomization
 
         self.randomization = get_randomization(env)
         self.remaining_ticks = torch.zeros(
@@ -223,7 +225,7 @@ class ProceduralTerrainCommand(OperatorVelocityCommand):
 
     def __init__(self, cfg, env):
         super().__init__(cfg, env)
-        from parkour_lab.environments.terrain import (
+        from ..terrains.procedural import (
             PROFILE_BY_COLUMN,
         )
 

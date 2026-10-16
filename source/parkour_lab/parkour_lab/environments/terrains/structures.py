@@ -178,6 +178,61 @@ def _apply_roughness(vertices, faces, support, layers, cap):
     return layers, scale, carrier_gradient
 
 
+def _validate_structure_family(family, tier):
+    """Validate the named family and its declared tier envelope."""
+    if type(family) is not str or family not in ("stairs", "ramp", "hill", "level"):
+        raise ValueError("Unknown structure family")
+    if not _positive(tier):
+        raise ValueError("Tier must be a positive finite number")
+    tiers = (0.04, 0.08, 0.12, 0.16) if family == "stairs" else (10, 15, 20)
+    if family == "level":
+        tiers = (0.01, 0.02)
+    if tier not in tiers:
+        raise ValueError("Tier is outside the declared structure envelope")
+
+
+def _validate_structure_options(
+    family, reverse, coarse_seed, fine_seed, risers, tread, incline_length
+):
+    """Reject unsupported direction, layer seeds and family-specific shapes."""
+    if (
+        type(reverse) is not bool
+        or any(type(seed) is not int or seed < 0 for seed in (coarse_seed, fine_seed))
+        or coarse_seed == fine_seed
+    ):
+        raise ValueError(
+            "Require a boolean direction and distinct nonnegative layer seeds"
+        )
+    if type(risers) is not int or risers not in (1, 4, 5, 6):
+        raise ValueError("Stairs require one or four through six risers")
+    if not _positive(tread) or not 0.31 <= tread <= 0.5:
+        raise ValueError("Treads must lie in [0.31,0.50] metres")
+    if not _positive(incline_length) or incline_length not in (2, 3):
+        raise ValueError("Ramp horizontal length must be two or three metres")
+    if (
+        (family != "stairs" and (risers != 4 or tread != 0.4))
+        or (family != "ramp" and incline_length != 2.0)
+        or (family == "level" and reverse)
+    ):
+        raise ValueError("Nondefault shape options do not apply to this family")
+
+
+def _validate_structure_extent(width, approach, landing, pad_length, resolution):
+    """Require supporting width and room for both endpoint pad tapers."""
+    if (
+        not all(
+            _positive(value)
+            for value in (width, approach, landing, pad_length, resolution)
+        )
+        or width < 2
+        or resolution > 0.02
+        or min(approach, landing) < pad_length + 0.5
+    ):
+        raise ValueError(
+            "Require width>=2 m, resolution<=0.02 m and room for pads/tapers"
+        )
+
+
 def build_structure(
     family,
     tier,
@@ -209,47 +264,11 @@ def build_structure(
     tolerances (tier-1 mm or tier-0.1 degrees); actual mesh quantities are reported.
     No native coordinate conversion or world-boundary stitching is certified here.
     """
-    if type(family) is not str or family not in ("stairs", "ramp", "hill", "level"):
-        raise ValueError("Unknown structure family")
-    if not _positive(tier):
-        raise ValueError("Tier must be a positive finite number")
-    tiers = (0.04, 0.08, 0.12, 0.16) if family == "stairs" else (10, 15, 20)
-    if family == "level":
-        tiers = (0.01, 0.02)
-    if tier not in tiers:
-        raise ValueError("Tier is outside the declared structure envelope")
-    if (
-        type(reverse) is not bool
-        or any(type(seed) is not int or seed < 0 for seed in (coarse_seed, fine_seed))
-        or coarse_seed == fine_seed
-    ):
-        raise ValueError(
-            "Require a boolean direction and distinct nonnegative layer seeds"
-        )
-    if type(risers) is not int or risers not in (1, 4, 5, 6):
-        raise ValueError("Stairs require one or four through six risers")
-    if not _positive(tread) or not 0.31 <= tread <= 0.5:
-        raise ValueError("Treads must lie in [0.31,0.50] metres")
-    if not _positive(incline_length) or incline_length not in (2, 3):
-        raise ValueError("Ramp horizontal length must be two or three metres")
-    if (
-        (family != "stairs" and (risers != 4 or tread != 0.4))
-        or (family != "ramp" and incline_length != 2.0)
-        or (family == "level" and reverse)
-    ):
-        raise ValueError("Nondefault shape options do not apply to this family")
-    if (
-        not all(
-            _positive(value)
-            for value in (width, approach, landing, pad_length, resolution)
-        )
-        or width < 2
-        or resolution > 0.02
-        or min(approach, landing) < pad_length + 0.5
-    ):
-        raise ValueError(
-            "Require width>=2 m, resolution<=0.02 m and room for pads/tapers"
-        )
+    _validate_structure_family(family, tier)
+    _validate_structure_options(
+        family, reverse, coarse_seed, fine_seed, risers, tread, incline_length
+    )
+    _validate_structure_extent(width, approach, landing, pad_length, resolution)
 
     entry = float(approach)
     lips = np.array([], dtype=float)

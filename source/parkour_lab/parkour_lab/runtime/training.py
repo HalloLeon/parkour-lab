@@ -2,16 +2,16 @@
 
 import torch
 
-from parkour_lab.control.controller import JointTargets
 from parkour_lab.control.action import BOUNDED_MODE, BOUNDED_RAW_ACTION_MEANING
+from parkour_lab.control.controller import JointTargets
 from parkour_lab.control.motor_contract import make_motor_contract
 from parkour_lab.control.proprioception import ACTION_SLICE, CONTACT_SLICE, FRAME_DIM
+from parkour_lab.runtime.metrics import TransitionMetrics
 from parkour_lab.runtime.motor import (
     NATIVE_RAW_ACTION_MEANING,
     NativeJointTargetBridge,
     _runtime_motor_binding,
 )
-from parkour_lab.runtime.metrics import TransitionMetrics
 
 
 class TrainingHost:

@@ -15,12 +15,12 @@ import hashlib
 import torch
 from torch import nn
 
-from parkour_lab.control.controller import ControllerSpec, JointTargets, finite_tensor
 from parkour_lab.control.action import (
     BOUNDED_MODE,
     BOUNDED_RAW_ACTION_MEANING,
     JointActionTransform,
 )
+from parkour_lab.control.controller import ControllerSpec, JointTargets, finite_tensor
 from parkour_lab.control.proprioception import (
     CONTACT_SLICE,
     CONTACT_THRESHOLD_N,
@@ -29,6 +29,7 @@ from parkour_lab.control.proprioception import (
     pack_proprioception,
     proprioceptive_sensor_specs,
 )
+
 from .model import (
     CODE_DIM,
     FRAME_DIM,

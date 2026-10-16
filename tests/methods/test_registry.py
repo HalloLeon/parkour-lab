@@ -5,7 +5,6 @@ import unittest
 
 from parkour_lab.config import MethodConfig
 from parkour_lab.methods import get_backend, roa
-
 from tests.support import installed_backends
 
 

@@ -4,7 +4,6 @@ import torch
 
 from .controller import SensorSpec
 
-
 FRAME_DIM = 49
 ACTION_SLICE = slice(33, 45)
 CONTACT_SLICE = slice(45, 49)

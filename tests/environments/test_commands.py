@@ -10,9 +10,9 @@ from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 import torch
-from parkour_lab.environments.sampling import OperatorCommandSampler
-from parkour_lab.environments.terrain import PROFILE_BY_COLUMN
 
+from parkour_lab.environments.commands.sampling import OperatorCommandSampler
+from parkour_lab.environments.terrains.procedural import PROFILE_BY_COLUMN
 from tests.support import SOURCE_ROOT
 
 
@@ -183,9 +183,9 @@ def native_commands():
     )
     command_module.UniformVelocityCommand = UniformVelocityCommand
     managers.SceneEntityCfg = lambda name: NS(name=name)
-    path = SOURCE_ROOT / "parkour_lab/environments/commands.py"
+    path = SOURCE_ROOT / "parkour_lab/environments/commands/native.py"
     spec = importlib.util.spec_from_file_location(
-        "parkour_lab.environments._commands_test", path
+        "parkour_lab.environments.commands._commands_test", path
     )
     module = importlib.util.module_from_spec(spec)
     with patch.dict(
@@ -201,14 +201,15 @@ class NativeCommandResetTests(unittest.TestCase):
         return NS(heading_command=False, rel_heading_envs=0.0, rel_standing_envs=0.0)
 
     def test_rough_seeded_packets_follow_current_level_without_heading_assistance(self):
+        import numpy as np
+
         from parkour_lab.config import TaskConfig
         from parkour_lab.environments.randomization import TaskRandomization
         from tests.support.isaaclab import (
             NativeConfig,
-            stock_rough_config,
             pinned_generator,
+            stock_rough_config,
         )
-        import numpy as np
 
         generator = stock_rough_config().scene.terrain.terrain_generator
         generator.num_cols = 25
@@ -243,7 +244,9 @@ class NativeCommandResetTests(unittest.TestCase):
         global_rng = torch.get_rng_state().clone()
         for seed, fraction in ((0, 0.0), (42, 0.0), (0, 0.2), (42, 0.2), (42, 0.9)):
             task = TaskConfig(
-                terrain="rough", num_envs=100, seed=seed,
+                terrain="rough",
+                num_envs=100,
+                seed=seed,
                 rough_pivot_fraction=fraction,
             )
             randomization, expected = TaskRandomization(task), TaskRandomization(task)
@@ -279,10 +282,9 @@ class NativeCommandResetTests(unittest.TestCase):
                 terrain.terrain_levels.fill_(level)
                 command._resample(torch.arange(100))
                 draws = expected.uniform(None, 4, "commands").astype(np.float32)
-                values = (
-                    draws[:, :3] * np.array([0.7, 0.4, 1.0], dtype=np.float32)
-                    + np.array([-0.2, -0.2, -0.5], dtype=np.float32)
-                )
+                values = draws[:, :3] * np.array(
+                    [0.7, 0.4, 1.0], dtype=np.float32
+                ) + np.array([-0.2, -0.2, -0.5], dtype=np.float32)
                 restricted = np.zeros(100, dtype=bool)
                 # Stairs, two-sided boxes and rounded pyramid faces narrow from row1.
                 if level >= 1:
@@ -295,9 +297,7 @@ class NativeCommandResetTests(unittest.TestCase):
                 stops = (draws[:, 3] < 0.1) & ~restricted
                 values[stops] = 0
                 pivots = (
-                    (draws[:, 3] >= 0.1)
-                    & (draws[:, 3] < 0.1 + fraction)
-                    & ~restricted
+                    (draws[:, 3] >= 0.1) & (draws[:, 3] < 0.1 + fraction) & ~restricted
                 )
                 yaw = draws[pivots, 2]
                 values[pivots, :2] = 0
@@ -314,9 +314,9 @@ class NativeCommandResetTests(unittest.TestCase):
                     )
                 )
                 if fraction == 0:
-                    self.assertTrue(torch.equal(
-                        command.vel_command_b, torch.from_numpy(values)
-                    ))
+                    self.assertTrue(
+                        torch.equal(command.vel_command_b, torch.from_numpy(values))
+                    )
                 self.assertEqual(command.is_standing_env.tolist(), stops.tolist())
                 self.assertFalse(command.is_heading_env.any())
                 self.assertEqual(command.sampling_report["pivots"], pivot_count)
@@ -348,27 +348,33 @@ class NativeCommandResetTests(unittest.TestCase):
         task = TaskConfig(terrain="rough", num_envs=10, rough_pivot_fraction=0.2)
         ids = torch.tensor([7, 2, 5, 1, 4, 0, 9, 8])
         # Stop upper bound, both pivot signs, pivot upper bound, and two restricted rows.
-        draws = torch.tensor([
-            [0.5, 0.5, 0.0, 0.099],
-            [0.5, 0.5, 0.0, 0.1],
-            [0.5, 0.5, 0.5, 0.299],
-            [0.5, 0.5, 0.25, 0.3],
-            [0.0, 0.5, 0.499, 0.1],
-            [1.0, 0.5, 0.999, 0.299],
-            [0.5, 0.5, 0.499, 0.1],
-            [0.5, 0.5, 0.999, 0.299],
-        ])
+        draws = torch.tensor(
+            [
+                [0.5, 0.5, 0.0, 0.099],
+                [0.5, 0.5, 0.0, 0.1],
+                [0.5, 0.5, 0.5, 0.299],
+                [0.5, 0.5, 0.25, 0.3],
+                [0.0, 0.5, 0.499, 0.1],
+                [1.0, 0.5, 0.999, 0.299],
+                [0.5, 0.5, 0.499, 0.1],
+                [0.5, 0.5, 0.999, 0.299],
+            ]
+        )
         generator = stock_rough_config().scene.terrain.terrain_generator
         terrain = NS(
             terrain_types=torch.tensor([0, 12, 12, 12, 0, 12, 12, 12, 12, 12]),
             terrain_levels=torch.ones(10, dtype=torch.long),
         )
         calls = []
+
         def uniform(selected, width, stream):
             calls.append((selected.tolist(), width, stream))
             return draws
+
         env = NS(
-            num_envs=10, device="cpu", episode_length_buf=torch.ones(10),
+            num_envs=10,
+            device="cpu",
+            episode_length_buf=torch.ones(10),
             cfg=NS(
                 parkour_task=asdict(task),
                 scene=NS(terrain=NS(terrain_generator=generator)),
@@ -378,20 +384,33 @@ class NativeCommandResetTests(unittest.TestCase):
         )
         with (
             native_commands() as commands,
-            patch.dict(sys.modules, {
-                "parkour_lab.environments.dynamics": NS(
-                    get_randomization=lambda env: env.parkour_randomization
-                ),
-            }),
+            patch.dict(
+                sys.modules,
+                {
+                    "parkour_lab.environments.dynamics": NS(
+                        get_randomization=lambda env: env.parkour_randomization
+                    ),
+                },
+            ),
         ):
             command = commands.RoughVelocityCommand(self.config(), env)
         command.vel_command_b.fill_(9)
         command._resample(ids)
-        torch.testing.assert_close(command.vel_command_b[ids], torch.tensor([
-            [0.0, 0.0, 0.0], [0.0, 0.0, -0.3], [0.0, 0.0, 0.3],
-            [0.15, 0.0, -0.25], [0.2, 0.0, 0.0], [0.5, 0.0, 0.0],
-            [0.0, 0.0, -0.4996], [0.0, 0.0, 0.4996],
-        ]))
+        torch.testing.assert_close(
+            command.vel_command_b[ids],
+            torch.tensor(
+                [
+                    [0.0, 0.0, 0.0],
+                    [0.0, 0.0, -0.3],
+                    [0.0, 0.0, 0.3],
+                    [0.15, 0.0, -0.25],
+                    [0.2, 0.0, 0.0],
+                    [0.5, 0.0, 0.0],
+                    [0.0, 0.0, -0.4996],
+                    [0.0, 0.0, 0.4996],
+                ]
+            ),
+        )
         self.assertEqual(command.is_standing_env[ids].tolist(), [True] + [False] * 7)
         self.assertTrue((command.vel_command_b[[3, 6]] == 9).all())
         self.assertEqual(calls, [(ids.tolist(), 4, "commands")])
@@ -447,8 +466,8 @@ class NativeCommandResetTests(unittest.TestCase):
         self.assertTrue(failed[1])
 
     def test_flat_uniform_sampler_exact_period_and_partial_reset(self):
-        from parkour_lab.environments.randomization import TaskRandomization
         from parkour_lab.config import TaskConfig
+        from parkour_lab.environments.randomization import TaskRandomization
 
         env = NS(
             num_envs=100,

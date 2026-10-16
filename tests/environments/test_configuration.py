@@ -2,8 +2,8 @@
 
 import ast
 import math
-from types import SimpleNamespace as NS
 import unittest
+from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 import torch
@@ -39,13 +39,17 @@ class EnvironmentConfigurationTests(unittest.TestCase):
 
     def test_rough_pivot_fraction_validation_round_trip_and_external_bypass(self):
         for fraction in (0, 0.2, 0.9):
-            config = ExperimentConfig(task=TaskConfig(
-                terrain="rough", rough_pivot_fraction=fraction,
-            ))
+            config = ExperimentConfig(
+                task=TaskConfig(
+                    terrain="rough",
+                    rough_pivot_fraction=fraction,
+                )
+            )
             self.assertEqual(ExperimentConfig.from_dict(config.to_dict()), config)
         for fraction in (-0.01, 0.901, float("nan"), float("inf"), True, "0.2"):
-            with self.subTest(fraction=fraction), self.assertRaisesRegex(
-                ValueError, "rough_pivot_fraction"
+            with (
+                self.subTest(fraction=fraction),
+                self.assertRaisesRegex(ValueError, "rough_pivot_fraction"),
             ):
                 TaskConfig(terrain="rough", rough_pivot_fraction=fraction)
         for terrain in ("rough", "flat"):
@@ -141,7 +145,7 @@ class EnvironmentConfigurationTests(unittest.TestCase):
                 world_yaw=0.37,
             ),
         )
-        with patch("parkour_lab.environments.connected.configure") as install:
+        with patch("parkour_lab.environments.terrains.connected.configure") as install:
             cfg = self.build(task, evaluation=True)
         install.assert_called_once_with(cfg, task)
         self.assertEqual(cfg.parkour_task["world"], task.world)
@@ -538,7 +542,7 @@ class EnvironmentConfigurationTests(unittest.TestCase):
         self.assertFalse(hasattr(cfg.terminations, "procedural_workspace"))
 
     def test_steps_use_exact_current_callbacks_and_three_exposed_rows(self):
-        from parkour_lab.environments.step_field import step_field_terrain
+        from parkour_lab.environments.terrains.step_field import step_field_terrain
 
         cfg = self.build(TaskConfig(terrain="steps"))
         self.assertEqual(cfg.scene.terrain.max_init_terrain_level, 2)
@@ -578,7 +582,7 @@ class EnvironmentConfigurationTests(unittest.TestCase):
                 )
 
     def test_traversal_layout_is_explicit_fixed_geometry(self):
-        from parkour_lab.environments.traversal import profiles_for_layout
+        from parkour_lab.environments.terrains.traversal import profiles_for_layout
 
         for layout in ("standard", "step_ladder"):
             cfg = self.build(

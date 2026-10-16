@@ -24,8 +24,9 @@ def train(
     backend = get_backend(config.method.name)
     method = backend.create(host, config.method.options, config.task.seed)
     if getattr(env, "parkour_randomization", None) is not None:
-        from parkour_lab.environments.dynamics import dynamics_report, start_report
         import numpy as np
+
+        from parkour_lab.environments.dynamics import dynamics_report, start_report
 
         write_json(Path(output) / "manifest.json", env.parkour_randomization.manifest())
         np.savez_compressed(

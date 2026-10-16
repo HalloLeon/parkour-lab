@@ -9,8 +9,8 @@ from dataclasses import dataclass
 from types import SimpleNamespace as NS
 
 import torch
-from parkour_lab.environments.terrain import _terrain_height_components
 
+from parkour_lab.environments.terrains.procedural import _terrain_height_components
 from tests.support import SOURCE_ROOT
 from tests.support.isaaclab import modules
 

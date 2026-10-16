@@ -9,9 +9,9 @@ stairs. The builder requires only NumPy; simulator imports are lazy.
 
 from __future__ import annotations
 
-from copy import deepcopy
 import hashlib
 import math
+from copy import deepcopy
 from numbers import Real
 
 import numpy as np
@@ -224,7 +224,7 @@ def stress_terrain(difficulty, cfg):
 
     import trimesh
 
-    from parkour_lab.environments.terrain import (
+    from .procedural import (
         surface_mesh_arrays,
     )
 

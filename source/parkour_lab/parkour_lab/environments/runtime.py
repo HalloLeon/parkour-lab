@@ -64,8 +64,8 @@ class LocomotionEnv(ManagerBasedRLEnv):
                     )
 
     def _capture_physics(self):
-        from parkour_lab.runtime.native import motion_state
         from parkour_lab.runtime.metrics import diagnostic_state
+        from parkour_lab.runtime.native import motion_state
 
         state = motion_state(self) if self.capture_motion else {}
         if self.capture_diagnostics:

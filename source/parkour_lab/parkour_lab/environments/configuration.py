@@ -56,16 +56,21 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
         UnitreeGo2RoughEnvCfg,
     )
 
+    from parkour_lab.runtime.native import foot_contacts
+
     from . import observations
-    from .commands import (
+    from .commands.native import (
         FlatVelocityCommand,
         ProceduralTerrainCommand,
         RoughVelocityCommand,
         procedural_physical_failure,
         procedural_workspace,
     )
-    from .terrain import BORDER_WIDTH, ENVELOPES, make_operator_terrain_generator
-    from parkour_lab.runtime.native import foot_contacts
+    from .terrains.procedural import (
+        BORDER_WIDTH,
+        ENVELOPES,
+        make_operator_terrain_generator,
+    )
 
     cfg = UnitreeGo2RoughEnvCfg() if task.terrain == "rough" else UnitreeGo2FlatEnvCfg()
     cfg.sim.dt = 1.0 / task.physics_hz
@@ -174,12 +179,16 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
             "minimum_surface_z_m": (
                 0.0
                 if task.terrain == "flat"
-                else -0.02
-                if task.terrain == "connected"
-                else -4.0
-                if task.terrain == "rough"
-                else -max(height for height, _ in ENVELOPES.values())
-                * task.difficulty_range[1]
+                else (
+                    -0.02
+                    if task.terrain == "connected"
+                    else (
+                        -4.0
+                        if task.terrain == "rough"
+                        else -max(height for height, _ in ENVELOPES.values())
+                        * task.difficulty_range[1]
+                    )
+                )
             ),
             "fall_margin_m": 0.5,
             "max_tilt_rad": math.pi / 4,
@@ -211,11 +220,11 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
         cfg.observations.proprio.enable_corruption = False
 
     if task.terrain == "steps":
-        from .step_field import configure
+        from .terrains.step_field import configure
 
         configure(cfg)
     elif task.terrain == "traversal":
-        from .traversal import configure, preflight
+        from .terrains.traversal import configure, preflight
 
         configure(
             cfg,
@@ -224,7 +233,7 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
             layout=task.traversal_layout,
         )
     elif task.terrain == "connected":
-        from .connected import configure
+        from .terrains.connected import configure
 
         configure(cfg, task)
     if evaluation:

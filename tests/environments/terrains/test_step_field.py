@@ -11,10 +11,10 @@ from pathlib import Path
 from types import SimpleNamespace as NS
 
 import numpy as np
-import parkour_lab.environments.step_field as field
 import torch
-from parkour_lab.environments import terrain
 
+import parkour_lab.environments.terrains.step_field as field
+from parkour_lab.environments.terrains import procedural as terrain
 from tests.support.isaaclab import modules, pinned_generator, pinned_raycast
 
 

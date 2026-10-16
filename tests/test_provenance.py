@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from parkour_lab import provenance
@@ -121,10 +122,54 @@ class RunProvenanceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "provenance"):
             provenance.collect_run_provenance(self.root)
 
+    def test_nested_editable_dependency_records_checkout_and_dirty_diff(self):
+        module = self.repo / "source/sdk/sdk/__init__.py"
+        module.parent.mkdir(parents=True)
+        module.write_text('"""Nested SDK fixture."""\n')
+        self.git("add", "source")
+        self.git("commit", "-q", "-m", "Add nested dependency")
+        commit = self.git("rev-parse", "HEAD").decode().strip()
+        with (
+            patch("importlib.metadata.version", return_value="2.3.2"),
+            patch(
+                "importlib.import_module",
+                return_value=SimpleNamespace(__file__=str(module)),
+            ),
+        ):
+            clean = provenance.dependency_identity("sdk", "sdk")
+            module.write_text('"""Modified SDK fixture."""\n')
+            dirty = provenance.dependency_identity("sdk", "sdk")
+        self.assertEqual(clean["commit"], commit)
+        self.assertFalse(clean["dirty"])
+        self.assertEqual(clean["diff_sha256"], hashlib.sha256(b"").hexdigest())
+        self.assertEqual(dirty["commit"], commit)
+        self.assertTrue(dirty["dirty"])
+        self.assertNotEqual(dirty["source_sha256"], clean["source_sha256"])
+        self.assertNotEqual(dirty["diff_sha256"], clean["diff_sha256"])
+
+    def test_dependency_installed_inside_repository_does_not_inherit_its_commit(self):
+        module = self.repo / ".venv/lib/python3.11/site-packages/sdk/__init__.py"
+        module.parent.mkdir(parents=True)
+        module.write_text('"""Installed SDK fixture."""\n')
+        with (
+            patch("importlib.metadata.version", return_value="2.3.2"),
+            patch(
+                "importlib.import_module",
+                return_value=SimpleNamespace(__file__=str(module)),
+            ),
+        ):
+            receipt = provenance.dependency_identity("sdk", "sdk")
+        self.assertEqual(receipt["version"], "2.3.2")
+        self.assertIn("source_sha256", receipt)
+        self.assertNotIn("commit", receipt)
+        self.assertNotIn("dirty", receipt)
+        self.assertNotIn("diff_sha256", receipt)
+
 
 class PackageSourceIdentityTests(unittest.TestCase):
     def test_dependency_receipt_describes_imported_upstream(self):
         from importlib.metadata import version
+
         import rsl_rl
 
         receipt = provenance.dependency_identity("rsl_rl", "rsl-rl-lib")
@@ -142,7 +187,7 @@ class PackageSourceIdentityTests(unittest.TestCase):
         self.assertTrue(
             {
                 "environments/configuration.py",
-                "environments/commands.py",
+                "environments/commands/native.py",
                 "environments/observations.py",
                 "runtime/native.py",
                 "config.py",

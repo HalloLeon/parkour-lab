@@ -10,10 +10,10 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
+
 from parkour_lab.config import TaskConfig
 from parkour_lab.control.motor_contract import make_motor_contract, verify_runtime_motor
 from parkour_lab.runtime.motor import _runtime_motor_binding
-
 from tests.support import ROOT
 from tests.support.isaaclab import modules, pinned_source_root
 from tests.support.native import make_native_env
@@ -156,6 +156,7 @@ def environment(module, *, dynamics="randomized", count=4):
 class DynamicsTests(unittest.TestCase):
     def test_rough_shared_reset_uses_changed_supported_origin_and_fixed_dynamics(self):
         from dataclasses import asdict
+
         from parkour_lab.runtime.native import causal_sensor_noise
 
         with native_dynamics() as dynamics:
@@ -191,6 +192,7 @@ class DynamicsTests(unittest.TestCase):
 
     def test_canonical_terrain_id_drives_native_dynamics_reset_and_causal_noise(self):
         from dataclasses import asdict
+
         from parkour_lab.environments.randomization import TaskRandomization
         from parkour_lab.runtime.native import causal_sensor_noise
 
@@ -337,9 +339,9 @@ class DynamicsTests(unittest.TestCase):
 
                 def set_materials(data, ids):
                     setter(data, ids)
-                    values["dof_limits" if key == "joint_limits" else key][index] += (
-                        0.01
-                    )
+                    values["dof_limits" if key == "joint_limits" else key][
+                        index
+                    ] += 0.01
 
                 with (
                     patch.object(view, "set_material_properties", set_materials),

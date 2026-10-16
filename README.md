@@ -5,19 +5,16 @@ teacher/student learning by default and interfaces for future learning methods. 
 covers training, continuation, export and command playback. **Successful training or playback
 does not establish robot qualification.**
 
+See the [package README](source/parkour_lab/docs/README.md) for installation,
+architecture and executable verification commands. This page is the detailed
+command and diagnostic reference. The command diagnostics are not a standardized
+benchmark.
+
 ## Setup and commands
 
-Use the interpreter already configured for Isaac Lab and RSL-RL:
-
-```bash
-python -m pip install -e source/parkour_lab
-export PYTHONPATH="$PWD/source/parkour_lab${PYTHONPATH:+:$PYTHONPATH}"
-python -m parkour_lab --help
-```
-
-The development environment used Isaac Lab 2.3.2.post1, Isaac Sim 5.1, and RSL-RL
-3.1.2. CPU tests are not simulator validation. There is no GPU discovery, leasing or
-exact-wheel admission gate. Select the device explicitly.
+Follow the [installation instructions](source/parkour_lab/docs/README.md#installation)
+using the interpreter configured for Isaac Lab. Select the device explicitly;
+CPU checks do not establish simulator compatibility.
 
 | Command | Purpose |
 | --- | --- |
@@ -99,9 +96,9 @@ rejection of genuinely nonfinite gradients remain unchanged.
 `task.terrain="rough"` uses Isaac Lab's Go2 rough terrain: stairs in both
 directions, slopes in both directions, boxes and uneven ground. It adds plane
 columns for 20% flat practice. Defaults are ten difficulty rows over `(0, 1)` and
-initial row zero. The recorded native training run actually began on row one,
-consistent with curriculum processing during the initial reset; that initialization
-mismatch remains to be corrected. Playback starts on row zero. The upstream
+configured initial row zero. Reset-time curriculum processing can change the
+realized initial training row, so the configured level alone is not a guarantee
+of the starting difficulty. Playback disables progression and starts on row zero. The upstream
 distance curriculum moves robots between levels. Stairs, boxes and slopes grow harder with row difficulty;
 the stock uneven-ground noise stays fixed. Flat practice provides training
 coverage; the separate flat bank still measures retention.
@@ -148,20 +145,11 @@ The upstream curriculum uses travel distance and the final command as a progress
 proxy; it does not certify tracking or traversal, particularly during stops and
 turns. `metrics.jsonl` records the number of environments at each terrain level;
 the final report includes command sampling counts. Playback freezes level changes.
-The native `fresh_flat_rough_oLzXNt` comparison completed 20k fresh flat updates
-and 20k rough updates. First-episode rough physical failures fell from 63/160 to
-5/160, but flat forward passes fell from 98/100 to 40/100 and pivot-left from
-84/100 to 0/100. Matched posture penalties of −0.1 and −0.2 reduce rough physical
-failures to zero and improve flat forward passes to 66/100 and 76/100, but pivots
-pass only 0/100 and 4/100. Posture and terrain progress improve while turning in
-place remains unresolved. Explicit pivot practice is the next unrun comparison;
-the recipe is not a validated default. This training layout remains separate
-from connected-world qualification.
 
-### Simulation timing candidate
+### Simulation timing
 
-`task.physics_hz` defaults to `200`; the only alternative is the approved `400`
-candidate. Both use 50 Hz commands/actions and the same 25-frame causal history.
+`task.physics_hz` accepts `200` (default) or `400`.
+Both use 50 Hz commands/actions and the same 25-frame causal history.
 Physics uses four/eight substeps, contact sensors update each substep, and native
 collision-history lookback remains 10 ms (three/five samples). Actor contact flags
 still use only the latest sample. Rendering and height scans remain at 50 Hz.
@@ -180,8 +168,7 @@ hash. The source checkpoint is never modified. Export preserves inference weight
 not closed-loop behavior or qualification. This setting does not configure a
 hardware servo or change the 50 Hz policy interface; changed simulated dynamics
 and contact inputs can nevertheless affect behavior and eventual sim-to-real
-transfer. The retained 200 Hz flat anchor remains the comparison baseline. No
-terrain training or production adoption is implied by candidate export.
+transfer. An explicit rate export requires native behavioral validation.
 
 ### Reward configuration and diagnostics
 
@@ -299,15 +286,13 @@ noise and motion before recomputing scores. Each group needs ≥90/100 overall a
 ≥45/50 in each stratum. Missing groups remain nonpasses; duplicate groups are
 rejected rather than selecting the best retry. Later reset episodes cannot replace
 a failed first attempt. This is **development evidence, not held-out qualification**.
-The retained 200 Hz anchor and its same-weight 400 Hz export pass the development
-flat bank; terrain acceptance remains open.
 
 Domain checks use root/body-link centres in a local ±6 m square, not collision-volume
 extents. Reports always retain `qualified=false` and `qualification_eligible=false`.
 
 ### Connected source geometry
 
-The simulator-free `environments.worlds.build_world` API constructs a single
+The simulator-free `environments.terrains.worlds.build_world` API constructs a single
 connected diagnostic mesh containing stairs, a perpendicular ramp, a rounded hill
 and rough connecting ground. One assigned encounter supplies prospective start,
 landing and stop regions for the fixed 30 s tape; these are geometry annotations,
@@ -316,7 +301,7 @@ not policy goals or a frozen evaluation bank.
 ```bash
 python - <<'PY'
 import json
-from parkour_lab.environments.worlds import build_world
+from parkour_lab.environments.terrains.worlds import build_world
 
 mesh = build_world("ramp", 20, coarse_seed=17, fine_seed=23)
 print(json.dumps(mesh["metadata"], indent=2, allow_nan=False))
@@ -374,16 +359,6 @@ this avoids accumulated float32 timestamp drift skipping nominal 20 ms updates.
 Playback stops at the first termination or truncation, saves the consumed partial
 tape, and reports `FIRST_ATTEMPT_ENDED_NOT_QUALIFIED`. Clean completion also remains
 unqualified. This is operational integration, not a terrain bank or training release.
-
-The first native run, `robot_world_PR8px3`, settled on the elevated pad but ended
-at 11.12 s with 45.79° tilt after accelerating down the ramp. Shutdown completed;
-the failed first attempt remains preserved. It also exposed 78 stale ray frames
-after 8 s, motivating the lazy-update correction above. The terminal ray was fresh,
-so this sampling defect does not excuse the tilt failure. The same-input
-`ray_refresh_W0XdIg` verification now has fresh rays at all 556 control samples,
-including all 156 after 8 s. Non-ray motion and all tracking arrays are identical
-to the original: the robot still terminates at 11.12 s. This verifies sampling on
-that trace, not full-horizon terrain capability; terrain learning is not released.
 
 Score saved connected-world evidence without starting the simulator:
 
@@ -447,30 +422,16 @@ the first native ending and retains the partial tape; a reset supplies no retry.
 receipts and noise before returning the assigned group/index alongside kinematic
 results. This does not qualify a complete bank or certify cooked contacts.
 
-The first assigned native case, `ramp/down/10deg` index 50, has a valid capture and
-binding, but terminates at 10.82 s with 45.03° tilt before clearing the ramp or
-reaching the final stop. Clean process exit means the capture completed, not that
-the robot passed. Broader native coverage, aggregation and retention remain open.
 Keep the generated assignment file and its source identity when preparing a bank;
 do not replace cases after observing robot outcomes.
 
 ## Ownership and boundaries
 
-| Package/module | Responsibility |
-| --- | --- |
-| `config.py`, `__main__.py`, `experiment.py` | Typed settings, public commands, lifecycle and training orchestration |
-| `environments/` | Explicit native configuration, terrain, observations, command sampling and physical termination |
-| `methods/roa/` | ROA observation adapter, teacher/student model, PPO/history-fitting schedule/state, numerical serialization and causal controller |
-| `methods/base.py`, `methods/__init__.py` | Small backend/learner contracts and named plugin loading |
-| `methods/models.py` | Torch neural components used by ROA; not required by other frameworks |
-| `control/` | Portable command tapes, sensor/action contracts and controller session semantics |
-| `runtime/` | Shared training ticks, native sensor/motor binding and cleanup |
-| `artifacts.py`, `provenance.py` | Method-neutral artifact envelope and source/dependency/run receipts |
-| `evaluation/` | Frozen command playback and diagnostic metrics |
-| `tests/` | Component-organized regression, contract, geometry and CPU integration checks; see [tests/README.md](tests/README.md) |
-
-There is no legacy task registration, gap curriculum, waypoint navigation, old
-teacher pipeline, experiment-specific executable or compatibility alias.
+The [package architecture map](source/parkour_lab/docs/README.md#architecture)
+identifies each owner. Native commands and command sampling live in
+`environments/commands/`; terrain geometry lives in `environments/terrains/`.
+See [tests/README.md](tests/README.md) for component checks. Saved terrain analysis
+has one retained import re-export, documented in the architecture map.
 Package imports do not launch Isaac Lab. ROA inference does not import PPO.
 
 `environments/runtime.py` retains separate termination/truncation flags and owned
@@ -480,13 +441,11 @@ next-action reset observations. Native observation terms must be stateless;
 history, filters and stateful preprocessing belong in the learner adapter.
 Flat native groups remain clean: noise is applied once at the shared causal-input
 boundary. Terminal-only reads do not consume that stream. Other diagnostic terrains
-retain isolated native observation noise; they are not yet acceptance-aligned tasks.
+retain isolated native observation noise.
 
 ROA uses the final clean state/terrain only for timeout value bootstrapping;
 this does not add privileged student inputs or push causal history twice.
-True termination takes precedence over a simultaneous timeout. This intentionally
-replaces RSL-RL's previous-state timeout estimate with the final-state estimate;
-it is a learning correction, not a claim of identical historical training.
+True termination takes precedence over a simultaneous timeout.
 Reports count captured final rows and metrics count timeout bootstraps per run.
 
 ## Method extension boundary
@@ -530,24 +489,18 @@ episodes; its controller owns recurrent inference/reset state. These responsibil
 are designed to avoid PPO hooks or edits to shared tasks, commands, motor delivery
 or evaluation. No DreamFLEX/Dreamer implementation or behavioral equivalence is
 claimed here. Contract tests and architecture review are not empirical proof of
-multi-learner interoperability; a real second learner is not required for acceptance.
+multi-learner interoperability.
 
-## Breaking change and evidence
-
-Old checkpoints, experiment manifests, baseline admission chains and script
-commands are intentionally unsupported. No converter is provided.
-Keep archived runs unchanged and use their original checkout for historical
-reproduction. The current workflow starts fresh or loads artifacts it produced.
+## Artifacts and provenance
 
 Source hashes are evidence, not a demand that every run use identical source.
 Commit new executable files before server runs: the Git receipt includes tracked
 changes but does not archive untracked file contents. No test/documentation files
 need to be synced to run the package commands.
 
-The current `.plab` format is `parkour_lab_method_v3`, with a nominal motor identity
-independent of bounded realized gains/strength. Earlier artifacts, including 49-D
-v2 files, are unsupported. Start fresh; do not convert archived weights or mix
-older runs into matched reward comparisons.
+The supported `.plab` format is `parkour_lab_method_v3`, with a nominal motor
+identity independent of bounded realized gains/strength. Unsupported formats are
+rejected rather than automatically converted.
 
 ## Default ROA recipe
 
@@ -614,24 +567,13 @@ and the first raw/delivered sensor sample. Replaying the same manifest resets th
 streams, not the physics engine's numerical nondeterminism.
 
 For ordinary flat diagnostics, `task.dynamics` can select `nominal` or `randomized`;
-the development bank always supplies its fixed 50/50 split. These corrections
-currently apply only to flat tasks. Rewards and learner settings are unchanged.
+the development bank always supplies its fixed 50/50 split. Flat, rough and
+connected tasks use the shared dynamics and causal sensor-noise bindings.
 
-## Acceptance
+## Validation limits
 
-Project targets are stairs with realized risers 4/8/12/16 cm, ramps/hills at
-10/15/20 degrees, and multiscale unevenness on structures and connecting ground.
-One causal policy must cross the assigned obstacle, track commands and stop
-stably. Each of 20 terrain and 10 flat groups has 100 first attempts, balanced between
-nominal and randomized dynamics; every group needs ≥90/100 overall and ≥45/50
-in each subset. Later candidates must also retain flat performance: at most 5
-percentage points pass loss and 0.02 m/s planar RMSE increase per profile.
-No gaps, steep backward traversal or sim-to-real qualification is required.
-These are ROA-informed project targets, not official ROA benchmark claims.
-
-The causal flat anchor is accepted; connected terrain contacts, traversal and
-complete-bank coverage remain unresolved. Terrain learning and held-out
-qualification are not cleared. Diagnostic tracking, exports and local tests
-cannot replace the empirical gates or independent overall score of at least 18/20.
-Detailed requirements and research history are maintained locally under ignored
-`.agent/`; they are not needed to run the package.
+Software checks establish their stated contracts: configuration, tensor/mesh
+arithmetic, persistence and native integration. They do not establish robot
+stability, full-terrain traversal or sim-to-real performance. Evaluate physical
+behavior using complete prescribed attempts and preserve failures in results.
+Process success, high training reward and tracking averages alone are insufficient.

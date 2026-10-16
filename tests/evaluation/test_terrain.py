@@ -1,8 +1,8 @@
 """Analytic first-attempt geometry/timing cases, not simulated locomotion."""
 
-from copy import deepcopy
 import math
 import unittest
+from copy import deepcopy
 
 import numpy as np
 
@@ -38,9 +38,11 @@ def ideal(*, axis=0, reverse=False, yaw=0.0, family="ramp"):
         size_m=[24.0, 24.0],
         trial=dict(
             family=family,
-            orientation=("long-first" if reverse else "short-first")
-            if family == "hill"
-            else ("down" if reverse else "up"),
+            orientation=(
+                ("long-first" if reverse else "short-first")
+                if family == "hill"
+                else ("down" if reverse else "up")
+            ),
             local_to_world_column_transform=matrix.tolist(),
             target_footprint_local_m=footprint.tolist(),
             approach_edge_local_m=approach.tolist(),

@@ -20,9 +20,7 @@ class PackageBoundaryTests(unittest.TestCase):
                 names = (
                     [alias.name for alias in node.names]
                     if isinstance(node, ast.Import)
-                    else [node.module or ""]
-                    if isinstance(node, ast.ImportFrom)
-                    else []
+                    else [node.module or ""] if isinstance(node, ast.ImportFrom) else []
                 )
                 for name in names:
                     self.assertFalse(
@@ -31,7 +29,8 @@ class PackageBoundaryTests(unittest.TestCase):
                     )
 
     def run_isolated(self, code, blocked):
-        guard = textwrap.dedent(f"""
+        guard = textwrap.dedent(
+            f"""
             import importlib.abc, sys
             sys.path.insert(0, {str(SOURCE_ROOT)!r})
             blocked = {tuple(blocked)!r}
@@ -40,7 +39,8 @@ class PackageBoundaryTests(unittest.TestCase):
                     if any(fullname == p or fullname.startswith(p + '.') for p in blocked):
                         raise AssertionError('Forbidden dependency: ' + fullname)
             sys.meta_path.insert(0, ImportGuard())
-        """)
+        """
+        )
         with tempfile.TemporaryDirectory() as directory:
             result = subprocess.run(
                 [sys.executable, "-I", "-c", guard + textwrap.dedent(code)],
@@ -75,6 +75,28 @@ class PackageBoundaryTests(unittest.TestCase):
                 "warp",
                 "scripts",
                 "parkour_lab.methods",
+            ),
+        )
+
+    def test_saved_terrain_analysis_does_not_import_live_execution_or_learning(self):
+        self.run_isolated(
+            """
+            from parkour_lab.evaluation.terrain_analysis import analyze_terrain_attempt
+            try:
+                analyze_terrain_attempt('missing-terrain-run')
+            except FileNotFoundError:
+                pass
+            else:
+                raise AssertionError('Missing evidence did not fail')
+            """,
+            (
+                "parkour_lab.evaluation.runner",
+                "parkour_lab.runtime",
+                "parkour_lab.methods",
+                "isaaclab",
+                "omni",
+                "pxr",
+                "warp",
             ),
         )
 
@@ -136,11 +158,12 @@ class PackageBoundaryTests(unittest.TestCase):
                 ("parkour_lab.methods",),
             ),
             "environments": (
-                "from parkour_lab.environments import terrain, configuration",
+                "from parkour_lab.environments import configuration\n"
+                "from parkour_lab.environments.terrains import procedural",
                 ("parkour_lab.methods",),
             ),
             "environments.worlds": (
-                "from parkour_lab.environments.worlds import build_world",
+                "from parkour_lab.environments.terrains.worlds import build_world",
                 ("torch", "parkour_lab.methods"),
             ),
             "methods": (

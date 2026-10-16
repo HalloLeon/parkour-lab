@@ -9,6 +9,7 @@ packet timestamp or wall clock. Scene/motor configuration must remain frozen.
 from __future__ import annotations
 
 import hashlib
+
 import torch
 
 from parkour_lab.control.controller import ControllerSession, Sample, finite_tensor
@@ -17,8 +18,6 @@ from parkour_lab.control.proprioception import (
     FOOT_NAMES,
     NATIVE_SENSORS,
 )
-
-
 from parkour_lab.runtime.motor import (
     NativeJointTargetBridge,
 )

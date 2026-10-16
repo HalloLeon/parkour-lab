@@ -2,26 +2,26 @@
 
 import hashlib
 import json
-from pathlib import Path
 import shutil
 import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
+from parkour_lab.control.command_tape import TapeBuilder
+from parkour_lab.environments.randomization import TaskRandomization
 from parkour_lab.evaluation.flat import (
     PROFILES,
     STEPS,
-    profile_commands,
     aggregate_development_bank,
     analyze_development_bank,
+    profile_commands,
     score_command_phase,
     score_development_profile,
     score_flat_profile,
     summarize_development_profile,
 )
-from parkour_lab.environments.randomization import TaskRandomization
-from parkour_lab.control.command_tape import TapeBuilder
 
 
 def ideal_trace(profile, count=2):

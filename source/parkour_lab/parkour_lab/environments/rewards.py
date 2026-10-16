@@ -4,9 +4,8 @@ Importing the schema requires neither Torch nor Isaac Lab. Only posture is a
 project-defined reward; all other functions come from the stock Go2 task.
 """
 
-from copy import deepcopy
 import math
-
+from copy import deepcopy
 
 # Default weight and unweighted formula. The manager applies weight * control dt.
 TERMS = {
