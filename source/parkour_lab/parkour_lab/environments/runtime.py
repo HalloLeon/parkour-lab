@@ -40,6 +40,9 @@ class LocomotionEnv(ManagerBasedRLEnv):
         super().__init__(*args, **kwargs)
         self.interactions = InteractionCounter(self.num_envs)
         try:
+            from parkour_lab.environments.faults import configure_fault
+
+            configure_fault(self)
             self._validate_observations()
         except Exception:
             # The caller cannot close an object whose constructor never returned.
@@ -102,6 +105,9 @@ class LocomotionEnv(ManagerBasedRLEnv):
                     name: value[env_ids].detach().clone()
                     for name, value in capture_information(self).items()
                 }
+        from parkour_lab.environments.faults import reset_fault
+
+        reset_fault(self, env_ids)
         super()._reset_idx(env_ids)
 
     def _training_information_enabled(self):

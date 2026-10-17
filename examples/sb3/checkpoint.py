@@ -107,14 +107,19 @@ def save_checkpoint(model, task, folder, *, run_id, milestones=()):
     return receipt
 
 
-def _verified(folder):
+def _verified(folder, *, training=True):
     folder = Path(folder)
     receipt = json.loads((folder / "checkpoint.json").read_text())
+    current_sources = _source_identity()
+    source_names = current_sources if training else ("stable_baselines3",)
     if (
         receipt["version"] != VERSION
         or receipt["library_version"] != stable_baselines3.__version__
         or receipt["algorithm"] not in ALGORITHMS
-        or receipt["source_sha256"] != _source_identity()
+        or any(
+            receipt["source_sha256"].get(name) != current_sources[name]
+            for name in source_names
+        )
     ):
         raise ValueError("Checkpoint library, version or source differs")
     expected = {"model.zip", "rng.pt", "progress.json"}
@@ -134,8 +139,14 @@ def _verified(folder):
 
 
 def load_model(folder, *, device="cpu"):
-    """Verify the complete bundle, load inference weights, preserve caller RNG."""
-    folder, receipt = _verified(folder)
+    """Load frozen inference with its original training identity and owned RNG.
+
+    Evaluation may use an expanded benchmark package. Its sources are recorded
+    separately in the capture; the SB3 implementation and saved bundle must
+    still match. Training continuation additionally requires the original task
+    package sources in ``load_checkpoint``.
+    """
+    folder, receipt = _verified(folder, training=False)
     before = capture_rng()
     try:
         model = ALGORITHMS[receipt["algorithm"]].load(

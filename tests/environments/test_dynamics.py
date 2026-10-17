@@ -1,5 +1,6 @@
 """Pinned DC torque arithmetic and deterministic native-API dynamics boundaries."""
 
+import ast
 import importlib.util
 import unittest
 from contextlib import contextmanager
@@ -11,6 +12,7 @@ from unittest.mock import patch
 import torch
 
 from parkour_lab.control.motor_contract import make_motor_contract, verify_runtime_motor
+from parkour_lab.environments.faults import DriveFault, FaultConfig
 from parkour_lab.runtime.motor import _runtime_motor_binding
 from tests.support import ROOT
 from tests.support.isaaclab import modules, pinned_source_root
@@ -151,7 +153,138 @@ def environment(module, *, dynamics="randomized", count=4):
     return env, motor, values, writes
 
 
+def sdk_function(relative, name, namespace, *, owner=None):
+    """Run one unmodified pinned SDK function without importing native plugins."""
+    source = (pinned_source_root() / relative).read_text()
+    tree = ast.parse(source)
+    body = (
+        tree.body
+        if owner is None
+        else next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == owner
+        ).body
+    )
+    node = next(n for n in body if isinstance(n, ast.FunctionDef) and n.name == name)
+    exec(
+        "from __future__ import annotations\n" + ast.get_source_segment(source, node),
+        namespace,
+    )
+    return namespace[name]
+
+
 class DynamicsTests(unittest.TestCase):
+    def test_drive_loss_follows_native_limit_at_every_speed_and_torque_sign(self):
+        with native_dynamics() as module:
+            healthy = actuator(module, count=5)
+            position = torch.zeros(5, 12)
+            velocity = torch.tensor([0.0, 15.0, 29.0, 40.0, -40.0])[:, None].expand(
+                -1, 12
+            )
+            clock = NS(step=0)
+            for factor in (1, 0.5, 0):
+                for request in (0.1, 10.0, -10.0):
+                    with self.subTest(factor=factor, request=request):
+                        motor = actuator(module, count=5)
+                        motor.motor_strength.fill_(1.1)
+                        healthy.motor_strength.fill_(1.1)
+                        motor.drive_fault = DriveFault(
+                            FaultConfig("j7", factor, 0.01),
+                            motor.joint_names,
+                            num_envs=5,
+                            device="cpu",
+                            physics_dt=0.005,
+                            clock=lambda: clock.step,
+                        )
+                        motor._drive_fault_columns = list(range(12))
+
+                        def command():
+                            return NS(
+                                joint_positions=torch.full_like(position, request),
+                                joint_velocities=velocity.clone(),
+                                joint_efforts=torch.zeros_like(position),
+                            )
+
+                        nominal = healthy.compute(
+                            command(), position, velocity
+                        ).joint_efforts.clone()
+                        clock.step = motor.drive_fault.reset_steps[0].item() + 2
+                        before = motor.compute(command(), position, velocity)
+                        self.assertTrue(torch.equal(before.joint_efforts, nominal))
+                        clock.step += 1
+                        delivered = motor.compute(command(), position, velocity)
+                        expected = nominal.clone()
+                        expected[:, 7] *= factor
+                        self.assertTrue(torch.equal(motor.limited_effort, nominal))
+                        self.assertTrue(torch.equal(delivered.joint_efforts, expected))
+                        self.assertTrue(
+                            torch.equal(motor.computed_effort, healthy.computed_effort)
+                        )
+                        self.assertIs(delivered.joint_efforts, motor.applied_effort)
+                        self.assertTrue(torch.equal(motor.stiffness, healthy.stiffness))
+                        self.assertTrue(
+                            torch.equal(motor.effort_limit, healthy.effort_limit)
+                        )
+                        self.assertTrue(
+                            torch.equal(motor.velocity_limit, healthy.velocity_limit)
+                        )
+
+    def test_sdk_publishes_final_drive_to_torque_buffers_and_reward(self):
+        with native_dynamics() as module:
+            motor = actuator(module, count=2)
+            motor.drive_fault = DriveFault(
+                FaultConfig("j7", 0, 0),
+                motor.joint_names,
+                num_envs=2,
+                device="cpu",
+                physics_dt=0.005,
+                clock=lambda: 0,
+            )
+            motor._drive_fault_columns = list(range(12))
+            motor.drive_fault._clock = lambda: 1
+            target = torch.full((2, 12), 10.0)
+            data = NS(
+                joint_pos_target=target.clone(),
+                joint_vel_target=torch.zeros(2, 12),
+                joint_effort_target=torch.zeros(2, 12),
+                joint_pos=torch.zeros(2, 12),
+                joint_vel=torch.zeros(2, 12),
+                computed_torque=torch.zeros(2, 12),
+                applied_torque=torch.zeros(2, 12),
+                soft_joint_vel_limits=torch.zeros(2, 12),
+            )
+            robot = NS(
+                actuators={"legs": motor},
+                _data=data,
+                _joint_effort_target_sim=torch.zeros(2, 12),
+                _joint_pos_target_sim=torch.zeros(2, 12),
+                _joint_vel_target_sim=torch.zeros(2, 12),
+            )
+            apply = sdk_function(
+                "assets/articulation/articulation.py",
+                "_apply_actuator_model",
+                dict(ArticulationActions=NS),
+                owner="Articulation",
+            )
+            apply(robot)
+            self.assertTrue(
+                torch.equal(data.applied_torque, robot._joint_effort_target_sim)
+            )
+            self.assertTrue(torch.equal(data.applied_torque, motor.applied_effort))
+            self.assertTrue((data.applied_torque[:, 7] == 0).all())
+            self.assertTrue((data.computed_torque[:, 7] > 0).all())
+            self.assertTrue(torch.equal(data.joint_pos_target, target))
+            reward = sdk_function(
+                "envs/mdp/rewards.py",
+                "joint_torques_l2",
+                dict(
+                    torch=torch,
+                    SceneEntityCfg=lambda name: NS(name=name, joint_ids=slice(None)),
+                ),
+            )
+            actual = reward(NS(scene={"robot": NS(data=data)}))
+            self.assertTrue(torch.equal(actual, data.applied_torque.square().sum(-1)))
+            self.assertTrue((actual < data.computed_torque.square().sum(-1)).all())
+
     def test_rough_shared_reset_uses_changed_supported_origin_and_fixed_dynamics(self):
         from parkour_lab.runtime.native import causal_sensor_noise
 

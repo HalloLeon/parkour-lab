@@ -25,6 +25,10 @@ STATE_FIELDS = {
     "foot_net_forces_w": "foot_contact_forces_w",
     "support_height_w": "support_height_w",
     "support_valid": "support_valid",
+    "fault_active": "fault_active",
+    "drive_factor": "drive_factor",
+    "limited_effort": "limited_effort",
+    "applied_effort": "applied_effort",
 }
 
 
@@ -38,6 +42,20 @@ def _check_receipt(manifest, evidence, case):
         raise ValueError("Case receipt differs from the prescribed manifest")
     if any(evidence.get(key) != manifest[key] for key in IDENTITY_FIELDS):
         raise ValueError("Case policy/checkpoint identity differs from the manifest")
+    if case.condition != "id" and evidence.get("trace_sha256") is not None:
+        from .robustness import VERSION as robustness_version
+
+        realized = evidence.get("realization", {})
+        terrain = realized.get("task", {}).get("terrain", {})
+        condition = case.condition if case.condition != "fault" else "id"
+        if (
+            manifest.get("robustness_version") != robustness_version
+            or terrain.get("condition", "id") != condition
+            or realized.get("fault") != (case.fault.as_dict() if case.fault else None)
+        ):
+            raise ValueError(
+                "Realized condition differs from the robustness prescription"
+            )
     recipe = evidence.get("realization", {}).get("task", {}).get("reward_recipe")
     if recipe is not None and (
         reward_identity(recipe) != evidence.get("core_reward_recipe_sha256")
@@ -167,7 +185,7 @@ def score_capture(folder):
         "core_reward_recipe_sha256": manifest.get("core_reward_recipe_sha256"),
         "final_policy_state_sha256": manifest.get("final_policy_state_sha256"),
         "capture_valid": capture_valid,
-        "valid_for_comparison": capture_valid and aggregate["full_partition_bank"],
+        "valid_for_comparison": capture_valid and aggregate["full_requested_bank"],
         "cases": [results.get(case.case_id) for case in cases],
         "aggregate": aggregate,
     }

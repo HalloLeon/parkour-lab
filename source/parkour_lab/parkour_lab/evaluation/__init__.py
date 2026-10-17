@@ -1,8 +1,15 @@
 """Frozen evaluation and versioned evidence interpretation, independent of learners."""
 
 from .cases import EvaluationCase, case_bank
+from .robustness import robustness_bank
 
-__all__ = ["EvaluationCase", "case_bank", "evaluate", "score_capture"]
+__all__ = [
+    "EvaluationCase",
+    "case_bank",
+    "robustness_bank",
+    "evaluate",
+    "score_capture",
+]
 
 
 def evaluate(policy, cases, output, **kwargs):

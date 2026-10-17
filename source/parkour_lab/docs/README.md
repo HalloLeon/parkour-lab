@@ -133,8 +133,8 @@ Evaluation disables runtime progression and generates one row at an explicit
 fixed physical level: easy 0, medium 3 or hard 7; the default is 3. Its native
 row index is zero for all three severities. All eight levels are allowed during
 training, so these are in-distribution severities, even if a particular learner
-never reaches them. Held-out composition and out-of-distribution cases require
-separate definitions. A root crossing a tile's ±6 m XY
+never reaches them. The evaluation-only robustness bank below defines held-out compositions and
+parameters beyond this training support. A root crossing a tile's ±6 m XY
 boundary truncates the episode. Feet can extend beyond that boundary, and
 neighboring tiles or central platforms must be disclosed when interpreting
 surface exposure. Remaining on a spawn platform does not demonstrate locomotion
@@ -344,6 +344,106 @@ python -m parkour_lab score CAPTURE_DIRECTORY
 engineering subset can have valid captures while remaining ineligible as a
 full-bank comparison. Check these fields and coverage before interpreting aggregates.
 
+### Unseen terrain and actuator robustness
+
+`robustness_bank("validation" | "test", attempts=...)` extends the core bank.
+One attempt produces **384 cases**, all evaluated with the same frozen policy:
+
+| Block | Cases | Condition and control |
+| --- | --- | --- |
+| Core ID | 114 | Unchanged base families, all profiles and three non-flat severities. |
+| Unseen compositions | 90 | Uneven Slopes, Stairs and Hills, with every matching base case in the core bank. |
+| Terrain OOD | 108 | Each non-flat family's parameter exceeds the entire allowed training range; matched nominal base cases remain available. |
+| Timed drive loss | 72 | Flat and level-3 Uneven, forward motion/stopping, all 12 joints, factors 1, 0.5 and 0. Factor 1 is the matched healthy control for each joint. |
+
+```python
+from parkour_lab.evaluation import evaluate, robustness_bank
+
+report = evaluate(policy, robustness_bank("validation"), output, app=app)
+```
+
+Compositions add seeded native Uneven heights to the same supporting mesh.
+Stair faces are refined before displacement, preserving their nominal risers and
+supporting treads. Both pyramid signs are included. Component parameters remain
+inside their respective training ranges. The layer is zero within the central
+2 x 2 m region, blends to full strength over the next 0.5 m and tapers over the
+outer 0.3 m boundary. Base origins and central starting support stay unchanged.
+These are declared start provisions; remaining there is not evidence of traversing
+the composed surface. Combined local grades and step transitions can exceed those
+of either component and must be assessed from realized geometry.
+
+Terrain OOD uses the following requested development parameters. Here 0/3/7 index
+OOD severities, not permitted training levels:
+
+| Parameter | Training maximum | OOD 0 | OOD 3 | OOD 7 |
+| --- | --- | --- | --- | --- |
+| Uneven noise amplitude, m | 0.05 | 0.06 | 0.077143 | 0.10 |
+| Slope rise/run | 0.30 | 0.35 | 0.392857 | 0.45 |
+| Stair riser, m | 0.16 | 0.18 | 0.197143 | 0.22 |
+| Hill native amplitude, m | 0.30 | 0.35 | 0.392857 | 0.45 |
+
+Reports retain unrounded values and the excluded training bounds. Uneven's
+interpolation can overshoot its requested amplitude. These are explicit parameter
+extrapolations, not calibrated recoverability levels. A fresh seed within allowed
+support is unseen ID, not OOD. Deterministic base slopes/stairs/hills repeat their
+primitive geometry; held-out seeds vary starts, dynamics and noise. This bank does
+not yet define dynamics OOD, jams or sensor faults.
+
+A timed fault multiplies **final native limited drive torque** by 0.5 or 0 at one
+named joint on every physics substep. It leaves targets, PD gains, native limits
+and startup randomization unchanged. Zero drive is a passive joint, not a jam or
+a zero-position command. Actual delivered effort also supplies the torque reward.
+The seeded onset falls on a control boundary between 6 and 8 seconds, shared by
+all joints/factors for the same base draw. The first physics interval starting at
+onset applies the loss; it persists until that row resets. The next attempt starts
+healthy and follows its own schedule. No fault label or memory reset is supplied
+to the policy at onset. Healthy controls use the same schedule with factor 1.
+
+For an explicit evaluation task, configure before construction:
+
+```python
+from parkour_lab.benchmark import FaultConfig, Go2Config, TerrainConfig, build_config
+
+composed = build_config(
+    Go2Config(task_id="Go2-Stairs-v1",
+              terrain=TerrainConfig(fixed_level=3, condition="composition")),
+    training=False,
+)
+faulted = build_config(
+    Go2Config(fault=FaultConfig("FR_thigh_joint", factor=0.5, onset_s=7.0)),
+    training=False,
+)
+```
+
+Core training rejects compositions, excluded terrain ranges and timed faults.
+Keep these conditions out of tuning and checkpoint selection when reporting
+unseen generalization. Using validation outcomes for tuning makes those outcomes
+development evidence; reserve a fresh final bank and disclose what was learned.
+
+The overall/family/profile scores remain **core ID only**. Each robustness block
+has separate weights and family summaries. Paired results include return and
+survival-duration changes against the prescribed control. Fault results add
+pre/post-onset tracking, post-onset coverage and time to failure. Failures before
+onset remain in the prescribed denominator, with unavailable post-onset tracking;
+missing controls yield unavailable paired deltas. Post-onset return deltas are
+explicitly conditional on both attempts reaching onset and their observed
+durations. Healthy seconds do not become a recovery score.
+
+Fault traces record `fault_active`, `drive_factor`, `limited_effort` and
+`applied_effort`. Effort/factor columns use leg-major FL, FR, RL, RR, each with
+hip, thigh, calf; this evaluator order is independent of native motor order.
+The offline scorer checks the prescribed joint/onset/factor and post-limit
+arithmetic, plus the realized condition and common core reward. Every missing or
+failed attempt remains visible. Full-bank admission requires all 384 prescriptions;
+adding a partial robustness subset cannot masquerade as a complete comparison.
+
+Inspect the prescriptions or score an existing capture offline:
+
+```bash
+python -m parkour_lab cases --suite robustness --partition validation --output cases.json
+python -m parkour_lab score CAPTURE_DIRECTORY --output offline_score.json
+```
+
 ## Development protocol and comparisons
 
 The development recipe is fixed by its versioned definitions and the realized
@@ -358,7 +458,7 @@ contract; they do not establish a calibrated final benchmark or a method ranking
 | Information and actions | Common 49D blind actor frame, declared use of the shared 352-value training-only packet, and the same bounded 12D action/motor contract. No training packet reaches evaluation. |
 | Objective | The realized native Go2 rough reward, identified by its recipe hash. Overrides define a separately identified custom objective. |
 | Evaluation | `go2_fixed_cases_development_v1`: disjoint train/validation/test seed identities; the 114-case bank and fixed command phases described above. The same endpoint policy is evaluated across every cell. |
-| Scores | `go2_fixed_scores_development_v1`: equal families, then equal physical levels, subtypes, profiles and attempts. Preserve failures, unavailable phases and exposure labels. |
+| Scores | `go2_fixed_scores_development_v1`: equal families, then equal physical levels, subtypes, profiles and attempts. Core ID remains separate from each `go2_robustness_development_v1` block. Preserve failures, unavailable phases and exposure labels. |
 | Experience | Aggregate real robot transitions, including warm-up and discarded collection. Consumer projects declare and enforce the same allowance across compared methods; optimizer or imagination steps are separate compute statistics. |
 | Continuation | A consumer-owned full learner checkpoint linked to task progress; cumulative experience and run identity survive recreation into fresh physical episodes. |
 
@@ -861,3 +961,95 @@ Keep the entire results directory, including source/dependency identities and
 command is independent of model checkpoints and does not require more reference
 training. The optional CPU suite includes its collection/assertion guards;
 successful execution establishes these contracts only, not benchmark calibration.
+
+### Composed-surface and drive-loss checks
+
+Use the configured native interpreter from the repository root. This check needs
+no learner or trained checkpoint. Each geometry invocation compares matched ID,
+composed and excluded-range surfaces, saving collider ray grids, starts and
+support measurements. A controlled placement outside the central region checks
+actual composed-surface foot contact with at most 32 control calls. It is a
+collision/support fixture, not learned traversal. Each motor invocation checks
+native compute at both torque signs, saturation and overspeed, then six real
+control calls with two replicas, onset, persistence and one-row reset. Its 0.04 s
+onset is a deliberate short fixture; the evaluation bank uses 6–8 s.
+
+```bash
+bash <<'BASH'
+set -uo pipefail
+PLAB_PY=${PLAB_PY:-python}
+export PYTHONPATH="$PWD/source/parkour_lab${PYTHONPATH:+:$PYTHONPATH}"
+mkdir -p logs/parkour_lab || exit 1
+RUN=$(mktemp -d logs/parkour_lab/robustness_check_XXXXXX) || exit 1
+trap 'status=$?; printf "{\"returncode\": %d}\n" "$status" > "$RUN/process_exit.json"; echo "Results: $PWD/$RUN"' EXIT
+run_check() {
+    local name=$1
+    shift
+    "$PLAB_PY" -u -m scripts.check_robustness "$@" --device cuda:0 \
+        --seed 1077 --output "$RUN/$name" > "$RUN/$name.log" 2>&1
+    local code=$?
+    printf '{"returncode": %d}\n' "$code" > "$RUN/${name}_process_exit.json"
+    return "$code"
+}
+for family in Slopes Stairs Hills; do
+    for level in 0 3 7; do
+        run_check "${family}_${level}" --check geometry --family "$family" \
+            --level "$level" || exit "$?"
+    done
+done
+for factor in 1 0.5 0; do
+    run_check "drive_${factor}" --check motor --factor "$factor" \
+        --joint FR_thigh_joint || exit "$?"
+done
+BASH
+```
+
+Every child report must say `ROBUSTNESS_CHECK_PASSED`, with complete environment
+and application cleanup, exact interaction totals and zero uncertain collection.
+Geometry receipts separate zero-step ray/start checks from real contact calls.
+Motor receipts separate synthetic native-compute inputs from actual physics
+intervals; extra same-counter writes do not count as physics. Retain the full
+returned directory, including failed outcomes, raw witnesses, configurations,
+source hashes and dependency identities. The CPU suite and these commands do not
+establish native acceptance until their actual outputs have been reviewed.
+
+### Full frozen-policy robustness collection
+
+An independent project passes its already-loaded policy to `evaluate` with
+`robustness_bank`, as above. The optional SB3 example can reuse a trusted existing
+endpoint without collecting more training data. Inference verifies the entire
+saved bundle and exact SB3 implementation, while allowing the evaluator package
+to change; the original training sources remain in the checkpoint receipt and
+current evaluator sources in the capture. Full training resume still requires
+the original package sources and task identity. This is not checkpoint migration
+or a claim of unchanged physical behavior between arbitrary package revisions.
+
+Set `PLAB_CHECKPOINT` to the existing full checkpoint folder, then run:
+
+```bash
+bash <<'BASH'
+set -uo pipefail
+: "${PLAB_CHECKPOINT:?Set PLAB_CHECKPOINT to the endpoint checkpoint folder}"
+PLAB_PY=${PLAB_PY:-python}
+[[ -r "$PLAB_CHECKPOINT/checkpoint.json" ]] || exit 1
+export PYTHONPATH="$PWD/source/parkour_lab${PYTHONPATH:+:$PYTHONPATH}"
+mkdir -p logs/parkour_lab || exit 1
+RUN=$(mktemp -d logs/parkour_lab/robustness_evaluation_XXXXXX) || exit 1
+trap 'status=$?; printf "{\"returncode\": %d}\n" "$status" > "$RUN/process_exit.json"; echo "Results: $PWD/$RUN"' EXIT
+"$PLAB_PY" -u -m examples.sb3 evaluate --suite robustness \
+    --checkpoint "$PLAB_CHECKPOINT" --device cuda:0 --learner-device cpu \
+    --output "$RUN/evaluation" > "$RUN/evaluation.log" 2>&1
+code=$?
+printf '{"returncode": %d}\n' "$code" > "$RUN/evaluation_process_exit.json"
+[[ "$code" -eq 0 ]] || exit "$code"
+"$PLAB_PY" -m parkour_lab score "$RUN/evaluation/capture" \
+    --output "$RUN/offline_score.json" || exit "$?"
+BASH
+```
+
+The example requires a complete valid capture and identical recomputed offline
+scores. Inspect all block summaries, missing attempts, pre-onset failures, paired
+controls and exposure. A full 384-case bank has at most 128 simulated minutes,
+plus construction overhead; early endings shorten collection. A poor recovery
+score is a valid result. It does not justify excluding cases or tuning the
+policy against this bank. Final robustness/difficulty calibration remains open.

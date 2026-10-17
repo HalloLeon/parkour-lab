@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
+from parkour_lab.environments.faults import FaultConfig
 from parkour_lab.environments.terrains.specification import TerrainConfig
 
 VERSION = "go2-blind-v1"
@@ -28,6 +29,7 @@ class Go2Config:
     seed: int = 42
     device: str = "cuda:0"
     terrain: TerrainConfig = field(default_factory=TerrainConfig)
+    fault: FaultConfig | None = None
 
     def __post_init__(self):
         if not isinstance(self.task_id, str) or self.task_id not in TASK_IDS:
@@ -40,6 +42,8 @@ class Go2Config:
             raise ValueError("Require an explicit device")
         if not isinstance(self.terrain, TerrainConfig):
             raise ValueError("Require TerrainConfig for terrain selection")
+        if self.fault is not None and not isinstance(self.fault, FaultConfig):
+            raise ValueError("Require FaultConfig for a timed drive loss")
         if self.task_id == "Go2-Mixed-v1" and self.num_envs < 10:
             raise ValueError(
                 "Mixed terrain requires at least ten replicas for its subtypes"
@@ -57,6 +61,8 @@ def build_config(options: Go2Config, *, training=True):
     """
     if not isinstance(options, Go2Config) or type(training) is not bool:
         raise ValueError("Require Go2Config and an explicit boolean training flag")
+    if training and options.fault is not None:
+        raise ValueError("Timed actuator faults are excluded from core training")
     from parkour_lab.environments.configuration import build_environment_config
     from parkour_lab.environments.terrains.configuration import (
         configure_terrain,
@@ -72,6 +78,8 @@ def build_config(options: Go2Config, *, training=True):
     cfg.benchmark_version = VERSION
     cfg.benchmark_task_id = options.task_id
     cfg.benchmark_terrain_options = options.terrain.as_dict()
+    if options.fault is not None:
+        cfg.benchmark_fault = options.fault.as_dict()
     configure_terrain(
         cfg,
         options.terrain,

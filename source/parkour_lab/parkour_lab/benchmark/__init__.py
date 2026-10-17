@@ -1,8 +1,15 @@
 """Learner-independent Go2 tasks with blind observations and native rewards."""
 
-from .config import TASK_IDS, Go2Config, TerrainConfig, build_config
+from .config import TASK_IDS, FaultConfig, Go2Config, TerrainConfig, build_config
 
-__all__ = ["TASK_IDS", "Go2Config", "TerrainConfig", "build_config", "make"]
+__all__ = [
+    "TASK_IDS",
+    "FaultConfig",
+    "Go2Config",
+    "TerrainConfig",
+    "build_config",
+    "make",
+]
 
 
 def make(config=None, *, training=None, render_mode=None):

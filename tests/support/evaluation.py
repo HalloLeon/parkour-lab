@@ -55,7 +55,7 @@ def analytic_trace(case, *, steps=STEPS, heading_rad=0.0):
             ]
         )
     )
-    return dict(
+    trace = dict(
         decision_time_s=time,
         command=command,
         root_position_w=position,
@@ -78,3 +78,16 @@ def analytic_trace(case, *, steps=STEPS, heading_rad=0.0):
         initial_support_valid=np.ones(4, dtype=bool),
         env_origin_w=np.array([2.0, -3.0, 0]),
     )
+    if case.fault is not None:
+        from parkour_lab.evaluation.robustness import JOINTS
+
+        active = time + PERIOD_S - 0.005 >= case.fault.onset_s - 1e-9
+        factors = np.ones((steps, 12))
+        factors[active, JOINTS.index(case.fault.joint_name)] = case.fault.factor
+        trace.update(
+            fault_active=active,
+            drive_factor=factors,
+            limited_effort=np.full((steps, 12), 10.0),
+            applied_effort=10.0 * factors,
+        )
+    return trace

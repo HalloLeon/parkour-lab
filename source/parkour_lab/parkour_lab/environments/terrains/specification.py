@@ -4,6 +4,8 @@ import math
 from dataclasses import asdict, dataclass
 
 VERSION = "go2-terrain-development-v1"
+CONDITION_VERSION = "go2-terrain-conditions-development-v1"
+CONDITIONS = ("id", "composition", "terrain_ood")
 LEVEL_COUNT = 8
 TILE_SIZE_M = (12.0, 12.0)
 HORIZONTAL_SCALE_M = 0.1
@@ -30,8 +32,11 @@ class TerrainConfig:
 
     fixed_level: int | None = None
     initial_level_range: tuple[int, int] = (0, 1)
+    condition: str = "id"
 
     def __post_init__(self):
+        if type(self.condition) is not str or self.condition not in CONDITIONS:
+            raise ValueError(f"Terrain condition must be one of {CONDITIONS}")
         if self.fixed_level is not None and (
             type(self.fixed_level) is not int or not 0 <= self.fixed_level < LEVEL_COUNT
         ):
@@ -48,17 +53,22 @@ class TerrainConfig:
             )
 
     def as_dict(self):
-        return asdict(self)
+        values = asdict(self)
+        if self.condition == "id":
+            values.pop("condition")
+        return values
 
 
-def physical_level(level):
+def physical_level(level, *, condition="id"):
     """Return requested native-generator parameters with units and wave convention."""
     if type(level) is not int or not 0 <= level < LEVEL_COUNT:
         raise ValueError("Terrain level must be an integer in [0, 7]")
+    if type(condition) is not str or condition not in CONDITIONS:
+        raise ValueError(f"Terrain condition must be one of {CONDITIONS}")
     fraction = level / (LEVEL_COUNT - 1)
     amplitude = 0.02 + 0.28 * fraction
     slope = 0.035 + 0.265 * fraction
-    return {
+    values = {
         "level": level,
         "uneven_noise_amplitude_m": 0.005 + 0.045 * fraction,
         "uneven_sample_spacing_m": 0.8 - 0.6 * fraction,
@@ -75,6 +85,19 @@ def physical_level(level):
         "hill_wavelength_m": 5.95,
         "hill_analytic_grade_bound": math.sqrt(2) * amplitude * math.pi / 5.95,
     }
+    if condition == "terrain_ood":
+        slope = 0.35 + 0.10 * fraction
+        amplitude = 0.35 + 0.10 * fraction
+        values.update(
+            uneven_noise_amplitude_m=0.06 + 0.04 * fraction,
+            slope_rise_run=slope,
+            slope_angle_deg=math.degrees(math.atan(slope)),
+            stair_riser_m=0.18 + 0.04 * fraction,
+            hill_native_amplitude_m=amplitude,
+            hill_per_axis_amplitude_bound_m=amplitude / 2,
+            hill_analytic_grade_bound=math.sqrt(2) * amplitude * math.pi / 5.95,
+        )
+    return values
 
 
 def columns_for(task_id):
@@ -96,13 +119,25 @@ def terrain_specification(options, *, training, task_id):
         raise ValueError("Require TerrainConfig and a boolean training role")
     if training and options.fixed_level is not None:
         raise ValueError("Fixed terrain levels are evaluation-only")
+    if training and options.condition != "id":
+        raise ValueError("Terrain compositions and excluded ranges are evaluation-only")
+    family = task_id.removeprefix("Go2-").removesuffix("-v1")
+    if options.condition == "composition" and family not in (
+        "Slopes",
+        "Stairs",
+        "Hills",
+        "Mixed",
+    ):
+        raise ValueError("Surface composition requires Slopes, Stairs, Hills or Mixed")
+    if options.condition == "terrain_ood" and family == "Flat":
+        raise ValueError("Flat has no excluded terrain parameter range")
     columns = columns_for(task_id)
     fixed_level = (
         None
         if training or task_id == "Go2-Flat-v1"
         else 3 if options.fixed_level is None else options.fixed_level
     )
-    return {
+    receipt = {
         "version": VERSION,
         "status": "development_geometry_pending_native_calibration",
         "task_id": task_id,
@@ -125,7 +160,10 @@ def terrain_specification(options, *, training, task_id):
             "requested parameters; native height quantization and cubic Uneven "
             "interpolation affect realized heights/grades; interpolation may overshoot"
         ),
-        "levels": [physical_level(level) for level in range(LEVEL_COUNT)],
+        "levels": [
+            physical_level(level, condition=options.condition)
+            for level in range(LEVEL_COUNT)
+        ],
         "training_level_cap": LEVEL_COUNT - 1,
         "calibration": "entry/support/ID-OOD caps remain uncalibrated until native evidence",
         "fixed_test_levels": {"easy": 0, "medium": 3, "hard": 7},
@@ -141,3 +179,38 @@ def terrain_specification(options, *, training, task_id):
             "their declared geometry, without hidden phase or roughness variation"
         ),
     }
+    if options.condition != "id":
+        receipt.update(
+            condition=options.condition,
+            condition_version=CONDITION_VERSION,
+            training_support={
+                "minimum": physical_level(0),
+                "maximum": physical_level(LEVEL_COUNT - 1),
+            },
+            exclusion="not available to core training, curriculum or method selection",
+        )
+        if options.condition == "composition":
+            receipt["composition"] = {
+                "families": ["Slopes", "Stairs", "Hills"],
+                "layer": "native Uneven heights added vertically to the same support mesh",
+                "component_level": fixed_level,
+                "central_clear_half_width_m": 1.0,
+                "central_blend_width_m": 0.5,
+                "perimeter_blend_width_m": 0.3,
+                "stair_surface_grid_max_spacing_m": HORIZONTAL_SCALE_M,
+                "origin": "unchanged native base origin; central support unchanged",
+                "bounds": "component parameters ID; realized grades/transitions may exceed ID",
+            }
+            receipt["roughness_layers"] = "ID Uneven layer on Slopes/Stairs/Hills only"
+            receipt["instance_variation"] = (
+                "native base plus Uneven layer seeded by the same level/column; "
+                "central start and perimeter blends are fixed, not randomized"
+            )
+        else:
+            receipt["excluded_training_support"] = {
+                "Uneven": "noise amplitude exceeds 0.05 m",
+                "Slopes": "rise/run exceeds 0.30",
+                "Stairs": "riser exceeds 0.16 m",
+                "Hills": "native wave amplitude exceeds 0.30 m",
+            }
+    return receipt

@@ -16,6 +16,7 @@ def parse_args(argv=None):
     cases = commands.add_parser("cases", help="Inspect the fixed evaluation case bank")
     cases.add_argument("--partition", default="validation")
     cases.add_argument("--attempts", type=int, default=1)
+    cases.add_argument("--suite", choices=("core", "robustness"), default="core")
     cases.add_argument("--output", type=Path)
     return parser.parse_args(argv)
 
@@ -29,9 +30,14 @@ def main(argv=None):
     else:
         from parkour_lab.evaluation.cases import case_bank
 
+        bank = case_bank
+        if args.suite == "robustness":
+            from parkour_lab.evaluation.robustness import robustness_bank
+
+            bank = robustness_bank
         result = [
             case.as_dict()
-            for case in case_bank(partition=args.partition, attempts=args.attempts)
+            for case in bank(partition=args.partition, attempts=args.attempts)
         ]
     if args.output is None:
         print(json.dumps(result, indent=2, sort_keys=True, allow_nan=False))

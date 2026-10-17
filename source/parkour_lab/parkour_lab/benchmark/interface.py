@@ -117,6 +117,8 @@ def terrain_metadata(env):
 
 def validate_task_config(cfg):
     """Allow native reward customization while enforcing the published task preset."""
+    from parkour_lab.environments.faults import FaultConfig
+
     from .config import Go2Config, TerrainConfig, build_config
 
     reference = build_config(
@@ -126,6 +128,11 @@ def validate_task_config(cfg):
             seed=cfg.seed,
             device=cfg.sim.device,
             terrain=TerrainConfig(**cfg.benchmark_terrain_options),
+            fault=(
+                FaultConfig(**cfg.benchmark_fault)
+                if getattr(cfg, "benchmark_fault", None) is not None
+                else None
+            ),
         ),
         training=cfg.benchmark_training,
     )

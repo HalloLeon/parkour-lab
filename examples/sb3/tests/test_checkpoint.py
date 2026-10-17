@@ -144,6 +144,27 @@ class CheckpointTests(unittest.TestCase):
                 loaded.predict(observation, deterministic=True)[0],
             )
 
+    def test_expanded_evaluator_loads_original_policy_without_relaxing_resume(self):
+        from examples.sb3 import checkpoint
+
+        with tempfile.TemporaryDirectory() as temporary:
+            task, model = trained("PPO")
+            folder = Path(temporary) / "checkpoint"
+            receipt = save_checkpoint(model, task, folder, run_id="smoke")
+            changed = dict(receipt["source_sha256"], parkour_lab="new-evaluator-source")
+            with patch.object(checkpoint, "_source_identity", return_value=changed):
+                loaded, actual = load_model(folder)
+                self.assertEqual(actual, receipt)
+                self.assertEqual(
+                    model_state_sha256(loaded), receipt["model_state_sha256"]
+                )
+                with self.assertRaisesRegex(ValueError, "version or source"):
+                    load_checkpoint(folder, FakeTask())
+            changed["stable_baselines3"] = "different-learner-source"
+            with patch.object(checkpoint, "_source_identity", return_value=changed):
+                with self.assertRaisesRegex(ValueError, "version or source"):
+                    load_model(folder)
+
     def test_bundle_corruption_identity_and_overwrite_rejected_before_deserialization(
         self,
     ):

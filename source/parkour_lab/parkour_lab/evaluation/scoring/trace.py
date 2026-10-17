@@ -98,4 +98,37 @@ def validate_trace(case, arrays):
     ).reshape(-1, 3)
     if not np.allclose(trace["command"], commands, atol=1e-7, rtol=0):
         raise ValueError("Applied commands differ from the fixed case")
+    if case.fault is not None:
+        _fault_trace(case, arrays, trace, supplied, count)
     return trace
+
+
+def _fault_trace(case, arrays, trace, supplied, count):
+    from ..robustness import JOINTS
+
+    for name in ("drive_factor", "limited_effort", "applied_effort"):
+        value = _array(arrays, name, (supplied, len(JOINTS)))[:count]
+        trace[name] = value
+    trace["fault_active"] = _array(arrays, "fault_active", (supplied,), boolean=True)[
+        :count
+    ]
+    expected_active = (
+        trace["decision_time_s"] + PERIOD_S - 0.005 >= case.fault.onset_s - 1e-9
+    )
+    expected_factor = np.ones((count, len(JOINTS)))
+    expected_factor[expected_active, JOINTS.index(case.fault.joint_name)] = (
+        case.fault.factor
+    )
+    if not np.array_equal(trace["fault_active"], expected_active) or not np.array_equal(
+        trace["drive_factor"], expected_factor
+    ):
+        raise ValueError(
+            "Recorded drive loss differs from prescribed onset/joint/factor"
+        )
+    if not np.allclose(
+        trace["applied_effort"],
+        trace["limited_effort"] * expected_factor,
+        rtol=1e-6,
+        atol=1e-6,
+    ):
+        raise ValueError("Recorded applied torque differs from post-limit drive loss")

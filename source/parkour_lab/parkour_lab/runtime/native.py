@@ -88,6 +88,10 @@ def motion_state(env):
         "foot_net_forces_w": foot_contact_forces(env),
     }
     if getattr(env, "capture_evaluation", False):
+        if getattr(env, "parkour_fault", None) is not None:
+            from parkour_lab.environments.faults import fault_state
+
+            state.update(fault_state(env))
         names = env.scene["robot"].body_names
         state["foot_position_w"] = robot.body_pos_w[
             :, [names.index(name) for name in FOOT_NAMES]

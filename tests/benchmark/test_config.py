@@ -12,6 +12,7 @@ import torch
 
 from parkour_lab.benchmark.config import (
     TASK_IDS,
+    FaultConfig,
     Go2Config,
     TerrainConfig,
     build_config,
@@ -68,6 +69,22 @@ def native_reward_manager(cfg):
 
 
 class PublicConfigTests(unittest.TestCase):
+    def test_faults_are_explicit_evaluation_only_and_default_configuration_stays_clean(
+        self,
+    ):
+        fault = FaultConfig("FL_hip_joint", 0.5, 7)
+        with self.assertRaisesRegex(ValueError, "excluded from core training"):
+            build_config(Go2Config(fault=fault), training=True)
+        with native_config_modules():
+            ordinary = build_config(Go2Config(), training=False)
+            perturbed = build_config(Go2Config(fault=fault), training=False)
+        self.assertFalse(hasattr(ordinary, "benchmark_fault"))
+        self.assertEqual(perturbed.benchmark_fault, fault.as_dict())
+        self.assertEqual(ordinary.benchmark_terrain, perturbed.benchmark_terrain)
+        self.assertEqual(ordinary.sim, perturbed.sim)
+        with self.assertRaises(ValueError):
+            Go2Config(fault={})
+
     def test_pure_configuration_needs_no_method_or_simulator_import(self):
         result = subprocess.run(
             [

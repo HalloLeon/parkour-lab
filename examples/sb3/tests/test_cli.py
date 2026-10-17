@@ -21,6 +21,32 @@ def module(name, **values):
 
 
 class CliTests(unittest.TestCase):
+    def test_robustness_suite_collects_full_bank_from_one_frozen_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            with self.native(root) as native:
+                native.evaluated["valid_for_comparison"] = True
+                code = cli.main(
+                    [
+                        "evaluate",
+                        "--suite",
+                        "robustness",
+                        "--checkpoint",
+                        str(checkpoint),
+                        "--output",
+                        str(root / "robustness"),
+                    ]
+                )
+                self.assertEqual(code, 0)
+                self.assertEqual(len(native.evaluate.call_args.args[1]), 384)
+                native.train.assert_not_called()
+                native.load.assert_called_once_with(checkpoint, device="cpu")
+            report = json.loads((root / "robustness" / "report.json").read_text())
+            self.assertTrue(report["full_bank"])
+            self.assertEqual(report["suite"], "robustness")
+
     @contextlib.contextmanager
     def native(self, root, *, training_result=None, training_error=None):
         closed = []

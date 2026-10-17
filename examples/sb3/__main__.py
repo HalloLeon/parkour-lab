@@ -31,6 +31,7 @@ def _parser():
     evaluate = commands.add_parser("evaluate", help="Evaluate an already-saved policy")
     evaluate.add_argument("--checkpoint", type=Path, required=True)
     evaluate.add_argument("--full-bank", action="store_true")
+    evaluate.add_argument("--suite", choices=("core", "robustness"), default="core")
     for command in (train, evaluate):
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--device", default="cuda:0")
@@ -76,9 +77,13 @@ def _example_sources():
     return {path.name: file_sha256(path) for path in sorted(paths)}
 
 
-def _cases(full_bank):
+def _cases(full_bank, suite="core"):
     from parkour_lab.evaluation import EvaluationCase, case_bank
 
+    if suite == "robustness":
+        from parkour_lab.evaluation import robustness_bank
+
+        return robustness_bank("validation")
     if full_bank:
         return case_bank("validation")
     return tuple(
@@ -120,7 +125,7 @@ def _evaluate(args, app, output, report):
     from .policy import load_policy
 
     policy, checkpoint = load_policy(args.checkpoint, device=args.learner_device)
-    cases = _cases(args.full_bank)
+    cases = _cases(args.full_bank, args.suite)
     result = evaluate(
         policy,
         cases,
@@ -133,14 +138,16 @@ def _evaluate(args, app, output, report):
     )
     if not result["capture_valid"]:
         raise RuntimeError("Policy evaluation did not produce a valid complete capture")
-    if result["valid_for_comparison"] is not args.full_bank:
+    full_bank = args.full_bank or args.suite == "robustness"
+    if result["valid_for_comparison"] is not full_bank:
         raise RuntimeError("Evaluation bank coverage differs from the requested scope")
     if score_capture(output / "capture") != result:
         raise RuntimeError("Saved capture scoring differs from native evaluation")
     report.update(
         status="LEARNER_EVALUATION_PASSED",
         checkpoint=checkpoint,
-        full_bank=args.full_bank,
+        full_bank=full_bank,
+        suite=args.suite,
         evaluation=result,
         recomputed_score_parity=True,
     )

@@ -24,9 +24,24 @@ def generate_terrain(difficulty, cfg):
     level = min(int(difficulty * LEVEL_COUNT), LEVEL_COUNT - 1)
     if cfg.fixed_level is not None:
         level = cfg.fixed_level
-    native = native_terrain_config(cfg.family, cfg.subtype, level, size=cfg.size)
-    if cfg.family != "Uneven":
-        return native.function(0.0, native)
+    condition = getattr(cfg, "condition", "id")
+    native = native_terrain_config(
+        cfg.family, cfg.subtype, level, size=cfg.size, condition=condition
+    )
+    if cfg.family == "Uneven":
+        return _seeded_noise(native, cfg, level)
+    pieces, origin = native.function(0.0, native)
+    if condition == "composition" and cfg.family in ("Slopes", "Stairs", "Hills"):
+        from .composition import compose_surface
+
+        noise = native_terrain_config("Uneven", "noise", level, size=cfg.size)
+        roughness, _ = _seeded_noise(noise, cfg, level)
+        pieces = compose_surface(pieces, roughness[0], family=cfg.family, size=cfg.size)
+    return pieces, origin
+
+
+def _seeded_noise(native, cfg, level):
+    """Native noise sampling retains the existing column/level seed and global RNG."""
     state = np.random.get_state()
     try:
         seed = np.random.SeedSequence((cfg.seed, cfg.column, level)).generate_state(1)[
@@ -38,11 +53,11 @@ def generate_terrain(difficulty, cfg):
         np.random.set_state(state)
 
 
-def native_terrain_config(family, subtype, level, *, size):
+def native_terrain_config(family, subtype, level, *, size, condition="id"):
     """Configure native primitives; no copied terrain algorithm or extra noise layer."""
     import isaaclab.terrains as native
 
-    values = physical_level(level)
+    values = physical_level(level, condition=condition)
     common = dict(size=deepcopy(size))
     heightfield = dict(
         **common,

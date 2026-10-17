@@ -13,6 +13,16 @@ from parkour_lab.__main__ import main, parse_args
 
 
 class CLITests(unittest.TestCase):
+    def test_robustness_prescriptions_are_available_without_native_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "cases.json"
+            main(["cases", "--suite", "robustness", "--output", str(output)])
+            cases = json.loads(output.read_text())
+            self.assertEqual(len(cases), 384)
+            self.assertEqual(
+                sum(case.get("condition") == "fault" for case in cases), 72
+            )
+
     def test_help_only_exposes_offline_commands(self):
         with contextlib.redirect_stdout(io.StringIO()) as output:
             with self.assertRaises(SystemExit) as stopped:

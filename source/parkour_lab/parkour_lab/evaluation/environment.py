@@ -45,8 +45,12 @@ def make_case_task(case, device):
         terrain=(
             TerrainConfig()
             if case.family == "Flat"
-            else TerrainConfig(fixed_level=case.physical_level)
+            else TerrainConfig(
+                fixed_level=case.physical_level,
+                condition=(case.condition if case.condition != "fault" else "id"),
+            )
         ),
+        fault=case.fault,
     )
     _prepare_case_stage()
     task = make(build_config(options, training=False))
@@ -103,7 +107,7 @@ def realization(task):
 
     env = task._env
     terrain = env.scene.terrain
-    return {
+    result = {
         "task": task.metadata,
         "dynamics": dynamics_report(env),
         "start": start_report(env),
@@ -113,6 +117,9 @@ def realization(task):
         "env_origin_w": env.scene.env_origins[0].cpu().tolist(),
         "training_information_available": env.capture_training_information,
     }
+    if getattr(env, "parkour_fault", None) is not None:
+        result["fault"] = env.cfg.benchmark_fault
+    return result
 
 
 def check_fixed_terrain(task, before):

@@ -6,7 +6,9 @@ from collections import defaultdict
 import numpy as np
 
 from ..cases import EvaluationCase, case_bank
+from ..robustness import block_name, robustness_bank
 from .case import VERSION
+from .robustness import paired_results
 
 
 def _weights(cases):
@@ -65,6 +67,32 @@ def _summary(cases, indexed):
             for case in observed
         ),
         diagnostics=_diagnostics(cases, indexed, weights),
+        **(
+            _fault_outcomes(cases, indexed, weights)
+            if any(case.fault for case in cases)
+            else {}
+        ),
+    )
+
+
+def _fault_outcomes(cases, indexed, weights):
+    outcomes = [
+        (weights[case.case_id], indexed[case.case_id]["fault"])
+        for case in cases
+        if case.case_id in indexed
+    ]
+    return dict(
+        fault_outcomes=dict(
+            prescribed_attempts=len(cases),
+            observed_attempts=len(outcomes),
+            onset_reached=sum(row["onset_reached"] for _, row in outcomes),
+            failures_before_onset=sum(
+                row["failure_before_onset"] for _, row in outcomes
+            ),
+            weighted_post_onset_coverage_prescribed=sum(
+                weight * row["post_onset_coverage"] for weight, row in outcomes
+            ),
+        )
     )
 
 
@@ -79,6 +107,8 @@ def _diagnostics(cases, indexed, weights):
             "exposure",
             "demonstrated_nonflat_fraction_of_contact_samples",
         ),
+        "post_onset_planar_rmse_m_s": ("fault", "post_onset_motion", "planar_rmse_m_s"),
+        "post_onset_yaw_rmse_rad_s": ("fault", "post_onset_motion", "yaw_rmse_rad_s"),
     }
     result = {}
     for name, path in fields.items():
@@ -102,18 +132,42 @@ def _diagnostics(cases, indexed, weights):
     return result
 
 
-def aggregate_cases(cases, results):
-    """One trained policy/seed: equal families, then levels, subtypes and profiles.
+def _validate_result(case, result):
+    if (
+        result.get("version") != VERSION
+        or result.get("case") != case.as_dict()
+        or result.get("seed") != case.seed
+    ):
+        raise ValueError("Scored case identity differs from its prescription")
+    if result.get("core_return") is not None and (
+        isinstance(result.get("core_return"), bool)
+        or not isinstance(result.get("core_return"), (int, float))
+        or not math.isfinite(result["core_return"])
+    ):
+        raise ValueError("Require a finite observed core return")
+    if any(
+        type(result.get(name)) is not bool
+        for name in ("physical_failure", "survived_horizon")
+    ):
+        raise ValueError("Require explicit failure and horizon outcomes")
+    if (
+        not isinstance(result.get("coverage"), (int, float))
+        or isinstance(result["coverage"], bool)
+        or not 0 <= result["coverage"] <= 1
+    ):
+        raise ValueError("Invalid observed first-attempt coverage")
+    if (
+        (result["physical_failure"] and result["survived_horizon"])
+        or (result["survived_horizon"] and result["coverage"] != 1)
+        or (
+            result["core_return"] is None
+            and (result["physical_failure"] or result["survived_horizon"])
+        )
+    ):
+        raise ValueError("Failure, horizon and known-return outcomes conflict")
 
-    Physical failures retain their original terminal return. Unknown missing
-    returns remain None; only explicitly conditional observed means omit them.
-    """
-    cases = tuple(cases)
-    if not cases or not all(isinstance(case, EvaluationCase) for case in cases):
-        raise ValueError("Require prescribed evaluation cases")
-    prescribed = {case.case_id: case for case in cases}
-    if len(prescribed) != len(cases) or len({case.partition for case in cases}) != 1:
-        raise ValueError("Cases require distinct IDs in one partition")
+
+def _index_results(prescribed, results):
     indexed = {}
     if isinstance(results, dict):
         if any(
@@ -129,68 +183,73 @@ def aggregate_cases(cases, results):
         if identity not in prescribed or identity in indexed:
             raise ValueError("Unknown or duplicate scored case; do not select reruns")
         case = prescribed[identity]
-        if (
-            result.get("version") != VERSION
-            or result.get("case") != case.as_dict()
-            or result.get("seed") != case.seed
-        ):
-            raise ValueError("Scored case identity differs from its prescription")
-        if result.get("core_return") is not None and (
-            isinstance(result.get("core_return"), bool)
-            or not isinstance(result.get("core_return"), (int, float))
-            or not math.isfinite(result["core_return"])
-        ):
-            raise ValueError("Require a finite observed core return")
-        if any(
-            type(result.get(name)) is not bool
-            for name in ("physical_failure", "survived_horizon")
-        ):
-            raise ValueError("Require explicit failure and horizon outcomes")
-        if (
-            not isinstance(result.get("coverage"), (int, float))
-            or isinstance(result["coverage"], bool)
-            or not 0 <= result["coverage"] <= 1
-        ):
-            raise ValueError("Invalid observed first-attempt coverage")
-        if (
-            (result["physical_failure"] and result["survived_horizon"])
-            or (result["survived_horizon"] and result["coverage"] != 1)
-            or (
-                result["core_return"] is None
-                and (result["physical_failure"] or result["survived_horizon"])
-            )
-        ):
-            raise ValueError("Failure, horizon and known-return outcomes conflict")
+        _validate_result(case, result)
         indexed[identity] = result
-    missing = [case.case_id for case in cases if case.case_id not in indexed]
+    return indexed
+
+
+def _group_summaries(cases, core, indexed):
     groups = {}
     for name, key in (
         ("family", lambda case: case.family),
         ("profile", lambda case: case.profile),
+        ("block", block_name),
+        ("block_family", lambda case: f"{block_name(case)}/{case.family}"),
         (
             "family_level_subtype",
             lambda case: f"{case.family}/{case.physical_level}/{case.subtype}",
         ),
     ):
         cells = defaultdict(list)
-        for case in cases:
+        for case in (cases if name.startswith("block") else core):
             cells[key(case)].append(case)
         groups[name] = {
             label: _summary(group, indexed) for label, group in sorted(cells.items())
         }
-    canonical = case_bank(
-        cases[0].partition, attempts=max(case.attempt for case in cases) + 1
-    )
+    return groups
+
+
+def aggregate_cases(cases, results):
+    """One trained policy/seed: equal families, then levels, subtypes and profiles.
+
+    Physical failures retain their original terminal return. Unknown missing
+    returns remain None; only explicitly conditional observed means omit them.
+    """
+    cases = tuple(cases)
+    if not cases or not all(isinstance(case, EvaluationCase) for case in cases):
+        raise ValueError("Require prescribed evaluation cases")
+    prescribed = {case.case_id: case for case in cases}
+    if len(prescribed) != len(cases) or len({case.partition for case in cases}) != 1:
+        raise ValueError("Cases require distinct IDs in one partition")
+    indexed = _index_results(prescribed, results)
+    missing = [case.case_id for case in cases if case.case_id not in indexed]
+    core = tuple(case for case in cases if case.condition == "id")
+    groups = _group_summaries(cases, core, indexed)
+    attempts = max(case.attempt for case in cases) + 1
+    canonical = case_bank(cases[0].partition, attempts=attempts)
+    has_robustness = len(core) != len(cases)
+    full_core = {case.case_id for case in core} == {case.case_id for case in canonical}
+    full_robustness = has_robustness and set(prescribed) == {
+        case.case_id for case in robustness_bank(cases[0].partition, attempts=attempts)
+    }
     return dict(
         version=VERSION,
         partition=cases[0].partition,
         complete=not missing
         and all(result["core_return"] is not None for result in indexed.values()),
-        full_partition_bank=set(prescribed) == {case.case_id for case in canonical},
+        full_partition_bank=full_core,
+        full_robustness_bank=full_robustness,
+        full_requested_bank=full_robustness if has_robustness else full_core,
         weights="Equal families; equal physical levels, subtypes, profiles and attempts within each family.",
-        case_weights=_weights(cases),
+        case_weights=_weights(core) if core else {},
         missing_case_ids=missing,
-        overall=_summary(cases, indexed),
+        overall=_summary(core, indexed) if core else None,
+        overall_scope="Core ID cases only; robustness blocks have independent summaries and weights.",
+        block_weights={
+            label: _weights(tuple(case for case in cases if block_name(case) == label))
+            for label in groups["block"]
+        },
+        paired=paired_results(cases, indexed),
         groups=groups,
         attempts=[
             indexed.get(
@@ -225,7 +284,7 @@ def aggregate_training_seeds(cases, results_by_seed):
     values = [
         report["overall"]["core_return_mean"]
         for report in summaries.values()
-        if report["complete"]
+        if report["complete"] and report["overall"] is not None
     ]
     complete = len(values) == len(summaries)
     mean = float(np.mean(values)) if values else None

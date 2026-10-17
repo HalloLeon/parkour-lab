@@ -3,6 +3,7 @@
 from ..cases import PERIOD_S, STEPS
 from .exposure import surface_exposure
 from .kinematics import motion_scores, phase_scores, stopping_scores
+from .robustness import fault_scores
 from .trace import validate_trace
 
 VERSION = "go2_fixed_scores_development_v1"
@@ -56,4 +57,5 @@ def score_case(case, arrays):
         motion=motion_scores(case, trace),
         stopping=stopping_scores(trace),
         exposure=surface_exposure(case, trace),
+        **({"fault": fault_scores(case, trace)} if case.fault is not None else {}),
     )

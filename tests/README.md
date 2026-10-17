@@ -9,7 +9,7 @@ shared fixtures live in `support/`, never in another test module.
 | `control/` | Command tapes, causal frames, loaded policies, reset masks and motor contracts |
 | `environments/` | Owned outgoing finals, RNG isolation, reward formulas, dynamics and scans |
 | `environments/commands/` | Episode/operator sampling, native command resets and curriculum eligibility |
-| `environments/terrains/` | Physical family levels, fixed geometry and curriculum |
+| `environments/terrains/` | Physical family levels, fixed geometry, curriculum, composed support surfaces and excluded parameter ranges |
 | `evaluation/` | Fixed cases, analytic tracking/stopping/failure scores, frozen playback and offline evidence validation |
 | `runtime/` | Native sensing, bounded action delivery, accounting and ordered cleanup |
 | Root `test_*.py` | Offline CLI, provenance and installed-package dependency boundaries |
@@ -84,3 +84,18 @@ Native case-context checks protect fresh-stage creation, ray-mesh cache isolatio
 and refusal to replace another active environment. Source topology and mocked
 contact checks do not replace actual cooked geometry, physical support or robot
 behavior evidence.
+
+Robustness tests preserve ID geometry/identities, reject excluded conditions in
+training, verify superposition on actual supporting treads and keep separate
+block weights and paired outcomes. Analytic traces cover fault onset, pre-onset
+falls, missing controls and delivered torque. Motor tests execute pinned native
+limiting, effort publication and reward functions with CPU buffers, including
+passive zero drive, overspeed and independent row resets. Inference may use an
+expanded evaluator while full learner continuation still rejects source drift.
+
+`scripts/check_robustness.py` separately checks native composed colliders, actual
+outer-surface contact and post-limit motor physics. Its CLI/lifecycle tests do
+not launch the simulator. The package README provides the bounded server command
+and the full 384-case frozen-policy collection; no additional learner training is
+needed for these checks. Neither synthetic traces nor CPU motor buffers establish
+native compatibility, recovery behavior or empirical severity calibration.

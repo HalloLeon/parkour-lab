@@ -10,7 +10,7 @@ from .randomization import TaskRandomization
 
 
 class RandomizedDCMotor(DCMotor):
-    """Scale generated effort before the unchanged native torque-speed limiter."""
+    """Apply startup strength before limiting and optional drive loss afterward."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -19,10 +19,16 @@ class RandomizedDCMotor(DCMotor):
         self.stiffness_scale = torch.ones_like(self.stiffness)
         self.damping_scale = torch.ones_like(self.damping)
         self.motor_strength = torch.ones_like(self.stiffness)
+        self.limited_effort = torch.zeros_like(self.stiffness)
+        self.drive_fault = None
+        self._drive_fault_columns = None
 
     def _clip_effort(self, effort):
         self.computed_effort = effort * self.motor_strength
-        return super()._clip_effort(self.computed_effort)
+        self.limited_effort = super()._clip_effort(self.computed_effort)
+        if self.drive_fault is None:
+            return self.limited_effort
+        return self.drive_fault.apply(self.limited_effort, self._drive_fault_columns)
 
 
 def get_randomization(env):

@@ -13,8 +13,8 @@ from parkour_lab.provenance import file_sha256, write_json
 from tests.support.evaluation import analytic_trace
 
 
-def write_capture(folder, *, steps=1000):
-    case = EvaluationCase("validation", "Flat", None, "plane", "stand")
+def write_capture(folder, *, steps=1000, case=None):
+    case = case or EvaluationCase("validation", "Flat", None, "plane", "stand")
     path = folder / case.case_id
     path.mkdir(parents=True)
     np.savez_compressed(path / "trace.npz", **analytic_trace(case, steps=steps))
@@ -45,12 +45,47 @@ def write_capture(folder, *, steps=1000):
         core_reward_recipe_sha256=reward_identity(recipe),
         trace_sha256=file_sha256(path / "trace.npz"),
     )
+    if case.condition != "id":
+        from parkour_lab.evaluation.robustness import VERSION as robustness_version
+
+        manifest["robustness_version"] = robustness_version
+        evidence["realization"]["task"]["terrain"] = {
+            "condition": case.condition if case.condition != "fault" else "id"
+        }
+        if case.fault:
+            evidence["realization"]["fault"] = case.fault.as_dict()
     write_json(folder / "manifest.json", manifest)
     write_json(path / "capture.json", evidence)
     return case, manifest, evidence
 
 
 class CaptureIntegrityTests(unittest.TestCase):
+    def test_robustness_trace_requires_matching_realized_condition_and_protocol(self):
+        from parkour_lab.evaluation.robustness import robustness_bank
+
+        case = next(case for case in robustness_bank("validation") if case.fault)
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            _, manifest, evidence = write_capture(folder, case=case)
+            self.assertTrue(score_capture(folder)["capture_valid"])
+            for mutate in (
+                lambda row: row["realization"].pop("fault"),
+                lambda row: row["realization"]["fault"].update(factor=0),
+                lambda row: row["realization"]["task"]["terrain"].update(
+                    condition="composition"
+                ),
+            ):
+                bad = deepcopy(evidence)
+                mutate(bad)
+                write_json(folder / case.case_id / "capture.json", bad)
+                with self.assertRaises(ValueError):
+                    score_capture(folder)
+            write_json(folder / case.case_id / "capture.json", evidence)
+            manifest.pop("robustness_version")
+            write_json(folder / "manifest.json", manifest)
+            with self.assertRaises(ValueError):
+                score_capture(folder)
+
     def test_known_subset_is_valid_capture_and_explicitly_not_full_benchmark(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)

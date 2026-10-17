@@ -59,6 +59,10 @@ def configure_terrain(cfg, options, *, training, task_id, seed):
         )
         for column, definition in enumerate(columns)
     }
+    # Keep the ID config schema and identity unchanged for existing consumers.
+    if options.condition != "id":
+        for sub_cfg in sub_terrains.values():
+            sub_cfg.condition = options.condition
     terrain.terrain_type = "generator"
     terrain.terrain_generator = TerrainGeneratorCfg(
         seed=seed,

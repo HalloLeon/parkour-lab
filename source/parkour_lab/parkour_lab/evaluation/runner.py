@@ -90,6 +90,10 @@ def evaluate(
         "package_sources": package_source_identity(),
         "execution": "sequential single-replica first attempts",
     }
+    if any(case.condition != "id" for case in cases):
+        from .robustness import VERSION as robustness_version
+
+        manifest["robustness_version"] = robustness_version
     try:
         if repository_path is not None:
             write_run_provenance(folder, repository_path)

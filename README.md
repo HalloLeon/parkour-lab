@@ -14,6 +14,8 @@ the public API, physical terrain levels, frozen evaluation and executable checks
   causal deployment inputs and permitted training-only physical fields.
 - [Frozen evaluation](source/parkour_lab/docs/README.md#frozen-evaluation):
   caller-loaded policies, fixed commands and offline scoring.
+- [Robustness](source/parkour_lab/docs/README.md#unseen-terrain-and-actuator-robustness):
+  unseen terrain compositions, terrain extrapolation and timed joint drive loss.
 - [Verification](source/parkour_lab/docs/README.md#verification): CPU tests,
   distribution checks and bounded native capture commands.
 - [Test coverage](tests/README.md): protected contracts and evidence limits.

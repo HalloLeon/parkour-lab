@@ -6,6 +6,8 @@ import math
 from dataclasses import asdict, dataclass, fields
 from types import MappingProxyType
 
+from parkour_lab.environments.faults import JOINT_NAMES, FaultConfig
+
 VERSION = "go2_fixed_cases_development_v1"
 PERIOD_S = 0.02
 DURATION_S = 20.0
@@ -50,6 +52,8 @@ class EvaluationCase:
     subtype: str
     profile: str
     attempt: int = 0
+    condition: str = "id"
+    fault: FaultConfig | None = None
 
     def __post_init__(self):
         if any(
@@ -74,23 +78,68 @@ class EvaluationCase:
             raise ValueError("Unknown fixed command profile")
         if type(self.attempt) is not int or self.attempt < 0:
             raise ValueError("Require a nonnegative attempt index")
+        if self.condition not in ("id", "composition", "terrain_ood", "fault"):
+            raise ValueError("Unknown evaluation condition")
+        if self.condition != "id" and self.partition == "train":
+            raise ValueError("Robustness conditions are excluded from training")
+        if self.condition == "composition" and self.family not in (
+            "Slopes",
+            "Stairs",
+            "Hills",
+        ):
+            raise ValueError("Composition requires Slopes, Stairs or Hills")
+        if self.condition == "terrain_ood" and self.family == "Flat":
+            raise ValueError("Flat has no terrain extrapolation")
+        if self.condition == "fault":
+            if (
+                not isinstance(self.fault, FaultConfig)
+                or self.fault.joint_name not in JOINT_NAMES
+                or self.family not in ("Flat", "Uneven")
+                or (self.family == "Uneven" and self.physical_level != 3)
+                or self.profile != "forward-035"
+                or not 6 <= self.fault.onset_s <= 8
+                or not math.isclose(
+                    self.fault.onset_s / PERIOD_S,
+                    round(self.fault.onset_s / PERIOD_S),
+                    rel_tol=0,
+                    abs_tol=1e-9,
+                )
+            ):
+                raise ValueError(
+                    "Fault cases require declared Flat/medium Uneven forward motion and onset in [6, 8] s"
+                )
+        elif self.fault is not None:
+            raise ValueError("Drive loss requires the separate fault condition")
 
     def as_dict(self):
         """Constructor fields only; identities are recomputed, never trusted input."""
-        return asdict(self)
+        value = asdict(self)
+        if self.fault is None:
+            value.pop("fault")
+        if self.condition == "id":
+            value.pop("condition")
+        return value
 
     @property
     def case_id(self):
         level = "flat" if self.physical_level is None else f"level{self.physical_level}"
-        return (
+        base = (
             f"{VERSION}_{self.partition}_{self.family}_{level}_{self.subtype}"
             f"_{self.profile}_attempt{self.attempt}"
         )
+        if self.condition == "id":
+            return base
+        suffix = self.condition
+        if self.fault is not None:
+            suffix += f"_{self.fault.joint_name}_drive{self.fault.factor:g}_onset{self.fault.onset_s:g}"
+        return f"{base}_{suffix}"
 
     @property
     def seed(self):
         identity = self.as_dict()
         identity.pop("profile")
+        identity.pop("condition", None)
+        identity.pop("fault", None)
         text = json.dumps(dict(version=VERSION, **identity), sort_keys=True)
         return int.from_bytes(hashlib.sha256(text.encode()).digest()[:4], "big")
 
@@ -104,11 +153,20 @@ class EvaluationCase:
 
 def case_from_dict(value):
     """Read exactly the prescribed case fields, without accepting identity aliases."""
-    if type(value) is not dict or set(value) != {
-        field.name for field in fields(EvaluationCase)
-    }:
+    required = {field.name for field in fields(EvaluationCase)} - {"condition", "fault"}
+    if (
+        type(value) is not dict
+        or not required <= set(value)
+        or set(value) - required - {"condition", "fault"}
+    ):
         raise ValueError("Invalid fixed case fields")
-    return EvaluationCase(**value)
+    values = dict(value)
+    if "fault" in values:
+        fault = values["fault"]
+        if type(fault) is not dict or set(fault) != {"joint_name", "factor", "onset_s"}:
+            raise ValueError("Invalid drive-loss prescription")
+        values["fault"] = FaultConfig(**fault)
+    return EvaluationCase(**values)
 
 
 def case_bank(partition, *, attempts=1):
