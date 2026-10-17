@@ -376,6 +376,100 @@ final rows before automatic reset. Consuming trainers own optimization,
 rollout/replay storage, inference memory and checkpoint loading. Shared control
 and terrain code do not select a network architecture.
 
+## Optional Stable-Baselines3 integration
+
+The repository example in [`examples/sb3/`](../../../examples/sb3/) calls real
+[Stable-Baselines3](https://github.com/DLR-RM/stable-baselines3) PPO and SAC.
+It is outside the installed benchmark package and adds no core learning
+dependency. The small NumPy `VecEnv` bridge transfers one native batch at a time;
+it is an integration reference, not a GPU-throughput baseline. Both actor and
+critic use the same blind 49D input; training GT is available but unused. Rewards,
+terrain, commands, action bounds and curriculum retain the public task recipe.
+Observation/reward normalization is disabled and schedules are constant.
+
+The optional requirements select SB3 2.7/2.8, tested here with 2.8.0. That line
+supports the reference stack's PyTorch 2.7;
+[SB3 2.9 requires PyTorch >=2.8](https://github.com/DLR-RM/stable-baselines3/releases/tag/v2.9.0).
+These example requirements do not constrain the benchmark core or other external
+learners. Check the selected native stack before upgrading its Torch distribution.
+
+Install into the configured Isaac Lab interpreter, from the repository root:
+
+```bash
+"${PLAB_PY:-python}" -m pip install -r examples/sb3/requirements.txt
+"${PLAB_PY:-python}" -m examples.sb3 --help
+```
+
+The following bounded command runs each method in three fresh processes: collect
+and update through 2,560 total interactions, resume through 5,120, then evaluate
+the saved policy on the six engineering cases. Twenty Mixed replicas include all
+five families from the first collection. PPO uses complete 32-step rollouts;
+an incompatible remaining allowance is rejected before collection. SAC's random
+warm-up counts toward the same physical allowance. Learner counters must match
+the native cumulative counter exactly, with no uncertain collection.
+
+```bash
+bash <<'BASH'
+set -uo pipefail
+PLAB_PY=${PLAB_PY:-python}
+export PYTHONPATH="$PWD/source/parkour_lab${PYTHONPATH:+:$PYTHONPATH}"
+mkdir -p logs/parkour_lab || exit 1
+RUN=$(mktemp -d logs/parkour_lab/learner_check_XXXXXX) || exit 1
+trap 'status=$?; printf "{\"returncode\": %d}\n" "$status" > "$RUN/process_exit.json"; echo "Results: $PWD/$RUN"' EXIT
+run_stage() {
+    local name=$1
+    shift
+    local log="$RUN/${name//\//_}"
+    "$PLAB_PY" -u -m examples.sb3 "$@" --device cuda:0 --learner-device cpu \
+        --output "$RUN/$name" > "$log.log" 2>&1
+    local code=$?
+    printf '{"returncode": %d}\n' "$code" > "${log}_process_exit.json"
+    return "$code"
+}
+for algorithm in ppo sac; do
+    run_stage "$algorithm/train" train --algorithm "$algorithm" \
+        --total-interactions 2560 || exit "$?"
+    run_stage "$algorithm/resume" train --algorithm "$algorithm" \
+        --resume "$RUN/$algorithm/train/checkpoint" \
+        --total-interactions 5120 || exit "$?"
+    run_stage "$algorithm/evaluation" evaluate \
+        --checkpoint "$RUN/$algorithm/resume/checkpoint" || exit "$?"
+done
+BASH
+```
+
+Training reports must say `LEARNER_CHECK_PASSED`, show changed parameters and
+increased external update counters, and close both native resources. The resumed
+report must have `learner_checkpoint_restored=true`, session 2,560 and cumulative
+5,120 interactions. Evaluation must say `LEARNER_EVALUATION_PASSED` with complete
+case/app cleanup and saved-score parity. Tiny runs establish collection, learning,
+checkpoint restoration and scoring; they do not establish successful locomotion.
+Use a new output folder and add `--full-bank` to `evaluate` for all 114 validation
+cases. Keep the complete returned directory, including failed attempts.
+
+Each completed phase saves SB3's model/optimizer archive, SAC replay when used,
+global/action-space RNG and checkpoint-linked task progress. Files and learner
+state are verified before continued learning; the original SB3 version and source
+must match. Inference uses SB3's deterministic prediction, including its own
+action unscaling. Timeout bootstrapping uses owned outgoing observations, while
+physical termination takes precedence. Resumption starts fresh physical episodes;
+no partial PPO rollout or live simulator state is restored. The short default
+run stays below 5,000 external updates and saves only its full terminal checkpoint.
+
+This example resumes clean checkpoints with exact accounting. It is not a crash
+recovery service. Error reports retain known interaction totals; collection after
+an older checkpoint still counts. Do not restart a failed run from that older
+checkpoint and erase its additional spend. Load only trusted SB3 checkpoint
+bundles, which contain Python serialization.
+
+The optional CPU suite exercises genuine PPO/SAC updates, outgoing-state replay
+semantics, checkpoint/RNG equality and fresh-process continuation on a synthetic
+task. It does not launch Isaac Sim:
+
+```bash
+python -m unittest discover -s examples/sb3/tests -t . -v
+```
+
 ## Verification
 
 ### CPU checks

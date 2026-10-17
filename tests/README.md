@@ -42,6 +42,12 @@ Do not add `tests/` to `PYTHONPATH`. See the
 distribution and bounded server commands. Git is needed for provenance tests.
 No training library is needed to exercise the common task or offline scorer.
 
+The separate optional SB3 example suite runs actual PPO/SAC updates, replay and
+checkpoint continuation on a synthetic CPU task. Install its optional requirements
+and run `python -m unittest discover -s examples/sb3/tests -t . -v`. These tests
+remain outside the core suite; the [package README](../source/parkour_lab/docs/README.md#optional-stable-baselines3-integration)
+contains the corresponding native train/resume/evaluation command.
+
 ## Evidence limits
 
 CPU tests use real tensor/mesh calculations and small native API doubles.
