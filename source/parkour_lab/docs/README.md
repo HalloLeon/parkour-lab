@@ -344,6 +344,48 @@ python -m parkour_lab score CAPTURE_DIRECTORY
 engineering subset can have valid captures while remaining ineligible as a
 full-bank comparison. Check these fields and coverage before interpreting aggregates.
 
+## Development protocol and comparisons
+
+The development recipe is fixed by its versioned definitions and the realized
+metadata recorded with each task/capture. These identify a reproducible software
+contract; they do not establish a calibrated final benchmark or a method ranking.
+
+| Component | Fixed development rule |
+| --- | --- |
+| Task | `go2-blind-v1`: Go2, 200 Hz physics, 50 Hz control, 20-second episodes and native physical termination. Tiled tasks have explicit tile-boundary truncation; standalone Flat uses an unbounded plane. |
+| Training terrain | `go2-terrain-development-v1`: the five-family mixture, eight physical levels and translation-eligible curriculum described above. Use a multiple of 20 replicas for exact replication of the 20 columns, equal family shares and balanced slope/stair signs. |
+| Commands | `go2_episode_twist_v1`: 50% translation, 10% stand and 10% each left/right pivot and arc; one command per episode. |
+| Information and actions | Common 49D blind actor frame, declared use of the shared 352-value training-only packet, and the same bounded 12D action/motor contract. No training packet reaches evaluation. |
+| Objective | The realized native Go2 rough reward, identified by its recipe hash. Overrides define a separately identified custom objective. |
+| Evaluation | `go2_fixed_cases_development_v1`: disjoint train/validation/test seed identities; the 114-case bank and fixed command phases described above. The same endpoint policy is evaluated across every cell. |
+| Scores | `go2_fixed_scores_development_v1`: equal families, then equal physical levels, subtypes, profiles and attempts. Preserve failures, unavailable phases and exposure labels. |
+| Experience | Aggregate real robot transitions, including warm-up and discarded collection. Consumer projects declare and enforce the same allowance across compared methods; optimizer or imagination steps are separate compute statistics. |
+| Continuation | A consumer-owned full learner checkpoint linked to task progress; cumulative experience and run identity survive recreation into fresh physical episodes. |
+
+Keep the resolved configuration, package/example sources, dependency identities,
+reward hash, motor/dynamics readbacks and checkpoint/progress linkage with results.
+Version labels alone do not prove that two runs used identical definitions or
+physical realizations. A changed source/configuration identity needs matching
+evidence; old checkpoints are not silently migrated.
+
+Before a method comparison, declare training seeds, replica count, interaction
+allowance, tuning allowance, training-information use and checkpoint-selection
+rule. Compare common-budget endpoints without choosing a different checkpoint
+for each family. Validation may guide development; final-test outcomes may not
+select the recipe or winning checkpoints. Report per-family/command failures and
+tracking alongside return, and summarize independent training seeds separately.
+Choose an allowance compatible with every integration's complete collection
+blocks. The bounded example rejects an incompatible remainder instead of hiding
+extra collection or rounding a run's recorded spend down to the allowance.
+
+There is no calibrated default training budget or guaranteed mastery threshold.
+The short PPO/SAC runs below exercise integration, not competitive baselines.
+Physical severity calibration, learnability, final comparison budgets and
+statistical ranking remain to be validated before making those claims. A full
+capture with `valid_for_comparison=true` establishes bank completeness and capture
+consistency; it does not supply that empirical validation. A poorly performing
+policy is still a valid test of failure accounting and the public evaluator.
+
 ## Architecture
 
 The environment, inference controller and learner are separate responsibilities.
@@ -364,6 +406,7 @@ The environment, inference controller and learner are separate responsibilities.
 | `scripts/check_public_task.py` | Runnable public-task consumer and bounded training/evaluation/continuation contract check. |
 | `scripts/check_terrain.py`, `scripts/_terrain_checks/` | Bounded native geometry, contact, curriculum and recreation checks. |
 | `scripts/check_evaluation.py` | Caller-format policy save/load, frozen native evaluation and independent offline scoring checks. |
+| `scripts/check_learning_contracts.py`, `scripts/_learning_checks.py` | Bounded native timeout/bootstrap, replay ownership and physical action-saturation witnesses for the optional learner bridge. |
 
 `control.Controller` and `runtime.NativeControllerSession` accept a loaded causal
 controller independently of a learner. `control.policy.PolicyController` adapts
@@ -462,6 +505,76 @@ an older checkpoint still counts. Do not restart a failed run from that older
 checkpoint and erase its additional spend. Load only trusted SB3 checkpoint
 bundles, which contain Python serialization.
 
+### Longer continuation and full validation
+
+After both short checks finish at 5,120 interactions, continue each saved learner
+to **25,600 total interactions** and evaluate its endpoint on all **114 validation
+cases**. Set `PLAB_INPUT` to the complete previous results directory, containing
+`ppo/resume/checkpoint/` and `sac/resume/checkpoint/`. Run from the repository root
+with the same native interpreter, dependencies and Python sources as those
+checkpoints. No package upgrade is needed for this continuation.
+
+```bash
+export PLAB_INPUT=/absolute/path/to/completed_learner_results
+export PLAB_PY=/absolute/path/to/native/python
+bash <<'BASH'
+set -uo pipefail
+: "${PLAB_INPUT:?Set PLAB_INPUT to the previous results directory}"
+PLAB_PY=${PLAB_PY:-python}
+BASE=$(cd "$PLAB_INPUT" && pwd) || exit 1
+export PYTHONPATH="$PWD/source/parkour_lab${PYTHONPATH:+:$PYTHONPATH}"
+for algorithm in ppo sac; do
+    CHECKPOINT="$BASE/$algorithm/resume/checkpoint/checkpoint.json"
+    [[ -r "$CHECKPOINT" ]] || { echo "Missing checkpoint: $CHECKPOINT" >&2; exit 1; }
+done
+mkdir -p logs/parkour_lab || exit 1
+RUN=$(mktemp -d logs/parkour_lab/learner_continuation_XXXXXX) || exit 1
+trap 'status=$?; printf "{\"returncode\": %d}\n" "$status" > "$RUN/process_exit.json"; echo "Results: $PWD/$RUN"' EXIT
+run_stage() {
+    local name=$1
+    shift
+    local log="$RUN/${name//\//_}"
+    "$PLAB_PY" -u -m examples.sb3 "$@" --device cuda:0 --learner-device cpu \
+        --output "$RUN/$name" > "$log.log" 2>&1
+    local code=$?
+    printf '{"returncode": %d}\n' "$code" > "${log}_process_exit.json"
+    return "$code"
+}
+for algorithm in ppo sac; do
+    run_stage "$algorithm/resume" train --algorithm "$algorithm" \
+        --task Go2-Mixed-v1 --num-envs 20 --seed 1077 \
+        --resume "$BASE/$algorithm/resume/checkpoint" \
+        --total-interactions 25600 || exit "$?"
+done
+for algorithm in ppo sac; do
+    run_stage "$algorithm/evaluation" evaluate --full-bank \
+        --checkpoint "$RUN/$algorithm/resume/checkpoint" || exit "$?"
+done
+BASH
+```
+
+This adds 20,480 interactions per method: 1,024 native batch steps, or 20.48
+simulated seconds of collection per replica in the new process. PPO completes
+32 additional rollouts. The original run identity, learner settings, reward and
+task recipe are retained; physical episodes restart. Surviving episodes can now
+reach the 20-second training timeout. Falls can prevent that coverage, so inspect
+the returned episode data before claiming timeout validation. Both terminal
+checkpoints are saved before the longer full-bank evaluations begin.
+
+Each resumed report must start at cumulative 5,120 and finish with session 20,480,
+cumulative 25,600 and zero uncertain interactions. The final checkpoint must link
+the same run identity and record changed policy parameters. SAC's 20,000-transition
+replay now wraps and evicts its oldest data normally; preserving the entire old
+buffer prefix is no longer expected. Both methods remain below 5,000 external
+updates, so the terminal checkpoint is sufficient for this bounded run.
+
+Full validation must retain every prescribed case, including early physical
+failures and unavailable later phases. Require `full_bank=true`,
+`capture_valid=true`, `valid_for_comparison=true` and saved-score parity. Full-bank
+coverage qualifies the capture; this small, single-seed run still does not
+establish learnability, final score calibration or a method ranking. Keep the
+complete output directory for review.
+
 The optional CPU suite exercises genuine PPO/SAC updates, outgoing-state replay
 semantics, checkpoint/RNG equality and fresh-process continuation on a synthetic
 task. It does not launch Isaac Sim:
@@ -487,6 +600,7 @@ python -m parkour_lab --help
 python scripts/check_public_task.py --help
 python scripts/check_terrain.py --help
 python scripts/check_evaluation.py --help
+python -m scripts.check_learning_contracts --help
 ```
 
 Formatting tools match `.pre-commit-config.yaml`. Formatting uses 88 columns;
@@ -535,8 +649,9 @@ task imports do not require learning libraries or a native simulator.
 
 ### Native checks
 
-These checks have been run with Isaac Lab 2.3.2.post1 and Isaac Sim 5.1. Run them
-when using a different stack to establish compatibility for the supported task.
+The reference native stack is Isaac Lab 2.3.2.post1 and Isaac Sim 5.1. Each check
+establishes only the contracts it actually exercises. Retain and inspect its
+complete output before accepting compatibility, including when using another stack.
 
 Use the configured Isaac Lab interpreter from the repository root. Activate it or
 export `PLAB_PY` with its Python executable path. Each invocation below launches a
@@ -699,3 +814,50 @@ minutes, plus environment-construction overhead. The fixture's performance is
 not a benchmark baseline. Training-progress recreation restores task counters
 and samplers only; genuine learner checkpoint continuation belongs to the
 consuming trainer.
+
+### Timeout and action-saturation checks
+
+This bounded check uses the optional SB3 installation and the real Flat task.
+It collects two PPO steps and one SAC step without optimizing either model,
+then checks stored-frame ownership and both action bounds. The host sets row
+zero's episode age to one step before the normal horizon for the first step of
+each check. It changes neither the physical state nor the configured horizon.
+The PPO critic uses an explicit analytic value of the previous delivered action
+so that outgoing and reset-frame bootstrap targets are observably different.
+These are controlled contract fixtures, not trained policies or stability tests.
+
+Run from the repository root using the configured native interpreter:
+
+```bash
+bash <<'BASH'
+set -uo pipefail
+PLAB_PY=${PLAB_PY:-python}
+export PYTHONPATH="$PWD/source/parkour_lab${PYTHONPATH:+:$PYTHONPATH}"
+mkdir -p logs/parkour_lab || exit 1
+RUN=$(mktemp -d logs/parkour_lab/learning_contracts_XXXXXX) || exit 1
+trap 'status=$?; printf "{\"returncode\": %d}\n" "$status" > "$RUN/process_exit.json"; echo "Results: $PWD/$RUN"' EXIT
+"$PLAB_PY" -u -m scripts.check_learning_contracts \
+    --device cuda:0 --num-envs 4 --seed 1077 --output "$RUN/native" \
+    > "$RUN/native.log" 2>&1
+code=$?
+printf '{"returncode": %d}\n' "$code" > "$RUN/native_process_exit.json"
+exit "$code"
+BASH
+```
+
+With four replicas the report must show `LEARNING_CONTRACTS_PASSED`, six control
+steps, session/cumulative 24 interactions, zero uncertain interactions and zero
+optimizer updates. Both environment/application cleanup fields must be `complete`.
+`ppo.json` records raw native rewards, pure timeout flags, outgoing/reset frames
+and the analytic bootstrap comparison. `sac.json` records owned outgoing replay
+frames and timeout-masked sampled dones. `saturation.json` records both extreme
+request signs for every joint, the delivered action, native processed/joint
+targets and saturation counts, including outgoing rows before automatic reset.
+The witnesses also check that final-frame reads do not consume extra actor-noise
+draws and that subsequent steps do not mutate saved frames.
+
+Keep the entire results directory, including source/dependency identities and
+`resolved_env.yaml`. Local CPU tests cannot replace this native witness. This
+command is independent of model checkpoints and does not require more reference
+training. The optional CPU suite includes its collection/assertion guards;
+successful execution establishes these contracts only, not benchmark calibration.

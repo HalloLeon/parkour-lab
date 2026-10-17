@@ -47,6 +47,11 @@ checkpoint continuation on a synthetic CPU task. Install its optional requiremen
 and run `python -m unittest discover -s examples/sb3/tests -t . -v`. These tests
 remain outside the core suite; the [package README](../source/parkour_lab/docs/README.md#optional-stable-baselines3-integration)
 contains the corresponding native train/resume/evaluation command.
+It also checks the bounded timeout/action-saturation host with synthetic CPU
+transitions, including rejection of reset-frame substitution, extra actor-noise
+draws and corrupted native targets. The separate
+`python -m scripts.check_learning_contracts` command requires the native SDK;
+see the package README for the complete bounded invocation and witness fields.
 
 ## Evidence limits
 
