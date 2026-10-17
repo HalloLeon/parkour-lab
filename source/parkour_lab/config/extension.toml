@@ -10,13 +10,12 @@ readme = "docs/README.md"
 title = "Parkour Lab"
 author = "Leon Yi Bai"
 maintainer = "Leon Yi Bai"
-description = "Adaptive parkour curriculum and reproducible evaluation for a Unitree Go2 in Isaac Lab"
+description = "Go2 locomotion environments and method-independent evaluation in Isaac Lab"
 repository = "https://github.com/HalloLeon/parkour-lab.git"
 
 [dependencies]
 "isaaclab" = {}
 "isaaclab_assets" = {}
-"isaaclab_rl" = {}
 "isaaclab_tasks" = {}
 
 [[python.module]]

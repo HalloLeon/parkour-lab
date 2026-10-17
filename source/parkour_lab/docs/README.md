@@ -2,10 +2,9 @@
 
 A learner-independent Isaac Lab / Unitree Go2 task package with blind controller
 inputs and a separate training-information contract. This page covers the public
-task API, installation and verification. The repository [README](../../../README.md)
-contains the retained ROA-like learner and artifact-command reference. Its command
-diagnostics are not a standardized benchmark; successful execution does not
-qualify a robot.
+task API, frozen evaluation, installation and verification. The consumer owns its
+learning code and checkpoint format. Successful execution alone does not establish
+locomotion quality or a calibrated benchmark ranking.
 
 ## Installation
 
@@ -15,8 +14,8 @@ NumPy <2. The selected SDK and learner may impose tighter requirements.
 
 For native execution, install Isaac Lab and Isaac Sim separately and use an
 interpreter supported by that stack. The package does not select a simulator,
-CUDA distribution or SDK installation layout. The optional `roa` extra uses
-RSL-RL 3.1.2, separately from the SDK's optional learner extras.
+CUDA distribution or SDK installation layout. External learners install their own
+training dependencies.
 
 From the repository root, in the configured interpreter:
 
@@ -25,19 +24,10 @@ python -m pip install -e source/parkour_lab
 python -m parkour_lab --help
 ```
 
-To include the bundled learner, use
-`python -m pip install -e 'source/parkour_lab[roa]'` instead. Package imports and
-CLI help do not launch Isaac Lab. Select the native device explicitly. The native
-checks below establish compatibility only for their tested task and scope;
-matching version labels alone do not establish it.
-
-The CLI provides `train`, `export`, `bound-actions`, `evaluate`, `play` and
-`analyze`. See [bounded action delivery](../../../README.md#bounded-action-delivery)
-for explicit learner revisions and
-[reward diagnostics](../../../README.md#reward-configuration-and-diagnostics)
-for recorded task metrics. `train --diagnose-training` captures extreme-action
-transitions, subsequent PPO rollouts and exceptions without changing learning.
-These tensor captures omit optimizer and simulator state and cannot resume a run.
+Package imports and CLI help do not launch Isaac Lab. Select the native device
+explicitly. The CLI scores saved evaluation captures; it does not load policies
+or train models. Native checks establish compatibility only for their tested
+scope, not from matching version labels alone.
 
 ## Public task API
 
@@ -257,6 +247,103 @@ not a recommended baseline. Native rewards sum `weight * term * control_dt`;
 metadata identifies the realized recipe. Custom objectives must be identified
 separately from a common-reward method comparison.
 
+## Frozen evaluation
+
+Start `AppLauncher` in the consuming program, load the policy using its own
+checkpoint format, then call the common evaluator:
+
+```python
+from parkour_lab.evaluation import case_bank, evaluate
+
+def evaluate_loaded_policy(policy, app, output):
+    return evaluate(
+        policy,
+        case_bank("validation", attempts=1),
+        output,
+        device="cuda:0",
+        training_seed="training-seed-42",
+        checkpoint_id="my-endpoint-checkpoint",
+        app=app,
+    )
+```
+
+A frame policy implements `reset(mask)`, `act(observation)` and
+`state_sha256()`. It receives only the shared float32 `(N, 49)` causal frame;
+`act` returns float32 `(N, 12)` encoded action requests. It owns feature
+normalization and causal memory. The state fingerprint must include learned
+parameters, buffers and preprocessing statistics, excluding evolving episode
+memory. Freeze them before evaluation. The evaluator checks that fingerprint,
+resets memory at episode boundaries and bounds targets through the same motor
+transform used by the public task. An existing named `Controller` is also
+accepted when its motor contract declares those same joint limits; named targets
+outside them are rejected. Neither interface loads files or receives simulator
+handles.
+
+The evaluator owns a dedicated simulation stage and closes each case environment.
+Call it with an application that has no active native environment; it creates a
+fresh stage and discards old ray-mesh caches between cases. Native SDK
+construction seeds process RNGs. A consuming trainer should evaluate in a separate
+process, or preserve and restore its own learner RNG state. The benchmark does not
+snapshot that state. The caller retains application and checkpoint ownership. `checkpoint_id` is an
+opaque caller label; optional `checkpoint_sha256` identifies its actual file.
+`repository_path` optionally adds Git evidence for an explicit checkout. Imported
+package-source hashes are always recorded; an installed wheel need not live in
+Git. Output directories are new captures and are never reused for another run.
+
+The versioned development bank contains six profiles: stand, forward at
+`(0.35, 0, 0)`, left/right pivots at `(0, 0, ±0.5)` and left/right arcs at
+`(0.35, 0, ±0.3)`. Commands use body-frame m/s, m/s and rad/s. Every attempt
+lasts at most 20 s: stand 0–2 s, named motion 2–14 s and stop 14–20 s. The stand
+profile remains zero throughout. Report fixed onset 2–3 s, settled motion 3–14 s,
+braking 14–15 s and stop/hold 15–20 s windows. Transients remain in the total
+native core reward return.
+
+`case_bank("train" | "validation" | "test", attempts=...)` gives disjoint
+semantic seed identities. One attempt per cell produces 114 cases: one Flat
+geometry plus easy/medium/hard Uneven, Slopes, Stairs and Hills; Slopes and Stairs
+include both pyramid signs. Each geometry cell receives every profile. Flat has
+no severity ladder. Geometry/start/dynamics/noise seeds are shared across its
+profiles and are independent of execution order. Cases execute sequentially with
+one replica; training remains batched. A pyramid sign is geometry, while recorded
+support changes describe actual ascent or descent.
+
+Scores retain original core return, planar and body-Z yaw RMSE, signed yaw rate,
+wrong-direction fraction, unwanted pivot translation, stopping residual motion
+and drift. World-heading diagnostics are separate from body-Z angular rate on
+slopes. Every attempt ends at its first native termination or truncation; no
+replacement reset episode contributes. Terminal reward is included once. Falls,
+tile-boundary censoring, horizon survival and phase coverage remain distinct.
+Missing phases are unavailable, never zero error. Missing cases prevent a complete
+comparison rather than disappearing from its denominators.
+
+Aggregate weights give equal shares to families, then their physical levels,
+subtypes, profiles and attempts. Keep family and direction tables visible, and
+summarize independent training seeds separately. A completed subset is labeled
+separately from the full bank. This development recipe does not establish final
+calibration or a ranking from an untrained fixture.
+
+Captures include outgoing postphysics states, commands, per-step rewards,
+termination causes, foot forces/support rays, physical realizations, motor/noise
+receipts and source identities. These are evaluator-only measurements. Surface
+exposure uses contact-supported height changes; a family label or a pivot on the
+central platform does not demonstrate non-flat locomotion. No curriculum levels
+advance and no training-information packet reaches inference.
+
+The authoritative scorer is the same pure function used by native playback and
+the offline command. Recompute from a saved capture without launching Sim or
+loading a policy:
+
+```bash
+python -m parkour_lab cases --partition validation --attempts 1
+python -m parkour_lab score CAPTURE_DIRECTORY
+```
+
+`score_capture` verifies capture consistency and retains incomplete/failed cases.
+`capture_valid` identifies a consistently completed prescribed capture;
+`valid_for_comparison` additionally requires the full partition bank. A six-case
+engineering subset can have valid captures while remaining ineligible as a
+full-bank comparison. Check these fields and coverage before interpreting aggregates.
+
 ## Architecture
 
 The environment, inference controller and learner are separate responsibilities.
@@ -264,39 +351,30 @@ The environment, inference controller and learner are separate responsibilities.
 | Owner | Responsibility |
 | --- | --- |
 | `benchmark/` | Public learner-independent task API: configuration/facade, actor/GT contracts, spaces and checkpoint-linked progress. |
-| `config.py` | Retained method/experiment settings and compatibility exports. |
-| `artifacts.py` | Data-only learning/controller artifacts and motor contracts. |
 | `provenance.py` | Package hashes, source-owned dependency identity and Git evidence. |
-| `control/` | Causal sensors, controller/reset interface, command tapes and motor contracts. |
+| `control/` | Causal sensors, caller-loaded policy/controller adapters, command tapes and motor contracts. |
 | `environments/` | Native task configuration, observations, dynamics, rewards and reset semantics. Isaac Lab owns physics, managers and step/reset order. |
-| `environments/task_config.py`, `configuration.py` | Method-independent task settings and their native configuration builder. |
-| `environments/commands/` | Native command terms, operator sampling and fixed command sequences. |
+| `environments/configuration.py` | Shared native Go2 scene, sensors, action and physical reset configuration. |
 | `environments/commands/episode.py` | Shared training episode sampler and prescribed curriculum eligibility. |
-| `environments/terrains/families/` | Native Flat/Uneven/Slopes/Stairs/Hills definitions, geometry bindings and per-replica curriculum. |
-| Other `environments/terrains/` modules | Procedural and connected terrain geometry, traversal fixtures and roughness helpers. |
-| `runtime/` | Native sensor/motor binding, transition accounting, training host and ordered environment/application cleanup. |
-| `evaluation/runner.py` | Frozen live playback and recording. |
-| `evaluation/terrain_analysis.py` | Saved connected-attempt validation and analysis without live execution or learner imports. |
-| `evaluation/flat.py`, `terrain.py` | Development-case definitions and physical trace scoring. |
-| `methods/` | Optional backend discovery, ROA-like optimization, inference implementation and learning payloads. |
-| `experiment.py` | Training orchestration and learner checkpoint continuation. |
-| `tests/` | Behavioral contracts, package boundaries, CPU learning and analytic geometry checks. |
-| `scripts/smoke_native.py` | Bounded native construction, stepping, final-observation, reset and shutdown checks. |
+| `environments/terrains/` | Native Flat/Uneven/Slopes/Stairs/Hills definitions, geometry bindings and per-replica curriculum. |
+| `runtime/` | Native sensor/motor binding, transition accounting and ordered environment/application cleanup. |
+| `evaluation/runner.py`, `environment.py`, `capture.py` | Frozen playback, dedicated case environments and portable outgoing-transition capture. |
+| `evaluation/cases.py`, `scoring/` | Fixed case identities and authoritative physical scores/aggregates. |
+| `tests/` | Behavioral contracts, package boundaries, analytic scores and geometry checks. |
 | `scripts/check_public_task.py` | Runnable public-task consumer and bounded training/evaluation/continuation contract check. |
 | `scripts/check_terrain.py`, `scripts/_terrain_checks/` | Bounded native geometry, contact, curriculum and recreation checks. |
+| `scripts/check_evaluation.py` | Caller-format policy save/load, frozen native evaluation and independent offline scoring checks. |
 
 `control.Controller` and `runtime.NativeControllerSession` accept a loaded causal
-controller independently of a learner. The CLI artifact workflow uses
-`MethodConfig` and a method backend to load `.plab` files; it is not a
-method-independent benchmark API. Saved terrain analysis is implemented in
-`terrain_analysis.py`; `runner.analyze_terrain_attempt` re-exports it for import
-compatibility.
+controller independently of a learner. `control.policy.PolicyController` adapts
+the common 49D policy interface to named sensors and bounded joint targets.
+The evaluation host supplies sensing and motor binding; a policy never receives
+an environment handle.
 
 Native stepping preserves separate termination/truncation flags and owned outgoing
-final-observation rows before automatic reset. Learner adapters own optimization,
-rollout/replay storage and learning snapshots. Shared control and terrain code do
-not select a network architecture. ROA inference does not import PPO; numerical
-and native imports remain lazy where unnecessary.
+final rows before automatic reset. Consuming trainers own optimization,
+rollout/replay storage, inference memory and checkpoint loading. Shared control
+and terrain code do not select a network architecture.
 
 ## Verification
 
@@ -305,16 +383,16 @@ and native imports remain lazy where unnecessary.
 From the repository root in a CPU Python environment:
 
 ```bash
-python -m pip install -e 'source/parkour_lab[roa]'
+python -m pip install -e source/parkour_lab
 python -m pip install scipy black==25.9.0 isort==6.1.0 flake8==7.1.1
 python -m unittest discover -s tests -t . -v
 black --workers 1 --check source/parkour_lab tests scripts
 isort --check-only source/parkour_lab tests scripts
 flake8 source/parkour_lab tests scripts
 python -m parkour_lab --help
-python scripts/smoke_native.py --help
 python scripts/check_public_task.py --help
 python scripts/check_terrain.py --help
+python scripts/check_evaluation.py --help
 ```
 
 Formatting tools match `.pre-commit-config.yaml`. Formatting uses 88 columns;
@@ -356,11 +434,10 @@ echo "Build and installation: $BUILD"
 BASH
 ```
 
-Check dependency metadata, installed backend discovery and archive contents as
-well as imports. The source archive must include `config/extension.toml` and this
+Check dependency metadata and archive contents as well as imports. The source archive must include `config/extension.toml` and this
 README, and exclude private planning files. An editable installation alone does
-not verify those contents. The CPU suite covers backend discovery, artifact round
-trips and data-only payload loading.
+not verify those contents. The CPU suite checks that portable scoring and public
+task imports do not require learning libraries or a native simulator.
 
 ### Native checks
 
@@ -413,20 +490,14 @@ hashes, or source checkout revisions/diffs in `sdk/git/`. A packaged SDK does no
 require Git metadata. An incomplete close receipt, missing dependency/source
 identity or failed assertion leaves native validation incomplete.
 
-The retained terrain plumbing helper remains available as
-`scripts/smoke_native.py --terrain flat --device cuda:0 --output NEW_DIRECTORY`
-(also rough, procedural, steps, traversal and connected); it reports `SMOKE_PASSED`
-and checks the retained command workflow separately from the public task API.
-
-Successful smoke checks do not establish traversal, robot stability, benchmark
+Successful checks do not establish robot stability, benchmark
 scores or equivalence between simulators. Commands not yet run on the server are
 not native evidence. Run relevant checks after task, controller, scoring or
 continuation changes and retain complete failed attempts when assessing behavior.
 
 ### Terrain and curriculum checks
 
-Native acceptance for this terrain recipe is pending. This command runs three
-fixed-severity Mixed views and training/recreation in
+This command runs three fixed-severity Mixed views and training/recreation in
 five fresh native processes, with 20 replicas covering every terrain column.
 The geometry probe reads the actual USD collider and raycasts an interior grid
 from −5.4 to +5.4 m in both axes. It saves surface arrays, initial root/foot link
@@ -478,3 +549,59 @@ is a fixture; no learner checkpoint is restored. Inspect `report.json`,
 alongside source/dependency receipts. The script keeps `calibration_validated`
 and `behavior_validated` false: returned native measurements and an explicit
 review are still needed before accepting candidate geometry or learning difficulty.
+
+
+### Loaded-policy evaluation checks
+
+This command checks a caller-format policy save/load, the fixed evaluation path
+and a fresh task-progress restart in three native processes. The evaluation
+fixture is a tiny untrained policy with frozen normalization; it is not a trained
+locomotion baseline. Its six-case engineering subset spans all five terrain
+families, all six profiles and physical levels 0, 3 and 7. It is explicitly not
+the full validation bank or a balanced method-comparison result.
+
+```bash
+bash <<'BASH'
+set -uo pipefail
+PLAB_PY=${PLAB_PY:-python}
+export PYTHONPATH="$PWD/source/parkour_lab${PYTHONPATH:+:$PYTHONPATH}"
+mkdir -p logs/parkour_lab || exit 1
+RUN=$(mktemp -d logs/parkour_lab/evaluation_check_XXXXXX) || exit 1
+trap 'status=$?; printf "{\"returncode\": %d}\n" "$status" > "$RUN/process_exit.json"; echo "Results: $PWD/$RUN"' EXIT
+run_check() {
+    local name=$1 script=$2
+    shift 2
+    "$PLAB_PY" -u "$script" --device cuda:0 --output "$RUN/$name" "$@" \
+        > "$RUN/$name.log" 2>&1
+    code=$?
+    printf '{"returncode": %d}\n' "$code" > "$RUN/${name}_process_exit.json"
+    return "$code"
+}
+run_check train scripts/check_public_task.py --role train --num-envs 4 --seed 1077 || exit "$?"
+run_check resume scripts/check_public_task.py --role train --num-envs 4 --seed 1077 \
+    --resume "$RUN/train/progress.json" --checkpoint-id no-learner-contract-fixture || exit "$?"
+run_check evaluation scripts/check_evaluation.py || exit "$?"
+BASH
+```
+
+The task processes must report `TASK_CHECK_PASSED` and the evaluation process
+`EVALUATION_CHECK_PASSED`, all with zero process status and complete application
+cleanup. The evaluator closes every native case environment; its case receipts
+must each show complete cleanup. The outer evaluation script owns only the app.
+It checks exact command timing, one sensor-noise frame per policy action,
+fixed physical levels, absent training GT and unchanged policy parameters and
+normalization. At least one non-standing case must complete all 1,000 steps;
+`phase_boundary_witness.json` retains commanded and outgoing physical samples
+around 2, 3, 14 and 15 s and the final step. If none reaches the horizon, the check
+fails rather than claiming phase coverage. Its fresh offline subprocess blocks native and learning-library
+imports, invokes the actual scoring CLI and requires identical JSON results.
+Retain the entire returned directory, including failures and dependency/source
+receipts. Native success still requires review of those measurements.
+
+Add `--full-bank` to a separate `scripts/check_evaluation.py` invocation with a
+new output directory to capture all 114 validation cases. Both modes stop each
+attempt at its first ending; the full bank can therefore take up to 38 simulated
+minutes, plus environment-construction overhead. The fixture's performance is
+not a benchmark baseline. Training-progress recreation restores task counters
+and samplers only; genuine learner checkpoint continuation belongs to the
+consuming trainer.

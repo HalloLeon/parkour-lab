@@ -239,15 +239,15 @@ class DependencyIdentityTests(unittest.TestCase):
 
 
 class PackageSourceIdentityTests(unittest.TestCase):
-    def test_dependency_receipt_describes_imported_upstream(self):
+    def test_dependency_receipt_describes_imported_core_dependency(self):
         from importlib.metadata import version
 
-        import rsl_rl
+        import gymnasium
 
-        receipt = provenance.dependency_identity("rsl_rl", "rsl-rl-lib")
-        self.assertEqual(receipt["version"], version("rsl-rl-lib"))
+        receipt = provenance.dependency_identity("gymnasium", "gymnasium")
+        self.assertEqual(receipt["version"], version("gymnasium"))
         self.assertEqual(
-            Path(receipt["module_path"]), Path(rsl_rl.__file__).resolve().parent
+            Path(receipt["module_path"]), Path(gymnasium.__file__).resolve().parent
         )
         self.assertEqual(len(receipt["source_sha256"]), 64)
         if (Path(receipt["module_path"]).parent / ".git").exists():
@@ -259,11 +259,12 @@ class PackageSourceIdentityTests(unittest.TestCase):
         self.assertTrue(
             {
                 "environments/configuration.py",
-                "environments/commands/native.py",
-                "environments/observations.py",
+                "environments/commands/episode.py",
+                "environments/terrains/generation.py",
                 "runtime/native.py",
-                "config.py",
-                "methods/roa/training.py",
+                "benchmark/config.py",
+                "evaluation/runner.py",
+                "evaluation/scoring/case.py",
                 "provenance.py",
             }.issubset(current)
         )

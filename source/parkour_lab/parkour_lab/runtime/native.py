@@ -1,9 +1,8 @@
-"""Native simulator input binding for a frozen, motor-bound actor artifact.
+"""Named causal sensing and motor-bound inference in native simulation.
 
-No RSL-RL, training policy, training command sampler, GUI or hardware driver. The caller
-supplies applied body-velocity commands and uses the verified motor bridge to
-deliver absolute joint targets. time_s is the physics-frame clock, not a remote
-packet timestamp or wall clock. Scene/motor configuration must remain frozen.
+The caller supplies applied body-velocity commands and uses the verified motor
+bridge to deliver absolute joint targets. time_s follows the physics-frame
+clock. Scene and motor configuration remain frozen throughout the session.
 """
 
 from __future__ import annotations
@@ -79,52 +78,44 @@ def foot_contacts(env):
 
 def motion_state(env):
     """Owned simulator truth for evaluation only; never part of actor sensing."""
-    robot, sensor = env.scene["robot"].data, env.scene["contact_forces"]
-    if sensor.body_names.count("base") != 1:
-        raise ValueError("Motion capture requires exactly one named base contact link")
+    robot = env.scene["robot"].data
     state = {
         "position_w": robot.root_pos_w,
         "quaternion_w": robot.root_quat_w,
         "linear_velocity_b": robot.root_lin_vel_b,
         "angular_velocity_b": robot.root_ang_vel_b,
         "angular_velocity_w": robot.root_ang_vel_w,
-        "base_contact_force_w": sensor.data.net_forces_w[
-            :, sensor.body_names.index("base")
-        ],
-        "body_position_w": robot.body_pos_w,
         "foot_net_forces_w": foot_contact_forces(env),
-        "base_surface_hits_w": env.scene["base_height_scanner"].data.ray_hits_w,
     }
-    if getattr(env.cfg, "parkour_task", {}).get("terrain") == "connected":
+    if getattr(env, "capture_evaluation", False):
         names = env.scene["robot"].body_names
         state["foot_position_w"] = robot.body_pos_w[
             :, [names.index(name) for name in FOOT_NAMES]
         ]
-        state["terrain_hits_w"] = env.scene["height_scanner"].data.ray_hits_w
+        heights, valid = foot_support(env, state["foot_position_w"])
+        state["support_height_w"], state["support_valid"] = heights, valid
+        for name in env.termination_manager.active_terms:
+            state["ending_" + name] = env.termination_manager.get_term(name)
     return {name: value.detach().clone() for name, value in state.items()}
 
 
-def configure_external_command(command, *, command_class=None):
-    """Zero on native reset; the host owns every applied body-twist command.
+def foot_support(env, feet):
+    """Cast down onto the native collision mesh at each foot's actual XY.
 
-    Call after AppLauncher when using the default native class. No terrain
-    sampler, heading assistance or standing override may compete with the host.
-    The host still freezes the timer and clears mode flags on each delivery.
+    This is evaluator truth, not a policy observation. Misses remain missing;
+    feet can leave the support before the root crosses the tile boundary.
     """
-    if command_class is None:
-        from isaaclab.envs.mdp.commands import UniformVelocityCommand
+    from isaaclab.utils.warp import raycast_mesh
 
-        command_class = UniformVelocityCommand
-    command.class_type = command_class
-    command.heading_command = False
-    command.rel_heading_envs = command.rel_standing_envs = 0.0
-    command.ranges.heading = None
-    command.ranges.lin_vel_x = command.ranges.lin_vel_y = command.ranges.ang_vel_z = (
-        0.0,
-        0.0,
-    )
-    command.resampling_time_range = (1.0e9, 1.0e9)
-    command.debug_vis = False
+    scanner = env.scene["height_scanner"]
+    mesh = scanner.meshes[scanner.cfg.mesh_prim_paths[0]]
+    starts = feet.clone()
+    starts[..., 2] += 20.0
+    directions = torch.zeros_like(starts)
+    directions[..., 2] = -1
+    hits, _, _, _ = raycast_mesh(starts, directions, mesh, max_dist=40.0)
+    valid = torch.isfinite(hits).all(-1)
+    return torch.where(valid, hits[..., 2], float("nan")), valid
 
 
 def validate_native_controller_spec(spec):
@@ -143,7 +134,7 @@ def validate_native_controller_spec(spec):
 class NativeControllerSession:
     """Native sensing/motor binding for an already-loaded causal Controller.
 
-    Artifact loaders/adapters own weights, normalization, history and provenance;
+    Caller adapters own weights, normalization, history and checkpoint identity;
     this host owns named sensing, command delivery and the native motor contract.
     No dynamic imports, policy hot-swaps or backend-specific latent assumptions.
     """
@@ -159,7 +150,6 @@ class NativeControllerSession:
         self.env = env
         self.failed = False
         self.last_sensor_noise = None
-        self.first_sensor_sample = None
         self.controller = controller
         self.motor = NativeJointTargetBridge(
             env,
@@ -217,7 +207,6 @@ class NativeControllerSession:
                     "joint_position_relative_default",
                     "joint_velocity",
                 )
-                raw = torch.cat([values[name] for name in names], dim=-1)
                 for name, perturbation in zip(
                     names,
                     self.last_sensor_noise.split((3, 3, 12, 12), dim=-1),
@@ -227,16 +216,6 @@ class NativeControllerSession:
                 values["joint_position"] = (
                     values["joint_position"] + self.last_sensor_noise[:, 6:18]
                 )
-                if self.first_sensor_sample is None:
-                    self.first_sensor_sample = {
-                        "initial_raw_sensors": raw.cpu().numpy().copy(),
-                        "initial_noisy_sensors": torch.cat(
-                            [values[name] for name in names], dim=-1
-                        )
-                        .cpu()
-                        .numpy()
-                        .copy(),
-                    }
             if (
                 not isinstance(reset_mask, torch.Tensor)
                 or reset_mask.shape != (env.num_envs,)

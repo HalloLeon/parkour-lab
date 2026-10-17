@@ -41,7 +41,7 @@ def _dependencies(output):
 
 
 def _run(task, app, args, output, report):
-    from parkour_lab.environments.terrains.families.curriculum import curriculum_state
+    from parkour_lab.environments.terrains.curriculum import curriculum_state
 
     native = task._env
     if args.resume:

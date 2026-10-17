@@ -1,15 +1,11 @@
 """Load native command definitions with simulator-free SDK command doubles."""
 
-import importlib.util
 import sys
 from contextlib import contextmanager
 from types import ModuleType
-from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 import torch
-
-from tests.support import SOURCE_ROOT
 
 
 @contextmanager
@@ -30,20 +26,10 @@ def native_commands():
         def _update_command(self):
             pass
 
-    command_module, managers = (
-        ModuleType("isaaclab.envs.mdp.commands"),
-        ModuleType("isaaclab.managers"),
-    )
+    command_module = ModuleType("isaaclab.envs.mdp.commands")
     command_module.UniformVelocityCommand = UniformVelocityCommand
-    managers.SceneEntityCfg = lambda name: NS(name=name)
-    path = SOURCE_ROOT / "parkour_lab/environments/commands/native.py"
-    spec = importlib.util.spec_from_file_location(
-        "parkour_lab.environments.commands._commands_test", path
-    )
-    module = importlib.util.module_from_spec(spec)
     with patch.dict(
         sys.modules,
-        {"isaaclab.envs.mdp.commands": command_module, "isaaclab.managers": managers},
+        {"isaaclab.envs.mdp.commands": command_module},
     ):
-        spec.loader.exec_module(module)
-        yield module
+        yield command_module

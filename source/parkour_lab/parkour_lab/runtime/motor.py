@@ -20,9 +20,6 @@ from parkour_lab.control.motor_contract import (
 )
 
 VERSION = "native_joint_target_bridge_v1"
-NATIVE_RAW_ACTION_MEANING = (
-    "stock unscaled action; q_target = default_q + 0.25 * raw_action; no clip"
-)
 
 
 def _named_finite(value, shape, name):
@@ -143,31 +140,32 @@ def _runtime_motor_binding(env):
 class NativeJointTargetBridge:
     """One encoded command followed by one verified native delivery.
 
-    Native-hint opt-in is for trusted archive loaders, not a policy-controlled
+    Native-hint opt-in is for trusted callers, not a policy-controlled
     capability. Even there, named absolute positions remain authoritative. A
     failure latches the bridge: recover externally, never replace bad output
-    with zeros. Bounded artifacts explicitly constrain delivery; unbounded
-    artifacts retain exact legacy semantics. Terminal rows are excluded from native
-    post-step buffer comparisons because auto-reset may already have run.
+    with zeros. Joint limits constrain every delivery. Terminal rows are excluded
+    from native post-step buffer comparisons because auto-reset may already have run.
     """
 
     def __init__(self, env, contract, manifest, *, preserve_native_raw=False):
         if type(preserve_native_raw) is not bool:
             raise ValueError("Native raw-action preservation must be an explicit bool")
-        limits = contract.get("target_limits_rad")
-        meaning = (
-            NATIVE_RAW_ACTION_MEANING if limits is None else BOUNDED_RAW_ACTION_MEANING
-        )
-        if preserve_native_raw and manifest.get("raw_action_meaning") != meaning:
-            raise ValueError("Native raw hint requires the exact stock action meaning")
+        if (
+            preserve_native_raw
+            and manifest.get("raw_action_meaning") != BOUNDED_RAW_ACTION_MEANING
+        ):
+            raise ValueError(
+                "Native raw hint requires the exact bounded action meaning"
+            )
         self.binding, _ = _runtime_motor_binding(env)
         self.motor_verification = verify_runtime_motor(contract, manifest, self.binding)
+        limits = contract["target_limits_rad"]
         self.env = env
         self.term = env.action_manager.get_term("joint_pos")
         self._robot_data = env.scene["robot"].data
         self.default = env.scene["robot"].data.default_joint_pos.detach().clone()
         self.action_transform = JointActionTransform(self.default, limits)
-        if limits is not None and not torch.equal(
+        if not torch.equal(
             self.action_transform.limits.expand(env.num_envs, -1, -1),
             self._robot_data.soft_joint_pos_limits,
         ):
@@ -232,24 +230,18 @@ class NativeJointTargetBridge:
                 # it is not inspected, normalized, clipped or used for delivery.
                 action = (target - self.default) / 0.25
                 requested = action
-                if self.action_transform.limits is not None:
-                    bounded, _ = self.action_transform(action)
-                    if not torch.equal(action, bounded):
-                        raise ValueError(
-                            "Requested joint targets exceed archived bounds"
-                        )
+                bounded, _ = self.action_transform(action)
+                if not torch.equal(action, bounded):
+                    raise ValueError("Requested joint targets exceed archived bounds")
             finite_tensor(action, (self.num_envs, 12), self.default)
             if not torch.equal(action * 0.25 + self.default, target):
                 raise ValueError(
                     "Native affine action cannot exactly reproduce requested joint targets"
                 )
-            if self.action_transform.limits is not None:
-                self._action_peak = torch.maximum(
-                    self._action_peak, requested.abs().max()
-                )
-                clipped = requested != action
-                self._clipped_joints += clipped.sum()
-                self._clipped_rows += clipped.any(dim=1).sum()
+            self._action_peak = torch.maximum(self._action_peak, requested.abs().max())
+            clipped = requested != action
+            self._clipped_joints += clipped.sum()
+            self._clipped_rows += clipped.any(dim=1).sum()
             self._pending = (action.detach().clone(), target)
             self._counts["encoded_steps"] += 1
             self._counts["native_hint_steps" if use_hint else "target_only_steps"] += 1
@@ -322,21 +314,15 @@ class NativeJointTargetBridge:
         return {
             "version": VERSION,
             **self._counts,
-            **(
-                {
-                    "action_boundary": {
-                        "max_requested_action_abs": float(self._action_peak),
-                        "saturated_joint_commands": int(self._clipped_joints),
-                        "saturated_row_commands": int(self._clipped_rows),
-                        "total_joint_commands": self._counts["encoded_steps"]
-                        * self.num_envs
-                        * 12,
-                        "target_limits_rad": self.action_transform.limits.tolist(),
-                    }
-                }
-                if self.action_transform.limits is not None
-                else {}
-            ),
+            "action_boundary": {
+                "max_requested_action_abs": float(self._action_peak),
+                "saturated_joint_commands": int(self._clipped_joints),
+                "saturated_row_commands": int(self._clipped_rows),
+                "total_joint_commands": self._counts["encoded_steps"]
+                * self.num_envs
+                * 12,
+                "target_limits_rad": self.action_transform.limits.tolist(),
+            },
             "pending_delivery": self.pending_delivery,
             "faulted": self.faulted,
             "qualification_passed": False,

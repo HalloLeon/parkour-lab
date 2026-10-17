@@ -1,9 +1,9 @@
-"""Connected first-attempt evidence through the existing frozen evaluator."""
+"""Loaded-policy playback, outgoing samples and independent offline reports."""
 
 import json
 import tempfile
 import unittest
-from dataclasses import asdict
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import Mock, patch
@@ -11,293 +11,188 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 
-from parkour_lab.control.command_tape import validate_tape
-from parkour_lab.evaluation.runner import evaluate
-from tests.support.isaaclab import modules
-from tests.support.native import make_native_env
+from parkour_lab.evaluation import runner, score_capture
+from parkour_lab.evaluation.cases import EvaluationCase
 
 
-class ConnectedPlaybackTests(unittest.TestCase):
-    def test_bound_attempt_archives_global_id_and_stops_after_first_ending(self):
-        from parkour_lab.config import TaskConfig
-        from parkour_lab.environments.randomization import TaskRandomization
+def _state(position=0.0):
+    return {
+        "position_w": torch.tensor([[position, 0.0, 0.4]]),
+        "quaternion_w": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        "linear_velocity_b": torch.zeros(1, 3),
+        "angular_velocity_b": torch.zeros(1, 3),
+        "foot_position_w": torch.tensor([[[0.0, 0.0, 0.04]] * 4]),
+        "foot_net_forces_w": torch.tensor([[[0.0, 0.0, 10.0]] * 4]),
+        "support_height_w": torch.zeros(1, 4),
+        "support_valid": torch.ones(1, 4, dtype=torch.bool),
+    }
 
-        task = TaskConfig(
-            terrain="connected",
-            num_envs=1,
-            episode_length_s=31,
-            terrain_group="ramp/down/10deg",
-            terrain_attempt_index=50,
+
+@contextmanager
+def _native_fixture(*, ending="terminated", fail=None, changed=False):
+    env = NS(device="cpu", step_dt=0.02, scene=NS(env_origins=torch.zeros(1, 3)))
+    env.index = 0
+    live = _state()
+    policy = NS(state_sha256=lambda: ("b" if changed and env.index else "a") * 64)
+    host = Mock(last_sensor_noise=None)
+    host.motor_verification = {"runtime": True}
+    host.controller.spec.manifest.return_value = {"external": True}
+    host.motor.encode.return_value = torch.zeros(1, 12)
+    host.motor.progress.return_value = {"verified": True}
+    if fail == "inference":
+        host.act.side_effect = RuntimeError("inference failed")
+    if fail == "verification":
+        host.motor.verify_delivery.side_effect = RuntimeError("verification failed")
+
+    def step(action):
+        env.index += 1
+        task.interactions.update(session=env.index, cumulative=env.index)
+        done = env.index == 2
+        terminated = torch.tensor([done and ending in ("terminated", "both")])
+        truncated = torch.tensor([done and ending in ("truncated", "both")])
+        outgoing = _state(float(env.index))
+        if ending == "truncated":
+            outgoing["ending_terrain_boundary"] = truncated.clone()
+        # Mimic automatic reset overwriting the live row after the owned final.
+        live["position_w"].fill_(-99 if done else env.index)
+        return (
+            {},
+            torch.tensor([float(env.index)]),
+            terminated,
+            truncated,
+            {"motion_state": outgoing},
         )
-        env = make_native_env(1)
-        env.cfg.seed = task.seed
-        env.cfg.parkour_task = asdict(task)
-        env.max_episode_length = 2
-        env.scene["robot"].body_names = [
-            "base",
-            "FR_foot",
-            "FL_foot",
-            "RR_foot",
-            "RL_foot",
-        ]
-        env.scene["height_scanner"] = NS(data=NS(ray_hits_w=torch.zeros(1, 132, 3)))
-        env.scene.terrain = NS(
-            world={
-                "vertices": np.zeros((3, 3)),
-                "faces": np.array([[0, 1, 2]]),
-                "metadata": {},
-            },
-            metadata={},
-            native_receipt={},
-        )
-        sampler = env.parkour_randomization = TaskRandomization(
-            task, evaluation=True, nominal_heading=task.world["world_yaw"] - np.pi / 2
-        )
-        sampler.dynamics()
-        env.reset = lambda **kwargs: (sampler.sample_start(None), {})
-        controller = NS(spec=NS(sensors={}), state_sha256=lambda: "fixed")
-        host = Mock(last_sensor_noise=None)
-        host.motor.encode.return_value = torch.zeros(1, 12)
-        host.motor.progress.return_value = {}
-        report = {}
-        commands = (
-            [[0.0, 0.0, 0.0]] * 100
-            + [[0.35, 0.0, 0.0]] * 1250
-            + [[0.0, 0.0, 0.0]] * 150
-        )
-        with (
-            tempfile.TemporaryDirectory() as folder,
-            modules(
-                {
-                    "parkour_lab.environments.dynamics": NS(
-                        dynamics_report=lambda env: {
-                            "randomization": sampler.manifest()
-                        },
-                        start_report=lambda env: {},
-                    )
-                }
+
+    env.step = step
+    task = NS(
+        _env=env,
+        device="cpu",
+        interactions={"session": 0, "cumulative": 0, "uncertain": 0},
+        close=Mock(),
+    )
+    with ExitStack() as stack:
+        for name, replacement in {
+            "make_case_task": Mock(return_value=task),
+            "reset_native": Mock(return_value=torch.ones(1, dtype=torch.bool)),
+            "realization": Mock(
+                return_value={"task": {"reward_recipe": {"core": True}}}
             ),
-            patch(
-                "parkour_lab.evaluation.runner.NativeControllerSession",
-                return_value=host,
-            ),
-        ):
-            evaluate(
-                env,
-                NS(is_running=lambda: True),
-                NS(controller=controller, motor_contract={}),
-                commands,
-                folder,
-                report,
+            "bind_policy": Mock(return_value=host),
+            "check_fixed_terrain": Mock(),
+        }.items():
+            stack.enter_context(
+                patch("parkour_lab.evaluation.environment." + name, replacement)
             )
-            manifest = json.loads((Path(folder) / "manifest.json").read_text())
-            tape = json.loads((Path(folder) / "commands.json").read_text())
-            with np.load(Path(folder) / "tracking.npz") as tracking:
-                self.assertEqual(set(tracking.files), {"root_com_velocity"})
-        self.assertEqual(manifest["group_id"], task.terrain_group)
-        self.assertEqual(manifest["attempts"][0]["attempt_index"], 50)
-        self.assertEqual(manifest["attempts"][0]["stratum"], "randomized")
-        self.assertEqual(
-            report["terrain_assignment"]["streams"], manifest["attempts"][0]["streams"]
-        )
-        self.assertEqual(report["requested_control_steps"], 1500)
-        self.assertEqual(report["control_steps"], 2)
-        self.assertEqual(host.act.call_count, 2)
-        self.assertFalse(tape["complete"])
-        self.assertEqual(report["status"], "FIRST_ATTEMPT_ENDED_NOT_QUALIFIED")
+        stack.enter_context(patch.object(runner, "motion_state", lambda env: live))
+        yield env, task, host, policy
 
-    def test_bound_attempt_rejects_wrong_tape_before_host_or_policy_consumption(self):
-        from parkour_lab.config import TaskConfig
 
-        task = TaskConfig(
-            terrain="connected",
-            num_envs=1,
-            episode_length_s=31,
-            terrain_group="ramp/down/10deg",
-            terrain_attempt_index=50,
-        )
-        env = NS(cfg=NS(parkour_task=asdict(task)), num_envs=1, step_dt=0.02)
-        with (
-            patch("parkour_lab.evaluation.runner.NativeControllerSession") as host,
-            self.assertRaisesRegex(ValueError, "assigned"),
-        ):
-            evaluate(env, None, None, [[0.0, 0.0, 0.0]] * 1500, None, {}, profile=None)
-        host.assert_not_called()
+class LoadedPolicyPlaybackTests(unittest.TestCase):
+    def setUp(self):
+        self.case = EvaluationCase("validation", "Flat", None, "plane", "stand")
 
-    def test_complete_ending_and_error_preserve_distinct_first_attempt_evidence(self):
-        for ending, missing_estimate in (
-            (None, None),
-            ("terminated", None),
-            ("truncated", None),
-            ("both", None),
-            ("error", None),
-            (None, 1),
-        ):
-            with (
-                self.subTest(ending=ending, missing_estimate=missing_estimate),
-                tempfile.TemporaryDirectory() as folder,
-            ):
-                env = make_native_env(1)
-                env.cfg.seed = 42
-                env.cfg.parkour_task = {"terrain": "connected"}
-                robot = env.scene["robot"]
-                robot.data.root_lin_vel_b[:] = torch.tensor([0.1, 0.2, 0.3])
-                robot.data.root_ang_vel_b[:] = torch.tensor([4.0, 5.0, 6.0])
-                robot.body_names = ["base", "FR_foot", "FL_foot", "RR_foot", "RL_foot"]
-                env.scene["height_scanner"] = NS(
-                    data=NS(ray_hits_w=torch.zeros(1, 132, 3))
-                )
-                env.scene.terrain = NS(
-                    world={
-                        "vertices": np.zeros((3, 3)),
-                        "faces": np.array([[0, 1, 2]]),
-                        "metadata": {},
-                    },
-                    metadata={"source": "synthetic"},
-                    native_receipt={"native": "synthetic"},
-                )
-                env.reset = lambda **kwargs: ({}, {})
-                original_step = env.step
-
-                def step(action):
-                    # Native cached tensors and the controller's buffer can change in place.
-                    robot.data.root_lin_vel_b[:] = torch.tensor(
-                        [env.index + 1.0, env.index + 2.0, env.index + 3.0]
+    def test_original_attempt_keeps_terminal_reward_and_owned_outgoing_state(self):
+        for ending in ("terminated", "truncated", "both"):
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory() as temp:
+                folder = Path(temp) / "capture"
+                with _native_fixture(ending=ending) as (env, task, host, policy):
+                    report = runner.evaluate(policy, [self.case], folder, device="cpu")
+                    self.assertEqual(env.index, 2)
+                    task.close.assert_called_once()
+                    self.assertEqual(host.act.call_count, 2)
+                    self.assertTrue(
+                        host.act.call_args_list[0].kwargs["reset_mask"].all()
                     )
-                    if controller.last_estimate is not None:
-                        controller.last_estimate.fill_(-777)
-                    if env.index == 2 and ending == "error":
-                        raise RuntimeError("injected step failure")
-                    robot.data.root_pos_w.fill_(env.index + 1)
-                    env.scene["contact_forces"].data.net_forces_w.fill_(env.index + 1)
-                    values = list(original_step(action))
-                    if env.index == 2 and ending in ("terminated", "truncated", "both"):
-                        values[2].fill_(ending != "truncated")
-                        values[3].fill_(ending != "terminated")
-                        # Outgoing extras own their arrays before this SDK-style reset.
-                        robot.data.root_pos_w.fill_(-99)
-                        robot.data.root_lin_vel_b.fill_(-99)
-                        env.scene["contact_forces"].data.net_forces_w.zero_()
-                    return tuple(values)
-
-                env.step = step
-                controller = NS(spec=NS(sensors={}), state_sha256=lambda: "fixed")
-                host = Mock(last_sensor_noise=None)
-
-                def act(command, *, time_s, reset_mask):
-                    controller.last_estimate = (
-                        None
-                        if env.index == missing_estimate
-                        else torch.tensor(
-                            [
-                                [
-                                    env.index + 10.0,
-                                    env.index + 20.0,
-                                    env.index + 30.0,
-                                    99.0,
-                                ]
-                            ]
-                        )
+                    self.assertFalse(
+                        host.act.call_args_list[1].kwargs["reset_mask"].any()
                     )
-                    return "unchanged-targets"
-
-                host.act.side_effect = act
-                host.motor.encode.return_value = torch.zeros(1, 12)
-                host.motor.progress.return_value = {"delivery": "synthetic"}
-                report = {}
-                with patch(
-                    "parkour_lab.evaluation.runner.NativeControllerSession",
-                    return_value=host,
-                ):
-                    if ending == "error":
-                        with self.assertRaisesRegex(RuntimeError, "injected"):
-                            evaluate(
-                                env,
-                                NS(is_running=lambda: True),
-                                NS(controller=controller, motor_contract={}),
-                                [(0, 0, 0)] * 5,
-                                folder,
-                                report,
-                            )
-                    else:
-                        evaluate(
-                            env,
-                            NS(is_running=lambda: True),
-                            NS(controller=controller, motor_contract={}),
-                            [(0, 0, 0)] * 5,
-                            folder,
-                            report,
-                        )
-                tape = json.loads((Path(folder) / "commands.json").read_text())
-                validate_tape(tape, require_complete=False)
-                expected_steps = 5 if ending is None else 2
-                self.assertEqual(tape["steps"], expected_steps)
-                self.assertEqual(tape["complete"], ending is None)
-                self.assertEqual(env.index, expected_steps)
-                self.assertFalse(env.capture_motion)
-                self.assertFalse(env.capture_diagnostics)
-                with np.load(Path(folder) / "tracking.npz") as tracking:
-                    expected_linear = np.array(
-                        [
-                            [[0.1, 0.2, 0.3]],
-                            *[
-                                [[step, step + 1, step + 2]]
-                                for step in range(1, expected_steps)
-                            ],
-                        ],
-                        dtype=np.float32,
-                    )
-                    expected_estimate = np.array(
-                        [
-                            [[step + 10, step + 20, step + 30]]
-                            for step in range(expected_steps)
-                        ],
-                        dtype=np.float32,
-                    )
-                    if missing_estimate is not None:
-                        expected_estimate[missing_estimate] = np.nan
-                    np.testing.assert_array_equal(
-                        tracking["root_com_linear_velocity_b"], expected_linear
-                    )
-                    np.testing.assert_array_equal(
-                        tracking["estimated_linear_velocity_b"], expected_estimate
-                    )
-                    np.testing.assert_array_equal(
-                        tracking["root_com_velocity"][:, :, :2],
-                        expected_linear[:, :, :2],
-                    )
-                    np.testing.assert_array_equal(
-                        tracking["root_com_velocity"][:, :, 2], 6
-                    )
+                result = report["cases"][0]
+                self.assertEqual(result["observed_steps"], 2)
+                self.assertEqual(result["core_return"], 3.0)
+                self.assertEqual(result["physical_failure"], ending != "truncated")
+                self.assertIsNone(result["phases"]["settled_motion"]["yaw_rmse_rad_s"])
+                self.assertEqual(report, score_capture(folder))
                 self.assertEqual(
-                    set(host.act.call_args.kwargs), {"time_s", "reset_mask"}
+                    report, json.loads((folder / "report.json").read_text())
                 )
-                self.assertTrue(
-                    torch.equal(env.action_manager.action, torch.zeros(1, 12))
+                self.assertTrue(report["capture_valid"])
+                self.assertFalse(report["valid_for_comparison"])
+                with np.load(folder / self.case.case_id / "trace.npz") as trace:
+                    np.testing.assert_array_equal(
+                        trace["root_position_w"][:, 0], [1, 2]
+                    )
+                    self.assertEqual(trace["reward"].sum(), 3)
+
+    def test_inference_failure_preserves_unobserved_case_and_closes_context(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "capture"
+            with _native_fixture(fail="inference") as (_, task, _, policy):
+                with self.assertRaisesRegex(RuntimeError, "inference failed"):
+                    runner.evaluate(policy, [self.case], folder, device="cpu")
+                task.close.assert_called_once()
+            report = score_capture(folder)
+            self.assertEqual(report["capture_status"], "ERROR")
+            self.assertFalse(report["valid_for_comparison"])
+            self.assertEqual(report["aggregate"]["overall"]["prescribed_attempts"], 1)
+            self.assertIsNone(report["aggregate"]["overall"]["core_return_mean"])
+
+    def test_delivery_failure_retains_physical_transition_and_partial_return(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "capture"
+            with _native_fixture(fail="verification") as (env, task, _, policy):
+                with self.assertRaisesRegex(RuntimeError, "verification failed"):
+                    runner.evaluate(policy, [self.case], folder, device="cpu")
+                self.assertEqual(env.index, 1)
+                task.close.assert_called_once()
+            report = score_capture(folder)
+            self.assertFalse(report["valid_for_comparison"])
+            self.assertEqual(report["cases"][0]["observed_steps"], 1)
+            self.assertIsNone(report["cases"][0]["core_return"])
+
+    def test_changed_normalization_or_weights_fails_and_keeps_receipt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "capture"
+            with _native_fixture(changed=True) as (_, task, _, policy):
+                with self.assertRaisesRegex(RuntimeError, "Policy parameters"):
+                    runner.evaluate(policy, [self.case], folder, device="cpu")
+                task.close.assert_called_once()
+            report = score_capture(folder)
+            self.assertFalse(report["valid_for_comparison"])
+            self.assertEqual(report["final_policy_state_sha256"], "b" * 64)
+
+    def test_interruption_keeps_unattempted_cases_in_prescribed_denominator(self):
+        other = EvaluationCase("validation", "Flat", None, "plane", "arc-right")
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "capture"
+            policy = NS(state_sha256=lambda: "a" * 64)
+            with patch.object(runner, "_run_case") as run:
+                report = runner.evaluate(
+                    policy,
+                    [self.case, other],
+                    folder,
+                    app=NS(is_running=lambda: False),
                 )
-                with np.load(Path(folder) / "motion.npz") as motion:
-                    self.assertEqual(len(motion["position_w"]), expected_steps)
-                    np.testing.assert_array_equal(
-                        motion["position_w"][-1], expected_steps
-                    )
-                    np.testing.assert_array_equal(
-                        motion["foot_net_forces_w"][-1], expected_steps
-                    )
-                    self.assertIn("initial_base_surface_hits_w", motion)
-                self.assertIn("world.npz", report["evidence_sha256"])
-                if ending != "error":
-                    self.assertEqual(report["control_steps"], expected_steps)
-                    self.assertEqual(report["requested_control_steps"], 5)
-                    self.assertTrue(report["policy_unchanged"])
-                    self.assertEqual(
-                        report["status"],
-                        (
-                            "EVALUATION_COMPLETE_NOT_QUALIFIED"
-                            if ending is None
-                            else "FIRST_ATTEMPT_ENDED_NOT_QUALIFIED"
-                        ),
-                    )
+                run.assert_not_called()
+            overall = report["aggregate"]["overall"]
+            self.assertEqual(overall["prescribed_attempts"], 2)
+            self.assertEqual(overall["missing_attempts"], 2)
+            self.assertEqual(report["capture_status"], "INTERRUPTED")
 
+    def test_trace_digest_detects_later_rewrite(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "capture"
+            with _native_fixture() as (_, _, _, policy):
+                runner.evaluate(policy, [self.case], folder, device="cpu")
+            path = folder / self.case.case_id / "trace.npz"
+            path.write_bytes(path.read_bytes() + b"changed")
+            with self.assertRaisesRegex(ValueError, "Trace digest"):
+                score_capture(folder)
 
-if __name__ == "__main__":
-    unittest.main()
+    def test_bad_case_selection_rejected_before_native_or_output(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "capture"
+            with patch.object(runner, "_run_case") as run:
+                with self.assertRaisesRegex(ValueError, "distinct"):
+                    runner.evaluate(None, [self.case, self.case], folder)
+                run.assert_not_called()
+            self.assertFalse(folder.exists())

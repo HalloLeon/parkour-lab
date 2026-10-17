@@ -9,6 +9,7 @@ import torch
 
 import parkour_lab.runtime.motor as motor_bridge
 from parkour_lab.control import motor_contract
+from parkour_lab.control.action import BOUNDED_RAW_ACTION_MEANING
 from parkour_lab.control.controller import JointTargets
 from tests.support.native import make_native_env
 
@@ -17,15 +18,22 @@ class NativeJointTargetBridgeTests(unittest.TestCase):
     def fixture(self, *, preserve=False, count=3):
         env = make_native_env(count)
         binding, digest = motor_bridge._runtime_motor_binding(env)
+        limits = env.scene["robot"].data.soft_joint_pos_limits[0].tolist()
         manifest = {
             "joint_names": binding["joint_names"],
-            "configuration": {"default_position_rad": binding["default_position_rad"]},
+            "configuration": {
+                "default_position_rad": binding["default_position_rad"],
+                "action_clip": {
+                    "version": "joint_limits_v1",
+                    "target_limits_rad": limits,
+                },
+            },
             "period_s": 0.02,
             "actuator_profile": "native_motor_sha256:" + digest,
-            "raw_action_meaning": motor_bridge.NATIVE_RAW_ACTION_MEANING,
+            "raw_action_meaning": BOUNDED_RAW_ACTION_MEANING,
         }
         contract = motor_contract.make_motor_contract(
-            binding, manifest["actuator_profile"]
+            binding, manifest["actuator_profile"], target_limits_rad=limits
         )
         bridge = motor_bridge.NativeJointTargetBridge(
             env, contract, manifest, preserve_native_raw=preserve
@@ -131,17 +139,27 @@ class NativeJointTargetBridgeTests(unittest.TestCase):
         for meaning in (
             "private latent",
             None,
-            motor_bridge.NATIVE_RAW_ACTION_MEANING + " ",
+            BOUNDED_RAW_ACTION_MEANING + " ",
         ):
             changed = {**manifest, "raw_action_meaning": meaning}
             with (
                 self.subTest(meaning=meaning),
-                self.assertRaisesRegex(ValueError, "exact stock"),
+                self.assertRaisesRegex(ValueError, "exact bounded"),
             ):
                 motor_bridge.NativeJointTargetBridge(
                     env, contract, changed, preserve_native_raw=True
                 )
             motor_bridge.NativeJointTargetBridge(env, contract, changed)
+
+    def test_target_only_outside_joint_limits_rejects_without_silent_clipping(self):
+        env, bridge, _, _ = self.fixture()
+        target = bridge.default.clone()
+        target[0, 0] = 1.25
+        with self.assertRaisesRegex(ValueError, "exceed archived bounds"):
+            bridge.encode(JointTargets(bridge.joint_names, target))
+        self.assertEqual(env.index, 0)
+        self.assertEqual(bridge.progress()["encoded_steps"], 0)
+        self.assert_faulted(bridge)
 
     def test_invalid_trusted_hint_faults_without_delivery(self):
         for hint in (

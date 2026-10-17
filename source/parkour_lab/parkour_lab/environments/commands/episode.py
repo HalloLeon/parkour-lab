@@ -1,10 +1,9 @@
 """Shared episode categories with sustained-translation curriculum eligibility."""
 
 import torch
+from isaaclab.envs.mdp.commands import UniformVelocityCommand
 
-from parkour_lab.environments.terrains.families.curriculum import initialize_levels
-
-from .native import FlatVelocityCommand
+from parkour_lab.environments.terrains.curriculum import initialize_levels
 
 VERSION = "go2_episode_twist_v1"
 CATEGORIES = (
@@ -19,11 +18,19 @@ PROBABILITIES = (0.5, 0.1, 0.1, 0.1, 0.1, 0.1)
 PERIOD_STEPS = 1000
 
 
-class EpisodeVelocityCommand(FlatVelocityCommand):
+class EpisodeVelocityCommand(UniformVelocityCommand):
     """Hold one independently sampled body twist until the physical episode ends."""
 
     def __init__(self, cfg, env):
+        if cfg.heading_command or cfg.rel_heading_envs or cfg.rel_standing_envs:
+            raise ValueError("Episode commands own stops; disable heading overrides")
         super().__init__(cfg, env)
+        from ..dynamics import get_randomization
+
+        self.randomization = get_randomization(env)
+        self.remaining_ticks = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
         self.category = torch.full(
             (self.num_envs,), -1, dtype=torch.long, device=self.device
         )
@@ -44,7 +51,15 @@ class EpisodeVelocityCommand(FlatVelocityCommand):
 
     def compute(self, dt):
         self.curriculum_eligible &= (self.vel_command_b == self.episode_command).all(-1)
-        super().compute(dt)
+        if dt != 0.02:
+            raise ValueError("Episode commands require 50 Hz control")
+        self._update_metrics()
+        # Same-step autoreset rows have not executed their new command yet.
+        sampled = torch.isfinite(self.time_left)
+        self.remaining_ticks -= (sampled & (self._env.episode_length_buf > 0)).long()
+        self._resample((sampled & (self.remaining_ticks <= 0)).nonzero().flatten())
+        self.time_left[sampled] = self.remaining_ticks[sampled] * dt
+        self._update_command()
 
     def _resample(self, env_ids):
         if isinstance(env_ids, slice):

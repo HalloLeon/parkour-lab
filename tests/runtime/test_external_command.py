@@ -13,16 +13,20 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace as NS
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import torch
 
-import parkour_lab.environments.terrains.traversal as terrain
 import parkour_lab.runtime.native as runtime
-from parkour_lab.methods.roa.environment import ROAEnvironment
-from parkour_lab.runtime.training import TrainingHost
+from parkour_lab.benchmark import Go2Config, build_config
+from parkour_lab.control.controller import ControllerSpec, JointTargets
+from parkour_lab.control.motor_contract import make_motor_contract
+from parkour_lab.environments.randomization import TaskRandomization
+from parkour_lab.runtime.motor import _runtime_motor_binding
+from tests.support import SOURCE_ROOT
 from tests.support.isaaclab import pinned_source_root
-from tests.support.native import TrainingEnvironmentFixture
+from tests.support.native import NativeEnvironmentFixture
+from tests.support.public_task import public_configs
 
 
 @contextmanager
@@ -69,6 +73,10 @@ def native_command_classes():
     module("isaaclab.envs")
     module("isaaclab.envs.mdp")
     commands = module("isaaclab.envs.mdp.commands")
+    module(
+        "parkour_lab.environments.dynamics",
+        get_randomization=lambda env: env.parkour_randomization,
+    )
 
     def load(name, path):
         spec = importlib.util.spec_from_file_location(name, path)
@@ -81,6 +89,7 @@ def native_command_classes():
         "isaaclab.managers.manager_base",
         "isaaclab.managers.command_manager",
         "isaaclab.envs.mdp.commands.velocity_command",
+        "parkour_lab.environments.commands._episode_native_test",
     )
     missing = object()
     originals = {
@@ -103,11 +112,16 @@ def native_command_classes():
             source / "envs/mdp/commands/velocity_command.py",
         )
         commands.UniformVelocityCommand = velocity.UniformVelocityCommand
+        episode = load(
+            "parkour_lab.environments.commands._episode_native_test",
+            SOURCE_ROOT / "parkour_lab/environments/commands/episode.py",
+        )
         yield NS(
             source=source,
             ManagerTermBase=base.ManagerTermBase,
             CommandTerm=manager.CommandTerm,
             UniformVelocityCommand=velocity.UniformVelocityCommand,
+            EpisodeVelocityCommand=episode.EpisodeVelocityCommand,
             forbidden=forbidden,
         )
     finally:
@@ -118,52 +132,16 @@ def native_command_classes():
                 sys.modules[name] = original
 
 
-def inherited_command_config():
-    """Nonzero archived sampling defaults that external ownership must replace."""
-    return NS(
-        class_type="training_20_column_sampler",
-        asset_name="robot",
-        heading_command=True,
-        heading_control_stiffness=0.5,
-        rel_heading_envs=0.7,
-        rel_standing_envs=0.2,
-        ranges=NS(
-            lin_vel_x=(-1.0, 1.0),
-            lin_vel_y=(-0.5, 0.5),
-            ang_vel_z=(-1.0, 1.0),
-            heading=(-3.14, 3.14),
-        ),
-        resampling_time_range=(2.0, 3.0),
-        debug_vis=True,
-        untouched_source_field="retained",
-    )
-
-
-def traversal_config():
-    return NS(
-        commands=NS(base_velocity=inherited_command_config()),
-        scene=NS(terrain=NS(terrain_generator=None, max_init_terrain_level=0)),
-        events=NS(reset_base=NS(params={"pose_range": {}})),
-        terminations=NS(
-            procedural_physical_failure=NS(params={"minimum_surface_z_m": -1})
-        ),
-    )
-
-
 class ExternalCommandTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         pinned_source_root()
-        cls.fixtures = terrain.preflight(1043)
 
     def setUp(self):
         rng = torch.random.fork_rng(devices=[])
         rng.__enter__()
         self.addCleanup(rng.__exit__, None, None, None)
         torch.manual_seed(143)
-        receipts = patch.object(terrain, "_RECEIPTS", [])
-        receipts.start()
-        self.addCleanup(receipts.stop)
 
     def assert_external_config(self, cfg, command_class):
         self.assertIs(cfg.class_type, command_class)
@@ -172,29 +150,27 @@ class ExternalCommandTests(unittest.TestCase):
         self.assertIsNone(cfg.ranges.heading)
         for name in ("lin_vel_x", "lin_vel_y", "ang_vel_z"):
             self.assertEqual(getattr(cfg.ranges, name), (0.0, 0.0))
-        self.assertEqual(cfg.resampling_time_range, (1e9, 1e9))
+        self.assertEqual(cfg.resampling_time_range, (20.0, 20.0))
         self.assertFalse(cfg.debug_vis)
-        self.assertEqual(cfg.untouched_source_field, "retained")
-        self.assertEqual(cfg.heading_control_stiffness, 0.5)
         self.assertEqual(cfg.asset_name, "robot")
 
     def configure_fixture(self, native):
-        cfg = traversal_config()
-        terrain.configure(cfg, 1043, self.fixtures)
-        self.assertEqual(cfg.scene.terrain.terrain_generator.num_cols, 4)
+        with public_configs():
+            cfg = build_config(
+                Go2Config(num_envs=4, seed=143, device="cpu"), training=False
+            )
+        # The small stock-config double omits this SDK-inherited asset selector.
+        cfg.commands.base_velocity.asset_name = "robot"
+        cfg.commands.base_velocity.class_type = native.EpisodeVelocityCommand
         self.assert_external_config(
-            cfg.commands.base_velocity, native.UniformVelocityCommand
+            cfg.commands.base_velocity, native.EpisodeVelocityCommand
         )
-        fixture = TrainingEnvironmentFixture(count=4)
-        fixture.env.cfg.scene = cfg.scene
-        fixture.env.scene["terrain"] = NS(
-            terrain_types=torch.arange(4),
-            terrain_levels=torch.zeros(4, dtype=torch.long),
+        fixture = NativeEnvironmentFixture(count=4)
+        fixture.env.cfg = cfg
+        fixture.env.parkour_randomization = TaskRandomization(
+            cfg.parkour_task, evaluation=True
         )
-        term = cfg.commands.base_velocity.class_type(
-            cfg.commands.base_velocity, fixture.env
-        )
-        self.assertIs(type(term), native.UniformVelocityCommand)
+        term = native.EpisodeVelocityCommand(cfg.commands.base_velocity, fixture.env)
         self.assertIsInstance(term, native.CommandTerm)
         self.assertIsInstance(term, native.ManagerTermBase)
         fixture.command_term = term
@@ -206,22 +182,12 @@ class ExternalCommandTests(unittest.TestCase):
         fixture.next_timed_out = torch.zeros(4, dtype=torch.bool)
         return fixture, term
 
-    def test_helper_accepts_injected_class_without_importing_simulator(self):
-        cfg = inherited_command_config()
-        with native_command_classes() as native:
-            selected = native.UniformVelocityCommand
-        # The source class survives module cleanup; this branch must not need
-        # the lazy default native import at all.
-        with patch.dict(sys.modules, {"isaaclab.envs.mdp.commands": None}):
-            runtime.configure_external_command(cfg, command_class=selected)
-        self.assert_external_config(cfg, selected)
-
-    def test_traversal_config_constructs_real_command_on_four_columns(self):
+    def test_public_config_constructs_real_episode_on_four_flat_replicas(self):
         with native_command_classes() as native:
             fixture, term = self.configure_fixture(native)
             self.assertEqual(
                 Path(inspect.getfile(type(term))),
-                native.source / "envs/mdp/commands/velocity_command.py",
+                SOURCE_ROOT / "parkour_lab/environments/commands/episode.py",
             )
             self.assertEqual(
                 Path(inspect.getfile(native.CommandTerm)),
@@ -229,14 +195,11 @@ class ExternalCommandTests(unittest.TestCase):
             )
             metrics = term.reset(torch.arange(4))
             self.assertEqual(set(metrics), {"error_vel_xy", "error_vel_yaw"})
-            self.assertTrue((term.command == 0).all())
-            self.assertTrue((term.time_left == 1e9).all())
+            self.assertTrue(torch.isfinite(term.command).all())
+            self.assertTrue((term.time_left == 20.0).all())
             self.assertTrue((term.command_counter == 1).all())
             self.assertFalse(term.is_heading_env.any())
-            self.assertFalse(term.is_standing_env.any())
-            self.assertEqual(
-                fixture.env.cfg.scene.terrain.terrain_generator.num_cols, 4
-            )
+            self.assertEqual(fixture.env.cfg.benchmark_task_id, "Go2-Flat-v1")
             native.forbidden.assert_not_called()
 
     def test_real_compute_preserves_signed_external_commands_without_resampling(self):
@@ -244,6 +207,8 @@ class ExternalCommandTests(unittest.TestCase):
             _, term = self.configure_fixture(native)
             term.reset(torch.arange(4))
             counter = term.command_counter.clone()
+            term.time_left.fill_(float("inf"))
+            term.is_standing_env.fill_(False)
             term.heading_target.fill_(100.0)
             term.is_heading_env.fill_(
                 True
@@ -259,21 +224,47 @@ class ExternalCommandTests(unittest.TestCase):
                 self.assertTrue((term.time_left > 0).all())
             native.forbidden.assert_not_called()
 
-    def test_real_partial_reset_zeroes_only_reset_rows_then_resumes_external_tape(self):
+    def test_real_partial_reset_preserves_outgoing_rows_then_resumes_external_tape(
+        self,
+    ):
         with native_command_classes() as native:
             fixture, term = self.configure_fixture(native)
-            host = ROAEnvironment(TrainingHost(fixture.env, fixture.app))
-            observations, reset = host.reset(seed=143, command=(0.4, 0.0, 0.5))
-            self.assertTrue(reset.all())
-            original_history = observations["history"].reshape(4, 25, 49).clone()
-            self.assertTrue(
-                torch.equal(original_history[:, -1], observations["policy"])
+            fixture.env.reset(seed=143)
+            binding, digest = _runtime_motor_binding(fixture.env)
+            profile = "native_motor_sha256:" + digest
+            limits = fixture.data.soft_joint_pos_limits[0].tolist()
+            raw = torch.linspace(-0.2, 0.2, 12).repeat(4, 1)
+            default = fixture.data.default_joint_pos
+            spec = ControllerSpec(
+                name="external_command_fixture",
+                artifact_sha256="a" * 64,
+                preprocessing_version="named_inputs_v1",
+                joint_names=tuple(binding["joint_names"]),
+                period_s=0.02,
+                actuator_profile=profile,
+                sensors={},
+                raw_action_meaning="none",
+                configuration={
+                    "default_position_rad": binding["default_position_rad"],
+                    "action_clip": {
+                        "version": "joint_limits_v1",
+                        "target_limits_rad": limits,
+                    },
+                },
             )
-            self.assertTrue(
-                torch.equal(
-                    original_history, observations["policy"][:, None].repeat(1, 25, 1)
-                )
+            controller = NS(
+                spec=spec,
+                reset=lambda mask: None,
+                act=lambda inputs: JointTargets(spec.joint_names, default + 0.25 * raw),
             )
+            host = runtime.NativeControllerSession(
+                fixture.env,
+                controller,
+                make_motor_contract(binding, profile, target_limits_rad=limits),
+            )
+            first = torch.ones(4, dtype=torch.bool)
+            initial_command = torch.tensor((0.4, 0.0, 0.5)).expand(4, 3)
+            targets = host.act(initial_command, time_s=0.0, reset_mask=first)
             self.assertTrue(torch.isinf(term.time_left).all())
             selected = torch.tensor([False, True, False, True])
             fixture.next_terminated = selected.clone()
@@ -289,12 +280,21 @@ class ExternalCommandTests(unittest.TestCase):
             fixture.on_step = native_command_update
             raw = torch.linspace(-0.2, 0.2, 12).repeat(4, 1)
             next_command = (-0.2, 0.1, -0.5)
-            observations, _, done, _ = host.step(
-                raw, "external_command_regression", next_command=next_command
+            delivered = host.motor.encode(targets)
+            observations, _, terminated, truncated, extras = fixture.env.step(delivered)
+            host.motor.verify_delivery(terminated, truncated)
+            done = terminated | truncated
+            targets = host.act(
+                torch.tensor(next_command).expand(4, 3), time_s=0.02, reset_mask=done
             )
+            observations = fixture.observations()
             self.assertTrue(torch.equal(done, selected))
             self.assertEqual(len(reset_commands), 1)
-            self.assertTrue((reset_commands[0][selected] == 0).all())
+            self.assertTrue(torch.isfinite(reset_commands[0][selected]).all())
+            torch.testing.assert_close(
+                extras["final_observation"]["proprio"][:, 6:9],
+                initial_command[selected],
+            )
             self.assertTrue(
                 torch.equal(
                     reset_commands[0][~selected],
@@ -303,38 +303,42 @@ class ExternalCommandTests(unittest.TestCase):
             )
             expected = torch.tensor(next_command).expand(4, 3)
             self.assertTrue(torch.equal(term.command, expected))
-            self.assertTrue(torch.equal(observations["policy"][:, 6:9], expected))
-            self.assertTrue(
-                torch.equal(observations["critic_state"][:, 9:12], expected)
-            )
-            history = observations["history"].reshape(4, 25, 49)
-            self.assertTrue(torch.equal(history[:, -1], observations["policy"]))
+            self.assertTrue(torch.equal(observations["proprio"][:, 6:9], expected))
+            self.assertTrue(torch.equal(observations["policy"][:, 9:12], expected))
+            self.assertFalse(observations["proprio"][selected, 33:45].any())
             self.assertTrue(
                 torch.equal(
-                    history[selected],
-                    observations["policy"][selected, None].repeat(1, 25, 1),
+                    observations["proprio"][~selected, 33:45], delivered[~selected]
                 )
             )
             self.assertTrue(
-                torch.equal(history[~selected, :-1], original_history[~selected, 1:])
-            )
-            self.assertTrue((observations["policy"][selected, 33:45] == 0).all())
-            self.assertTrue(
-                torch.equal(observations["policy"][~selected, 33:45], raw[~selected])
+                torch.equal(
+                    extras["final_observation"]["proprio"][:, 33:45],
+                    delivered[selected],
+                )
             )
             self.assertFalse(term.is_heading_env.any())
             self.assertFalse(term.is_standing_env.any())
             self.assertTrue(torch.isinf(term.time_left).all())
             fixture.next_terminated.zero_()
             counter = term.command_counter.clone()
-            for command in ((0.0, 0.0, 0.0), (0.3, 0.0, 0.4), (0.0, 0.0, -0.4)):
-                observations, _, done, _ = host.step(
-                    raw, "external_command_regression", next_command=command
+            for index, command in enumerate(
+                ((0.0, 0.0, 0.0), (0.3, 0.0, 0.4), (0.0, 0.0, -0.4)), start=2
+            ):
+                delivered = host.motor.encode(targets)
+                _, _, terminated, truncated, _ = fixture.env.step(delivered)
+                host.motor.verify_delivery(terminated, truncated)
+                done = terminated | truncated
+                targets = host.act(
+                    torch.tensor(command).expand(4, 3),
+                    time_s=index * 0.02,
+                    reset_mask=done,
                 )
+                observations = fixture.observations()
                 self.assertFalse(done.any())
                 self.assertTrue(
                     torch.equal(
-                        observations["policy"][:, 6:9],
+                        observations["proprio"][:, 6:9],
                         torch.tensor(command).expand(4, 3),
                     )
                 )

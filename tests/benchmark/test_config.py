@@ -16,10 +16,7 @@ from parkour_lab.benchmark.config import (
     TerrainConfig,
     build_config,
 )
-from parkour_lab.config import TaskConfig as WorkflowTaskConfig
-from parkour_lab.environments.configuration import build_environment_config
 from parkour_lab.environments.rewards import reward_recipe
-from parkour_lab.environments.task_config import TaskConfig
 from tests.support.isaaclab import (
     NativeConfig,
     NativeRewardTerm,
@@ -84,14 +81,8 @@ class Guard:
 sys.meta_path.insert(0, Guard())
 from parkour_lab.benchmark.config import Go2Config, TASK_IDS, build_config
 assert Go2Config().task_id == 'Go2-Flat-v1'
-for name, (_, supported) in TASK_IDS.items():
-    if not supported:
-        try:
-            build_config(Go2Config(task_id=name))
-        except NotImplementedError:
-            pass
-        else:
-            raise AssertionError(name)
+for name in TASK_IDS:
+    assert Go2Config(task_id=name).task_id == name
 """,
             ],
             capture_output=True,
@@ -99,15 +90,15 @@ for name, (_, supported) in TASK_IDS.items():
             check=False,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIs(WorkflowTaskConfig, TaskConfig)
-        self.assertEqual(TaskConfig().terrain, "procedural")
 
     def test_options_are_frozen_and_all_declared_families_are_available(self):
         options = Go2Config()
         with self.assertRaises(FrozenInstanceError):
             options.seed = 1
         self.assertEqual(len(TASK_IDS), 6)
-        self.assertTrue(all(ready for _, ready in TASK_IDS.values()))
+        self.assertEqual(
+            TASK_IDS["Go2-Mixed-v1"], ("Flat", "Uneven", "Slopes", "Stairs", "Hills")
+        )
         for kwargs in (
             {"task_id": "missing"},
             {"task_id": []},
@@ -137,7 +128,7 @@ for name, (_, supported) in TASK_IDS.items():
                     self.assertEqual(cfg.benchmark_task_id, task_id)
                     self.assertEqual(cfg.benchmark_terrain["task_id"], task_id)
                     self.assertIsNone(cfg.observations.policy)
-                    self.assertIsNone(cfg.observations.terrain)
+                    self.assertFalse(hasattr(cfg.observations, "terrain"))
                     self.assertEqual(
                         cfg.commands.base_velocity.resampling_time_range, (20, 20)
                     )
@@ -183,9 +174,9 @@ for name, (_, supported) in TASK_IDS.items():
         self.assertEqual(cfg.benchmark_task_id, "Go2-Flat-v1")
         self.assertTrue(cfg.benchmark_training)
         self.assertIsNone(cfg.observations.policy)
-        self.assertIsNone(cfg.observations.terrain)
+        self.assertFalse(hasattr(cfg.observations, "terrain"))
         self.assertIsNotNone(cfg.observations.proprio)
-        self.assertIsNone(cfg.terminations.procedural_physical_failure)
+        self.assertFalse(hasattr(cfg.terminations, "procedural_physical_failure"))
         self.assertFalse(cfg.terminations.base_contact.time_out)
         self.assertTrue(cfg.terminations.time_out.time_out)
         for name, expected in vars(rough.rewards).items():
@@ -201,21 +192,6 @@ for name, (_, supported) in TASK_IDS.items():
         self.assertFalse(hasattr(cfg.rewards, "joint_posture"))
         cfg.rewards.feet_air_time.params["threshold"] = 0.37
         self.assertEqual(rough.rewards.feet_air_time.params["threshold"], 0.5)
-
-    def test_current_workflow_defaults_stay_unchanged(self):
-        with native_config_modules(rough=rough_recipe()):
-            cfg = build_environment_config(TaskConfig(terrain="flat"))
-            evaluation = build_config(Go2Config(device="cpu"), training=False)
-        self.assertEqual(cfg.rewards.flat_orientation_l2.weight, -2.5)
-        self.assertEqual(cfg.rewards.dof_pos_limits.weight, -10)
-        self.assertEqual(cfg.rewards.feet_air_time.weight, 0.01)
-        self.assertIsNotNone(cfg.terminations.procedural_physical_failure)
-        self.assertIsNotNone(cfg.observations.policy)
-        self.assertIsNotNone(cfg.observations.terrain)
-        self.assertFalse(evaluation.benchmark_training)
-        self.assertEqual(
-            evaluation.commands.base_velocity.resampling_time_range, (20.0, 20.0)
-        )
 
     def test_native_configuration_accepts_added_reward_and_zero_disables_computation(
         self,

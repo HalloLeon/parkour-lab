@@ -9,8 +9,6 @@ implemented here. Privilege filtering is an API boundary, not a Python sandbox.
 from __future__ import annotations
 
 import copy
-import hashlib
-import json
 import math
 from dataclasses import asdict, dataclass, field
 from types import MappingProxyType
@@ -128,8 +126,6 @@ class ControllerSession:
         *,
         joint_names: tuple[str, ...],
         actuator_profile: str,
-        allow_privileged=False,
-        capture=False,
     ):
         self.controller = controller
         spec = controller.spec
@@ -162,35 +158,51 @@ class ControllerSession:
                 or sensor.max_age_s < 0
             ):
                 raise ValueError("Invalid sensor specification")
-            if sensor.privileged and not allow_privileged:
+            if sensor.privileged:
                 raise ValueError(f"Privileged sensor forbidden: {name}")
         self.manifest = copy.deepcopy(spec.manifest())
-        encoded = json.dumps(self.manifest, sort_keys=True, allow_nan=False).encode()
-        self.interface_sha256 = hashlib.sha256(encoded).hexdigest()
         self.time_s = None
         self.batch_signature = None
         self.faulted = False
-        self.allow_privileged = allow_privileged
         self.reset_at_s = None
-        self.record = None
-        self.capture = capture
 
     def step(self, *, time_s, command, command_time_s, sensors, reset_mask):
         if self.faulted:
             raise RuntimeError("Controller session faulted; external recovery required")
-        self.record = None
         try:
             return self._step(time_s, command, command_time_s, sensors, reset_mask)
-        except Exception as error:
+        except Exception:
             self.faulted = True
-            if self.record is not None:
-                self.record.update(status="FAULT", error=str(error))
             raise
 
     def _step(self, time_s, command, command_time_s, sensors, reset_mask):
         spec = self.controller.spec
         if spec.manifest() != self.manifest:
             raise ValueError("Controller specification changed during session")
+        signature, reset_at = self._validate_decision(
+            spec, time_s, command, command_time_s, reset_mask
+        )
+        delivered = self._project_sensors(spec, sensors, command, time_s, reset_at)
+        # Only declared causal inputs reach inference; episode memory stays upstream.
+        self.controller.reset(reset_mask.clone())
+        with torch.inference_mode():
+            output = self.controller.act(
+                ControllerInput(
+                    time_s,
+                    command.detach().clone(),
+                    command_time_s,
+                    MappingProxyType(delivered),
+                )
+            )
+        self._validate_output(output, spec, command)
+        self.time_s, self.batch_signature, self.reset_at_s = time_s, signature, reset_at
+        return JointTargets(
+            output.joint_names,
+            output.position_rad.detach().clone(),
+            None if output.raw_action is None else output.raw_action.detach().clone(),
+        )
+
+    def _validate_decision(self, spec, time_s, command, command_time_s, reset_mask):
         if not math.isfinite(time_s) or time_s < 0:
             raise ValueError("Invalid decision time")
         if self.time_s is not None and not math.isclose(
@@ -228,7 +240,11 @@ class ControllerSession:
             else self.reset_at_s.clone()
         )
         reset_at[reset_mask] = time_s
-        delivered = {}
+        return signature, reset_at
+
+    @staticmethod
+    def _project_sensors(spec, sensors, command, time_s, reset_at):
+        batch, delivered = len(command), {}
         for name, requirement in spec.sensors.items():
             sample = sensors.get(name)
             if sample is None:
@@ -239,9 +255,7 @@ class ControllerSession:
             finite_tensor(sample.value, (batch, *requirement.shape), command)
             if sample.units != requirement.units or sample.frame != requirement.frame:
                 raise ValueError(f"Sensor units/frame differ: {name}")
-            if sample.privileged and (
-                not self.allow_privileged or not requirement.privileged
-            ):
+            if sample.privileged:
                 raise ValueError(f"Privileged provider sample forbidden: {name}")
             age = time_s - sample.acquired_at_s
             if not math.isfinite(age) or age < 0 or age > requirement.max_age_s + 1e-9:
@@ -256,9 +270,8 @@ class ControllerSession:
             if torch.any(sample.valid & (sample.acquired_at_s < reset_at)):
                 raise ValueError(f"Sensor predates episode reset: {name}")
             value = sample.value.detach().clone()
-            value[~sample.valid] = (
-                0  # Invalid optional rows must not leak old episode data.
-            )
+            # Invalid optional rows must not leak data from their old episodes.
+            value[~sample.valid] = 0
             delivered[name] = Sample(
                 value,
                 sample.acquired_at_s,
@@ -267,52 +280,13 @@ class ControllerSession:
                 sample.frame,
                 sample.privileged,
             )
-        # Snapshot before inference: even a badly behaved adapter cannot rewrite
-        # what the recorder says it received. Store one step, not another run log.
-        self.record = (
-            None
-            if not self.capture
-            else {
-                "version": VERSION,
-                "interface_sha256": self.interface_sha256,
-                "time_s": time_s,
-                "applied_command": command.detach().cpu().tolist(),
-                "applied_at_s": command_time_s,
-                "reset_mask": reset_mask.cpu().tolist(),
-                "sensors": {
-                    name: (
-                        None
-                        if sample is None
-                        else {
-                            "value": sample.value.cpu().tolist(),
-                            "acquired_at_s": sample.acquired_at_s,
-                            "valid": sample.valid.cpu().tolist(),
-                            "units": sample.units,
-                            "frame": sample.frame,
-                            "privileged": sample.privileged,
-                        }
-                    )
-                    for name, sample in delivered.items()
-                },
-                "joint_names": list(spec.joint_names),
-                "requested_position_rad": None,
-                "raw_action": None,
-                "status": "INFERENCE_PENDING",
-            }
-        )
-        # Only declared inputs reach the adapter. No environment or full sensor dict.
-        self.controller.reset(reset_mask.clone())
-        with torch.inference_mode():
-            output = self.controller.act(
-                ControllerInput(
-                    time_s,
-                    command.detach().clone(),
-                    command_time_s,
-                    MappingProxyType(delivered),
-                )
-            )
+        return delivered
+
+    @staticmethod
+    def _validate_output(output, spec, command):
         if output.joint_names != spec.joint_names:
             raise ValueError("Output joint order differs from contract")
+        batch = len(command)
         finite_tensor(output.position_rad, (batch, len(spec.joint_names)), command)
         if output.raw_action is not None:
             if output.raw_action.ndim != 2 or output.raw_action.shape[1] < 1:
@@ -320,20 +294,3 @@ class ControllerSession:
             finite_tensor(
                 output.raw_action, (batch, output.raw_action.shape[1]), command
             )
-        self.time_s, self.batch_signature = time_s, signature
-        self.reset_at_s = reset_at
-        if self.record is not None:
-            self.record.update(
-                status="TARGETS_COMPUTED_NOT_DELIVERED",
-                requested_position_rad=output.position_rad.detach().cpu().tolist(),
-                raw_action=(
-                    None
-                    if output.raw_action is None
-                    else output.raw_action.detach().cpu().tolist()
-                ),
-            )
-        return JointTargets(
-            output.joint_names,
-            output.position_rad.detach().clone(),
-            None if output.raw_action is None else output.raw_action.detach().clone(),
-        )

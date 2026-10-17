@@ -8,10 +8,8 @@ from types import ModuleType
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
-import numpy as np
 import torch
 
-from parkour_lab.config import TaskConfig
 from parkour_lab.control.motor_contract import make_motor_contract, verify_runtime_motor
 from parkour_lab.runtime.motor import _runtime_motor_binding
 from tests.support import ROOT
@@ -155,15 +153,11 @@ def environment(module, *, dynamics="randomized", count=4):
 
 class DynamicsTests(unittest.TestCase):
     def test_rough_shared_reset_uses_changed_supported_origin_and_fixed_dynamics(self):
-        from dataclasses import asdict
-
         from parkour_lab.runtime.native import causal_sensor_noise
 
         with native_dynamics() as dynamics:
             env, motor, physical, writes = environment(dynamics)
-            env.cfg.parkour_task = asdict(
-                TaskConfig(terrain="rough", num_envs=4, seed=123)
-            )
+            env.cfg.parkour_task = dict(num_envs=4, seed=123, dynamics="randomized")
             dynamics.initialize_dynamics(env)
             dynamics.reset_state(env, torch.arange(4))
             self.assertTrue(
@@ -189,74 +183,6 @@ class DynamicsTests(unittest.TestCase):
                     <= torch.tensor([0.2] * 3 + [0.05] * 3 + [0.01] * 12 + [1.5] * 12)
                 ).all()
             )
-
-    def test_canonical_terrain_id_drives_native_dynamics_reset_and_causal_noise(self):
-        from dataclasses import asdict
-
-        from parkour_lab.environments.randomization import TaskRandomization
-        from parkour_lab.runtime.native import causal_sensor_noise
-
-        for index in (49, 50):
-            with self.subTest(index=index), native_dynamics() as module:
-                task = TaskConfig(
-                    terrain="connected",
-                    num_envs=1,
-                    device="cpu",
-                    episode_length_s=31,
-                    terrain_group="ramp/down/10deg",
-                    terrain_attempt_index=index,
-                )
-                heading = task.world["world_yaw"] - np.pi / 2
-                env, _, _, writes = environment(module, count=1)
-                env.scene.env_origins.zero_()
-                env.scene.terrain = NS(
-                    start_position=[3.0, 7.0, 0.7], start_heading=heading
-                )
-                env.cfg.parkour_task = asdict(task)
-                env.cfg.parkour_evaluation = True
-                expected = TaskRandomization(
-                    task, evaluation=True, nominal_heading=heading
-                )
-                physical = expected.dynamics()
-                start = expected.sample_start(None)
-                module.initialize_dynamics(env)
-                module.reset_state(env, torch.tensor([0]))
-                data = env.scene["robot"].data
-                data.root_pos_w, data.root_quat_w = (
-                    writes["pose"][:, :3],
-                    writes["pose"][:, 3:],
-                )
-                data.root_state_w = torch.cat(
-                    [writes["pose"], writes["velocity"]], dim=1
-                )
-                data.joint_pos, data.joint_vel = (
-                    writes["joint_pos"],
-                    writes["joint_vel"],
-                )
-                report = module.dynamics_report(env)
-                self.assertEqual(report["randomization"], expected.manifest())
-                np.testing.assert_allclose(
-                    report["physical_readback"]["masses"][0][0],
-                    6 + physical["added_mass"][0],
-                    rtol=1e-6,
-                )
-                np.testing.assert_allclose(
-                    module.start_report(env)["root_position"][0][:2],
-                    np.array([3, 7]) + start["start_xy"][0],
-                    rtol=0,
-                    atol=2e-6,
-                )
-                noise = expected.uniform(None, 30, "observation-noise", -1, 1) * (
-                    [0.2] * 3 + [0.05] * 3 + [0.01] * 12 + [1.5] * 12
-                )
-                np.testing.assert_array_equal(
-                    causal_sensor_noise(env).numpy(), noise.astype(np.float32)
-                )
-
-    def test_connected_high_start_keeps_world_datum_and_realized_manifest(self):
-        for support in (0.0, 0.7):
-            with self.subTest(support=support):
-                self.check_connected_start(support)
 
     def check_connected_start(self, support):
         with native_dynamics() as module:
@@ -376,15 +302,21 @@ class DynamicsTests(unittest.TestCase):
             motor.cfg.to_dict = lambda: {"class_type": "RandomizedDCMotor"}
             robot.actuators["legs"] = motor
             binding, digest = _runtime_motor_binding(env)
+            limits = robot.data.soft_joint_pos_limits[0].tolist()
             manifest = dict(
                 joint_names=robot.joint_names,
                 period_s=0.02,
                 configuration=dict(
-                    default_position_rad=binding["default_position_rad"]
+                    default_position_rad=binding["default_position_rad"],
+                    action_clip=dict(
+                        version="joint_limits_v1", target_limits_rad=limits
+                    ),
                 ),
                 actuator_profile="native_motor_sha256:" + digest,
             )
-            contract = make_motor_contract(binding, manifest["actuator_profile"])
+            contract = make_motor_contract(
+                binding, manifest["actuator_profile"], target_limits_rad=limits
+            )
             motor.stiffness_scale[:, ::2] = 0.91
             motor.damping_scale[:, 1::2] = 1.09
             motor.stiffness.copy_(motor.nominal_stiffness * motor.stiffness_scale)
@@ -514,7 +446,9 @@ class DynamicsTests(unittest.TestCase):
                 ),
                 sim=NS(),
             )
-            module.configure_dynamics(cfg, TaskConfig(num_envs=4, seed=0))
+            module.configure_dynamics(
+                cfg, dict(num_envs=4, seed=0, dynamics="randomized")
+            )
             self.assertIs(original.class_type, module.RandomizedDCMotor)
             self.assertEqual(original.effort_limit, 23.5)
             self.assertEqual(original.velocity_limit, 30.0)

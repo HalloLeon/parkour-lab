@@ -26,7 +26,7 @@ class LocomotionEnv(ManagerBasedRLEnv):
         self._capturing = False
         self._final = None
         self.capture_motion = False
-        self.capture_diagnostics = False
+        self.capture_evaluation = False
         self.capture_training_information = False
         self._final_physics = None
         self._final_information = None
@@ -69,13 +69,11 @@ class LocomotionEnv(ManagerBasedRLEnv):
                     )
 
     def _capture_physics(self):
-        from parkour_lab.runtime.metrics import diagnostic_state
+        if not self.capture_motion:
+            return {}
         from parkour_lab.runtime.native import motion_state
 
-        state = motion_state(self) if self.capture_motion else {}
-        if self.capture_diagnostics:
-            state["diagnostic_state"] = diagnostic_state(self)
-        return state
+        return motion_state(self)
 
     def _reset_idx(self, env_ids):
         if self._capturing:
@@ -139,7 +137,6 @@ class LocomotionEnv(ManagerBasedRLEnv):
             if len(ids):
                 for name, value in physics.items():
                     value[ids] = self._final_physics[name]
-            diagnostics = physics.pop("diagnostic_state", None)
             self.transition_counts["control_steps"] += 1
             self.transition_counts["terminated_rows"] += int(terminated.sum())
             self.transition_counts["truncated_rows"] += int(truncated.sum())
@@ -158,7 +155,6 @@ class LocomotionEnv(ManagerBasedRLEnv):
                     "final_env_ids": ids.clone(),
                     "final_observation": final,
                     "motion_state": physics if self.capture_motion else None,
-                    "diagnostic_state": diagnostics,
                     **(
                         {"final_training_information": self._final_information}
                         if self._training_information_enabled()

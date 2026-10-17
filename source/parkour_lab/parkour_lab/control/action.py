@@ -13,25 +13,35 @@ BOUNDED_RAW_ACTION_MEANING = (
 class JointActionTransform:
     """Bound encoded actions so even rounded affine targets stay inside the limits."""
 
-    def __init__(self, default, target_limits_rad=None):
+    def __init__(self, default, target_limits_rad):
+        if target_limits_rad is None:
+            raise ValueError("Joint target limits are required")
         self.default = default
-        self.limits = self.lower = self.upper = None
-        if target_limits_rad is not None:
-            self.limits = default.new_tensor(target_limits_rad)
-            self.lower = (self.limits[:, 0] - default) / 0.25
-            self.upper = (self.limits[:, 1] - default) / 0.25
-            # Division by 0.25 is exact; subtraction/addition may round outward.
-            self.lower = torch.where(
-                default + 0.25 * self.lower < self.limits[:, 0],
-                torch.nextafter(self.lower, torch.full_like(self.lower, torch.inf)),
-                self.lower,
+        self.limits = default.new_tensor(target_limits_rad)
+        if (
+            self.limits.shape != (12, 2)
+            or not torch.isfinite(self.limits).all()
+            or not (self.limits[:, 0] < self.limits[:, 1]).all()
+            or not (default >= self.limits[:, 0]).all()
+            or not (default <= self.limits[:, 1]).all()
+        ):
+            raise ValueError(
+                "Require twelve finite ordered limits containing the default pose"
             )
-            self.upper = torch.where(
-                default + 0.25 * self.upper > self.limits[:, 1],
-                torch.nextafter(self.upper, torch.full_like(self.upper, -torch.inf)),
-                self.upper,
-            )
+        self.lower = (self.limits[:, 0] - default) / 0.25
+        self.upper = (self.limits[:, 1] - default) / 0.25
+        # Division by 0.25 is exact; subtraction/addition may round outward.
+        self.lower = torch.where(
+            default + 0.25 * self.lower < self.limits[:, 0],
+            torch.nextafter(self.lower, torch.full_like(self.lower, torch.inf)),
+            self.lower,
+        )
+        self.upper = torch.where(
+            default + 0.25 * self.upper > self.limits[:, 1],
+            torch.nextafter(self.upper, torch.full_like(self.upper, -torch.inf)),
+            self.upper,
+        )
 
     def __call__(self, raw):
-        delivered = raw if self.limits is None else raw.clamp(self.lower, self.upper)
+        delivered = raw.clamp(self.lower, self.upper)
         return delivered, self.default + 0.25 * delivered

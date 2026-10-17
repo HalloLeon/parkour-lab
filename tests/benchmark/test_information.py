@@ -9,10 +9,8 @@ from types import SimpleNamespace as NS
 import numpy as np
 import torch
 
-from parkour_lab.benchmark.information import (
-    capture_information,
-    information_schema,
-)
+from parkour_lab.benchmark.information import capture_information
+from parkour_lab.benchmark.schema import information_schema
 from parkour_lab.control.proprioception import FOOT_NAMES
 
 

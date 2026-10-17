@@ -1,53 +1,22 @@
-"""Fresh Go2 task construction, with no checkpoint or experiment reconstruction.
-
-The installed stock Go2 tasks supply motors and root-COM velocity terms.
-Flat/rough tasks use independently seeded commands, starts and bounded dynamics.
-The actor receives 49 causal values, including four
-noiseless foot-contact flags. Steps/traversal are diagnostic geometries, not an
-approved behavioral gate.
-"""
+"""Fixed Go2 motor, causal sensing, reward and dynamics configuration."""
 
 from __future__ import annotations
 
-import copy
-import math
-
-from .task_config import TaskConfig
+from copy import deepcopy
 
 
-def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
-    """Construct a native config after AppLauncher; importing this module is inert.
+def build_environment_config(*, num_envs, seed, device, training):
+    """Build the shared native base after AppLauncher, before family selection."""
+    if type(num_envs) is not int or num_envs <= 0:
+        raise ValueError("Require a positive integer environment count")
+    if type(seed) is not int or not 0 <= seed < 2**32:
+        raise ValueError("Require a uint32 seed")
+    if not isinstance(device, str) or not device.strip():
+        raise ValueError("Require an explicit device")
+    if type(training) is not bool:
+        raise ValueError("Require an explicit boolean training role")
 
-    Flat sensor noise is applied at the shared causal-input boundary, not here.
-    Evaluation changes command ownership, not reward arithmetic. Flat uses a real privileged
-    plane scan with the same 264-D schema as procedural terrain. Traversal has a
-    fixed diagnostic layout and must be externally commanded during evaluation.
-    """
-    if not isinstance(task, TaskConfig) or type(evaluation) is not bool:
-        raise ValueError("Require TaskConfig and an explicit boolean evaluation flag")
-    if task.terrain == "procedural" and task.num_rows not in (1, 3, 5):
-        raise ValueError("Procedural command sampling supports one, three or five rows")
-    if task.terrain == "steps" and (
-        task.num_rows != 3 or task.difficulty_range != (0.15, 0.55)
-    ):
-        raise ValueError(
-            "Step diagnostic geometry requires three rows and difficulty (0.15, 0.55)"
-        )
-    if task.terrain == "traversal" and (
-        not evaluation or task.num_rows != 1 or task.difficulty_range != (1.0, 1.0)
-    ):
-        raise ValueError(
-            "Traversal is evaluation-only fixed geometry: one row, difficulty (1.0, 1.0)"
-        )
-    if task.terrain == "connected" and not evaluation:
-        raise ValueError("Connected worlds are evaluation-only")
-
-    from isaaclab.managers import (
-        ObservationGroupCfg,
-        ObservationTermCfg,
-        SceneEntityCfg,
-        TerminationTermCfg,
-    )
+    from isaaclab.managers import ObservationTermCfg
     from isaaclab.sensors import RayCasterCfg, patterns
     from isaaclab_tasks.manager_based.locomotion.velocity.config.go2.flat_env_cfg import (
         UnitreeGo2FlatEnvCfg,
@@ -58,82 +27,38 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
 
     from parkour_lab.runtime.native import foot_contacts
 
-    from . import observations
-    from .commands.native import (
-        FlatVelocityCommand,
-        ProceduralTerrainCommand,
-        RoughVelocityCommand,
-        procedural_physical_failure,
-        procedural_workspace,
-    )
-    from .terrains.procedural import (
-        BORDER_WIDTH,
-        ENVELOPES,
-        make_operator_terrain_generator,
-    )
+    from .commands.episode import EpisodeVelocityCommand
+    from .dynamics import configure_dynamics
 
-    cfg = UnitreeGo2RoughEnvCfg() if task.terrain == "rough" else UnitreeGo2FlatEnvCfg()
-    cfg.sim.dt = 1.0 / task.physics_hz
-    cfg.decimation = task.physics_hz // 50
-    cfg.sim.render_interval = cfg.decimation
-    cfg.scene.num_envs = task.num_envs
-    cfg.seed = task.seed
-    cfg.sim.device = task.device
-    cfg.episode_length_s = task.episode_length_s
-    cfg.scene.contact_forces.update_period = cfg.sim.dt
-    # Preserve the stock 10 ms oldest-to-current span, including the latest sample.
-    cfg.scene.contact_forces.history_length = task.physics_hz // 100 + 1
-    if task.terrain != "rough" or evaluation:
-        cfg.curriculum.terrain_levels = None
+    cfg = UnitreeGo2FlatEnvCfg()
+    cfg.sim.dt = 0.005
+    cfg.decimation = 4
+    cfg.sim.render_interval = 4
+    cfg.scene.num_envs = num_envs
+    cfg.seed = seed
+    cfg.sim.device = device
+    cfg.episode_length_s = 20.0
+    cfg.scene.contact_forces.update_period = 0.005
+    cfg.scene.contact_forces.history_length = 3
+    cfg.curriculum.terrain_levels = None
     if cfg.scene.robot.soft_joint_pos_limit_factor != 0.9:
-        raise ValueError(
-            "The current acquisition task requires the stock 0.9 soft joint-limit factor"
-        )
+        raise ValueError("Require the stock 0.9 soft joint-limit factor")
+    cfg.rewards = deepcopy(UnitreeGo2RoughEnvCfg().rewards)
 
     command = cfg.commands.base_velocity
     command.heading_command = False
     command.rel_heading_envs = command.rel_standing_envs = 0.0
     command.ranges.heading = None
-    command.ranges.lin_vel_x = (-0.3, 0.7)
+    command.ranges.lin_vel_x = (-0.2, 0.5)
     command.ranges.lin_vel_y = (-0.2, 0.2)
-    command.ranges.ang_vel_z = (-0.8, 0.8)
-    command.resampling_time_range = (2.0, 12.0)
+    command.ranges.ang_vel_z = (-0.5, 0.5)
     command.debug_vis = False
-    command.class_type = {
-        "flat": FlatVelocityCommand,
-        "rough": RoughVelocityCommand,
-    }.get(task.terrain, ProceduralTerrainCommand)
-    cfg.events.reset_base.params["pose_range"] = {
-        "x": (-0.2, 0.2),
-        "y": (-0.2, 0.2),
-        "yaw": (-math.pi, math.pi),
-    }
-    from .rewards import configure_rewards
-
-    configure_rewards(cfg, task)
-
-    if task.terrain == "rough":
-        from isaaclab.terrains import MeshPlaneTerrainCfg
-
-        generator = cfg.scene.terrain.terrain_generator
-        generator.seed = task.seed
-        generator.num_rows = task.num_rows
-        generator.num_cols = 25
-        generator.difficulty_range = task.difficulty_range
-        generator.curriculum = True
-        # Stock rough shares sum to one: adding .25 gives five of 25 plane columns.
-        generator.sub_terrains["flat"] = MeshPlaneTerrainCfg(proportion=0.25)
-        cfg.scene.terrain.max_init_terrain_level = 0
-        cfg.observations.policy.height_scan = None
-    elif task.terrain not in ("flat", "connected"):
-        cfg.scene.terrain.terrain_type = "generator"
-        cfg.scene.terrain.terrain_generator = make_operator_terrain_generator(
-            seed=task.seed,
-            num_rows=task.num_rows,
-            difficulty_range=task.difficulty_range,
-            curriculum=True,
-        )
-        cfg.scene.terrain.max_init_terrain_level = task.num_rows - 1
+    if not training:
+        command.ranges.lin_vel_x = (0.0, 0.0)
+        command.ranges.lin_vel_y = (0.0, 0.0)
+        command.ranges.ang_vel_z = (0.0, 0.0)
+    command.class_type = EpisodeVelocityCommand
+    command.resampling_time_range = (20.0, 20.0)
 
     cfg.scene.height_scanner = RayCasterCfg(
         prim_path="{ENV_REGEX_NS}/Robot/base",
@@ -147,98 +72,17 @@ def build_environment_config(task: TaskConfig, *, evaluation: bool = False):
         ),
         mesh_prim_paths=[cfg.scene.terrain.prim_path],
         max_distance=25.0,
-        # Lazy reads cast at control boundaries; invalidate each tick to avoid clock drift.
         update_period=0.0,
         debug_vis=False,
     )
-    cfg.scene.base_height_scanner = cfg.scene.height_scanner.replace(
-        pattern_cfg=patterns.GridPatternCfg(
-            resolution=1.0, size=(0.0, 0.0), direction=(0.0, 0.0, -1.0)
-        )
-    )
-    terrain_observations = ObservationGroupCfg(
-        enable_corruption=False, concatenate_terms=True
-    )
-    terrain_observations.height_scan = ObservationTermCfg(
-        func=observations.terrain_height_scan,
-        params={
-            "asset_cfg": SceneEntityCfg("robot"),
-            "sensor_cfg": SceneEntityCfg("height_scanner"),
-            "obs_cfg": observations.HeightScanObservationCfg(
-                num_rays=132, vertical_offset=0.3, clip=0.5
-            ),
-        },
-    )
-    cfg.observations.terrain = terrain_observations
-    # Opposite rough stairs span +/-1.61 m in the whole grid: a neighboring
-    # surface can be 3.22 m below the current origin, so allow a -4 m floor.
-    cfg.terminations.procedural_physical_failure = TerminationTermCfg(
-        func=procedural_physical_failure,
-        params={
-            "minimum_m": 0.12,
-            "minimum_surface_z_m": (
-                0.0
-                if task.terrain == "flat"
-                else (
-                    -0.02
-                    if task.terrain == "connected"
-                    else (
-                        -4.0
-                        if task.terrain == "rough"
-                        else -max(height for height, _ in ENVELOPES.values())
-                        * task.difficulty_range[1]
-                    )
-                )
-            ),
-            "fall_margin_m": 0.5,
-            "max_tilt_rad": math.pi / 4,
-        },
-        time_out=False,
-    )
-    # Keep every physical failure before this censoring term.
-    if task.terrain not in ("flat", "connected", "rough"):
-        cfg.terminations.procedural_workspace = TerminationTermCfg(
-            func=procedural_workspace,
-            params={"margin_m": BORDER_WIDTH + 0.25},
-            time_out=True,
-        )
-
-    # Copy sensor noise before making privileged clean state noiseless. The actor
-    # retains the native term order minus the three oracle linear velocities.
-    cfg.observations.policy.foot_contacts = ObservationTermCfg(func=foot_contacts)
-    cfg.observations.proprio = copy.deepcopy(cfg.observations.policy)
+    cfg.observations.proprio = deepcopy(cfg.observations.policy)
     cfg.observations.proprio.base_lin_vel = None
-    cfg.observations.policy.enable_corruption = False
-
-    if task.terrain in ("flat", "connected", "rough"):
-        from .dynamics import configure_dynamics
-
-        configure_dynamics(cfg, task, evaluation=evaluation)
-        command.ranges.lin_vel_x = (-0.2, 0.5)
-        command.ranges.ang_vel_z = (-0.5, 0.5)
-        command.resampling_time_range = (4.0, 4.0)
-        cfg.observations.proprio.enable_corruption = False
-
-    if task.terrain == "steps":
-        from .terrains.step_field import configure
-
-        configure(cfg)
-    elif task.terrain == "traversal":
-        from .terrains.traversal import configure, preflight
-
-        configure(
-            cfg,
-            task.seed,
-            preflight(task.seed, task.traversal_layout),
-            layout=task.traversal_layout,
-        )
-    elif task.terrain == "connected":
-        from .terrains.connected import configure
-
-        configure(cfg, task)
-    if evaluation:
-        from parkour_lab.runtime.native import configure_external_command
-
-        configure_external_command(command)
-        cfg.observations.proprio.enable_corruption = False
+    cfg.observations.proprio.foot_contacts = ObservationTermCfg(func=foot_contacts)
+    cfg.observations.proprio.enable_corruption = False
+    cfg.observations.policy = None
+    configure_dynamics(
+        cfg,
+        dict(num_envs=num_envs, seed=seed, dynamics="randomized"),
+        evaluation=not training,
+    )
     return cfg

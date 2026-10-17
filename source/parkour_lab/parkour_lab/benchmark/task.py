@@ -32,7 +32,6 @@ class Go2Task:
             or type(getattr(cfg, "benchmark_training", None)) is not bool
             or not isinstance(task_id, str)
             or task_id not in TASK_IDS
-            or not TASK_IDS[task_id][1]
         ):
             raise ValueError("Use build_config to select a supported Go2 task and role")
         cfg.validate()

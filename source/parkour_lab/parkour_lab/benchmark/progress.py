@@ -3,7 +3,7 @@
 import json
 from copy import deepcopy
 
-from parkour_lab.environments.terrains.families import curriculum
+from parkour_lab.environments.terrains import curriculum
 from parkour_lab.runtime.accounting import nonnegative_integer
 
 VERSION = "go2_checkpoint_progress_v1"
@@ -165,15 +165,11 @@ def _validate_sampling_report(saved, current):
     ):
         raise ValueError("Command sampling report identity differs")
     for name, value in saved.items():
-        if name in ("samples", "restricted_samples", *categories):
+        if name in ("samples", *categories):
             nonnegative_integer(value, name)
         elif type(value) is not type(current[name]) or value != current[name]:
             raise ValueError("Command sampling report definition differs")
-    if any(
-        saved[name] > saved["samples"]
-        for name in ("restricted_samples", *categories)
-        if name in saved
-    ):
+    if any(saved[name] > saved["samples"] for name in categories if name in saved):
         raise ValueError("Command category counts exceed total samples")
     if (
         all(name in saved for name in categories)

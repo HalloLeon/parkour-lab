@@ -6,7 +6,6 @@ from types import SimpleNamespace as NS
 import torch
 
 from parkour_lab.control.motor_contract import PARAMETERS
-from parkour_lab.runtime.metrics import diagnostic_state
 from parkour_lab.runtime.native import foot_contacts, motion_state
 
 
@@ -59,6 +58,7 @@ def make_native_env(count=8):
     data = NS(
         default_joint_pos=default,
         default_joint_vel=zeros(12),
+        soft_joint_pos_limits=torch.tensor([-1.0, 1.0]).repeat(count, 12, 1),
         joint_pos=default + 0.1,
         joint_vel=zeros(12),
         joint_pos_target=zeros(12),
@@ -135,7 +135,6 @@ def make_native_env(count=8):
         episode_length_buf=torch.zeros(count, dtype=torch.long),
         max_episode_length=1000,
         capture_motion=False,
-        capture_diagnostics=False,
         reward_manager=NS(active_terms=["tracking", "effort"], _step_reward=zeros(2)),
     )
 
@@ -156,9 +155,6 @@ def make_native_env(count=8):
             timed_out,
             {
                 "motion_state": motion_state(env) if env.capture_motion else None,
-                "diagnostic_state": (
-                    diagnostic_state(env) if env.capture_diagnostics else None
-                ),
             },
         )
 
@@ -167,11 +163,10 @@ def make_native_env(count=8):
         body_names=["base", "RL_foot", "FR_foot", "RR_foot", "FL_foot"],
         data=NS(net_forces_w=torch.zeros(count, 5, 3)),
     )
-    env.scene["base_height_scanner"] = NS(data=NS(ray_hits_w=torch.zeros(count, 1, 3)))
     return env
 
 
-class TrainingEnvironmentFixture:
+class NativeEnvironmentFixture:
     """Resolved stock motor plus deterministic, auto-resetting native API doubles."""
 
     def __init__(self, count=8):
@@ -299,9 +294,6 @@ class TrainingEnvironmentFixture:
             else None
         )
         motion = motion_state(self.env) if self.env.capture_motion else None
-        diagnostics = (
-            diagnostic_state(self.env) if self.env.capture_diagnostics else None
-        )
         self.env.action_manager.action[done] = 0
         self.env.episode_length_buf[done] = 0
         self.data.joint_pos[done] = self.data.default_joint_pos[done]
@@ -330,6 +322,5 @@ class TrainingEnvironmentFixture:
                 "final_env_ids": ids,
                 "final_observation": final,
                 "motion_state": motion,
-                "diagnostic_state": diagnostics,
             },
         )

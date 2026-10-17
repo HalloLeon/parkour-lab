@@ -76,12 +76,12 @@ class PackageBoundaryTests(unittest.TestCase):
             ),
         )
 
-    def test_saved_terrain_analysis_does_not_import_live_execution_or_learning(self):
+    def test_saved_capture_scoring_does_not_import_live_execution_or_learning(self):
         self.run_isolated(
             """
-            from parkour_lab.evaluation.terrain_analysis import analyze_terrain_attempt
+            from parkour_lab.evaluation import score_capture
             try:
-                analyze_terrain_attempt('missing-terrain-run')
+                score_capture('missing-capture')
             except FileNotFoundError:
                 pass
             else:
@@ -98,14 +98,12 @@ class PackageBoundaryTests(unittest.TestCase):
             ),
         )
 
-    def test_cli_help_and_portable_dispatch_need_no_numeric_or_native_imports(self):
+    def test_cli_help_needs_no_numeric_native_or_learner_imports(self):
         self.run_isolated(
             """
-            import contextlib, io, json, tempfile
-            from pathlib import Path
-            from unittest.mock import patch
+            import contextlib, io
             from parkour_lab.__main__ import main
-            for prefix in ([], ['train'], ['evaluate'], ['play'], ['export'], ['analyze']):
+            for prefix in ([], ['score'], ['cases']):
                 with contextlib.redirect_stdout(io.StringIO()):
                     try:
                         main([*prefix, '--help'])
@@ -113,18 +111,6 @@ class PackageBoundaryTests(unittest.TestCase):
                         assert error.code == 0
                     else:
                         raise AssertionError('Help did not exit')
-            with tempfile.TemporaryDirectory() as folder:
-                report = Path(folder) / 'report.json'
-                report.write_text('{"status": "recorded"}')
-                with contextlib.redirect_stdout(io.StringIO()) as output:
-                    assert main(['analyze', folder], standalone=True) == 0
-                assert json.loads(output.getvalue()) == {'status': 'recorded'}
-            # Dispatch itself is portable; tensor decoding belongs to export_actor.
-            with patch('parkour_lab.artifacts.export_actor', return_value={'exported': True}) as export:
-                with contextlib.redirect_stdout(io.StringIO()) as output:
-                    assert main(['export', 'checkpoint.plab', 'actor.plab'], standalone=True) == 0
-                assert json.loads(output.getvalue()) == {'exported': True}
-                export.assert_called_once_with(Path('checkpoint.plab'), Path('actor.plab'), physics_hz=None)
             """,
             (
                 "numpy",
@@ -136,16 +122,45 @@ class PackageBoundaryTests(unittest.TestCase):
                 "warp",
                 "scripts",
                 "parkour_lab.runtime",
-                "parkour_lab.methods.roa",
+                "parkour_lab.methods",
+                "rsl_rl",
             ),
         )
 
+    def test_retired_controller_workflows_are_absent(self):
+        for relative in (
+            "methods",
+            "artifacts.py",
+            "experiment.py",
+            "config.py",
+            "runtime/training.py",
+            "runtime/metrics.py",
+            "environments/task_config.py",
+            "environments/commands/native.py",
+            "environments/commands/sampling.py",
+            "environments/commands/sequences.py",
+            "evaluation/flat.py",
+            "evaluation/terrain.py",
+            "evaluation/terrain_analysis.py",
+            "evaluation/native.py",
+        ):
+            self.assertFalse(
+                (SOURCE_ROOT / "parkour_lab" / relative).exists(), relative
+            )
+
     def test_imports_respect_package_layers_without_simulator_startup(self):
         cases = {
-            "config": (
-                "from parkour_lab.config import MethodConfig, TaskConfig\n"
-                "assert MethodConfig().name == 'roa'",
-                ("torch",),
+            "task_settings": (
+                "from parkour_lab.benchmark import Go2Config\n"
+                "assert Go2Config().num_envs == 160",
+                ("torch", "parkour_lab.methods"),
+            ),
+            "benchmark": (
+                "from parkour_lab.benchmark import Go2Config, TASK_IDS\n"
+                "from parkour_lab.benchmark.task import Go2Task\n"
+                "assert len(TASK_IDS) == 6\n"
+                "assert Go2Config().task_id == 'Go2-Flat-v1'",
+                ("parkour_lab.methods", "parkour_lab.config", "parkour_lab.artifacts"),
             ),
             "runtime.native": (
                 "from parkour_lab.runtime.native import NativeControllerSession",
@@ -156,29 +171,17 @@ class PackageBoundaryTests(unittest.TestCase):
                 ("parkour_lab.methods",),
             ),
             "environments": (
-                "from parkour_lab.environments import configuration\n"
-                "from parkour_lab.environments.terrains import procedural",
+                "from parkour_lab.environments import configuration",
                 ("parkour_lab.methods",),
             ),
-            "environments.worlds": (
-                "from parkour_lab.environments.terrains.worlds import build_world",
+            "environments.terrains": (
+                "from parkour_lab.environments.terrains import specification",
                 ("torch", "parkour_lab.methods"),
             ),
-            "methods": (
-                "from parkour_lab.methods import models\nfrom parkour_lab.methods.roa import model",
-                (),
-            ),
-            "inference": (
-                "import parkour_lab.methods.roa.runtime",
-                ("parkour_lab.methods.roa.training",),
-            ),
             "evaluation": (
-                "import parkour_lab.evaluation.runner",
+                "from parkour_lab.evaluation import evaluate, score_capture, case_bank\n"
+                "assert len(case_bank('validation')) == 114",
                 ("parkour_lab.methods",),
-            ),
-            "artifacts": (
-                "import parkour_lab.artifacts",
-                ("torch", "parkour_lab.methods.roa"),
             ),
         }
         for name, (code, blocked) in cases.items():

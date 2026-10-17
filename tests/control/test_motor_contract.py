@@ -10,15 +10,24 @@ from tests.support.native import motor_binding, rebatch
 class MotorContractTests(unittest.TestCase):
     def setUp(self):
         self.binding = motor_binding([f"j{i}" for i in range(12)], [0.0] * 12)
+        self.limits = [[-1.0, 1.0] for _ in range(12)]
         self.manifest = {
             "actuator_profile": "native_motor_sha256:"
             + motor.nominal_binding_sha256(self.binding),
             "joint_names": self.binding["joint_names"],
-            "configuration": {"default_position_rad": [0.0] * 12},
+            "configuration": {
+                "default_position_rad": [0.0] * 12,
+                "action_clip": {
+                    "version": "joint_limits_v1",
+                    "target_limits_rad": self.limits,
+                },
+            },
             "period_s": 0.02,
         }
         self.contract = motor.make_motor_contract(
-            self.binding, self.manifest["actuator_profile"]
+            self.binding,
+            self.manifest["actuator_profile"],
+            target_limits_rad=self.limits,
         )
 
     def test_nominal_identity_is_preserved_across_runtime_batches(self):
@@ -34,7 +43,11 @@ class MotorContractTests(unittest.TestCase):
             )
         self.assertEqual(
             self.contract,
-            motor.make_motor_contract(self.binding, self.manifest["actuator_profile"]),
+            motor.make_motor_contract(
+                self.binding,
+                self.manifest["actuator_profile"],
+                target_limits_rad=self.limits,
+            ),
         )
 
     def test_candidate_timing_has_distinct_identity_and_cross_rate_rejects(self):
@@ -42,7 +55,9 @@ class MotorContractTests(unittest.TestCase):
         candidate.update(physics_dt_s=0.0025, decimation=8)
         profile = "native_motor_sha256:" + motor.nominal_binding_sha256(candidate)
         manifest = dict(self.manifest, actuator_profile=profile)
-        contract = motor.make_motor_contract(candidate, profile)
+        contract = motor.make_motor_contract(
+            candidate, profile, target_limits_rad=self.limits
+        )
         self.assertNotEqual(profile, self.manifest["actuator_profile"])
         report = motor.verify_runtime_motor(contract, manifest, rebatch(candidate, 80))
         self.assertEqual(report["runtime_num_envs"], 80)
@@ -133,7 +148,50 @@ class MotorContractTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 motor.validate_motor_contract(bad, self.manifest)
         with self.assertRaises(ValueError):
-            motor.make_motor_contract(self.binding, "native_motor_sha256:" + "0" * 64)
+            motor.make_motor_contract(
+                self.binding,
+                "native_motor_sha256:" + "0" * 64,
+                target_limits_rad=self.limits,
+            )
+
+    def test_joint_limits_are_required_validated_and_owned(self):
+        profile = self.manifest["actuator_profile"]
+        with self.assertRaises(TypeError):
+            motor.make_motor_contract(self.binding, profile)
+        for limits in (
+            None,
+            [],
+            [[0.0, 0.0]] * 12,
+            [[0.1, 1.0]] * 12,
+            [[-1.0, float("inf")]] * 12,
+        ):
+            with self.subTest(limits=limits), self.assertRaises(ValueError):
+                motor.make_motor_contract(
+                    self.binding, profile, target_limits_rad=limits
+                )
+        limits = copy.deepcopy(self.limits)
+        contract = motor.make_motor_contract(
+            self.binding, profile, target_limits_rad=limits
+        )
+        limits[0][0] = -2.0
+        self.assertEqual(contract["target_limits_rad"], self.limits)
+        for mutate in (
+            lambda c: c.pop("target_limits_rad"),
+            lambda c: c.update(version="unsupported"),
+            lambda c: c.update(target_limits_rad=None),
+        ):
+            bad = copy.deepcopy(contract)
+            mutate(bad)
+            with self.assertRaises(ValueError):
+                motor.validate_motor_contract(bad, self.manifest)
+        for clip in (
+            None,
+            {"version": "joint_limits_v1", "target_limits_rad": [[-2.0, 2.0]] * 12},
+        ):
+            manifest = copy.deepcopy(self.manifest)
+            manifest["configuration"]["action_clip"] = clip
+            with self.assertRaisesRegex(ValueError, "boundary differs"):
+                motor.validate_motor_contract(contract, manifest)
 
     def test_declared_variation_is_verified_but_not_actor_identity(self):
         binding = copy.deepcopy(self.binding)
@@ -152,7 +210,9 @@ class MotorContractTests(unittest.TestCase):
             )
         profile = "native_motor_sha256:" + motor.nominal_binding_sha256(binding)
         manifest = dict(self.manifest, actuator_profile=profile)
-        contract = motor.make_motor_contract(binding, profile)
+        contract = motor.make_motor_contract(
+            binding, profile, target_limits_rad=self.limits
+        )
         motor.verify_runtime_motor(contract, manifest, binding)
         nominal = copy.deepcopy(binding)
         for key in motor.RANDOMIZATION_RANGES:

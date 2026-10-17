@@ -291,14 +291,12 @@ class NativeTransitionTests(unittest.TestCase):
             capture.side_effect = lambda _: {
                 "position_w": self.state.clone(),
                 "foot_net_forces_w": self.state[:, None].expand(-1, 4, 3).clone(),
-                "base_surface_hits_w": self.state[:, None].expand(-1, 1, 3).clone(),
             }
             _, _, _, _, info = env.step(torch.ones(4, 1))
             motion = info["motion_state"]["position_w"]
-            for key in ("foot_net_forces_w", "base_surface_hits_w"):
-                torch.testing.assert_close(
-                    info["motion_state"][key][:, 0, 0], motion[:, 0]
-                )
+            torch.testing.assert_close(
+                info["motion_state"]["foot_net_forces_w"][:, 0, 0], motion[:, 0]
+            )
             torch.testing.assert_close(
                 motion[:, 0], torch.tensor([-96.0, -96.0, -96.0, 11.0])
             )
@@ -353,29 +351,6 @@ class NativeTransitionTests(unittest.TestCase):
                 self.truncated.zero_()
                 self.assertTrue((env.step(torch.ones(4, 1))[0]["proprio"] == 1).all())
                 self.assertEqual(physics_ticks, [dt] * (2 * decimation))
-
-    def test_compact_diagnostics_reuse_pre_reset_capture_with_or_without_motion(self):
-        for capture_motion in (False, True):
-            with self.subTest(capture_motion=capture_motion):
-                env = self.environment()
-                env.capture_diagnostics = True
-                env.capture_motion = capture_motion
-                with (
-                    patch(
-                        "parkour_lab.runtime.metrics.diagnostic_state",
-                        side_effect=lambda _: self.state.repeat(1, 7),
-                    ),
-                    patch(
-                        "parkour_lab.runtime.native.motion_state",
-                        side_effect=lambda _: {"position_w": self.state.clone()},
-                    ),
-                ):
-                    _, _, _, _, info = env.step(torch.ones(4, 1))
-                torch.testing.assert_close(
-                    info["diagnostic_state"][:, 0], torch.tensor([4.0, 5.0, 6.0, 7.0])
-                )
-                self.assertEqual(info["motion_state"] is not None, capture_motion)
-                self.assertIsNone(env._final_physics)
 
     def test_capture_exception_clears_context_before_manual_reset(self):
         env = self.environment()

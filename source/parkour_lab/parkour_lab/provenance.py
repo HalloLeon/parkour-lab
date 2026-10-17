@@ -1,4 +1,4 @@
-"""Explicit Git identity for training runs, independent of RSL-RL's diff logger.
+"""Explicit source and dependency identity for benchmark runs.
 
 Only local Git metadata is recorded. Remote URLs and environment variables are
 deliberately excluded. Untracked paths are reported, not archived or deleted.
@@ -27,12 +27,12 @@ def _git(directory: Path, *arguments: str, allow_detached: bool = False) -> byte
     try:
         result = subprocess.run(command, capture_output=True, check=False)
     except FileNotFoundError as error:
-        raise RuntimeError("Training provenance requires Git.") from error
+        raise RuntimeError("Run provenance requires Git.") from error
     if result.returncode:
         if allow_detached and result.returncode == 1:
             return b""
         raise RuntimeError(
-            "Cannot record training Git provenance: "
+            "Cannot record run Git provenance: "
             + result.stderr.decode("utf-8", errors="replace").strip()
         )
     return result.stdout

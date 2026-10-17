@@ -19,11 +19,10 @@ from tests.support.curriculum import curriculum_environment
 def episode_command(env):
     path = SOURCE_ROOT / "parkour_lab/environments/commands/episode.py"
     with (
-        native_commands() as native,
+        native_commands(),
         patch.dict(
             sys.modules,
             {
-                "parkour_lab.environments.commands.native": native,
                 "parkour_lab.environments.dynamics": NS(
                     get_randomization=lambda env: env.parkour_randomization
                 ),

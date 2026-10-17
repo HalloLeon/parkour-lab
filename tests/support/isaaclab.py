@@ -5,7 +5,6 @@ import sys
 import unittest
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import asdict
 from types import ModuleType
 from types import SimpleNamespace as NS
 from unittest.mock import patch
@@ -173,31 +172,7 @@ class NativeCommand:
     pass
 
 
-class FlatCommand:
-    pass
-
-
-class RoughCommand:
-    pass
-
-
 class EpisodeCommand:
-    pass
-
-
-class TerrainCommand:
-    pass
-
-
-def scan(*args):
-    pass
-
-
-def failure(*args):
-    pass
-
-
-def workspace(*args):
     pass
 
 
@@ -206,7 +181,7 @@ def com_velocity(*args):
 
 
 def configure_dynamics(cfg, task, *, evaluation=False):
-    cfg.parkour_task = asdict(task)
+    cfg.parkour_task = dict(task)
     cfg.parkour_evaluation = evaluation
 
 
@@ -317,7 +292,7 @@ def stock_rough_config():
             ),
         },
     )
-    cfg.curriculum.terrain_levels = NativeConfig(func=workspace)
+    cfg.curriculum.terrain_levels = NativeConfig(func=com_velocity)
     cfg.observations.policy.height_scan = NativeConfig(num_rays=187)
     cfg.rewards.flat_orientation_l2.weight = 0.0
     return cfg
@@ -362,17 +337,6 @@ def native_config_modules(stock=None, *, rough=None):
                 rough if rough is not None else stock_rough_config()
             )
         },
-        "parkour_lab.environments.observations": {
-            "HeightScanObservationCfg": NativeConfig,
-            "terrain_height_scan": scan,
-        },
-        "parkour_lab.environments.commands.native": {
-            "FlatVelocityCommand": FlatCommand,
-            "RoughVelocityCommand": RoughCommand,
-            "ProceduralTerrainCommand": TerrainCommand,
-            "procedural_physical_failure": failure,
-            "procedural_workspace": workspace,
-        },
         "parkour_lab.environments.commands.episode": {
             "EpisodeVelocityCommand": EpisodeCommand,
         },
@@ -382,15 +346,5 @@ def native_config_modules(stock=None, *, rough=None):
         module = ModuleType(name)
         vars(module).update(attributes)
         replacements[name] = module
-    import parkour_lab.environments as environments
-
-    with (
-        patch.dict(sys.modules, replacements),
-        patch.object(
-            environments,
-            "observations",
-            replacements["parkour_lab.environments.observations"],
-            create=True,
-        ),
-    ):
+    with patch.dict(sys.modules, replacements):
         yield

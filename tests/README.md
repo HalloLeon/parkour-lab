@@ -1,41 +1,31 @@
 # Tests
 
-The suite mirrors the production packages. Test modules use `test_<component>.py`;
-classes name the component or contract, and methods describe observable behavior.
-Shared fixtures live in `support/`, never in another test module.
+The suite mirrors the production packages. Modules use `test_<component>.py`;
+shared fixtures live in `support/`, never in another test module.
 
-| Location | What the checks protect |
+| Location | Protected behavior |
 | --- | --- |
-| `benchmark/` | Public task API, permitted actor/GT observations, spaces, accounting and continuation |
-| `control/` | Command tapes, frame ordering, sensor units and motor contracts |
-| `environments/` | Owned terminal observations and RNG isolation, reward configuration/formulas, dynamics and scan preprocessing |
-| `environments/commands/` | Episode/operator sampling, native command reset behavior and curriculum eligibility |
-| `environments/terrains/families/` | Native family mappings, physical severity, fixed-row geometry and curriculum contracts |
-| Other `environments/terrains/` tests | Procedural/connected geometry and traversal fixtures |
-| `evaluation/` | Flat profiles and terrain crossing/tracking/finish rules, first-attempt failure retention, and read-only archive-integrity checks |
-| `methods/` | Real ROA updates, causal routing, timeout semantics, optimizer state, history, export parity and installed backend discovery |
-| `runtime/` | Native sensor/action binding, signed reward accounting and pre-reset diagnostics, external command ownership and cleanup |
-| Root `test_*.py` | CLI/config validation, artifacts, provenance, package boundaries and the train/export/evaluate workflow |
+| `benchmark/` | Public task API, actor/GT separation, spaces, accounting and continuation |
+| `control/` | Command tapes, causal frames, loaded policies, reset masks and motor contracts |
+| `environments/` | Owned outgoing finals, RNG isolation, reward formulas, dynamics and scans |
+| `environments/commands/` | Episode/operator sampling, native command resets and curriculum eligibility |
+| `environments/terrains/` | Physical family levels, fixed geometry and curriculum |
+| `evaluation/` | Fixed cases, analytic tracking/stopping/failure scores, frozen playback and offline evidence validation |
+| `runtime/` | Native sensing, bounded action delivery, accounting and ordered cleanup |
+| Root `test_*.py` | Offline CLI, provenance and installed-package dependency boundaries |
 
-Keep a test when it guards a supported behavior, numerical contract or meaningful
-failure mode. Prefer parameterized cases to repeated checks. Do not assert that
-removed private functions remain absent or preserve historical implementation
-names. Unsupported artifact formats must still be rejected, and existing evidence
-must never be overwritten. Those are data-safety contracts, not legacy support.
+Keep tests for supported behavior, numerical contracts and meaningful failure
+modes. Do not preserve removed private names merely for historical compatibility.
+Reject inconsistent evidence and never overwrite previous captures.
 
 ## Local execution
 
-Use a CPU Python environment with NumPy, PyTorch, TensorDict, RSL-RL, trimesh and
-SciPy for native heightfield source checks.
-Install package/learner dependencies through
-`python -m pip install -e 'source/parkour_lab[roa]'` in Python 3.10 or 3.11, then
-install the geometry-test dependency with `python -m pip install scipy`.
-Tooling, package-build and bounded server smoke commands are
-in the [package README](../source/parkour_lab/docs/README.md#verification).
-The project uses RSL-RL 3.1.2; learner tests execute real PPO and history-fitting
-updates, not mock optimizers. Git is needed for provenance tests. From the repository root:
+Use Python 3.10 or 3.11 with the package dependencies and SciPy for native
+heightfield-source tests. From the repository root:
 
 ```bash
+python -m pip install -e source/parkour_lab
+python -m pip install scipy
 export PYTHONPATH="$PWD/source/parkour_lab${PYTHONPATH:+:$PYTHONPATH}"
 python -m unittest discover -s tests -t . -v
 ```
@@ -44,89 +34,42 @@ Run a component independently, for example:
 
 ```bash
 python -m unittest discover -s tests/control -t . -v
-python -m unittest tests.methods.roa.test_training -v
+python -m unittest discover -s tests/evaluation -t . -v
 ```
 
-Do not add `tests/` to `PYTHONPATH`. Imports use the `tests` package and its shared
-fixtures. These commands are for local development; server runs use the package
-CLI and do not require test files.
+Do not add `tests/` to `PYTHONPATH`. See the
+[package README](../source/parkour_lab/docs/README.md#verification) for formatting,
+distribution and bounded server commands. Git is needed for provenance tests.
+No training library is needed to exercise the common task or offline scorer.
 
 ## Evidence limits
 
-`test_action_boundary.py` exercises actual PPO sample/likelihood storage alongside
-bounded native delivery, previous-action/reset feedback, the action-rate formula,
-frozen inference parity and explicit artifact conversion. `test_gradients.py`
-checks ordinary clipping agreement, large finite norms and true nonfinite
-rejection. These portable tests do not depend on downloaded run archives.
+CPU tests use real tensor/mesh calculations and small native API doubles.
+Selected checks read Isaac Lab 2.3.2 source from a sibling `IsaacLab2.3.2` or
+`IsaacLab` checkout; they skip explicitly when it is absent. A skip is not
+compatibility evidence. The CPU suite does not launch Isaac Sim or PhysX.
 
-Most checks use real CPU tensor/mesh code with small native API doubles. Selected
-adapter tests also load Isaac Lab 2.3.2 source from a sibling `IsaacLab2.3.2` or
-`IsaacLab` checkout. They explicitly skip when that checkout is absent; a skipped
-check is not evidence of compatibility. No test launches Isaac Sim or PhysX.
+The public-task tests cover the fixed 352-value training packet, physical frames,
+named motor mapping, scan validity, reset masking, owned buffers and unchanged
+RNG state. `scripts/check_public_task.py` separately verifies native readbacks,
+role-specific observations, outgoing rows and a fresh task-progress restart.
+That checkpoint token is a fixture, not a restored learner.
 
-The public-task checks include real tensor calculations for the fixed 352-value
-GT schema, physical frames, named motor mapping, scan validity, reset masking,
-owned values and unchanged RNG state. Facade/native API doubles establish their
-stated information, action, ending and accounting contracts. The runnable
-`scripts/check_public_task.py` separately checks training, evaluation and a fresh
-task-progress restart on the server. CPU success does not establish actual native
-readback, physical locomotion or learner-checkpoint restoration.
+Geometry checks call native terrain-generator source. Curriculum checks cover
+translation eligibility, turning/standing holds, stable families, level boundaries
+and progress restoration. `scripts/check_terrain.py` separately records real
+colliders, rays, nonzero contacts and controlled native curriculum/reset cases.
+These establish their stated plumbing and sampled geometry, not learnability.
 
-Benchmark geometry checks call native terrain generator source for the five
-families, explicit Uneven severity, pyramid signs and fixed evaluation rows.
-Curriculum checks protect eligible translation, stop/pivot/arc holds, stable
-family assignment, level boundaries and checkpoint-linked level restoration.
-`scripts/check_terrain.py` separately captures real collider/ray measurements,
-settled nonzero contacts and controlled native curriculum changes across fixed
-easy/medium/hard settings. Its command is in the package README. The script's
-CPU help/syntax checks do not replace those returned native captures or establish
-calibrated geometry, learnability or non-flat locomotion.
+Analytic traces distinguish correct/wrong turns, unwanted translation, stationary
+arc spinning, residual stopping motion, early endings and missing phases.
+Frozen playback checks preserve applied-command/outgoing-state alignment and
+first-attempt accounting. `scripts/check_evaluation.py` separately loads a tiny
+caller-format policy, captures native cases and invokes the offline CLI in a
+fresh process. Its near-default policy is an engineering fixture, not a trained
+baseline or proof of successful terrain locomotion.
 
-Timing checks cover 200/400 Hz configuration with unchanged 50 Hz actions, the
-SDK's four/eight-substep sampling/reset order, exact cross-rate rejection, and
-explicit actor-export weight preservation. The actual SDK lazy-ray scheduling
-regression reproduces missed updates and checks fresh cached control reads over
-30 seconds at both rates, including partial reset. These do not establish physical
-equivalence, flat retention or sim-to-real transfer at the new rate.
-
-Connected-world tests measure source and local float32 topology, feature
-dimensions, common roughness and prospective command-tape margins across all
-terrain tiers/directions and shape boundaries. Ordinary geometry checks allow
-small angle rounding; strict cap/RMS and no-redraw behavior remain covered.
-These checks do not qualify native meshes or robot traversal. Mocked native calls
-and SDK source checks do not substitute for native execution. Diagnostic-only
-geometry/contact runners are not part of the package or test suite; scoped native
-checks use direct server commands when needed.
-
-Single-world playback checks additionally cover importer wiring, supported rotated
-resets, shared dynamics/noise, first-ending tape preservation, and aligned outgoing
-forces/rays. These protect the operational `connected` terrain path, not a
-diagnostic runner or a claim of physical support on the server.
-
-Terrain scoring tests use analytic traces for rotated ascent/descent/hill crossings,
-bypass and side-edge failures, first-entry tracking, exact timing windows, stable
-finish, falls, stalls and map bounds. Offline loader tests reject incomplete or
-inconsistent archives and invalid delivery/cleanup receipts. These checks do not
-certify cooked contacts or replace a preassigned native qualification bank.
-
-Terrain assignment checks cover development-only IDs, full-SHA/PCG64 mappings,
-collision rejection, per-stratum dimension/tread/yaw coverage, deterministic
-serialization and unchanged existing randomization. Cheap nominal-margin checks
-do not construct all assigned meshes or establish native feasibility. The native
-connected evaluator can now consume one explicitly selected development group and
-global index. Binding checks cover IDs 0/49/50/99 across all 20 groups, native API
-application of seeded mass/friction/gains/reset/noise, the fixed 1500-control tape,
-first-ending preservation and rejection of altered saved assignments/physical
-receipts/draws even when file hashes are recomputed. Existing flat/train/diagnostic
-outputs retain exact parity. These are software/API-double checks; native assigned
-cases and bank qualification remain unverified.
-
-The two traversal-layout classes intentionally apply the same adapter checks to
-different layouts. The end-to-end CPU test verifies software data flow, artifact
-round trips and frozen playback—not physical locomotion, contact generation or
-robot qualification. Those require separate native execution and behavioral evidence.
-
-The installed entry-point fixture aliases ROA, and the artifact payload probe only
-serializes data. They verify loader/configuration/persistence contracts, not a second
-learner or cross-framework interoperability. No alternative learner dependency is
-needed to run the suite.
+Native case-context checks protect fresh-stage creation, ray-mesh cache isolation
+and refusal to replace another active environment. Source topology and mocked
+contact checks do not replace actual cooked geometry, physical support or robot
+behavior evidence.

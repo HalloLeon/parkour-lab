@@ -1,4 +1,4 @@
-"""Native host contracts for non-GRU mock controllers, entirely on CPU."""
+"""Native host contracts for caller-owned controllers, entirely on CPU."""
 
 import unittest
 from dataclasses import replace
@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 import parkour_lab.runtime.native as host_module
+from parkour_lab.benchmark.observations import actor_frame
 from parkour_lab.control.controller import ControllerSpec, JointTargets, SensorSpec
 from parkour_lab.control.motor_contract import (
     make_motor_contract,
@@ -14,7 +15,6 @@ from parkour_lab.control.motor_contract import (
 )
 from parkour_lab.control.proprioception import FOOT_NAMES
 from parkour_lab.environments.randomization import TaskRandomization
-from parkour_lab.runtime.training import TrainingHost
 from tests.support.native import make_native_env, rebatch
 
 
@@ -31,7 +31,7 @@ class MockController:
             actuator_profile=reference.actuator_profile,
             sensors=sensors,
             raw_action_meaning="three private diagnostic values, never native actions",
-            configuration={"default_position_rad": default[0].tolist()},
+            configuration=reference.configuration,
         )
         self.default = default.clone()
         self.private_raw = private_raw
@@ -47,19 +47,22 @@ class MockController:
 
 
 class NativeControllerHostTests(unittest.TestCase):
-    def test_connected_motion_owns_aligned_named_forces_feet_and_rays(self):
+    def test_evaluation_motion_owns_aligned_named_forces_feet_and_support(self):
         from types import SimpleNamespace as NS
 
-        self.env.cfg.parkour_task = {"terrain": "connected"}
+        self.env.capture_evaluation = True
         robot = self.env.scene["robot"]
         robot.body_names = ["base", "FL_foot", "RR_foot", "RL_foot", "FR_foot"]
         robot.data.body_pos_w.copy_(torch.arange(15).reshape(1, 5, 3))
         sensor = self.env.scene["contact_forces"]
         sensor.data.net_forces_w.copy_(torch.arange(15).reshape(1, 5, 3) * 2)
-        self.env.scene["height_scanner"] = NS(
-            data=NS(ray_hits_w=torch.ones(80, 132, 3))
-        )
-        sample = host_module.motion_state(self.env)
+        self.env.termination_manager = NS(active_terms=[])
+        heights = torch.ones(80, 4)
+        valid = torch.ones(80, 4, dtype=torch.bool)
+        with patch(
+            "parkour_lab.runtime.native.foot_support", return_value=(heights, valid)
+        ):
+            sample = host_module.motion_state(self.env)
         torch.testing.assert_close(
             sample["foot_position_w"], robot.data.body_pos_w[:, [4, 1, 2, 3]]
         )
@@ -68,11 +71,11 @@ class NativeControllerHostTests(unittest.TestCase):
         )
         robot.data.body_pos_w.zero_()
         sensor.data.net_forces_w.zero_()
-        self.env.scene["height_scanner"].data.ray_hits_w.zero_()
+        heights.zero_()
         self.assertTrue(sample["foot_position_w"].any())
         self.assertTrue(sample["foot_net_forces_w"].any())
-        self.assertTrue((sample["terrain_hits_w"] == 1).all())
-        self.assertEqual(sample["base_surface_hits_w"].shape, (80, 1, 3))
+        self.assertTrue((sample["support_height_w"] == 1).all())
+        self.assertTrue(sample["support_valid"].all())
 
     def setUp(self):
         self.env = make_native_env(80)
@@ -80,6 +83,7 @@ class NativeControllerHostTests(unittest.TestCase):
 
         binding = rebatch(_runtime_motor_binding(self.env)[0], 4)
         profile = "native_motor_sha256:" + nominal_binding_sha256(binding)
+        limits = self.env.scene["robot"].data.soft_joint_pos_limits[0].tolist()
         self.reference = ControllerSpec(
             name="native_fixture",
             artifact_sha256="a" * 64,
@@ -89,8 +93,15 @@ class NativeControllerHostTests(unittest.TestCase):
             actuator_profile=profile,
             sensors={},
             raw_action_meaning="none",
+            configuration={
+                "default_position_rad": binding["default_position_rad"],
+                "action_clip": {
+                    "version": "joint_limits_v1",
+                    "target_limits_rad": limits,
+                },
+            },
         )
-        self.contract = make_motor_contract(binding, profile)
+        self.contract = make_motor_contract(binding, profile, target_limits_rad=limits)
         self.robot = self.env.scene["robot"].data
 
     def controller(self, sensors=None, *, private_raw=False):
@@ -219,7 +230,6 @@ class NativeControllerHostTests(unittest.TestCase):
         self.enable_noise(self.env)
         training_env = make_native_env(self.env.num_envs)
         self.enable_noise(training_env)
-        training = TrainingHost(training_env, None)
         command = torch.tensor([[0.4, -0.2, 0.5]]).repeat(self.env.num_envs, 1)
         training_env.command_manager.get_term("base_velocity").vel_command_b.copy_(
             command
@@ -243,9 +253,7 @@ class NativeControllerHostTests(unittest.TestCase):
             terrain=torch.ones(self.env.num_envs, 264),
         )
         original = {key: value.clone() for key, value in native.items()}
-        delivered = training.observations(
-            native, torch.ones(self.env.num_envs, dtype=torch.bool)
-        )
+        delivered = actor_frame(training_env, frame)
         controller = self.all_sensor_controller()
         inference = self.host(controller)
         self.act(inference)
@@ -262,15 +270,11 @@ class NativeControllerHostTests(unittest.TestCase):
             ),
             dim=1,
         )
-        self.assertTrue(torch.equal(delivered["proprio"], inference_frame))
+        self.assertTrue(torch.equal(delivered, inference_frame))
         for key, value in original.items():
             self.assertTrue(torch.equal(native[key], value))
-        for key in ("policy", "terrain"):
-            self.assertTrue(torch.equal(delivered[key], original[key]))
         for selection in (slice(6, 9), slice(33, 49)):
-            self.assertTrue(
-                torch.equal(delivered["proprio"][:, selection], frame[:, selection])
-            )
+            self.assertTrue(torch.equal(delivered[:, selection], frame[:, selection]))
 
     def test_shuffled_sensor_declarations_receive_correct_named_current_values(self):
         names = (

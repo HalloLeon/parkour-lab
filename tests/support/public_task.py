@@ -16,7 +16,7 @@ from tests.support.isaaclab import (
     native_config_modules,
     stock_config,
 )
-from tests.support.native import TrainingEnvironmentFixture
+from tests.support.native import NativeEnvironmentFixture
 
 
 def config_dict(value):
@@ -43,7 +43,7 @@ def public_configs():
         yield
 
 
-class PublicTaskFixture(TrainingEnvironmentFixture):
+class PublicTaskFixture(NativeEnvironmentFixture):
     """Four replicas, distinguishable outgoing/reset states and two ending flags."""
 
     def __init__(self, num_envs=4):

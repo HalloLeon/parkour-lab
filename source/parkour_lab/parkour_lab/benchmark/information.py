@@ -6,9 +6,9 @@ import torch
 
 from parkour_lab.control.proprioception import FOOT_NAMES
 
-from .schema import FIELD_SPECS, information_schema, validate_joint_names
+from .schema import FIELD_SPECS, validate_joint_names
 
-__all__ = ["capture_information", "information_schema", "FIELD_SPECS"]
+__all__ = ["capture_information"]
 
 
 def _copy(value, shape, name, device):
