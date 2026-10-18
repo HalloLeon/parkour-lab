@@ -1,7 +1,9 @@
 """Evaluation exclusions and real native support geometry for terrain conditions."""
 
 import json
+import sys
 import unittest
+from itertools import product
 
 import numpy as np
 import trimesh
@@ -98,6 +100,96 @@ class TerrainConditionSpecificationTests(unittest.TestCase):
 
 
 class TerrainConditionGeometryTests(unittest.TestCase):
+    def test_actual_sdk_copy_and_dispatch_preserve_conditions_and_change_geometry(self):
+        with native_geometry():
+            generator_type = sys.modules[
+                "isaaclab.terrains.terrain_generator"
+            ].TerrainGenerator
+            for level, (family, subtype) in product(
+                (0, 3, 7),
+                (
+                    ("Slopes", "pyramid"),
+                    ("Slopes", "inverted_pyramid"),
+                    ("Stairs", "pyramid"),
+                    ("Stairs", "inverted_pyramid"),
+                    ("Hills", "wave"),
+                    ("Uneven", "noise"),
+                ),
+            ):
+                generated = {}
+                conditions = (
+                    ("id", "terrain_ood")
+                    if family == "Uneven"
+                    else ("id", "composition", "terrain_ood")
+                )
+                for condition in conditions:
+                    with self.subTest(
+                        level=level, family=family, subtype=subtype, condition=condition
+                    ):
+                        cfg = config()
+                        configure_terrain(
+                            cfg,
+                            TerrainConfig(fixed_level=level, condition=condition),
+                            training=False,
+                            task_id=f"Go2-{family}-v1",
+                            seed=1077,
+                        )
+                        generator = generator_type.__new__(generator_type)
+                        generator.cfg = cfg.scene.terrain.terrain_generator
+                        selected = next(
+                            sub_cfg
+                            for sub_cfg in generator.cfg.sub_terrains.values()
+                            if sub_cfg.subtype == subtype
+                        )
+                        # Match the common-size propagation from SDK __init__,
+                        # while avoiding its unused Warp/importer boundaries.
+                        selected.size = generator.cfg.size
+                        copied = selected.copy()
+                        self.assertEqual(getattr(copied, "condition", "id"), condition)
+                        if condition == "id":
+                            self.assertFalse(hasattr(copied, "condition"))
+                        # Exercise the real SDK copy/hash/dispatch/centering path,
+                        # not a direct call that can hide lost config fields.
+                        generated[condition] = generator._get_terrain_mesh(
+                            0.9, selected
+                        )
+                base, base_origin = generated["id"]
+                for condition in conditions[1:]:
+                    mesh, origin = generated[condition]
+                    self.assertFalse(np.array_equal(mesh.vertices, base.vertices))
+                    np.testing.assert_array_equal(
+                        mesh.bounds[:, :2], base.bounds[:, :2]
+                    )
+                    if condition == "composition":
+                        np.testing.assert_array_equal(origin, base_origin)
+                        for x, y in ((0, 0), (0.4, -0.3), (-0.8, 0.7)):
+                            self.assertAlmostEqual(
+                                height_at(mesh, x, y), height_at(base, x, y), places=7
+                            )
+                        # Quantized low-amplitude noise can be zero at a few
+                        # selected points; probe a spatial grid of real support.
+                        changed = any(
+                            abs(height_at(mesh, x, y) - height_at(base, x, y)) > 0.0001
+                            for x, y in product(
+                                (-3.25, -2.25, 2.25, 3.25), (-2.75, -0.75, 0.75, 2.75)
+                            )
+                        )
+                        self.assertTrue(changed, (level, family, subtype))
+                    elif family == "Slopes":
+                        self.assertGreater(
+                            abs(height_at(mesh, 2, 0) - height_at(mesh, 3, 0)), 0.30
+                        )
+                    elif family == "Stairs":
+                        self.assertAlmostEqual(
+                            abs(height_at(mesh, 3.05, 0) - height_at(mesh, 3.35, 0)),
+                            physical_level(level, condition="terrain_ood")[
+                                "stair_riser_m"
+                            ],
+                            places=7,
+                        )
+                    elif family == "Hills":
+                        self.assertGreater(np.ptp(mesh.vertices[:, 2]), 0.60)
+
     def test_composition_changes_actual_support_while_preserving_origins_and_starts(
         self,
     ):

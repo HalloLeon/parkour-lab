@@ -43,6 +43,103 @@ def surfaces():
 
 
 class RobustnessCheckTests(unittest.TestCase):
+    def test_geometry_initialization_allows_public_step_without_extra_motor_sensing(
+        self,
+    ):
+        import torch
+
+        from tests.support.public_task import PublicTaskFixture
+
+        args = SimpleNamespace(
+            seed=1077,
+            device="cpu",
+            family="Slopes",
+            level=0,
+            joint="FR_thigh_joint",
+            factor=0.5,
+        )
+        for condition in ("id", "composition", "terrain_ood", None):
+            with self.subTest(condition=condition):
+                fixture = PublicTaskFixture()
+                with (
+                    fixture.task(training=False) as task,
+                    tempfile.TemporaryDirectory() as tmp,
+                    patch("parkour_lab.evaluation.environment._prepare_case_stage"),
+                    patch(
+                        "parkour_lab.benchmark.build_config",
+                        return_value=SimpleNamespace(to_dict=lambda: {}),
+                    ),
+                    patch("parkour_lab.benchmark.make", return_value=task),
+                    patch.object(geometry, "select_geometry_rows") as select,
+                ):
+                    noise_before = task._env.parkour_randomization.state_dict()
+                    self.assertIs(
+                        check._task(args, Path(tmp), condition=condition), task
+                    )
+                    self.assertEqual(fixture.reset_seeds, [None])
+                    self.assertEqual(
+                        task.interactions, dict(session=0, cumulative=0, uncertain=0)
+                    )
+                    if condition is None:
+                        select.assert_not_called()
+                        self.assertEqual(
+                            task._env.parkour_randomization.state_dict(), noise_before
+                        )
+                        with self.assertRaisesRegex(RuntimeError, "Reset the task"):
+                            task.step(torch.zeros(task.num_envs, 12))
+                    else:
+                        select.assert_called_once_with(task)
+                        observation, _, _, _, info = task.step(
+                            torch.zeros(task.num_envs, 12)
+                        )
+                        self.assertEqual(
+                            observation["actor"].shape, (task.num_envs, 49)
+                        )
+                        self.assertEqual(info["interactions"]["session"], task.num_envs)
+
+    def test_geometry_rows_cover_both_signs_and_update_reset_origins(self):
+        import torch
+
+        from parkour_lab.environments.terrains.specification import (
+            TerrainConfig,
+            terrain_specification,
+        )
+
+        for family in ("Slopes", "Stairs", "Hills"):
+            with self.subTest(family=family):
+                definition = terrain_specification(
+                    TerrainConfig(fixed_level=3),
+                    training=False,
+                    task_id=f"Go2-{family}-v1",
+                )
+                origins = torch.arange(60).reshape(1, 20, 3).float()
+                terrain = SimpleNamespace(
+                    terrain_types=torch.tensor([0, 9]),
+                    terrain_levels=torch.zeros(2, dtype=torch.long),
+                    terrain_origins=origins,
+                    env_origins=origins[0, [0, 9]].clone(),
+                )
+                scene = SimpleNamespace(
+                    terrain=terrain, env_origins=terrain.env_origins.clone()
+                )
+                task = SimpleNamespace(
+                    num_envs=2,
+                    device="cpu",
+                    _env=SimpleNamespace(
+                        scene=scene, cfg=SimpleNamespace(benchmark_terrain=definition)
+                    ),
+                )
+                geometry.select_geometry_rows(task)
+                chosen = terrain.terrain_types.tolist()
+                self.assertEqual(len(set(chosen)), 2)
+                self.assertEqual(
+                    {definition["columns"][i]["subtype"] for i in chosen},
+                    {"wave"} if family == "Hills" else {"pyramid", "inverted_pyramid"},
+                )
+                torch.testing.assert_close(terrain.env_origins, origins[0, chosen])
+                torch.testing.assert_close(scene.env_origins, terrain.env_origins)
+                self.assertEqual(terrain.terrain_levels.tolist(), [0, 0])
+
     def test_help_imports_no_native_or_learning_runtime(self):
         program = """
 import importlib.abc, runpy, sys

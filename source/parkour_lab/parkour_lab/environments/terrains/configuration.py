@@ -48,21 +48,28 @@ def configure_terrain(cfg, options, *, training, task_id, seed):
         column: int = 0
         fixed_level: int | None = None
 
+    @configclass
+    class EvaluationTerrainCfg(PhysicalTerrainCfg):
+        # SDK configclass.copy() rebuilds declared dataclass fields. An instance
+        # attribute would disappear before the native generator calls our hook.
+        condition: str = "id"
+
+    terrain_class = (
+        PhysicalTerrainCfg if options.condition == "id" else EvaluationTerrainCfg
+    )
+    condition = {} if options.condition == "id" else {"condition": options.condition}
     columns = receipt["columns"]
     sub_terrains = {
-        f"column_{column:02d}_{definition['family'].lower()}": PhysicalTerrainCfg(
+        f"column_{column:02d}_{definition['family'].lower()}": terrain_class(
             proportion=1 / len(columns),
             family=definition["family"],
             subtype=definition["subtype"],
             column=column,
             fixed_level=receipt["fixed_level"],
+            **condition,
         )
         for column, definition in enumerate(columns)
     }
-    # Keep the ID config schema and identity unchanged for existing consumers.
-    if options.condition != "id":
-        for sub_cfg in sub_terrains.values():
-            sub_cfg.condition = options.condition
     terrain.terrain_type = "generator"
     terrain.terrain_generator = TerrainGeneratorCfg(
         seed=seed,

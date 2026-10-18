@@ -38,9 +38,15 @@ def _task(args, folder, *, condition=None):
     (folder / "resolved_env.yaml").write_text(yaml.dump(cfg.to_dict(), sort_keys=False))
     task = make(cfg)
     try:
-        # The controller host owns sensing in the motor check. Avoid preparing
-        # additional public actor frames or resetting learner RNGs here.
-        task._env.reset(seed=None)
+        if condition is None:
+            # The motor controller host owns sensing; do not draw an extra
+            # public actor frame before it starts.
+            task._env.reset(seed=None)
+        else:
+            from scripts._robustness_checks.geometry import select_geometry_rows
+
+            select_geometry_rows(task)
+            task.reset()
         return task
     except BaseException:
         task.close()

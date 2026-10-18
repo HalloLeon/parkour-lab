@@ -1,6 +1,27 @@
 """Read composed/OOD surfaces from the actual collider, with paired base controls."""
 
 
+def select_geometry_rows(task):
+    """Probe both pyramid signs, or two distinct wave instances, before reset."""
+    import torch
+
+    native = task._env
+    columns = native.cfg.benchmark_terrain["columns"]
+    subtypes = list(dict.fromkeys(column["subtype"] for column in columns))
+    selected = [
+        next(i for i, column in enumerate(columns) if column["subtype"] == subtype)
+        for subtype in subtypes
+    ]
+    if len(selected) == 1:
+        selected.append(next(i for i in range(len(columns)) if i not in selected))
+    assert len(selected) == task.num_envs == 2
+    terrain = native.scene.terrain
+    terrain.terrain_types.copy_(torch.tensor(selected, device=task.device))
+    terrain.terrain_levels.zero_()
+    terrain.env_origins.copy_(terrain.terrain_origins[0, terrain.terrain_types])
+    native.scene.env_origins.copy_(terrain.env_origins)
+
+
 def sample_surface(task, output):
     import numpy as np
     import torch
