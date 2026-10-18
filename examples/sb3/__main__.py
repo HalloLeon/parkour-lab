@@ -1,7 +1,9 @@
-"""Short external Stable-Baselines3 training, continuation and frozen evaluation."""
+"""External Stable-Baselines3 training, continuation and frozen evaluation."""
 
 import argparse
+import platform
 import sys
+import time
 import traceback
 from pathlib import Path
 
@@ -28,6 +30,19 @@ def _parser():
     train.add_argument("--num-envs", type=int, default=20)
     train.add_argument("--seed", type=int, default=1077)
     train.add_argument("--run-id")
+    train.add_argument(
+        "--save-every-updates",
+        type=int,
+        default=5000,
+        help="Full checkpoint interval in declared learner update units",
+    )
+    train.add_argument(
+        "--milestones",
+        type=int,
+        nargs="+",
+        default=(),
+        help="Absolute interaction totals for full checkpoint saves",
+    )
     evaluate = commands.add_parser("evaluate", help="Evaluate an already-saved policy")
     evaluate.add_argument("--checkpoint", type=Path, required=True)
     evaluate.add_argument("--full-bank", action="store_true")
@@ -45,6 +60,12 @@ def _validate(parser, args):
             parser.error("Interaction target and replica count must be positive")
         if not 0 <= args.seed < 2**32:
             parser.error("Require a uint32 seed")
+        if args.save_every_updates <= 0 or any(
+            point <= 0 or point > args.total_interactions for point in args.milestones
+        ):
+            parser.error(
+                "Require positive save interval and milestones within the target"
+            )
         checkpoint = args.resume
     else:
         checkpoint = args.checkpoint
@@ -112,6 +133,8 @@ def _train(args, app, output, report, task):
             resume=args.resume,
             app=app,
             run_id=args.run_id,
+            save_every_updates=args.save_every_updates,
+            milestones=args.milestones,
         )
     )
     if task.interactions["cumulative"] != args.total_interactions:
@@ -159,6 +182,7 @@ def main(argv=None):
     _validate(parser, args)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
+    started = time.perf_counter()
     report = dict(
         status="RUNNING",
         command=args.command,
@@ -168,9 +192,16 @@ def main(argv=None):
         behavior_validated=False,
         calibration_validated=False,
         learner_device=args.learner_device,
+        resources=dict(
+            physics_device=args.device,
+            learner_device=args.learner_device,
+            system=platform.platform(),
+            processor=platform.processor(),
+        ),
     )
 
     def publish():
+        report["resources"]["wall_time_s"] = time.perf_counter() - started
         write_json(output / "report.json", report)
 
     app = task = None
@@ -184,6 +215,13 @@ def main(argv=None):
         import torch
 
         torch.set_num_threads(2)
+        report["resources"].update(
+            torch_threads=torch.get_num_threads(),
+            available_cuda_devices=[
+                torch.cuda.get_device_name(index)
+                for index in range(torch.cuda.device_count())
+            ],
+        )
         report["dependencies"] = _dependencies()
         if args.command == "train":
             import yaml

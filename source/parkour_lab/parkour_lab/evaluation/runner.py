@@ -7,6 +7,7 @@ import torch
 
 from parkour_lab.control.command_tape import TapeBuilder, write_tape
 from parkour_lab.provenance import (
+    dependency_identity,
     package_source_identity,
     write_json,
     write_run_provenance,
@@ -24,6 +25,22 @@ from .capture import (
 )
 
 __all__ = ["evaluate"]
+
+
+def _native_dependencies():
+    """Identify the running stack after the caller has started AppLauncher."""
+    return {
+        name: dependency_identity(name, name)
+        for name in (
+            "isaaclab",
+            "isaaclab_assets",
+            "isaaclab_tasks",
+            "isaacsim",
+            "torch",
+            "gymnasium",
+            "numpy",
+        )
+    }
 
 
 def _identity(policy):
@@ -88,6 +105,7 @@ def evaluate(
         "checkpoint_sha256": checkpoint_sha256,
         "policy_state_sha256": before,
         "package_sources": package_source_identity(),
+        "native_dependencies": None,
         "execution": "sequential single-replica first attempts",
     }
     if any(case.condition != "id" for case in cases):
@@ -95,6 +113,7 @@ def evaluate(
 
         manifest["robustness_version"] = robustness_version
     try:
+        manifest["native_dependencies"] = _native_dependencies()
         if repository_path is not None:
             write_run_provenance(folder, repository_path)
         publish_capture(folder, manifest)

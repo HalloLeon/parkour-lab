@@ -11,6 +11,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import torch  # noqa: F401 - load before patch.dict removes newly imported modules
+
 from examples.sb3 import __main__ as cli
 
 
@@ -125,6 +127,11 @@ class CliTests(unittest.TestCase):
                         str(checkpoint),
                         "--run-id",
                         "run-1077",
+                        "--save-every-updates",
+                        "10",
+                        "--milestones",
+                        "1280",
+                        "2560",
                     ]
                 )
                 self.assertEqual(code, 0)
@@ -136,6 +143,8 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(arguments["resume"], checkpoint)
                 self.assertEqual(arguments["learner_device"], "cpu")
                 self.assertEqual(arguments["run_id"], "run-1077")
+                self.assertEqual(arguments["save_every_updates"], 10)
+                self.assertEqual(arguments["milestones"], [1280, 2560])
                 self.assertIs(arguments["app"], native.app)
                 self.assertEqual(native.build.call_args.kwargs, {"training": True})
                 native.exit_process.assert_called_once_with(0)

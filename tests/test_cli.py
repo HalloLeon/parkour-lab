@@ -28,7 +28,7 @@ class CLITests(unittest.TestCase):
             with self.assertRaises(SystemExit) as stopped:
                 main(["--help"])
         self.assertEqual(stopped.exception.code, 0)
-        self.assertIn("{score,cases}", output.getvalue())
+        self.assertIn("{score,report,cases}", output.getvalue())
         for command in (
             "train",
             "evaluate",
@@ -53,6 +53,15 @@ class CLITests(unittest.TestCase):
         self.assertEqual(
             json.loads(output.getvalue()), {"capture": "checked", "score": 0.0}
         )
+
+    def test_report_dispatches_offline_and_retains_incomplete_design(self):
+        module = ModuleType("parkour_lab.evaluation")
+        module.report_campaign = Mock(return_value={"data_complete": False})
+        with patch.dict("sys.modules", {module.__name__: module}):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(main(["report", "campaign.json"]), 0)
+        module.report_campaign.assert_called_once_with(Path("campaign.json"))
+        self.assertFalse(json.loads(output.getvalue())["data_complete"])
 
     def test_score_output_file_is_complete_json_and_scorer_errors_propagate(self):
         module = ModuleType("parkour_lab.evaluation")

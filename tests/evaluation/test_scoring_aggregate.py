@@ -2,8 +2,9 @@
 
 import unittest
 from copy import deepcopy
+from dataclasses import replace
 
-from parkour_lab.evaluation.cases import case_bank
+from parkour_lab.evaluation.cases import EvaluationCase, case_bank
 from parkour_lab.evaluation.scoring import (
     aggregate_cases,
     aggregate_training_seeds,
@@ -84,6 +85,56 @@ class AggregationTests(unittest.TestCase):
         missing = aggregate_training_seeds(cases, {42: [first], 73: []})
         self.assertFalse(missing["complete"])
         self.assertIsNone(missing["core_return_mean"])
+
+    def test_five_seed_group_statistics_and_unavailable_phases(self):
+        cases = case_bank("validation")[:1]
+        rows = {}
+        for seed in range(5):
+            result = score_case(cases[0], analytic_trace(cases[0]))
+            result["core_return"] = seed + 1
+            rows[seed] = [result]
+        report = aggregate_training_seeds(cases, rows)
+        self.assertAlmostEqual(report["core_return_mean"], 3)
+        self.assertAlmostEqual(report["core_return_standard_deviation"], 2.5**0.5)
+        self.assertAlmostEqual(report["core_return_standard_error"], 0.5**0.5)
+        group = report["group_statistics"]["family"]["Flat"]
+        self.assertEqual(group["core_return_mean"]["available_training_seeds"], 5)
+        self.assertAlmostEqual(group["core_return_mean"]["standard_error"], 0.5**0.5)
+        self.assertTrue(
+            group["diagnostics"]["settled_planar_rmse_m_s"][
+                "conditional_on_available_phases"
+            ]
+        )
+        rows[4] = []
+        missing = aggregate_training_seeds(cases, rows)["group_statistics"]["family"][
+            "Flat"
+        ]
+        self.assertIsNone(missing["physical_failure_fraction_prescribed"]["mean"])
+        self.assertEqual(
+            missing["physical_failure_fraction_prescribed"]["available_training_seeds"],
+            4,
+        )
+
+    def test_paired_block_deltas_are_averaged_within_training_seed(self):
+        base = EvaluationCase("validation", "Slopes", 0, "pyramid", "forward-035")
+        composed = replace(base, condition="composition")
+        cases, rows = (base, composed), {}
+        for seed, delta in enumerate((2.0, 4.0, 6.0)):
+            pair = []
+            for case, value in ((base, 100.0 + seed), (composed, 100.0 + seed + delta)):
+                trace = analytic_trace(case, steps=1)
+                trace["terminated"][:] = True
+                trace["reward"][:] = value
+                pair.append(score_case(case, trace))
+            rows[seed] = pair
+        summary = aggregate_training_seeds(cases, rows)
+        statistics = summary["paired_statistics"]["composition"]["statistics"][
+            "core_return_delta"
+        ]
+        self.assertAlmostEqual(statistics["mean"], 4)
+        self.assertAlmostEqual(statistics["standard_deviation"], 2)
+        self.assertAlmostEqual(statistics["standard_error"], 2 / 3**0.5)
+        self.assertEqual(statistics["prescribed_training_seeds"], 3)
 
 
 if __name__ == "__main__":

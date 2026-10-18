@@ -502,6 +502,7 @@ The environment, inference controller and learner are separate responsibilities.
 | `runtime/` | Native sensor/motor binding, transition accounting and ordered environment/application cleanup. |
 | `evaluation/runner.py`, `environment.py`, `capture.py` | Frozen playback, dedicated case environments and portable outgoing-transition capture. |
 | `evaluation/cases.py`, `scoring/` | Fixed case identities and authoritative physical scores/aggregates. |
+| `evaluation/campaign.py` | Offline planned-run completeness and uncertainty across independent training seeds. |
 | `tests/` | Behavioral contracts, package boundaries, analytic scores and geometry checks. |
 | `scripts/check_public_task.py` | Runnable public-task consumer and bounded training/evaluation/continuation contract check. |
 | `scripts/check_terrain.py`, `scripts/_terrain_checks/` | Bounded native geometry, contact, curriculum and recreation checks. |
@@ -596,8 +597,15 @@ state are verified before continued learning; the original SB3 version and sourc
 must match. Inference uses SB3's deterministic prediction, including its own
 action unscaling. Timeout bootstrapping uses owned outgoing observations, while
 physical termination takes precedence. Resumption starts fresh physical episodes;
-no partial PPO rollout or live simulator state is restored. The short default
-run stays below 5,000 external updates and saves only its full terminal checkpoint.
+no partial PPO rollout or live simulator state is restored. Full saves occur every
+5,000 declared updates and at normal completion. PPO counts epochs; SAC counts
+gradient steps. `--milestones` additionally saves at absolute interaction totals;
+all targets must align with complete collection blocks. Saving continues the live
+physical episodes. `checkpoint_index.json` links each completed bundle, counter,
+save reason and session training-loop time. Intermediate bundles are under
+`checkpoints/step_<interactions>/`; the terminal bundle remains `checkpoint/`.
+An interrupted save cannot replace an earlier complete bundle. The short default
+run stays below the periodic interval and saves only its terminal checkpoint.
 
 This example resumes clean checkpoints with exact accounting. It is not a crash
 recovery service. Error reports retain known interaction totals; collection after
@@ -682,6 +690,164 @@ task. It does not launch Isaac Sim:
 ```bash
 python -m unittest discover -s examples/sb3/tests -t . -v
 ```
+
+### Bounded development pilot
+
+This pilot measures learning trends under the existing integration recipes.
+Train three fresh seeds per method on the five-family Mixed task, retaining full
+checkpoints at 256,000, 512,000 and 1,024,000 cumulative real transitions. The six
+runs collect **6,144,000 training transitions** in total. Evaluate all 114 fixed
+validation cases at each checkpoint in separate native processes; evaluation
+interactions are recorded separately. Keep the seed list, recipe, milestones and
+bank fixed for the entire pilot. The command preserves failures and produces an
+offline completeness report even when a run fails.
+
+Run from the repository root with the configured native interpreter. This uses
+the same small PPO/SAC architectures, update ratios and SAC replay capacity as the
+integration checks above. These settings are disclosed integration recipes; a
+flat learning curve would leave learnability inconclusive. Inspect return,
+tracking in both turn directions, stopping, falls and actual nonflat support
+exposure together. Survival alone cannot establish commanded locomotion.
+
+```bash
+export PLAB_PY=/absolute/path/to/native/python
+bash <<'BASH'
+set -uo pipefail
+PLAB_PY=${PLAB_PY:-python}
+export PYTHONPATH="$PWD/source/parkour_lab${PYTHONPATH:+:$PYTHONPATH}"
+mkdir -p logs/parkour_lab || exit 1
+RUN=$(mktemp -d logs/parkour_lab/calibration_pilot_XXXXXX) || exit 1
+export RUN
+trap 'status=$?; printf "{\"returncode\": %d}\n" "$status" > "$RUN/process_exit.json"; echo "Results: $PWD/$RUN"' EXIT
+# Declare the complete grid before any collection; absent artifacts stay planned.
+"$PLAB_PY" - <<'PY' || exit "$?"
+import hashlib, json, os
+from pathlib import Path
+from examples.sb3.__main__ import _example_sources
+from parkour_lab.provenance import dependency_identity
+root = Path(os.environ['RUN'])
+library = dependency_identity('stable_baselines3', 'stable-baselines3')
+library = {k: library[k] for k in ('version', 'source_sha256')}
+sources = dict(example_sources=_example_sources(), stable_baselines3=library)
+source = hashlib.sha256(json.dumps(sources, sort_keys=True).encode()).hexdigest()
+plan = dict(version='go2_campaign_v1', purpose='development', partition='validation',
+            suite='core', seeds=[1078, 2078, 3078], milestones=[256000, 512000, 1024000], methods=[])
+for algorithm in ('ppo', 'sac'):
+    method = dict(method_id=algorithm, source_id=source, recipe_id=f'{algorithm}:{source}',
+                  ground_truth_usage=[], runs=[])
+    for seed in plan['seeds']:
+        prefix = f'{algorithm}/seed_{seed}'
+        run = dict(training_seed=seed, run_id=f'{root.name}:{algorithm}:{seed}',
+                   configuration_id='unavailable', training_report=f'{prefix}/train/report.json', endpoints=[])
+        for point in plan['milestones']:
+            checkpoint = 'checkpoint' if point == plan['milestones'][-1] else f'checkpoints/step_{point}'
+            run['endpoints'].append(dict(interactions=point,
+                capture=f'{prefix}/evaluation_{point}/capture',
+                progress=f'{prefix}/train/{checkpoint}/progress.json', resources=dict(wall_time_s=0)))
+        method['runs'].append(run)
+    plan['methods'].append(method)
+(root/'campaign.json').write_text(json.dumps(plan, indent=2)+'\n')
+PY
+run_stage() {
+    local name=$1
+    shift
+    local log="$RUN/${name//\//_}"
+    "$PLAB_PY" -u -m examples.sb3 "$@" --device cuda:0 --learner-device cpu \
+        --output "$RUN/$name" > "$log.log" 2>&1
+    local code=$?
+    printf '{"returncode": %d}\n' "$code" > "${log}_process_exit.json"
+    return "$code"
+}
+failed=0
+for algorithm in ppo sac; do
+    for seed in 1078 2078 3078; do
+        prefix="$algorithm/seed_$seed"
+        run_stage "$prefix/train" train --algorithm "$algorithm" \
+            --task Go2-Mixed-v1 --num-envs 20 --seed "$seed" \
+            --run-id "${RUN##*/}:$algorithm:$seed" --total-interactions 1024000 \
+            --milestones 256000 512000 1024000 || failed=1
+        for point in 256000 512000 1024000; do
+            checkpoint="$RUN/$prefix/train/checkpoints/step_$point"
+            [[ $point == 1024000 ]] && checkpoint="$RUN/$prefix/train/checkpoint"
+            [[ -r "$checkpoint/checkpoint.json" ]] || { failed=1; continue; }
+            run_stage "$prefix/evaluation_$point" evaluate --full-bank \
+                --checkpoint "$checkpoint" || failed=1
+        done
+    done
+done
+# Fill observed configuration identities and cumulative fresh-run timing.
+# Original reports/indexes remain separate, including any later failed collection.
+"$PLAB_PY" - <<'PY' || exit "$?"
+import hashlib, json, os
+from pathlib import Path
+root = Path(os.environ['RUN'])
+plan = json.loads((root/'campaign.json').read_text())
+def read(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+for method in plan['methods']:
+    for run in method['runs']:
+        report = read(root/run['training_report'])
+        index = read((root/run['training_report']).with_name('checkpoint_index.json'))
+        entries = {v['training_interactions']: v for v in index.get('checkpoints', [])}
+        library = report.get('dependencies', {}).get('stable_baselines3', {})
+        sources = dict(example_sources=report.get('example_sources'),
+                       stable_baselines3={k: library.get(k) for k in ('version', 'source_sha256')})
+        source = hashlib.sha256(json.dumps(sources, sort_keys=True).encode()).hexdigest()
+        for endpoint in run['endpoints']:
+            progress = read(root/endpoint['progress'])
+            if progress:
+                run['configuration_id'] = progress['configuration_id']
+            endpoint['resources'] = dict(report.get('resources', {}),
+                wall_time_s=entries.get(endpoint['interactions'], {}).get('training_loop_wall_time_s', 0),
+                timing_scope='cumulative fresh training loop; full process timing in training_report')
+            if source != method['source_id']:
+                endpoint.update(status='failed', reason='Training source receipt missing or differs from the declared method')
+            elif report.get('status') != 'LEARNER_CHECK_PASSED':
+                endpoint.update(status='failed', reason='Training process failed; retain its report and all collected spend')
+            elif report.get('training_information_used') != method['ground_truth_usage']:
+                endpoint.update(status='failed', reason='Training information use differs from the declaration')
+(root/'campaign.json').write_text(json.dumps(plan, indent=2)+'\n')
+PY
+"$PLAB_PY" -m parkour_lab report "$RUN/campaign.json" \
+    --output "$RUN/campaign_report.json" || exit "$?"
+exit "$failed"
+BASH
+```
+
+Recompute the report on a CPU machine with the installed core package:
+
+```bash
+python -m parkour_lab report /absolute/path/to/pilot/campaign.json --output /tmp/pilot_report.json
+```
+
+The manifest is learner independent: each method declares source/recipe identity
+and the training-packet GT fields it uses; each seed declares one run identity,
+task configuration and checkpoint-linked progress/capture paths. Paths resolve
+relative to the manifest. `resources.wall_time_s` is a cumulative external
+declaration at that checkpoint, never a sum of milestone timings. Other external
+learners can write this manifest with their own checkpoint format. The reporter
+loads only task progress and saved traces, rechecks native/source/reward identities
+and complete banks, and computes sample SD/SE across independent training seeds.
+Missing or invalid endpoints block a complete result; physical falls retain
+their recorded returns. Generating a report succeeds even for incomplete data;
+inspect its completeness and readiness fields.
+
+For a clean continuation, keep the same seed/task/replica count and sources, pass
+`--resume <full-checkpoint-folder>`, and set `--total-interactions` to the original
+absolute budget, with only future `--milestones`. New-session loop times must be
+added to prior session times when declaring cumulative resources. A resumed
+checkpoint remains part of its original seed run. The example refuses uncertain
+or discarded collection that no longer equals the saved learner counter; retain
+the failure and its spend rather than treating a retry as free data.
+
+These development results can inform shared protocol changes, which need a new
+declared pilot. They do not freeze difficulty, validate the provisional 100M
+allowance or rank methods. Keep final-test cases unopened during calibration.
+Final comparisons require a frozen protocol, at least five fresh seeds per method,
+common-budget endpoints and the complete ID/OOD/fault banks with seed uncertainty.
 
 ## Verification
 

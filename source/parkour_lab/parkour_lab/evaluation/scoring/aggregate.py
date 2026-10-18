@@ -3,8 +3,6 @@
 import math
 from collections import defaultdict
 
-import numpy as np
-
 from ..cases import EvaluationCase, case_bank
 from ..robustness import block_name, robustness_bank
 from .case import VERSION
@@ -265,43 +263,4 @@ def aggregate_cases(cases, results):
             )
             for case in cases
         ],
-    )
-
-
-def aggregate_training_seeds(cases, results_by_seed):
-    """Uncertainty is across independently trained seeds, never across test cases."""
-    if (
-        not isinstance(results_by_seed, dict)
-        or not results_by_seed
-        or any(type(seed) is not int or seed < 0 for seed in results_by_seed)
-    ):
-        raise ValueError("Require nonnegative independent training seed IDs")
-    cases = tuple(cases)
-    summaries = {
-        seed: aggregate_cases(cases, results)
-        for seed, results in sorted(results_by_seed.items())
-    }
-    values = [
-        report["overall"]["core_return_mean"]
-        for report in summaries.values()
-        if report["complete"] and report["overall"] is not None
-    ]
-    complete = len(values) == len(summaries)
-    mean = float(np.mean(values)) if values else None
-    deviation = float(np.std(values, ddof=1)) if len(values) > 1 else None
-    return dict(
-        version=VERSION,
-        prescribed_training_seeds=len(summaries),
-        complete_training_seeds=len(values),
-        complete=complete,
-        core_return_mean=mean if complete else None,
-        core_return_mean_complete_seeds_conditional=mean,
-        core_return_standard_deviation=deviation if complete else None,
-        core_return_standard_error=(
-            deviation / math.sqrt(len(values))
-            if complete and deviation is not None
-            else None
-        ),
-        uncertainty_unit="independently trained seed; no uncertainty from treating cases as independent learners",
-        training_seeds={str(seed): report for seed, report in summaries.items()},
     )

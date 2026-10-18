@@ -9,6 +9,7 @@ __all__ = [
     "robustness_bank",
     "evaluate",
     "score_capture",
+    "report_campaign",
 ]
 
 
@@ -24,3 +25,10 @@ def score_capture(folder):
     from .capture import score_capture as score
 
     return score(folder)
+
+
+def report_campaign(path):
+    """Check a declared campaign and summarize independent training seeds offline."""
+    from .campaign import report_campaign as report
+
+    return report(path)

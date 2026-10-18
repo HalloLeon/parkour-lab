@@ -13,6 +13,12 @@ def parse_args(argv=None):
     score = commands.add_parser("score", help="Score an existing evaluation capture")
     score.add_argument("capture", type=Path)
     score.add_argument("--output", type=Path)
+    report = commands.add_parser(
+        "report",
+        help="Check planned campaign endpoints and independent-seed uncertainty",
+    )
+    report.add_argument("campaign", type=Path)
+    report.add_argument("--output", type=Path)
     cases = commands.add_parser("cases", help="Inspect the fixed evaluation case bank")
     cases.add_argument("--partition", default="validation")
     cases.add_argument("--attempts", type=int, default=1)
@@ -27,6 +33,10 @@ def main(argv=None):
         from parkour_lab.evaluation import score_capture
 
         result = score_capture(args.capture)
+    elif args.command == "report":
+        from parkour_lab.evaluation import report_campaign
+
+        result = report_campaign(args.campaign)
     else:
         from parkour_lab.evaluation.cases import case_bank
 

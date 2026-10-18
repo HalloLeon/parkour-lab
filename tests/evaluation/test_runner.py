@@ -84,6 +84,9 @@ def _native_fixture(*, ending="terminated", fail=None, changed=False):
                 patch("parkour_lab.evaluation.environment." + name, replacement)
             )
         stack.enter_context(patch.object(runner, "motion_state", lambda env: live))
+        stack.enter_context(
+            patch.object(runner, "_native_dependencies", return_value={"fixture": True})
+        )
         yield env, task, host, policy
 
 
@@ -116,6 +119,7 @@ class LoadedPolicyPlaybackTests(unittest.TestCase):
                     report, json.loads((folder / "report.json").read_text())
                 )
                 self.assertTrue(report["capture_valid"])
+                self.assertEqual(report["native_dependencies"], {"fixture": True})
                 self.assertFalse(report["valid_for_comparison"])
                 with np.load(folder / self.case.case_id / "trace.npz") as trace:
                     np.testing.assert_array_equal(
@@ -165,7 +169,10 @@ class LoadedPolicyPlaybackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp) / "capture"
             policy = NS(state_sha256=lambda: "a" * 64)
-            with patch.object(runner, "_run_case") as run:
+            with (
+                patch.object(runner, "_run_case") as run,
+                patch.object(runner, "_native_dependencies", return_value={}),
+            ):
                 report = runner.evaluate(
                     policy,
                     [self.case, other],

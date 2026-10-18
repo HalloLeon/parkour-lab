@@ -1,9 +1,5 @@
 """Shared contact-aware Go2 frame; history and reset state belong to each method."""
 
-import torch
-
-from .controller import SensorSpec
-
 FRAME_DIM = 49
 ACTION_SLICE = slice(33, 45)
 CONTACT_SLICE = slice(45, 49)
@@ -35,6 +31,8 @@ NATIVE_SENSORS = {
 
 def proprioceptive_sensor_specs():
     """Return a fresh declaration of the six causal sensor fields."""
+    from .controller import SensorSpec
+
     return {
         name: SensorSpec(*NATIVE_SENSORS[name], max_age_s=0.02)
         for name in (
@@ -57,6 +55,8 @@ def pack_proprioception(
     previous_raw_action,
     foot_contacts,
 ):
+    import torch
+
     return torch.cat(
         (
             base_ang_vel,

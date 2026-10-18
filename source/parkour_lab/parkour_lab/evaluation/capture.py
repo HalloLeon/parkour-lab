@@ -183,6 +183,7 @@ def score_capture(folder):
         "checkpoint_sha256": manifest["checkpoint_sha256"],
         "policy_state_sha256": manifest["policy_state_sha256"],
         "core_reward_recipe_sha256": manifest.get("core_reward_recipe_sha256"),
+        "native_dependencies": manifest.get("native_dependencies"),
         "final_policy_state_sha256": manifest.get("final_policy_state_sha256"),
         "capture_valid": capture_valid,
         "valid_for_comparison": capture_valid and aggregate["full_requested_bank"],
