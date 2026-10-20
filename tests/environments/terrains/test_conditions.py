@@ -14,6 +14,7 @@ from parkour_lab.environments.terrains.generation import (
     native_terrain_config,
 )
 from parkour_lab.environments.terrains.specification import (
+    EVALUATION_LEVELS,
     LEVEL_COUNT,
     TerrainConfig,
     physical_level,
@@ -80,7 +81,7 @@ class TerrainConditionSpecificationTests(unittest.TestCase):
         json.dumps(receipt, allow_nan=False)
 
     def test_composition_components_are_id_and_invalid_family_labels_rejected(self):
-        for level in (0, 3, 7):
+        for level in EVALUATION_LEVELS:
             self.assertEqual(
                 physical_level(level, condition="composition"), physical_level(level)
             )
@@ -106,7 +107,7 @@ class TerrainConditionGeometryTests(unittest.TestCase):
                 "isaaclab.terrains.terrain_generator"
             ].TerrainGenerator
             for level, (family, subtype) in product(
-                (0, 3, 7),
+                (0, 8, 15),
                 (
                     ("Slopes", "pyramid"),
                     ("Slopes", "inverted_pyramid"),
@@ -156,6 +157,11 @@ class TerrainConditionGeometryTests(unittest.TestCase):
                 base, base_origin = generated["id"]
                 for condition in conditions[1:]:
                     mesh, origin = generated[condition]
+                    if level == 0 and condition == "composition":
+                        np.testing.assert_array_equal(mesh.vertices, base.vertices)
+                        np.testing.assert_array_equal(mesh.faces, base.faces)
+                        np.testing.assert_array_equal(origin, base_origin)
+                        continue
                     self.assertFalse(np.array_equal(mesh.vertices, base.vertices))
                     np.testing.assert_array_equal(
                         mesh.bounds[:, :2], base.bounds[:, :2]
@@ -194,7 +200,7 @@ class TerrainConditionGeometryTests(unittest.TestCase):
         self,
     ):
         with native_geometry():
-            for level in (0, 3, 7):
+            for level in EVALUATION_LEVELS:
                 for family, subtype in (
                     ("Slopes", "pyramid"),
                     ("Slopes", "inverted_pyramid"),
@@ -207,6 +213,14 @@ class TerrainConditionGeometryTests(unittest.TestCase):
                         pieces, composed, origin = generated(
                             family, subtype, level, "composition"
                         )
+                        if level == 0:
+                            np.testing.assert_array_equal(
+                                base.vertices, composed.vertices
+                            )
+                            np.testing.assert_array_equal(base.faces, composed.faces)
+                            np.testing.assert_array_equal(origin, base_origin)
+                            np.testing.assert_array_equal(composed.vertices[:, 2], 0)
+                            continue
                         np.testing.assert_array_equal(origin, base_origin)
                         np.testing.assert_array_equal(
                             base.bounds[:, :2], composed.bounds[:, :2]
@@ -238,8 +252,8 @@ class TerrainConditionGeometryTests(unittest.TestCase):
 
     def test_irregularity_is_within_one_supporting_tread_not_separate_patches(self):
         with native_geometry():
-            _, base, _ = generated("Stairs", "pyramid", 3, "id")
-            _, composed, _ = generated("Stairs", "pyramid", 3, "composition")
+            _, base, _ = generated("Stairs", "pyramid", 8, "id")
+            _, composed, _ = generated("Stairs", "pyramid", 8, "composition")
             samples = [(9.05, 6.05), (9.15, 6.05), (9.25, 6.05)]
             nominal = np.asarray([height_at(base, x, y) for x, y in samples])
             actual = np.asarray([height_at(composed, x, y) for x, y in samples])
@@ -248,7 +262,7 @@ class TerrainConditionGeometryTests(unittest.TestCase):
 
     def test_native_ood_parameters_are_used_in_real_geometry(self):
         with native_geometry():
-            for level in (0, 3, 7):
+            for level in EVALUATION_LEVELS:
                 values = physical_level(level, condition="terrain_ood")
                 cfg = native_terrain_config(
                     "Uneven", "noise", level, size=(12, 12), condition="terrain_ood"

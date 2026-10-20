@@ -3,13 +3,18 @@
 import math
 from dataclasses import asdict, dataclass
 
-VERSION = "go2-terrain-development-v1"
-CONDITION_VERSION = "go2-terrain-conditions-development-v1"
+VERSION = "go2-terrain-development-v2"
+CONDITION_VERSION = "go2-terrain-conditions-development-v2"
 CONDITIONS = ("id", "composition", "terrain_ood")
-LEVEL_COUNT = 8
+LEVEL_COUNT = 16
+EVALUATION_LEVELS = (0, 4, 8, 12, 15)
 TILE_SIZE_M = (12.0, 12.0)
 HORIZONTAL_SCALE_M = 0.1
-VERTICAL_SCALE_M = 0.005
+VERTICAL_SCALE_M = 0.001
+UNEVEN_AMPLITUDE_MM = (0, 1, 2, 3, 5, 7, 10, 12, 15, 20, 25, 30, 35, 40, 45, 50)
+SLOPE_PER_MILLE = (0, 5, 10, 15, 20, 30, 40, 60, 80, 100, 120, 150, 180, 220, 260, 300)
+STAIR_RISER_MM = (0, 5, 10, 15, 20, 30, 40, 50, 60, 70, 80, 90, 100, 120, 140, 160)
+HILL_NATIVE_AMPLITUDE_CM = (0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 14, 16, 19, 22, 26, 30)
 FAMILIES = ("Flat", "Uneven", "Slopes", "Stairs", "Hills")
 MIXED_COLUMNS = (
     *(("Flat", "plane"),) * 4,
@@ -24,14 +29,14 @@ MIXED_COLUMNS = (
 
 @dataclass(frozen=True)
 class TerrainConfig:
-    """Select fixed evaluation severity or the initial training level interval.
+    """Select fixed evaluation severity; the v2 training entry interval is (0, 0).
 
     Geometry is a versioned development recipe, not a calibrated capability claim.
     Fixed levels apply to non-flat views; Flat never gains a difficulty ladder.
     """
 
     fixed_level: int | None = None
-    initial_level_range: tuple[int, int] = (0, 1)
+    initial_level_range: tuple[int, int] = (0, 0)
     condition: str = "id"
 
     def __post_init__(self):
@@ -40,7 +45,7 @@ class TerrainConfig:
         if self.fixed_level is not None and (
             type(self.fixed_level) is not int or not 0 <= self.fixed_level < LEVEL_COUNT
         ):
-            raise ValueError("Fixed terrain level must be an integer in [0, 7]")
+            raise ValueError("Fixed terrain level must be an integer in [0, 15]")
         bounds = self.initial_level_range
         if (
             type(bounds) is not tuple
@@ -49,7 +54,7 @@ class TerrainConfig:
             or not 0 <= bounds[0] <= bounds[1] < LEVEL_COUNT
         ):
             raise ValueError(
-                "Initial terrain levels require ordered integers in [0, 7]"
+                "Initial terrain levels require ordered integers in [0, 15]"
             )
 
     def as_dict(self):
@@ -62,20 +67,20 @@ class TerrainConfig:
 def physical_level(level, *, condition="id"):
     """Return requested native-generator parameters with units and wave convention."""
     if type(level) is not int or not 0 <= level < LEVEL_COUNT:
-        raise ValueError("Terrain level must be an integer in [0, 7]")
+        raise ValueError("Terrain level must be an integer in [0, 15]")
     if type(condition) is not str or condition not in CONDITIONS:
         raise ValueError(f"Terrain condition must be one of {CONDITIONS}")
     fraction = level / (LEVEL_COUNT - 1)
-    amplitude = 0.02 + 0.28 * fraction
-    slope = 0.035 + 0.265 * fraction
+    amplitude = HILL_NATIVE_AMPLITUDE_CM[level] / 100
+    slope = SLOPE_PER_MILLE[level] / 1000
     values = {
         "level": level,
-        "uneven_noise_amplitude_m": 0.005 + 0.045 * fraction,
-        "uneven_sample_spacing_m": 0.8 - 0.6 * fraction,
+        "uneven_noise_amplitude_m": UNEVEN_AMPLITUDE_MM[level] / 1000,
+        "uneven_sample_spacing_m": 0.8 - 0.6 * max(level - 4, 0) / 11,
         "uneven_noise_step_m": VERTICAL_SCALE_M,
         "slope_rise_run": slope,
         "slope_angle_deg": math.degrees(math.atan(slope)),
-        "stair_riser_m": 0.02 + 0.14 * fraction,
+        "stair_riser_m": STAIR_RISER_MM[level] / 1000,
         "stair_tread_m": 0.3,
         "pyramid_platform_width_m": 2.0,
         # Native waves use half this parameter on each of their two axes.
@@ -119,6 +124,8 @@ def terrain_specification(options, *, training, task_id):
         raise ValueError("Require TerrainConfig and a boolean training role")
     if training and options.fixed_level is not None:
         raise ValueError("Fixed terrain levels are evaluation-only")
+    if training and options.initial_level_range != (0, 0):
+        raise ValueError("The v2 family curriculum starts every replica at level zero")
     if training and options.condition != "id":
         raise ValueError("Terrain compositions and excluded ranges are evaluation-only")
     family = task_id.removeprefix("Go2-").removesuffix("-v1")
@@ -135,7 +142,7 @@ def terrain_specification(options, *, training, task_id):
     fixed_level = (
         None
         if training or task_id == "Go2-Flat-v1"
-        else 3 if options.fixed_level is None else options.fixed_level
+        else 8 if options.fixed_level is None else options.fixed_level
     )
     receipt = {
         "version": VERSION,
@@ -166,10 +173,17 @@ def terrain_specification(options, *, training, task_id):
         ],
         "training_level_cap": LEVEL_COUNT - 1,
         "calibration": "entry/support/ID-OOD caps remain uncalibrated until native evidence",
-        "fixed_test_levels": {"easy": 0, "medium": 3, "hard": 7},
+        "fixed_test_levels": dict(
+            zip(("flat_entry", "low", "medium", "high", "maximum"), EVALUATION_LEVELS)
+        ),
         "flat_fraction": sum(family == "Flat" for family, _ in columns) / len(columns),
-        "initialization": "private seeded level draw; Flat holds level zero",
+        "initialization": (
+            "all training replicas start at level zero; Flat has no difficulty ladder"
+            if training
+            else "fixed physical severity in native row zero"
+        ),
         "layout": "ordered columns and rows; runtime level updates are separate",
+        "level_zero": "true plane for ID and composition; excluded terrain ranges remain nonflat",
         "boundary": "root crossing tile edge truncates; edge samples disclose footprint spill",
         "exposure": "origin/platform occupancy is not evidence of non-flat contact",
         "direction": "pyramid sign is geometry, not measured ascent/descent motion",

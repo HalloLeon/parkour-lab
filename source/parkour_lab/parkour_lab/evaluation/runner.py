@@ -83,6 +83,10 @@ def evaluate(
         or len({case.partition for case in cases}) != 1
     ):
         raise ValueError("Require distinct prescribed cases from one partition")
+    if any(case.version != "v2" for case in cases):
+        raise ValueError(
+            "Legacy case versions are offline-only; collect the current recipe"
+        )
     if not isinstance(checkpoint_id, str) or not checkpoint_id.strip():
         raise ValueError("Require the caller's checkpoint identity")
     if checkpoint_sha256 is not None and (
@@ -100,6 +104,7 @@ def evaluate(
         "version": VERSION,
         "status": "RUNNING",
         "cases": [case.as_dict() for case in cases],
+        "case_version": "v2",
         "training_seed": training_seed,
         "checkpoint_id": checkpoint_id,
         "checkpoint_sha256": checkpoint_sha256,

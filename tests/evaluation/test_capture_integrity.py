@@ -46,9 +46,7 @@ def write_capture(folder, *, steps=1000, case=None):
         trace_sha256=file_sha256(path / "trace.npz"),
     )
     if case.condition != "id":
-        from parkour_lab.evaluation.robustness import VERSION as robustness_version
-
-        manifest["robustness_version"] = robustness_version
+        manifest["robustness_version"] = f"go2_robustness_development_{case.version}"
         evidence["realization"]["task"]["terrain"] = {
             "condition": case.condition if case.condition != "fault" else "id"
         }
@@ -60,6 +58,36 @@ def write_capture(folder, *, steps=1000, case=None):
 
 
 class CaptureIntegrityTests(unittest.TestCase):
+    def test_legacy_receipt_remains_scoreable_and_wrong_recipe_version_is_rejected(
+        self,
+    ):
+        from dataclasses import replace
+
+        base = EvaluationCase("validation", "Flat", None, "plane", "stand")
+        for case in (base, replace(base, version="v1")):
+            with tempfile.TemporaryDirectory() as temp:
+                folder = Path(temp)
+                _, manifest, evidence = write_capture(folder, case=case)
+                evidence["realization"]["task"]["terrain"] = {
+                    "version": f"go2-terrain-development-{case.version}"
+                }
+                write_json(folder / case.case_id / "capture.json", evidence)
+                self.assertTrue(score_capture(folder)["capture_valid"])
+                evidence["realization"]["task"]["terrain"][
+                    "version"
+                ] = "go2-terrain-development-v3"
+                write_json(folder / case.case_id / "capture.json", evidence)
+                with self.assertRaisesRegex(ValueError, "recipe"):
+                    score_capture(folder)
+                manifest["cases"].append(
+                    replace(
+                        case, version="v1" if case.version == "v2" else "v2"
+                    ).as_dict()
+                )
+                write_json(folder / "manifest.json", manifest)
+                with self.assertRaisesRegex(ValueError, "version"):
+                    score_capture(folder)
+
     def test_robustness_trace_requires_matching_realized_condition_and_protocol(self):
         from parkour_lab.evaluation.robustness import robustness_bank
 

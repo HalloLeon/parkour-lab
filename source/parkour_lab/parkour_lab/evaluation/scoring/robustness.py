@@ -1,7 +1,7 @@
 """Post-onset diagnostics and paired deltas with every prescribed outcome retained."""
 
 from ..cases import DURATION_S, PERIOD_S
-from ..robustness import VERSION, matched_control
+from ..robustness import matched_control
 from .kinematics import tracking
 
 
@@ -88,7 +88,7 @@ def paired_results(cases, indexed):
             )
         )
     return dict(
-        version=VERSION,
+        version=f"go2_robustness_development_{cases[0].version}",
         interpretation="Paired deltas retain missing and pre-onset failures. Post-onset deltas require both attempts to reach onset and remain conditional on their unequal observed durations.",
         prescribed_pairs=len(pairs),
         complete_pairs=sum(pair["complete"] for pair in pairs),

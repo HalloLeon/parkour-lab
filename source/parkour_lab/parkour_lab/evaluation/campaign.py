@@ -7,7 +7,7 @@ from pathlib import Path
 from parkour_lab.benchmark.schema import FIELD_SPECS
 
 from .capture import score_capture
-from .cases import case_bank
+from .cases import VERSIONS, case_bank
 from .robustness import robustness_bank
 from .scoring import aggregate_training_seeds
 
@@ -43,6 +43,8 @@ def _declaration(data):
         data.get("purpose") not in ("development", "comparison")
         or data.get("partition") not in ("validation", "test")
         or data.get("suite") not in ("core", "robustness")
+        or type(data.get("case_version", "v1")) is not str
+        or data.get("case_version", "v1") not in VERSIONS
         or (data.get("purpose") == "development" and data.get("partition") == "test")
         or not isinstance(seeds, list)
         or not seeds
@@ -173,7 +175,7 @@ def _endpoint(base, run, endpoint, cases):
                 "Require cumulative declared training wall_time_s at this endpoint"
             )
         if (
-            progress.get("version") != "go2_checkpoint_progress_v1"
+            progress.get("version") != f"go2_checkpoint_progress_{cases[0].version}"
             or not _text(progress.get("protocol"))
             or not _text(progress.get("task_id"))
             or type(progress.get("num_envs")) is not int
@@ -234,7 +236,8 @@ def report_campaign(path):
     declaration = _declaration(_read(path))
     seeds, milestones = declaration["seeds"], declaration["milestones"]
     bank = robustness_bank if declaration["suite"] == "robustness" else case_bank
-    cases = bank(declaration["partition"])
+    case_version = declaration.get("case_version", "v1")
+    cases = bank(declaration["partition"], version=case_version)
     minimum = 3 if declaration["purpose"] == "development" else 5
     configurations = {seed: set() for seed in seeds}
     for method in declaration["methods"]:
@@ -307,6 +310,7 @@ def report_campaign(path):
     )
     return dict(
         version=VERSION,
+        **({"case_version": case_version} if case_version != "v1" else {}),
         purpose=declaration["purpose"],
         partition=declaration["partition"],
         suite=declaration["suite"],

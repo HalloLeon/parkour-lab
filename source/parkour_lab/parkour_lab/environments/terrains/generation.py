@@ -28,6 +28,8 @@ def generate_terrain(difficulty, cfg):
     native = native_terrain_config(
         cfg.family, cfg.subtype, level, size=cfg.size, condition=condition
     )
+    if level == 0 and condition != "terrain_ood":
+        return native.function(0.0, native)
     if cfg.family == "Uneven":
         return _seeded_noise(native, cfg, level)
     pieces, origin = native.function(0.0, native)
@@ -59,6 +61,17 @@ def native_terrain_config(family, subtype, level, *, size, condition="id"):
 
     values = physical_level(level, condition=condition)
     common = dict(size=deepcopy(size))
+    supported = {
+        "Flat": ("plane",),
+        "Uneven": ("noise",),
+        "Slopes": ("pyramid", "inverted_pyramid"),
+        "Stairs": ("pyramid", "inverted_pyramid"),
+        "Hills": ("wave",),
+    }
+    if subtype not in supported.get(family, ()):
+        raise ValueError(f"Unsupported terrain family/subtype: {family}/{subtype}")
+    if family == "Flat" or (level == 0 and condition != "terrain_ood"):
+        return native.MeshPlaneTerrainCfg(**common)
     heightfield = dict(
         **common,
         horizontal_scale=HORIZONTAL_SCALE_M,
@@ -66,8 +79,6 @@ def native_terrain_config(family, subtype, level, *, size, condition="id"):
         border_width=0.0,
         slope_threshold=None,
     )
-    if family == "Flat" and subtype == "plane":
-        return native.MeshPlaneTerrainCfg(**common)
     if family == "Uneven" and subtype == "noise":
         amplitude = values["uneven_noise_amplitude_m"]
         return native.HfRandomUniformTerrainCfg(

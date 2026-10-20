@@ -42,7 +42,7 @@ class CliTests(unittest.TestCase):
                     ]
                 )
                 self.assertEqual(code, 0)
-                self.assertEqual(len(native.evaluate.call_args.args[1]), 384)
+                self.assertEqual(len(native.evaluate.call_args.args[1]), 588)
                 native.train.assert_not_called()
                 native.load.assert_called_once_with(checkpoint, device="cpu")
             report = json.loads((root / "robustness" / "report.json").read_text())

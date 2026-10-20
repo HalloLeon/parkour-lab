@@ -10,6 +10,7 @@ PLATFORM_OUTER_HALF_WIDTH_M = 1.3
 
 
 def surface_exposure(case, trace):
+    height_change = HEIGHT_CHANGE_M if case.version == "v1" else 0.0005
     support, valid = trace["support_height_w"], trace["support_valid"]
     contact = (
         np.linalg.norm(trace["foot_contact_forces_w"], axis=-1) > CONTACT_THRESHOLD_N
@@ -23,12 +24,12 @@ def surface_exposure(case, trace):
     changed = (
         supported
         & initial_valid[None]
-        & (np.abs(support - initial[None]) > HEIGHT_CHANGE_M)
+        & (np.abs(support - initial[None]) > height_change)
     )
     local_span = np.zeros(len(support), dtype=bool)
     for index, mask in enumerate(supported):
         if mask.sum() > 1:
-            local_span[index] = np.ptp(support[index, mask]) > HEIGHT_CHANGE_M
+            local_span[index] = np.ptp(support[index, mask]) > height_change
     exposed = changed.any(-1) | local_span
     contacting = supported.any(-1)
     outside = platform_only = None
@@ -39,6 +40,12 @@ def surface_exposure(case, trace):
         platform_only = bool((radius <= 1.0).all())
     if case.family == "Flat":
         label = "flat"
+    elif (
+        case.version == "v2"
+        and case.physical_level == 0
+        and case.condition in ("id", "composition")
+    ):
+        label = "flat_entry"
     elif exposed.any():
         label = "nonflat_contact_demonstrated"
     elif contacting.any() and platform_only and case.family in ("Slopes", "Stairs"):
@@ -50,7 +57,7 @@ def surface_exposure(case, trace):
     return dict(
         label=label,
         contact_force_threshold_N=CONTACT_THRESHOLD_N,
-        support_height_change_threshold_m=HEIGHT_CHANGE_M,
+        support_height_change_threshold_m=height_change,
         maximum_foot_center_clearance_m=MAXIMUM_FOOT_CENTER_CLEARANCE_M,
         surface_sample_valid_fraction=float(valid.mean()) if valid.size else None,
         supported_contact_samples=int(supported.sum()),
@@ -61,8 +68,14 @@ def surface_exposure(case, trace):
         ),
         outside_platform_fraction_of_supported_feet=outside,
         central_platform_half_width_m=(
-            1.0 if case.family in ("Slopes", "Stairs") else None
+            1.0
+            if case.family in ("Slopes", "Stairs") and label != "flat_entry"
+            else None
         ),
         outside_platform_buffer_m=PLATFORM_OUTER_HALF_WIDTH_M - 1.0,
-        interpretation="Contact plus changed/local supporting heights is conservative evidence; a family label or missing evidence is not traversability.",
+        interpretation=(
+            "Version 2 level zero is a true-plane entry control; composition adds no roughness. It is not evidence of nonflat traversal."
+            if label == "flat_entry"
+            else "Contact plus changed/local supporting heights is conservative evidence; a family label or missing evidence is not traversability."
+        ),
     )

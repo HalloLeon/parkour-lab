@@ -13,12 +13,23 @@ from parkour_lab.__main__ import main, parse_args
 
 
 class CLITests(unittest.TestCase):
+    def test_current_core_bank_has_versioned_five_severity_anchors(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(main(["cases"]), 0)
+        cases = json.loads(output.getvalue())
+        self.assertEqual(len(cases), 186)
+        self.assertEqual({case["version"] for case in cases}, {"v2"})
+        self.assertEqual(
+            {case["physical_level"] for case in cases if case["family"] != "Flat"},
+            {0, 4, 8, 12, 15},
+        )
+
     def test_robustness_prescriptions_are_available_without_native_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "cases.json"
             main(["cases", "--suite", "robustness", "--output", str(output)])
             cases = json.loads(output.read_text())
-            self.assertEqual(len(cases), 384)
+            self.assertEqual(len(cases), 588)
             self.assertEqual(
                 sum(case.get("condition") == "fault" for case in cases), 72
             )

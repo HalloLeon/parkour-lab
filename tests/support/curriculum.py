@@ -1,49 +1,31 @@
-"""Native origin-update fixture with independent private randomization streams."""
+"""Measured family-teacher fixture; no native simulation or fake learner state."""
 
-import ast
-from types import MethodType
 from types import SimpleNamespace as NS
 
 import torch
 
+from parkour_lab.control.proprioception import FOOT_NAMES
 from parkour_lab.environments.randomization import TaskRandomization
+from parkour_lab.environments.terrains.curriculum import (
+    begin_episodes,
+    initialize_levels,
+)
 from parkour_lab.runtime.accounting import InteractionCounter
-from tests.support.isaaclab import pinned_source_root
 
 
 def curriculum_environment():
-    """Execute the SDK's real update_env_origins, with no simulator or meshes."""
-    path = pinned_source_root() / "terrains/terrain_importer.py"
-    tree = ast.parse(path.read_text())
-    cls = next(
-        n
-        for n in tree.body
-        if isinstance(n, ast.ClassDef) and n.name == "TerrainImporter"
-    )
-    method = next(
-        n
-        for n in cls.body
-        if isinstance(n, ast.FunctionDef) and n.name == "update_env_origins"
-    )
-    namespace = {"torch": torch}
-    exec(
-        compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"),
-        namespace,
-    )
+    """Eight asynchronous replicas with stable five-family column assignments."""
     types = torch.tensor([0, 1, 2, 3, 4, 1, 1, 1])
-    levels = torch.tensor([0, 2, 3, 4, 5, 0, 7, 4])
-    origins = torch.zeros(8, 5, 3)
-    origins[:, :, 0] = torch.arange(8)[:, None] * 12
+    levels = torch.zeros(8, dtype=torch.long)
+    origins = torch.zeros(16, 5, 3)
+    origins[:, :, 0] = torch.arange(16)[:, None] * 12
     origins[:, :, 1] = torch.arange(5)[None] * 12
     terrain = NS(
         terrain_origins=origins,
         terrain_levels=levels,
         terrain_types=types,
-        max_terrain_level=8,
         env_origins=origins[levels, types].clone(),
-        cfg=NS(terrain_generator=NS(size=(12.0, 12.0))),
     )
-    terrain.update_env_origins = MethodType(namespace["update_env_origins"], terrain)
     command = NS(
         command=torch.tensor([[0.4, 0.0, 0.0]]).repeat(8, 1),
         episode_command=torch.tensor([[0.4, 0.0, 0.0]]).repeat(8, 1),
@@ -59,27 +41,45 @@ def curriculum_environment():
             arcs=0,
         ),
     )
+    data = NS(
+        root_pos_w=terrain.env_origins.clone(),
+        root_quat_w=torch.tensor([[1.0, 0, 0, 0]]).repeat(8, 1),
+        root_com_lin_vel_b=torch.tensor([[0.4, 0, 0]]).repeat(8, 1),
+        root_ang_vel_b=torch.zeros(8, 3),
+        body_pos_w=terrain.env_origins[:, None, :].repeat(1, 4, 1),
+    )
+    data.root_pos_w[:, 2] = 0.4
+    data.body_pos_w[:, :, 2] = 0.02
 
     class Scene(dict):
         pass
 
-    scene = Scene(robot=NS(data=NS(root_pos_w=terrain.env_origins.clone())))
+    scene = Scene(
+        robot=NS(data=data, body_names=list(FOOT_NAMES)),
+        contact_forces=NS(
+            body_names=list(FOOT_NAMES), data=NS(net_forces_w=torch.zeros(8, 4, 3))
+        ),
+    )
     scene.terrain = terrain
-    scene.env_origins = terrain.env_origins
+    scene["contact_forces"].data.net_forces_w[:, :, 2] = 20.0
+    terms = {
+        name: torch.zeros(8, dtype=torch.bool)
+        for name in ("time_out", "terrain_boundary", "base_contact")
+    }
     sampler = TaskRandomization(dict(num_envs=8, seed=42, dynamics="randomized"))
     sampler.dynamics()
-    return NS(
+    env = NS(
         cfg=NS(
             benchmark_version="go2-blind-v1",
             benchmark_task_id="Go2-Mixed-v1",
             benchmark_training=True,
             seed=42,
             benchmark_terrain=dict(
-                version="test-physical-levels-v1",
-                level_count=8,
-                num_rows=8,
+                version="test-physical-levels-v2",
+                level_count=16,
+                num_rows=16,
                 initial_min_level=0,
-                initial_max_level=1,
+                initial_max_level=0,
                 columns=[
                     dict(family=name, subtype="test")
                     for name in ("Flat", "Uneven", "Slopes", "Stairs", "Hills")
@@ -90,8 +90,15 @@ def curriculum_environment():
         device="cpu",
         scene=scene,
         max_episode_length_s=20.0,
-        episode_length_buf=torch.ones(8, dtype=torch.long),
+        step_dt=0.02,
+        episode_length_buf=torch.zeros(8, dtype=torch.long),
         command_manager=NS(get_term=lambda name: command),
+        termination_manager=NS(active_terms=list(terms), get_term=terms.__getitem__),
+        reset_terminated=torch.zeros(8, dtype=torch.bool),
+        reset_time_outs=torch.zeros(8, dtype=torch.bool),
         parkour_randomization=sampler,
         interactions=InteractionCounter(8),
     )
+    initialize_levels(env)
+    begin_episodes(env, torch.arange(8))
+    return env

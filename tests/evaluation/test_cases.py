@@ -1,5 +1,6 @@
 """Stable disjoint partitions and paired fixed geometry/noise draws."""
 
+import hashlib
 import json
 import unittest
 from collections import Counter, defaultdict
@@ -9,13 +10,44 @@ from parkour_lab.evaluation.cases import EvaluationCase, case_bank, case_from_di
 
 
 class FixedCaseTests(unittest.TestCase):
-    def test_complete_bank_has_nineteen_cells_six_profiles_and_no_flat_ladder(self):
+    def test_legacy_bank_identities_and_missing_version_decode_are_unchanged(self):
+        from parkour_lab.evaluation.robustness import robustness_bank
+
+        for bank, expected in (
+            (
+                case_bank,
+                "15146114196cba78d71ffb8da376f373108a6d629e3a6e365b7adbeb08846c0c",
+            ),
+            (
+                robustness_bank,
+                "d0569079c16067caa538219edc839f9b40aedd82a8196468d1552435ed4e765c",
+            ),
+        ):
+            cases = bank("validation", attempts=2, version="v1")
+            values = [
+                dict(case=c.as_dict(), case_id=c.case_id, seed=c.seed) for c in cases
+            ]
+            self.assertEqual(
+                hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest(),
+                expected,
+            )
+            for case in cases:
+                self.assertNotIn("version", case.as_dict())
+                self.assertEqual(case_from_dict(case.as_dict()), case)
+        new = case_bank("validation")[0]
+        self.assertEqual(new.as_dict()["version"], "v2")
+        old = case_from_dict({k: v for k, v in new.as_dict().items() if k != "version"})
+        self.assertEqual(old.version, "v1")
+        self.assertNotEqual(new.seed, old.seed)
+        self.assertNotEqual(new.case_id, old.case_id)
+
+    def test_complete_bank_has_thirty_one_cells_six_profiles_and_no_flat_ladder(self):
         cases = case_bank("validation")
-        self.assertEqual(len(cases), 114)
-        self.assertEqual(len({case.case_id for case in cases}), 114)
+        self.assertEqual(len(cases), 186)
+        self.assertEqual(len({case.case_id for case in cases}), 186)
         self.assertEqual(
             Counter(case.family for case in cases),
-            dict(Flat=6, Uneven=18, Slopes=36, Stairs=36, Hills=18),
+            dict(Flat=6, Uneven=30, Slopes=60, Stairs=60, Hills=30),
         )
         self.assertEqual(
             {case.physical_level for case in cases if case.family == "Flat"}, {None}
@@ -39,9 +71,9 @@ class FixedCaseTests(unittest.TestCase):
                     case, case_from_dict(json.loads(json.dumps(case.as_dict())))
                 )
                 identities.add(case.case_id)
-        self.assertEqual(len(identities), 684)
+        self.assertEqual(len(identities), 1116)
         self.assertTrue(all(len(seeds) == 1 for seeds in paired.values()))
-        self.assertEqual(len({next(iter(seeds)) for seeds in paired.values()}), 114)
+        self.assertEqual(len({next(iter(seeds)) for seeds in paired.values()}), 186)
 
     def test_twenty_second_windows_and_both_yaw_signs(self):
         for case in case_bank("validation"):

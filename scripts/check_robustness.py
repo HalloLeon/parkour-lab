@@ -5,6 +5,7 @@ import sys
 import traceback
 from pathlib import Path
 
+from parkour_lab.environments.terrains.specification import LEVEL_COUNT
 from parkour_lab.provenance import (
     dependency_identity,
     file_sha256,
@@ -76,8 +77,13 @@ def _geometry(args, output, report, publish, app):
             samples[condition], receipt["surface"] = sample_surface(task, folder)
             definitions[condition] = task._env.cfg.benchmark_terrain
             assert task.interactions == dict(session=0, cumulative=0, uncertain=0)
-            if condition == "composition":
+            if condition == "composition" and args.level > 0:
                 receipt["contact"] = check_outer_contact(task, app, folder)
+            elif condition == "composition":
+                receipt["contact"] = dict(
+                    flat_entry=True,
+                    interpretation="Level-zero composition is an intentional plane, without added roughness",
+                )
             receipt.update(status="SURFACE_CAPTURED", interactions=task.interactions)
             code = 0
         except BaseException as error:
@@ -137,7 +143,7 @@ def _arguments(argv):
     parser.add_argument(
         "--family", choices=("Slopes", "Stairs", "Hills"), default="Slopes"
     )
-    parser.add_argument("--level", type=int, choices=(0, 3, 7), default=3)
+    parser.add_argument("--level", type=int, choices=range(LEVEL_COUNT), default=8)
     parser.add_argument("--factor", type=float, choices=(0, 0.5, 1), default=0.5)
     joints = tuple(
         f"{leg}_{joint}_joint"

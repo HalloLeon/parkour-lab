@@ -85,61 +85,90 @@ from parkour_lab.benchmark import Go2Config, TerrainConfig, build_config
 
 training_cfg = build_config(Go2Config(task_id="Go2-Mixed-v1"), training=True)
 test_cfg = build_config(
-    Go2Config(task_id="Go2-Stairs-v1", terrain=TerrainConfig(fixed_level=3)),
+    Go2Config(task_id="Go2-Stairs-v1", terrain=TerrainConfig(fixed_level=8)),
     training=False,
 )
 ```
 
-`go2-terrain-development-v1` uses 12 × 12 m tiles. Mixed has 20 ordered columns:
+`go2-terrain-development-v2` uses 12 × 12 m tiles. Mixed has 20 ordered columns:
 four Flat, four Uneven, four Slopes, four Stairs and four Hills. Slopes and Stairs
 split their columns equally between ordinary and inverted pyramids. Pyramid sign
-describes the surface; it does not establish that a robot ascended or descended.
-Family-specific tasks use the same physical recipe. Flat is explicitly present
-and stays level zero; a non-flat family's level zero is already non-flat.
+describes the surface; recorded motion and support establish ascent or descent.
+Family-specific tasks use the same physical recipe.
 
-The eight candidate levels use these requested native-generator parameters:
+All replicas start at level 0. This is a true plane in every family, explicitly
+reported as **flat entry**, without implying nonflat capability. Flat stays flat;
+other families progress through these 16 candidate levels:
 
-| Level | Uneven noise amplitude, m | Uneven sample spacing, m | Slope rise/run | Stair riser, m | Hill amplitude parameter, m |
-| --- | --- | --- | --- | --- | --- |
-| 0 | 0.0050 | 0.8000 | 0.0350 | 0.02 | 0.02 |
-| 1 | 0.0114 | 0.7143 | 0.0729 | 0.04 | 0.06 |
-| 2 | 0.0179 | 0.6286 | 0.1107 | 0.06 | 0.10 |
-| 3 | 0.0243 | 0.5429 | 0.1486 | 0.08 | 0.14 |
-| 4 | 0.0307 | 0.4571 | 0.1864 | 0.10 | 0.18 |
-| 5 | 0.0371 | 0.3714 | 0.2243 | 0.12 | 0.22 |
-| 6 | 0.0436 | 0.2857 | 0.2621 | 0.14 | 0.26 |
-| 7 | 0.0500 | 0.2000 | 0.3000 | 0.16 | 0.30 |
+| Level | Uneven amplitude, mm | Slope rise/run | Stair riser, cm | Hill native amplitude, cm |
+| --- | --- | --- | --- | --- |
+| 0 | 0 | 0.000 | 0 | 0 |
+| 1 | 1 | 0.005 | 0.5 | 1 |
+| 2 | 2 | 0.010 | 1 | 2 |
+| 3 | 3 | 0.015 | 1.5 | 3 |
+| 4 | 5 | 0.020 | 2 | 4 |
+| 5 | 7 | 0.030 | 3 | 5 |
+| 6 | 10 | 0.040 | 4 | 6 |
+| 7 | 12 | 0.060 | 5 | 8 |
+| 8 | 15 | 0.080 | 6 | 10 |
+| 9 | 20 | 0.100 | 7 | 12 |
+| 10 | 25 | 0.120 | 8 | 14 |
+| 11 | 30 | 0.150 | 9 | 16 |
+| 12 | 35 | 0.180 | 10 | 19 |
+| 13 | 40 | 0.220 | 12 | 22 |
+| 14 | 45 | 0.260 | 14 | 26 |
+| 15 | 50 | 0.300 | 16 | 30 |
 
-Heightfields use 0.1 m horizontal cells and 0.005 m height increments. Uneven
-uses the native random-uniform heightfield with cubic interpolation; its realized
-height can exceed the requested noise amplitude. Slopes and Stairs have 2 m
-central platforms; stairs use 0.3 m treads and a 0.3 m border. Hills uses two waves
-along each axis, with approximately 5.95 m wavelength; the native amplitude
-parameter contributes half its value on each axis. Its resulting peak-to-peak
-height is approximately twice the table value. No extra roughness is added to
-Slopes, Stairs or Hills. Reports retain exact unrounded parameters.
+Heightfields use 0.1 m horizontal cells and 0.001 m height increments; Uneven's
+noise step is also 0.001 m. Its sample spacing stays 0.8 m through level 4, then
+decreases linearly to 0.2 m at level 15. Native cubic interpolation may exceed the
+requested amplitude. Slopes and Stairs retain 2 m central platforms; stairs have
+0.3 m treads and a 0.3 m border. Hills retain two waves per axis, approximately
+5.95 m wavelength, and half the listed amplitude parameter per axis. Combined
+ideal peak-to-peak height is approximately twice that parameter. No added
+roughness appears on ID Slopes, Stairs or Hills. Receipts keep unrounded values.
 
-Training initializes non-flat replicas at levels 0–1 by default, configurable
-through `TerrainConfig(initial_level_range=(low, high))`. A shared 20 s episode
-packet selects translation with probability 0.5, or standing, left/right pivot
-and left/right arc with probability 0.1 each. Only an unchanged translation
-episode is eligible for progression. Net XY displacement greater than half the
-tile length promotes one level; displacement below half the full-horizon travel
-implied by the translational command demotes one level, unless promoted. Other
-episodes hold. The bottom clips at zero and the top holds at seven. This is a
-distance heuristic, without tracking or obstacle-clearance gates.
+The shared command sampler is unchanged: one held 20 s episode packet selects
+translation with probability 0.5, or stand, left/right pivot and left/right arc
+with probability 0.1 each. The `go2_family_block_curriculum_v2` teacher maintains
+one target per nonflat family and assesses non-overlapping blocks of 20 unchanged
+translation episodes at that target, pooled across the family's replicas.
 
-Evaluation disables runtime progression and generates one row at an explicit
-fixed physical level: easy 0, medium 3 or hard 7; the default is 3. Its native
-row index is zero for all three severities. All eight levels are allowed during
-training, so these are in-distribution severities, even if a particular learner
-never reaches them. The evaluation-only robustness bank below defines held-out compositions and
-parameters beyond this training support. A root crossing a tile's ±6 m XY
-boundary truncates the episode. Feet can extend beyond that boundary, and
-neighboring tiles or central platforms must be disclosed when interpreting
-surface exposure. Remaining on a spawn platform does not demonstrate locomotion
-on the surrounding family. Geometry/family assignment is host metadata and task
-progress, not an extra actor input or a training GT label.
+An eligible episode succeeds when it has no physical fall, ends at the horizon
+or a legitimate tile boundary, supplies at least 8 s of measurements, tracks
+planar speed with RMSE at most 30% of command magnitude after the first second,
+tracks yaw with RMSE at most 0.15 rad/s, and achieves at least 70% of requested
+travel projected onto the initial commanded world direction. At nonzero levels,
+it must additionally supply at least 1 s of supported contact on the relevant
+terrain: outside the 1.3 m platform buffer for Slopes/Stairs, or changed/local
+support height above 0.5 mm for Uneven/Hills. Support requires a named foot force
+above 1.5 N, a valid surface ray and absolute foot-center clearance at most 0.08 m.
+Level 0 is exempt from the nonflat-contact requirement. Early physical falls and
+short otherwise eligible endings count as failures.
+
+At least 16 successes out of 20 promotes one level; eight or fewer demotes one;
+9–15 holds. Every assessed block clears. The bottom clips at 0 and the top holds
+at 15. Apply target changes only as replicas reset; running episodes retain
+their assigned geometry and obsolete-target outcomes cannot fill a newer block.
+Stand, pivot, arc, changed-command and no-step resets hold progression. These
+thresholds are provisional teacher settings, not evaluation success gates.
+
+Task progress preserves family targets, assessment blocks/history and physical
+assignments. A fresh-process restart retains completed teacher state while
+clearing partial physical episodes; periodic saves do not reset episodes.
+Teacher-only simulator measurements do not enter actor or method GT observations.
+
+Evaluation disables progression and generates one row at an explicit physical
+anchor: 0 (flat entry), 4, 8, 12 or 15. The default fixed level is 8; its native
+row index is zero at every severity. All levels are permitted during training,
+so an unreached level is still ID. A root crossing a tile's ±6 m XY boundary
+truncates the episode; feet may already extend beyond it. Report actual exposure:
+a spawn platform does not establish traversal of its surrounding terrain.
+
+The changed quantization and teacher have new recipe identities. Existing v1
+captures and campaigns remain scoreable as v1; they are not reinterpreted using
+this table. Old task/learner checkpoints cannot resume under the new curriculum.
+Geometry, progression and empirical difficulty still require native calibration.
 
 ### Actor and training information
 
@@ -299,8 +328,8 @@ braking 14–15 s and stop/hold 15–20 s windows. Transients remain in the tota
 native core reward return.
 
 `case_bank("train" | "validation" | "test", attempts=...)` gives disjoint
-semantic seed identities. One attempt per cell produces 114 cases: one Flat
-geometry plus easy/medium/hard Uneven, Slopes, Stairs and Hills; Slopes and Stairs
+semantic seed identities. One attempt per cell produces 186 cases: one Flat
+geometry plus levels 0/4/8/12/15 of Uneven, Slopes, Stairs and Hills; Slopes and Stairs
 include both pyramid signs. Each geometry cell receives every profile. Flat has
 no severity ladder. Geometry/start/dynamics/noise seeds are shared across its
 profiles and are independent of execution order. Cases execute sequentially with
@@ -347,14 +376,14 @@ full-bank comparison. Check these fields and coverage before interpreting aggreg
 ### Unseen terrain and actuator robustness
 
 `robustness_bank("validation" | "test", attempts=...)` extends the core bank.
-One attempt produces **384 cases**, all evaluated with the same frozen policy:
+One attempt produces **588 cases**, all evaluated with the same frozen policy:
 
 | Block | Cases | Condition and control |
 | --- | --- | --- |
-| Core ID | 114 | Unchanged base families, all profiles and three non-flat severities. |
-| Unseen compositions | 90 | Uneven Slopes, Stairs and Hills, with every matching base case in the core bank. |
-| Terrain OOD | 108 | Each non-flat family's parameter exceeds the entire allowed training range; matched nominal base cases remain available. |
-| Timed drive loss | 72 | Flat and level-3 Uneven, forward motion/stopping, all 12 joints, factors 1, 0.5 and 0. Factor 1 is the matched healthy control for each joint. |
+| Core ID | 186 | Base families, all profiles and five physical anchors, including flat entry. |
+| Unseen compositions | 150 | Uneven Slopes, Stairs and Hills, with every matching base case in the core bank. |
+| Terrain OOD | 180 | Each non-flat family's parameter exceeds the entire allowed training range; matched nominal base cases remain available. |
+| Timed drive loss | 72 | Flat and level-8 Uneven, forward motion/stopping, all 12 joints, factors 1, 0.5 and 0. Factor 1 is the matched healthy control for each joint. |
 
 ```python
 from parkour_lab.evaluation import evaluate, robustness_bank
@@ -368,19 +397,20 @@ supporting treads. Both pyramid signs are included. Component parameters remain
 inside their respective training ranges. The layer is zero within the central
 2 x 2 m region, blends to full strength over the next 0.5 m and tapers over the
 outer 0.3 m boundary. Base origins and central starting support stay unchanged.
+Level-0 composition is an intentional plane with no added roughness.
 These are declared start provisions; remaining there is not evidence of traversing
 the composed surface. Combined local grades and step transitions can exceed those
 of either component and must be assessed from realized geometry.
 
-Terrain OOD uses the following requested development parameters. Here 0/3/7 index
-OOD severities, not permitted training levels:
+Terrain OOD uses excluded parameters at anchors 0/4/8/12/15. Its anchor 0
+remains nonflat; it is not the ID flat entry.
 
-| Parameter | Training maximum | OOD 0 | OOD 3 | OOD 7 |
-| --- | --- | --- | --- | --- |
-| Uneven noise amplitude, m | 0.05 | 0.06 | 0.077143 | 0.10 |
-| Slope rise/run | 0.30 | 0.35 | 0.392857 | 0.45 |
-| Stair riser, m | 0.16 | 0.18 | 0.197143 | 0.22 |
-| Hill native amplitude, m | 0.30 | 0.35 | 0.392857 | 0.45 |
+| Parameter | Training maximum | OOD 0 | OOD 4 | OOD 8 | OOD 12 | OOD 15 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Uneven noise amplitude, m | 0.05 | 0.06 | 0.0706667 | 0.0813333 | 0.092 | 0.1 |
+| Slope rise/run | 0.3 | 0.35 | 0.376667 | 0.403333 | 0.43 | 0.45 |
+| Stair riser, m | 0.16 | 0.18 | 0.190667 | 0.201333 | 0.212 | 0.22 |
+| Hill native amplitude, m | 0.3 | 0.35 | 0.376667 | 0.403333 | 0.43 | 0.45 |
 
 Reports retain unrounded values and the excluded training bounds. Uneven's
 interpolation can overshoot its requested amplitude. These are explicit parameter
@@ -406,7 +436,7 @@ from parkour_lab.benchmark import FaultConfig, Go2Config, TerrainConfig, build_c
 
 composed = build_config(
     Go2Config(task_id="Go2-Stairs-v1",
-              terrain=TerrainConfig(fixed_level=3, condition="composition")),
+              terrain=TerrainConfig(fixed_level=8, condition="composition")),
     training=False,
 )
 faulted = build_config(
@@ -434,7 +464,7 @@ Fault traces record `fault_active`, `drive_factor`, `limited_effort` and
 hip, thigh, calf; this evaluator order is independent of native motor order.
 The offline scorer checks the prescribed joint/onset/factor and post-limit
 arithmetic, plus the realized condition and common core reward. Every missing or
-failed attempt remains visible. Full-bank admission requires all 384 prescriptions;
+failed attempt remains visible. Full-bank admission requires all 588 prescriptions;
 adding a partial robustness subset cannot masquerade as a complete comparison.
 
 Inspect the prescriptions or score an existing capture offline:
@@ -453,12 +483,12 @@ contract; they do not establish a calibrated final benchmark or a method ranking
 | Component | Fixed development rule |
 | --- | --- |
 | Task | `go2-blind-v1`: Go2, 200 Hz physics, 50 Hz control, 20-second episodes and native physical termination. Tiled tasks have explicit tile-boundary truncation; standalone Flat uses an unbounded plane. |
-| Training terrain | `go2-terrain-development-v1`: the five-family mixture, eight physical levels and translation-eligible curriculum described above. Use a multiple of 20 replicas for exact replication of the 20 columns, equal family shares and balanced slope/stair signs. |
+| Training terrain | `go2-terrain-development-v2`: the five-family mixture, 16 physical levels and family-block curriculum described above. Use a multiple of 20 replicas for exact replication of the 20 columns, equal family shares and balanced slope/stair signs. |
 | Commands | `go2_episode_twist_v1`: 50% translation, 10% stand and 10% each left/right pivot and arc; one command per episode. |
 | Information and actions | Common 49D blind actor frame, declared use of the shared 352-value training-only packet, and the same bounded 12D action/motor contract. No training packet reaches evaluation. |
 | Objective | The realized native Go2 rough reward, identified by its recipe hash. Overrides define a separately identified custom objective. |
-| Evaluation | `go2_fixed_cases_development_v1`: disjoint train/validation/test seed identities; the 114-case bank and fixed command phases described above. The same endpoint policy is evaluated across every cell. |
-| Scores | `go2_fixed_scores_development_v1`: equal families, then equal physical levels, subtypes, profiles and attempts. Core ID remains separate from each `go2_robustness_development_v1` block. Preserve failures, unavailable phases and exposure labels. |
+| Evaluation | `go2_fixed_cases_development_v2`: disjoint train/validation/test seed identities; the 186-case bank and fixed command phases described above. The same endpoint policy is evaluated across every cell. |
+| Scores | `go2_fixed_scores_development_v1`: equal families, then equal physical levels, subtypes, profiles and attempts. Core ID remains separate from each `go2_robustness_development_v2` block. Preserve failures, unavailable phases and exposure labels. |
 | Experience | Aggregate real robot transitions, including warm-up and discarded collection. Consumer projects declare and enforce the same allowance across compared methods; optimizer or imagination steps are separate compute statistics. |
 | Continuation | A consumer-owned full learner checkpoint linked to task progress; cumulative experience and run identity survive recreation into fresh physical episodes. |
 
@@ -498,7 +528,7 @@ The environment, inference controller and learner are separate responsibilities.
 | `environments/` | Native task configuration, observations, dynamics, rewards and reset semantics. Isaac Lab owns physics, managers and step/reset order. |
 | `environments/configuration.py` | Shared native Go2 scene, sensors, action and physical reset configuration. |
 | `environments/commands/episode.py` | Shared training episode sampler and prescribed curriculum eligibility. |
-| `environments/terrains/` | Native Flat/Uneven/Slopes/Stairs/Hills definitions, geometry bindings and per-replica curriculum. |
+| `environments/terrains/` | Native Flat/Uneven/Slopes/Stairs/Hills definitions, geometry bindings and shared family targets. |
 | `runtime/` | Native sensor/motor binding, transition accounting and ordered environment/application cleanup. |
 | `evaluation/runner.py`, `environment.py`, `capture.py` | Frozen playback, dedicated case environments and portable outgoing-transition capture. |
 | `evaluation/cases.py`, `scoring/` | Fixed case identities and authoritative physical scores/aggregates. |
@@ -588,7 +618,7 @@ report must have `learner_checkpoint_restored=true`, session 2,560 and cumulativ
 5,120 interactions. Evaluation must say `LEARNER_EVALUATION_PASSED` with complete
 case/app cleanup and saved-score parity. Tiny runs establish collection, learning,
 checkpoint restoration and scoring; they do not establish successful locomotion.
-Use a new output folder and add `--full-bank` to `evaluate` for all 114 validation
+Use a new output folder and add `--full-bank` to `evaluate` for all 186 validation
 cases. Keep the complete returned directory, including failed attempts.
 
 Each completed phase saves SB3's model/optimizer archive, SAC replay when used,
@@ -616,7 +646,7 @@ bundles, which contain Python serialization.
 ### Longer continuation and full validation
 
 After both short checks finish at 5,120 interactions, continue each saved learner
-to **25,600 total interactions** and evaluate its endpoint on all **114 validation
+to **25,600 total interactions** and evaluate its endpoint on all **186 validation
 cases**. Set `PLAB_INPUT` to the complete previous results directory, containing
 `ppo/resume/checkpoint/` and `sac/resume/checkpoint/`. Run from the repository root
 with the same native interpreter, dependencies and Python sources as those
@@ -696,7 +726,7 @@ python -m unittest discover -s examples/sb3/tests -t . -v
 This pilot measures learning trends under the existing integration recipes.
 Train three fresh seeds per method on the five-family Mixed task, retaining full
 checkpoints at 256,000, 512,000 and 1,024,000 cumulative real transitions. The six
-runs collect **6,144,000 training transitions** in total. Evaluate all 114 fixed
+runs collect **6,144,000 training transitions** in total. Evaluate all 186 fixed
 validation cases at each checkpoint in separate native processes; evaluation
 interactions are recorded separately. Keep the seed list, recipe, milestones and
 bank fixed for the entire pilot. The command preserves failures and produces an
@@ -704,10 +734,16 @@ offline completeness report even when a run fails.
 
 Run from the repository root with the configured native interpreter. This uses
 the same small PPO/SAC architectures, update ratios and SAC replay capacity as the
-integration checks above. These settings are disclosed integration recipes; a
-flat learning curve would leave learnability inconclusive. Inspect return,
+integration checks above. These settings are disclosed integration recipes. Negligible commanded movement
+would leave entry learnability unvalidated and require further common-task
+calibration before method ranking. Inspect return,
 tracking in both turn directions, stopping, falls and actual nonflat support
 exposure together. Survival alone cannot establish commanded locomotion.
+
+This first v2 pilot checks flat entry and early progression. Twenty eligible
+translation outcomes are needed for each family assessment; the finite pilot
+does not require reaching level 15. Inspect family blocks/history, command
+response and physical exposure before extending the budget.
 
 ```bash
 export PLAB_PY=/absolute/path/to/native/python
@@ -731,7 +767,7 @@ library = {k: library[k] for k in ('version', 'source_sha256')}
 sources = dict(example_sources=_example_sources(), stable_baselines3=library)
 source = hashlib.sha256(json.dumps(sources, sort_keys=True).encode()).hexdigest()
 plan = dict(version='go2_campaign_v1', purpose='development', partition='validation',
-            suite='core', seeds=[1078, 2078, 3078], milestones=[256000, 512000, 1024000], methods=[])
+            suite='core', case_version='v2', seeds=[1078, 2078, 3078], milestones=[256000, 512000, 1024000], methods=[])
 for algorithm in ('ppo', 'sac'):
     method = dict(method_id=algorithm, source_id=source, recipe_id=f'{algorithm}:{source}',
                   ground_truth_usage=[], runs=[])
@@ -972,8 +1008,8 @@ continuation changes and retain complete failed attempts when assessing behavior
 
 ### Terrain and curriculum checks
 
-This command runs three fixed-severity Mixed views and training/recreation in
-five fresh native processes, with 20 replicas covering every terrain column.
+This command runs five fixed-severity Mixed views and training/recreation in
+seven fresh native processes, with 20 replicas covering every terrain column.
 The geometry probe reads the actual USD collider and raycasts an interior grid
 from −5.4 to +5.4 m in both axes. It saves surface arrays, initial root/foot link
 clearances, height/roughness measurements, signed pyramid profiles and edge hits.
@@ -986,9 +1022,9 @@ requires a nonzero contact sample on a Flat replica after at least 32 calls,
 then captures its outgoing force frame before a forced timeout. Training compares
 that frame with the separately aligned final GT. A controlled tile-edge pose
 checks truncation and reset, followed by a list-based partial reset that preserves
-other replicas, assignments and interaction totals. The training host also writes
-declared poses and command packets to exercise promotion, demotion, holds,
-changed packets and bottom/top cases through the actual curriculum manager. These administrative
+other replicas, assignments and interaction totals. The training host also supplies
+controlled teacher measurements to exercise family-block promotion, demotion,
+holds, changed packets and bottom/top cases through the curriculum manager. These administrative
 fixtures measure rules, not policy performance; only real steps charge interactions.
 
 ```bash
@@ -1008,7 +1044,7 @@ run_check() {
     printf '{"returncode": %d}\n' "$code" > "$RUN/${name}_process_exit.json"
     return "$code"
 }
-for level in 0 3 7; do
+for level in 0 4 8 12 15; do
     run_check "level_$level" --role eval --level "$level" || exit "$?"
 done
 run_check train --role train || exit "$?"
@@ -1017,8 +1053,8 @@ BASH
 ```
 
 Each process must exit zero, report `TERRAIN_CHECK_PASSED` and close both resources.
-The fresh resumed task must recover levels, stable columns, sampler/report and
-cumulative interactions before resetting fresh episodes. The checkpoint token
+The fresh resumed task must recover levels, family targets/blocks/history, stable columns, sampler/report
+and cumulative interactions before resetting fresh episodes. The checkpoint token
 is a fixture; no learner checkpoint is restored. Inspect `report.json`,
 `surface_readback.npz`, `contact_witness.json` and the training `progress.json`
 alongside source/dependency receipts. The script keeps `calibration_validated`
@@ -1032,7 +1068,7 @@ This command checks a caller-format policy save/load, the fixed evaluation path
 and a fresh task-progress restart in three native processes. The evaluation
 fixture is a tiny untrained policy with frozen normalization; it is not a trained
 locomotion baseline. Its six-case engineering subset spans all five terrain
-families, all six profiles and physical levels 0, 3 and 7. It is explicitly not
+families, all six profiles and physical levels 0, 8 and 15. It is explicitly not
 the full validation bank or a balanced method-comparison result.
 
 ```bash
@@ -1074,8 +1110,8 @@ Retain the entire returned directory, including failures and dependency/source
 receipts. Native success still requires review of those measurements.
 
 Add `--full-bank` to a separate `scripts/check_evaluation.py` invocation with a
-new output directory to capture all 114 validation cases. Both modes stop each
-attempt at its first ending; the full bank can therefore take up to 38 simulated
+new output directory to capture all 186 validation cases. Both modes stop each
+attempt at its first ending; the full bank can therefore take up to 62 simulated
 minutes, plus environment-construction overhead. The fixture's performance is
 not a benchmark baseline. Training-progress recreation restores task counters
 and samplers only; genuine learner checkpoint continuation belongs to the
@@ -1158,7 +1194,7 @@ run_check() {
     return "$code"
 }
 for family in Slopes Stairs Hills; do
-    for level in 0 3 7; do
+    for level in 0 4 8 12 15; do
         run_check "${family}_${level}" --check geometry --family "$family" \
             --level "$level" || exit "$?"
     done
@@ -1215,7 +1251,7 @@ BASH
 
 The example requires a complete valid capture and identical recomputed offline
 scores. Inspect all block summaries, missing attempts, pre-onset failures, paired
-controls and exposure. A full 384-case bank has at most 128 simulated minutes,
+controls and exposure. A full 588-case bank has at most 196 simulated minutes,
 plus construction overhead; early endings shorten collection. A poor recovery
 score is a valid result. It does not justify excluding cases or tuning the
 policy against this bank. Final robustness/difficulty calibration remains open.

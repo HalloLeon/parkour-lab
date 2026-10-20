@@ -15,11 +15,11 @@ from tests.support.evaluation import analytic_trace
 class RobustnessTests(unittest.TestCase):
     def test_complete_bank_balances_joints_and_pairs_seeded_starts_and_onsets(self):
         cases = robustness_bank("validation")
-        self.assertEqual(len(cases), 384)
-        self.assertEqual(len({case.case_id for case in cases}), 384)
+        self.assertEqual(len(cases), 588)
+        self.assertEqual(len({case.case_id for case in cases}), 588)
         self.assertEqual(
             Counter(case.condition for case in cases),
-            dict(id=114, composition=90, terrain_ood=108, fault=72),
+            dict(id=186, composition=150, terrain_ood=180, fault=72),
         )
         indexed = {case.case_id: case for case in cases}
         faults = [case for case in cases if case.fault]
@@ -49,7 +49,15 @@ class RobustnessTests(unittest.TestCase):
         base = EvaluationCase("validation", "Flat", None, "plane", "stand")
         self.assertEqual(
             set(base.as_dict()),
-            {"partition", "family", "physical_level", "subtype", "profile", "attempt"},
+            {
+                "partition",
+                "family",
+                "physical_level",
+                "subtype",
+                "profile",
+                "attempt",
+                "version",
+            },
         )
         for changes in (
             dict(condition="composition"),
@@ -122,12 +130,12 @@ class RobustnessTests(unittest.TestCase):
         self.assertTrue(report["full_robustness_bank"])
         self.assertTrue(report["full_requested_bank"])
         self.assertFalse(report["complete"])
-        self.assertEqual(report["overall"]["prescribed_attempts"], 114)
+        self.assertEqual(report["overall"]["prescribed_attempts"], 186)
         for weights in report["block_weights"].values():
             self.assertAlmostEqual(sum(weights.values()), 1)
         partial = aggregate_cases(cases[:-1], [])
         self.assertFalse(partial["full_requested_bank"])
-        self.assertEqual(report["paired"]["prescribed_pairs"], 246)
+        self.assertEqual(report["paired"]["prescribed_pairs"], 378)
 
 
 if __name__ == "__main__":

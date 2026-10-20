@@ -180,7 +180,7 @@ class PackageBoundaryTests(unittest.TestCase):
             ),
             "evaluation": (
                 "from parkour_lab.evaluation import evaluate, score_capture, case_bank\n"
-                "assert len(case_bank('validation')) == 114",
+                "assert len(case_bank('validation')) == 186",
                 ("parkour_lab.methods",),
             ),
         }

@@ -1,159 +1,310 @@
-"""Pinned native origin updates, prescribed eligibility and atomic continuation."""
+"""Measured translation outcomes, asynchronous family blocks and atomic continuation."""
 
 import json
 import unittest
 from copy import deepcopy
+from unittest.mock import patch
 
-import numpy as np
 import torch
 
 from parkour_lab.benchmark.progress import capture_progress, restore_progress
-from parkour_lab.environments.terrains.curriculum import (
-    curriculum_state,
-    initialize_levels,
-    terrain_levels,
-)
+from parkour_lab.environments.terrains import curriculum as teacher
 from tests.support.curriculum import curriculum_environment
 
 
 def checkpoint(env):
     return capture_progress(
         env,
-        run_id="method-seed42",
+        run_id="seed42",
         checkpoint_id="learner-A",
-        configuration_id="mixed-recipe",
-        milestones=[16],
+        configuration_id="mixed-v2",
+        milestones=[],
     )
 
 
 def restore(env, record):
     return restore_progress(
-        env, record, checkpoint_id="learner-A", configuration_id="mixed-recipe"
+        env, record, checkpoint_id="learner-A", configuration_id="mixed-v2"
     )
 
 
+def episode(
+    env,
+    row=1,
+    *,
+    steps=1000,
+    velocity=0.4,
+    yaw=0.0,
+    progress_velocity=None,
+    ending="time_out",
+    contact=True,
+):
+    """Advance the actual accumulator over every controlled outgoing sample."""
+    robot = env.scene["robot"].data
+    ids = torch.tensor([row])
+    env.episode_length_buf.zero_()
+    env.reset_terminated.zero_()
+    env.reset_time_outs.zero_()
+    for name in env.termination_manager.active_terms:
+        env.termination_manager.get_term(name).zero_()
+    robot.root_pos_w[row] = env.scene.terrain.env_origins[row]
+    teacher.begin_episodes(env, ids)
+    robot.root_com_lin_vel_b[row] = torch.tensor([velocity, 0, 0])
+    robot.root_ang_vel_b[row, 2] = yaw
+
+    def contact_samples(e, ids, state):
+        if type(contact) is bool:
+            return torch.full((len(ids),), contact, dtype=torch.bool)
+        return state["steps"][ids] > steps - contact
+
+    with patch.object(teacher, "_contact_samples", side_effect=contact_samples):
+        for _ in range(steps):
+            env.episode_length_buf += 1
+            robot.root_pos_w[row, 0] += (
+                velocity if progress_velocity is None else progress_velocity
+            ) * env.step_dt
+            teacher.observe_step(env)
+    env.reset_terminated[row] = ending == "base_contact"
+    env.reset_time_outs[row] = ending in ("time_out", "terrain_boundary")
+    if ending:
+        env.termination_manager.get_term(ending)[row] = True
+    teacher.terrain_levels(env, ids)
+
+
+def at_level(env, family, level):
+    state = env._benchmark_teacher["families"][family]
+    state["history"] = [
+        dict(block=i + 1, level=i, successes=20, next_level=i + 1) for i in range(level)
+    ]
+    state.update(target_level=level, revision=level, completed_blocks=level, block=[])
+    for row, name in enumerate(teacher._families(env)):
+        if name == family:
+            env.scene.terrain.terrain_levels[row] = level
+            env.scene.terrain.env_origins[row] = env.scene.terrain.terrain_origins[
+                level, env.scene.terrain.terrain_types[row]
+            ]
+    teacher.begin_episodes(env, torch.arange(env.num_envs))
+
+
 class CurriculumTests(unittest.TestCase):
-    def test_native_promote_demote_caps_and_nontranslation_holds_preserve_rng_types(
+    def test_all_start_zero_without_global_or_private_rng_draws(self):
+        env = curriculum_environment()
+        before = deepcopy(env.parkour_randomization.state_dict())
+        rng = torch.get_rng_state().clone()
+        teacher.initialize_levels(env)
+        self.assertEqual(env.scene.terrain.terrain_levels.tolist(), [0] * 8)
+        self.assertEqual(before, env.parkour_randomization.state_dict())
+        self.assertTrue(torch.equal(rng, torch.get_rng_state()))
+
+    def test_native_buffer_dtype_is_independent_of_external_torch_default(self):
+        env = curriculum_environment()
+        previous = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(torch.float64)
+            teacher.initialize_levels(env)
+            teacher.begin_episodes(env, torch.arange(8))
+            env.episode_length_buf += 1
+            teacher.observe_step(env)
+        finally:
+            torch.set_default_dtype(previous)
+        episode = env._benchmark_teacher["episodes"]
+        for name in ("command", "anchor", "direction", "support"):
+            self.assertEqual(
+                episode[name].dtype, env.scene["robot"].data.root_pos_w.dtype
+            )
+        self.assertEqual(episode["planar_squared"].dtype, torch.float64)
+
+    def test_measured_correct_stationary_wrong_direction_yaw_fall_and_short_boundary(
+        self,
+    ):
+        cases = [
+            ({}, True),
+            ({"velocity": 0}, False),
+            ({"velocity": -0.4}, False),
+            ({"yaw": 0.3}, False),
+            ({"progress_velocity": 0}, False),
+            ({"ending": "base_contact", "steps": 10}, False),
+            ({"ending": "terrain_boundary", "steps": 399}, False),
+            ({"ending": "terrain_boundary", "steps": 400}, True),
+            ({"ending": "time_out", "steps": 400}, False),
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                env = curriculum_environment()
+                episode(env, **kwargs)
+                self.assertEqual(
+                    env._benchmark_teacher["families"]["Uneven"]["block"], [expected]
+                )
+
+    def test_level_zero_contact_exemption_and_nonflat_minimum_time(self):
+        env = curriculum_environment()
+        episode(env, contact=False)
+        self.assertEqual(env._benchmark_teacher["families"]["Uneven"]["block"], [True])
+        at_level(env, "Uneven", 1)
+        episode(env, contact=False)
+        episode(env, contact=49)
+        episode(env, contact=50)
+        self.assertEqual(
+            env._benchmark_teacher["families"]["Uneven"]["block"], [False, False, True]
+        )
+
+    def test_twenty_outcome_blocks_promote_demote_hold_and_clear(self):
+        for successes, new in ((16, 1), (15, 0), (8, 0)):
+            env = curriculum_environment()
+            state = env._benchmark_teacher["families"]["Uneven"]
+            state["block"] = [True] * (successes - 1) + [False] * (20 - successes)
+            episode(env)
+            self.assertEqual(state["target_level"], new)
+            self.assertEqual(state["block"], [])
+            self.assertEqual(
+                state["history"],
+                [dict(block=1, level=0, successes=successes, next_level=new)],
+            )
+        env = curriculum_environment()
+        at_level(env, "Uneven", 1)
+        state = env._benchmark_teacher["families"]["Uneven"]
+        state["block"] = [True] * 8 + [False] * 11
+        episode(env, velocity=0)
+        self.assertEqual(state["target_level"], 0)
+        self.assertEqual(state["revision"], 2)
+
+    def test_family_target_reset_only_and_obsolete_inflight_outcome_does_not_count(
         self,
     ):
         env = curriculum_environment()
-        term, terrain = env.command_manager.get_term("base_velocity"), env.scene.terrain
-        env.scene["robot"].data.root_pos_w[:, 0] += torch.tensor(
-            [100, 6.01, 0, 100, 100, 0, 100, 100]
+        state = env._benchmark_teacher["families"]["Uneven"]
+        state["block"] = [True] * 19
+        episode(env, row=1)
+        self.assertEqual(state["target_level"], 1)
+        self.assertEqual(env.scene.terrain.terrain_levels[1], 1)
+        self.assertEqual(env.scene.terrain.terrain_levels[5], 0)
+        self.assertEqual(
+            env.scene.terrain.terrain_types.tolist(), [0, 1, 2, 3, 4, 1, 1, 1]
         )
-        term.curriculum_eligible[3:5] = False
-        term.command[7, 2] = 0.3
-        types, rng = terrain.terrain_types.clone(), torch.get_rng_state().clone()
-        terrain_levels(env, torch.arange(8))
-        self.assertEqual(terrain.terrain_levels.tolist(), [0, 3, 2, 4, 5, 0, 7, 4])
-        torch.testing.assert_close(terrain.terrain_types, types)
-        torch.testing.assert_close(
-            terrain.env_origins, terrain.terrain_origins[terrain.terrain_levels, types]
+        # Row5's old-level episode started before the other replica's promotion.
+        env.reset_time_outs[5] = True
+        env.termination_manager.get_term("time_out")[5] = True
+        teacher.terrain_levels(env, torch.tensor([5]))
+        self.assertEqual(state["block"], [])
+        self.assertEqual(env.scene.terrain.terrain_levels[5], 1)
+        self.assertEqual(
+            env._benchmark_teacher["families"]["Slopes"]["target_level"], 0
         )
-        self.assertTrue(torch.equal(torch.get_rng_state(), rng))
 
-    def test_strict_distance_thresholds_and_initial_reset_hold(self):
+    def test_pivot_changed_command_and_manual_reset_are_not_translation_outcomes(self):
         env = curriculum_environment()
-        terrain = env.scene.terrain
-        env.scene["robot"].data.root_pos_w[1:3, 0] += torch.tensor([6.0, 4.0])
-        terrain_levels(env, torch.tensor([1, 2]))
-        self.assertEqual(terrain.terrain_levels[1:3].tolist(), [2, 3])
-        env.episode_length_buf.zero_()
-        env.scene["robot"].data.root_pos_w[:, 0] += 100
-        before = terrain.terrain_levels.clone()
-        terrain_levels(env, torch.arange(8))
-        torch.testing.assert_close(terrain.terrain_levels, before)
+        term = env.command_manager.get_term("base_velocity")
+        term.category[1] = 2
+        episode(env)
+        term.category[1] = 0
+        episode(env, ending=None)
+        term.command[1, 0] = 0.3
+        teacher.observe_step(env)
+        env.reset_time_outs[1] = True
+        teacher.terrain_levels(env, torch.tensor([1]))
+        self.assertEqual(env._benchmark_teacher["families"]["Uneven"]["block"], [])
 
-    def test_private_initial_range_is_reproducible_and_flat_stays_zero(self):
-        first, second = curriculum_environment(), curriculum_environment()
-        expected = deepcopy(first.parkour_randomization).uniform(None, 1, "geometry")[
-            :, 0
-        ]
-        rng = torch.get_rng_state().clone()
-        initialize_levels(first)
-        initialize_levels(second)
-        levels = first.scene.terrain.terrain_levels
-        np.testing.assert_array_equal(
-            levels[1:].numpy(), (expected[1:] * 2).astype(int)
-        )
-        self.assertEqual(levels[0], 0)
-        torch.testing.assert_close(levels, second.scene.terrain.terrain_levels)
-        self.assertTrue(torch.equal(torch.get_rng_state(), rng))
-
-    def test_fixed_evaluation_row_zero_represents_its_declared_physical_level(self):
+    def test_actual_support_contact_filters_and_platform_gate(self):
         env = curriculum_environment()
-        env.cfg.benchmark_training = False
-        env.cfg.benchmark_terrain.update(
-            num_rows=1, fixed_level=3, physical_levels_by_row=[3]
-        )
-        terrain = env.scene.terrain
-        terrain.terrain_origins = terrain.terrain_origins[:1]
-        terrain.terrain_levels.zero_()
-        before = env.parkour_randomization.state_dict()
-        initialize_levels(env)
-        self.assertEqual(env.parkour_randomization.state_dict(), before)
-        self.assertEqual(curriculum_state(env)["levels"], [0] * 8)
+        at_level(env, "Slopes", 1)
+        ep = env._benchmark_teacher["episodes"]
+        ids = torch.tensor([2])
+        feet = env.scene["robot"].data.body_pos_w
+        feet[2, :, 0] = env.scene.terrain.env_origins[2, 0] + 1.5
 
-    def test_json_restore_keeps_physical_assignments_then_starts_fresh_episodes(self):
+        def ray(e, xyz):
+            return torch.zeros(xyz.shape[:2]), torch.ones(
+                xyz.shape[:2], dtype=torch.bool
+            )
+
+        with patch("parkour_lab.runtime.native.foot_support", side_effect=ray):
+            self.assertTrue(teacher._contact_samples(env, ids, ep).item())
+            feet[2, :, 0] = env.scene.terrain.env_origins[2, 0] + 0.5
+            self.assertFalse(teacher._contact_samples(env, ids, ep).item())
+
+            feet[2, :, 0] = env.scene.terrain.env_origins[2, 0] + 1.5
+            feet[2, :, 2] = 0.09
+            self.assertFalse(teacher._contact_samples(env, ids, ep).item())
+            feet[2, :, 2] = 0.02
+            env.scene["contact_forces"].data.net_forces_w.zero_()
+            self.assertFalse(teacher._contact_samples(env, ids, ep).item())
+
+    def test_no_step_reset_ignores_stale_teacher_and_termination_buffers(self):
+        env = curriculum_environment()
+        env._benchmark_teacher["episodes"]["steps"][1] = 1000
+        env.reset_time_outs[1] = True
+        env.termination_manager.get_term("time_out")[1] = True
+        teacher.terrain_levels(env, torch.tensor([1]))
+        self.assertEqual(env._benchmark_teacher["families"]["Uneven"]["block"], [])
+
+    def test_changed_support_and_missing_ray_are_conservative(self):
+        env = curriculum_environment()
+        ep = env._benchmark_teacher["episodes"]
+        ids = torch.tensor([1])
+        height = torch.zeros(1, 4)
+        valid = torch.ones(1, 4, dtype=torch.bool)
+        with patch(
+            "parkour_lab.runtime.native.foot_support",
+            side_effect=lambda e, f: (height.clone(), valid.clone()),
+        ):
+            self.assertFalse(teacher._contact_samples(env, ids, ep).item())
+            height[0, 0] = 0.001
+            self.assertTrue(teacher._contact_samples(env, ids, ep).item())
+            valid.zero_()
+            self.assertFalse(teacher._contact_samples(env, ids, ep).item())
+
+    def test_json_restore_keeps_blocks_history_and_sampler_but_discards_partial_episode(
+        self,
+    ):
         source = curriculum_environment()
         source.interactions.sync(6, 24)
-        report = source.command_manager.get_term("base_velocity").sampling_report
-        report.update(samples=8, translations=4, stops=1, pivots=2, arcs=1)
+        state = source._benchmark_teacher["families"]["Uneven"]
+        state["block"] = [True] * 19
+        episode(source)
+        source._benchmark_teacher["episodes"]["steps"][2] = 30
         record = json.loads(json.dumps(checkpoint(source)))
         target = curriculum_environment()
-        initialize_levels(target)
         restore(target, record)
-        self.assertEqual(curriculum_state(target), record["curriculum"])
-        torch.testing.assert_close(
-            target.scene.terrain.env_origins, source.scene.terrain.env_origins
+        self.assertEqual(teacher.curriculum_state(target), record["curriculum"])
+        self.assertFalse(target._benchmark_teacher["episodes"]["steps"].any())
+        self.assertEqual(
+            target.parkour_randomization.state_dict(),
+            source.parkour_randomization.state_dict(),
+        )
+        self.assertEqual(target.interactions.cumulative, 48)
+        env_state = teacher.curriculum_state(target)
+        teacher.terrain_levels(target, torch.arange(8))
+        self.assertEqual(
+            target.scene.terrain.terrain_levels.tolist(), [0, 1, 0, 0, 0, 1, 1, 1]
         )
         self.assertEqual(
-            target.interactions.state_dict(),
-            dict(session=0, cumulative=48, uncertain=0),
+            teacher.curriculum_state(target)["families"], env_state["families"]
         )
-        self.assertEqual(
-            target.command_manager.get_term("base_velocity").sampling_report, report
-        )
-        np.testing.assert_array_equal(
-            target.parkour_randomization.uniform(None, 4, "commands"),
-            source.parkour_randomization.uniform(None, 4, "commands"),
-        )
-        target.episode_length_buf.zero_()
-        target.scene["robot"].data.root_pos_w[:, 0] += 1000
-        terrain_levels(target, torch.arange(8))
-        self.assertEqual(curriculum_state(target), record["curriculum"])
 
-    def test_all_identity_levels_and_late_report_rejections_are_atomic(self):
+    def test_old_schema_and_late_corruptions_reject_without_partial_restore(self):
         source = curriculum_environment()
-        source.interactions.sync(6, 24)
-        original = checkpoint(source)
-        original["sampling_report"].update(samples=2, translations=2)
+        record = checkpoint(source)
         variants = []
         for mutate in (
-            lambda r: r["curriculum"].update(version="other"),
-            lambda r: r["curriculum"]["definition"]["columns"][1].update(family="Flat"),
-            lambda r: r["curriculum"]["types"].__setitem__(1, 2),
+            lambda r: r.update(version="go2_checkpoint_progress_v1"),
+            lambda r: r["curriculum"].update(
+                version="go2_eligible_distance_curriculum_v1"
+            ),
+            lambda r: r["curriculum"]["levels"].__setitem__(1, 16),
             lambda r: r["curriculum"]["types"].__setitem__(1, True),
-            lambda r: r["curriculum"]["levels"].__setitem__(1, -1),
-            lambda r: r["curriculum"]["levels"].__setitem__(1, 8),
-            lambda r: r["curriculum"]["levels"].__setitem__(0, 1),
+            lambda r: r["curriculum"]["families"]["Uneven"].update(target_level=1),
+            lambda r: r["curriculum"]["families"]["Uneven"].update(block=[True] * 20),
             lambda r: r["sampling_report"].update(period_steps=4),
-            lambda r: r["sampling_report"].update(stops=1),
         ):
-            bad = deepcopy(original)
+            bad = deepcopy(record)
             mutate(bad)
             variants.append(bad)
         for bad in variants:
-            target = curriculum_environment()
-            initialize_levels(target)
-            state, sampler = (
-                curriculum_state(target),
-                target.parkour_randomization.state_dict(),
-            )
-            origins = target.scene.terrain.env_origins.clone()
+            env = curriculum_environment()
+            before = teacher.curriculum_state(env)
+            sampler = deepcopy(env.parkour_randomization.state_dict())
             with self.subTest(record=bad), self.assertRaises(ValueError):
-                restore(target, bad)
-            self.assertEqual(curriculum_state(target), state)
-            self.assertEqual(target.parkour_randomization.state_dict(), sampler)
-            torch.testing.assert_close(target.scene.terrain.env_origins, origins)
-            self.assertEqual(target.interactions.cumulative, 0)
+                restore(env, bad)
+            self.assertEqual(teacher.curriculum_state(env), before)
+            self.assertEqual(env.parkour_randomization.state_dict(), sampler)
+            self.assertEqual(env.interactions.cumulative, 0)

@@ -17,9 +17,11 @@ from parkour_lab.provenance import file_sha256, write_json
 from tests.support.evaluation import analytic_trace
 
 
-def campaign(directory, *, seeds=(7, 8), milestones=(256,), methods=("a",)):
+def campaign(
+    directory, *, seeds=(7, 8), milestones=(256,), methods=("a",), case_version="v2"
+):
     root = Path(directory)
-    cases = case_bank("validation")
+    cases = case_bank("validation", version=case_version)
     recipe = {"terms": {"tracking": {"weight": 1.0}}, "control_dt_s": 0.02}
     dependencies = {
         name: dict(version="1", source_sha256="d" * 64, module_path="/first/install")
@@ -38,6 +40,7 @@ def campaign(directory, *, seeds=(7, 8), milestones=(256,), methods=("a",)):
         purpose="development",
         partition="validation",
         suite="core",
+        case_version=case_version,
         seeds=list(seeds),
         milestones=list(milestones),
         methods=[],
@@ -99,7 +102,7 @@ def campaign(directory, *, seeds=(7, 8), milestones=(256,), methods=("a",)):
                     write_json(child / "capture.json", receipt)
                 write_json(folder / "manifest.json", manifest)
                 progress = dict(
-                    version="go2_checkpoint_progress_v1",
+                    version=f"go2_checkpoint_progress_{case_version}",
                     protocol="go2-blind-v1",
                     task_id="Go2-Mixed-v1",
                     num_envs=20,
@@ -141,6 +144,23 @@ def campaign(directory, *, seeds=(7, 8), milestones=(256,), methods=("a",)):
 
 
 class CampaignTests(unittest.TestCase):
+    def test_historical_declaration_defaults_to_v1_without_relabelling_captures(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path, declaration = campaign(temp, seeds=(7,), case_version="v1")
+            declaration.pop("case_version")
+            write_json(path, declaration)
+            legacy = report_campaign(path)
+            self.assertTrue(legacy["data_complete"])
+            self.assertEqual(
+                legacy["methods"]["a"]["endpoints"][0]["case_coverage"]["prescribed"],
+                114,
+            )
+            declaration["case_version"] = "v2"
+            write_json(path, declaration)
+            mixed = report_campaign(path)
+            self.assertFalse(mixed["data_complete"])
+            self.assertEqual(mixed["methods"]["a"]["endpoints"][0]["status"], "invalid")
+
     def test_three_seed_complete_pilot_meets_data_design_without_calibration_claim(
         self,
     ):

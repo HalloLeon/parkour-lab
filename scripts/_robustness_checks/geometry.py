@@ -107,10 +107,14 @@ def compare_surfaces(samples, definitions):
     }
     delta = relative["composition"] - relative["id"]
     assert np.max(abs(delta[:, platform])) < 2e-4
-    changed = np.mean(abs(delta[:, outside]) > 0.0025, axis=1)
-    assert (
-        changed > 0.01
-    ).all(), "Composition did not change the realized outer surface"
+    changed = np.mean(abs(delta[:, outside]) > 0.0005, axis=1)
+    flat_entry = definitions["composition"]["fixed_level"] == 0
+    if flat_entry:
+        assert np.max(abs(delta)) < 2e-4, "Flat-entry composition must remain a plane"
+    else:
+        assert (
+            changed > 0.01
+        ).all(), "Composition did not change the realized outer surface"
     np.testing.assert_allclose(
         base["root_position_w_m"], composed["root_position_w_m"], atol=1e-5, rtol=0
     )
@@ -123,9 +127,12 @@ def compare_surfaces(samples, definitions):
     np.testing.assert_allclose(
         base["foot_support_w_m"], composed["foot_support_w_m"], atol=1e-5, rtol=0
     )
-    from parkour_lab.environments.terrains.specification import physical_level
+    from parkour_lab.environments.terrains.specification import (
+        LEVEL_COUNT,
+        physical_level,
+    )
 
-    cap = physical_level(7)
+    cap = physical_level(LEVEL_COUNT - 1)
     level = definitions["terrain_ood"]["fixed_level"]
     values = definitions["terrain_ood"]["levels"][level]
     family = definitions["terrain_ood"]["columns"][0]["family"]
@@ -139,6 +146,7 @@ def compare_surfaces(samples, definitions):
         paired_platform_maximum_difference_m=float(np.max(abs(delta[:, platform]))),
         composed_outside_changed_fraction=changed.tolist(),
         composed_delta_range_m=[float(delta.min()), float(delta.max())],
+        flat_entry_composition=flat_entry,
         paired_starts_and_support=True,
         ood_field=field,
         ood_value=values[field],

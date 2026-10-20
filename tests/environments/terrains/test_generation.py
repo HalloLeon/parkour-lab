@@ -17,6 +17,8 @@ from parkour_lab.environments.terrains.configuration import (
 )
 from parkour_lab.environments.terrains.generation import generate_terrain
 from parkour_lab.environments.terrains.specification import (
+    EVALUATION_LEVELS,
+    LEVEL_COUNT,
     MIXED_COLUMNS,
     TerrainConfig,
 )
@@ -117,11 +119,11 @@ def height_at(mesh, x, y):
 class NativeTerrainGeometryTests(unittest.TestCase):
     def test_real_meshes_have_finite_support_and_both_signed_pyramids(self):
         with native_geometry():
-            for level in (0, 3, 7):
+            for level in EVALUATION_LEVELS:
                 for family, subtype in dict.fromkeys(MIXED_COLUMNS):
                     with self.subTest(level=level, family=family, subtype=subtype):
                         pieces, origin = generate_terrain(
-                            (level + 0.4) / 8, subterrain(family, subtype)
+                            (level + 0.4) / LEVEL_COUNT, subterrain(family, subtype)
                         )
                         mesh = trimesh.util.concatenate(pieces)
                         self.assertTrue(np.isfinite(mesh.vertices).all())
@@ -134,11 +136,11 @@ class NativeTerrainGeometryTests(unittest.TestCase):
                         for x, y in ((0.2, 0.2), (3, 3), (6, 6), (9, 9), (11.8, 11.8)):
                             self.assertTrue(np.isfinite(height_at(mesh, x, y)))
                         self.assertGreaterEqual(origin[2] + 1e-7, center)
-                        if family == "Flat":
+                        if family == "Flat" or level == 0:
                             np.testing.assert_array_equal(mesh.vertices[:, 2], 0)
                         else:
                             self.assertGreater(np.ptp(mesh.vertices[:, 2]), 0)
-                        if family in ("Stairs", "Slopes"):
+                        if family in ("Stairs", "Slopes") and level > 0:
                             sign = 1 if subtype == "pyramid" else -1
                             self.assertGreater(sign * (center - outer), 0)
                             self.assertAlmostEqual(
@@ -151,14 +153,14 @@ class NativeTerrainGeometryTests(unittest.TestCase):
         with native_geometry():
             np.random.seed(108)
             state = np.random.get_state()
-            first, _ = generate_terrain(0.01, subterrain("Uneven", "noise"))
+            first, _ = generate_terrain(0.08, subterrain("Uneven", "noise"))
             after = np.random.random(6)
             np.random.set_state(state)
             np.testing.assert_array_equal(after, np.random.random(6))
-            second, _ = generate_terrain(0.1, subterrain("Uneven", "noise"))
+            second, _ = generate_terrain(0.10, subterrain("Uneven", "noise"))
             np.testing.assert_array_equal(first[0].vertices, second[0].vertices)
             high, _ = generate_terrain(0.99, subterrain("Uneven", "noise"))
-            changed, _ = generate_terrain(0.01, subterrain("Uneven", "noise", seed=8))
+            changed, _ = generate_terrain(0.08, subterrain("Uneven", "noise", seed=8))
             self.assertGreater(
                 np.std(high[0].vertices[:, 2]), np.std(first[0].vertices[:, 2])
             )
@@ -175,6 +177,25 @@ class NativeTerrainGeometryTests(unittest.TestCase):
                     np.testing.assert_array_equal(left.vertices, right.vertices)
                     np.testing.assert_array_equal(left.faces, right.faces)
 
+    def test_entry_uneven_levels_resolve_single_millimeter_native_heights(self):
+        with native_geometry():
+            for level in (1, 2, 3):
+                pieces, _ = generate_terrain(
+                    0.0, subterrain("Uneven", "noise", fixed_level=level)
+                )
+                heights = pieces[0].vertices[:, 2]
+                self.assertGreater(np.ptp(heights), 0)
+                np.testing.assert_allclose(
+                    heights / 0.001, np.rint(heights / 0.001), atol=1e-5
+                )
+            pieces, _ = generate_terrain(
+                0.0, subterrain("Stairs", "pyramid", fixed_level=1)
+            )
+            mesh = trimesh.util.concatenate(pieces)
+            self.assertAlmostEqual(
+                abs(height_at(mesh, 9.05, 6) - height_at(mesh, 9.35, 6)), 0.005
+            )
+
     def test_native_configs_preserve_columns_ordering_and_one_row_fixed_eval(self):
         with native_geometry():
             train, evaluation = config(), config()
@@ -183,7 +204,7 @@ class NativeTerrainGeometryTests(unittest.TestCase):
             )
             configure_terrain(
                 evaluation,
-                TerrainConfig(fixed_level=7),
+                TerrainConfig(fixed_level=15),
                 training=False,
                 task_id="Go2-Mixed-v1",
                 seed=5,
@@ -191,8 +212,8 @@ class NativeTerrainGeometryTests(unittest.TestCase):
             generator = train.scene.terrain.terrain_generator
             self.assertTrue(generator.curriculum)
             self.assertFalse(generator.use_cache)
-            self.assertEqual(generator.num_rows, 8)
-            self.assertEqual(train.scene.terrain.max_init_terrain_level, 1)
+            self.assertEqual(generator.num_rows, 16)
+            self.assertEqual(train.scene.terrain.max_init_terrain_level, 0)
             self.assertIsNotNone(train.curriculum.terrain_levels)
             fixed = evaluation.scene.terrain.terrain_generator
             self.assertEqual(fixed.num_rows, 1)
@@ -204,7 +225,7 @@ class NativeTerrainGeometryTests(unittest.TestCase):
                 MIXED_COLUMNS,
             )
             self.assertTrue(
-                all(c.fixed_level == 7 for c in fixed.sub_terrains.values())
+                all(c.fixed_level == 15 for c in fixed.sub_terrains.values())
             )
             flat = config()
             configure_terrain(
@@ -229,7 +250,9 @@ class NativeTerrainGeometryTests(unittest.TestCase):
             generated = []
 
             def capture(difficulty, sub_cfg):
-                generated.append((sub_cfg.family, sub_cfg.subtype, int(difficulty * 8)))
+                generated.append(
+                    (sub_cfg.family, sub_cfg.subtype, int(difficulty * LEVEL_COUNT))
+                )
                 return None, None
 
             generator._get_terrain_mesh = capture
@@ -238,7 +261,7 @@ class NativeTerrainGeometryTests(unittest.TestCase):
             expected = [
                 (family, kind, row)
                 for family, kind in MIXED_COLUMNS
-                for row in range(8)
+                for row in range(LEVEL_COUNT)
             ]
             self.assertEqual(generated, expected)
 

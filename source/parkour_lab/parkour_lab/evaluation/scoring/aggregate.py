@@ -217,18 +217,27 @@ def aggregate_cases(cases, results):
     if not cases or not all(isinstance(case, EvaluationCase) for case in cases):
         raise ValueError("Require prescribed evaluation cases")
     prescribed = {case.case_id: case for case in cases}
-    if len(prescribed) != len(cases) or len({case.partition for case in cases}) != 1:
-        raise ValueError("Cases require distinct IDs in one partition")
+    if (
+        len(prescribed) != len(cases)
+        or len({case.partition for case in cases}) != 1
+        or len({case.version for case in cases}) != 1
+    ):
+        raise ValueError("Cases require distinct IDs in one partition and version")
     indexed = _index_results(prescribed, results)
     missing = [case.case_id for case in cases if case.case_id not in indexed]
     core = tuple(case for case in cases if case.condition == "id")
     groups = _group_summaries(cases, core, indexed)
     attempts = max(case.attempt for case in cases) + 1
-    canonical = case_bank(cases[0].partition, attempts=attempts)
+    canonical = case_bank(
+        cases[0].partition, attempts=attempts, version=cases[0].version
+    )
     has_robustness = len(core) != len(cases)
     full_core = {case.case_id for case in core} == {case.case_id for case in canonical}
     full_robustness = has_robustness and set(prescribed) == {
-        case.case_id for case in robustness_bank(cases[0].partition, attempts=attempts)
+        case.case_id
+        for case in robustness_bank(
+            cases[0].partition, attempts=attempts, version=cases[0].version
+        )
     }
     return dict(
         version=VERSION,

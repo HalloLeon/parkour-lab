@@ -42,14 +42,18 @@ def _check_receipt(manifest, evidence, case):
         raise ValueError("Case receipt differs from the prescribed manifest")
     if any(evidence.get(key) != manifest[key] for key in IDENTITY_FIELDS):
         raise ValueError("Case policy/checkpoint identity differs from the manifest")
+    terrain = evidence.get("realization", {}).get("task", {}).get("terrain", {})
+    if (
+        "version" in terrain
+        and terrain["version"] != f"go2-terrain-development-{case.version}"
+    ):
+        raise ValueError("Realized terrain recipe differs from the case version")
     if case.condition != "id" and evidence.get("trace_sha256") is not None:
-        from .robustness import VERSION as robustness_version
-
         realized = evidence.get("realization", {})
-        terrain = realized.get("task", {}).get("terrain", {})
         condition = case.condition if case.condition != "fault" else "id"
         if (
-            manifest.get("robustness_version") != robustness_version
+            manifest.get("robustness_version")
+            != f"go2_robustness_development_{case.version}"
             or terrain.get("condition", "id") != condition
             or realized.get("fault") != (case.fault.as_dict() if case.fault else None)
         ):
@@ -142,8 +146,13 @@ def score_capture(folder):
     if manifest.get("version") != VERSION:
         raise ValueError("Unsupported evaluation capture version")
     cases = tuple(case_from_dict(item) for item in manifest["cases"])
-    if not cases or len({case.case_id for case in cases}) != len(cases):
-        raise ValueError("Require distinct prescribed evaluation cases")
+    if (
+        not cases
+        or len({case.case_id for case in cases}) != len(cases)
+        or len({case.version for case in cases}) != 1
+        or manifest.get("case_version", cases[0].version) != cases[0].version
+    ):
+        raise ValueError("Require distinct prescribed evaluation cases in one version")
     results = {}
     for case in cases:
         path = folder / case.case_id

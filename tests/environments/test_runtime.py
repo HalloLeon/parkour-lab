@@ -201,6 +201,47 @@ class NativeTransitionTests(unittest.TestCase):
         torch.testing.assert_close(self.reset_noise, reset_noise, rtol=0, atol=0)
         self.assertTrue(torch.equal(torch.random.get_rng_state(), state))
 
+    def test_teacher_reads_outgoing_reward_boundary_before_native_curriculum_reset(
+        self,
+    ):
+        initialize = self.initialize
+        events = []
+
+        def with_teacher(env):
+            initialize(env)
+            env._benchmark_teacher = {}
+            env.curriculum_manager.compute = lambda **kwargs: events.append("decision")
+
+        def observe(env):
+            events.append("outgoing")
+            torch.testing.assert_close(
+                self.state[:, 0], torch.tensor([4.0, 5.0, 6.0, 7.0])
+            )
+            self.assertEqual(env.episode_length_buf.tolist(), [1] * 4)
+            self.assertEqual(env.reset_terminated.tolist(), [True, False, True, False])
+
+        def begin(env, ids):
+            events.append("fresh")
+            self.assertEqual(ids.tolist(), [0, 1, 2])
+            torch.testing.assert_close(self.state[ids, 0], torch.full((3,), -100.0))
+            self.assertEqual(env.episode_length_buf[ids].tolist(), [0] * 3)
+
+        with (
+            patch.object(self, "initialize", side_effect=with_teacher),
+            patch(
+                "parkour_lab.environments.terrains.curriculum.observe_step",
+                side_effect=observe,
+            ),
+            patch(
+                "parkour_lab.environments.terrains.curriculum.begin_episodes",
+                side_effect=begin,
+            ),
+        ):
+            env = self.environment()
+            _, reward, _, _, _ = env.step(torch.ones(4, 1))
+        self.assertEqual(events, ["outgoing", "decision", "fresh"])
+        torch.testing.assert_close(reward, torch.tensor([4.0, 5.0, 6.0, 7.0]))
+
     def test_training_information_owns_compact_outgoing_rows_before_reset(self):
         env = self.environment()
         env.cfg.benchmark_training = True

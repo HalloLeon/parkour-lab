@@ -37,6 +37,8 @@ def make_case_task(case, device):
     A fresh native context is closed after each attempt. Training remains batched;
     this deliberately small evaluator does not introduce a second batch scheduler.
     """
+    if case.version != "v2":
+        raise ValueError("Legacy case versions are offline-only")
     options = Go2Config(
         task_id=f"Go2-{case.family}-v1",
         num_envs=1,

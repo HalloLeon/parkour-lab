@@ -112,9 +112,9 @@ def _cases(full_bank, suite="core"):
         for fields in (
             ("Flat", None, "plane", "stand"),
             ("Uneven", 0, "noise", "forward-035"),
-            ("Slopes", 3, "pyramid", "pivot-left"),
-            ("Stairs", 7, "inverted_pyramid", "pivot-right"),
-            ("Hills", 3, "wave", "arc-left"),
+            ("Slopes", 8, "pyramid", "pivot-left"),
+            ("Stairs", 15, "inverted_pyramid", "pivot-right"),
+            ("Hills", 8, "wave", "arc-left"),
             ("Flat", None, "plane", "arc-right"),
         )
     )

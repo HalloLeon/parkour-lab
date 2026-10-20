@@ -44,10 +44,22 @@ class LocomotionEnv(ManagerBasedRLEnv):
 
             configure_fault(self)
             self._validate_observations()
+            if getattr(self, "_benchmark_teacher", None) is not None:
+                # SDK computes reward after termination flags but before reset.
+                # Read the outgoing transition here without changing its reward.
+                self._native_reward_compute = self.reward_manager.compute
+                self.reward_manager.compute = self._reward_and_curriculum
         except Exception:
             # The caller cannot close an object whose constructor never returned.
             self.close()
             raise
+
+    def _reward_and_curriculum(self, dt):
+        reward = self._native_reward_compute(dt=dt)
+        from parkour_lab.environments.terrains.curriculum import observe_step
+
+        observe_step(self)
+        return reward
 
     def _validate_observations(self):
         # An extra observation read must not advance a filter or return stale
@@ -109,6 +121,9 @@ class LocomotionEnv(ManagerBasedRLEnv):
 
         reset_fault(self, env_ids)
         super()._reset_idx(env_ids)
+        from parkour_lab.environments.terrains.curriculum import begin_episodes
+
+        begin_episodes(self, env_ids)
 
     def _training_information_enabled(self):
         return self.capture_training_information and getattr(

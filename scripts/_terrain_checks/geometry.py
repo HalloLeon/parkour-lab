@@ -76,16 +76,21 @@ def _surface_metrics(assignment, height, axis, definition, physical_level):
         height_rms_about_mean_m=float(height.std()),
         adjacent_height_rms_m=float(np.sqrt(np.mean(np.diff(height, axis=1) ** 2))),
         outside_platform_fraction=float(outside.mean()),
-        varied_outside_fraction=float((abs(height[outside] - center) > 0.0025).mean()),
+        varied_outside_fraction=float((abs(height[outside] - center) > 0.0005).mean()),
         probe_extent_xy_m=[float(axis[0]), float(axis[-1])],
         probe_spacing_m=spacing,
     )
     family, subtype = assignment["family"], assignment["subtype"]
     requested = definition["levels"][physical_level]
-    if family == "Flat":
+    flat_entry = (
+        physical_level == 0 and definition.get("condition", "id") != "terrain_ood"
+    )
+    result["flat_entry"] = flat_entry
+    if family == "Flat" or flat_entry:
         assert result["height_ptp_m"] < 1e-4
+        return result
     else:
-        assert result["height_ptp_m"] > 0.003
+        assert result["height_ptp_m"] > 0.0005
         assert result["varied_outside_fraction"] > 0.01
     if family in ("Slopes", "Stairs"):
         sign = 1 if subtype == "pyramid" else -1

@@ -47,7 +47,7 @@ class MotionScoringTests(unittest.TestCase):
         self.assertEqual(zero["motion"]["yaw_rmse_rad_s"], 0.5)
 
     def test_tilted_body_yaw_is_primary_world_heading_is_separate(self):
-        case = EvaluationCase("validation", "Slopes", 3, "pyramid", "pivot-left")
+        case = EvaluationCase("validation", "Slopes", 8, "pyramid", "pivot-left")
         trace = analytic_trace(case)
         angle = np.cumsum(trace["command"][:, 2]) * 0.02
         cosine, sine = np.cos(np.pi / 6), np.sin(np.pi / 6)
@@ -155,8 +155,31 @@ class MotionScoringTests(unittest.TestCase):
 
 
 class ExposureScoringTests(unittest.TestCase):
+    def test_v2_plane_entry_and_fine_exposure_do_not_reinterpret_legacy_zero(self):
+        from dataclasses import replace
+
+        zero = EvaluationCase("validation", "Slopes", 0, "pyramid", "stand")
+        for case in (zero, replace(zero, condition="composition")):
+            self.assertEqual(
+                score_case(case, analytic_trace(case))["exposure"]["label"],
+                "flat_entry",
+            )
+        old = replace(zero, version="v1")
+        self.assertEqual(
+            score_case(old, analytic_trace(old))["exposure"]["label"],
+            "platform_only_supported_contacts",
+        )
+        for version, level, expected in (
+            ("v1", 3, "platform_only_supported_contacts"),
+            ("v2", 4, "nonflat_contact_demonstrated"),
+        ):
+            case = replace(zero, version=version, physical_level=level)
+            trace = analytic_trace(case)
+            trace["support_height_w"][100:, 0] = 0.001
+            self.assertEqual(score_case(case, trace)["exposure"]["label"], expected)
+
     def test_platform_pivot_has_no_nonflat_proof_and_true_support_change_does(self):
-        case = EvaluationCase("validation", "Stairs", 3, "pyramid", "pivot-left")
+        case = EvaluationCase("validation", "Stairs", 8, "pyramid", "pivot-left")
         trace = analytic_trace(case)
         platform = score_case(case, trace)
         self.assertEqual(
@@ -172,7 +195,7 @@ class ExposureScoringTests(unittest.TestCase):
         self.assertIsNone(exposed["motion"]["flat_reference"])
 
     def test_missing_support_or_no_contact_is_unavailable_never_exposure(self):
-        case = EvaluationCase("test", "Uneven", 0, "noise", "stand")
+        case = EvaluationCase("test", "Uneven", 4, "noise", "stand")
         trace = analytic_trace(case)
         trace["support_height_w"][:] = np.nan
         trace["support_valid"][:] = False

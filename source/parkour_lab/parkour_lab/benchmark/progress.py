@@ -6,7 +6,7 @@ from copy import deepcopy
 from parkour_lab.environments.terrains import curriculum
 from parkour_lab.runtime.accounting import nonnegative_integer
 
-VERSION = "go2_checkpoint_progress_v1"
+VERSION = "go2_checkpoint_progress_v2"
 
 
 def _text(value, name):

@@ -14,6 +14,19 @@ from tests.support.evaluation import analytic_trace
 
 
 class AggregationTests(unittest.TestCase):
+    def test_full_bank_recognition_uses_original_version_and_mixing_is_rejected(self):
+        legacy = case_bank("validation", version="v1")
+        old = aggregate_cases(legacy, [])
+        self.assertTrue(old["full_partition_bank"])
+        self.assertEqual(old["overall"]["prescribed_attempts"], 114)
+        cases = (legacy[0], case_bank("validation")[0])
+        for aggregate, results in (
+            (aggregate_cases, []),
+            (aggregate_training_seeds, {1: []}),
+        ):
+            with self.assertRaisesRegex(ValueError, "version"):
+                aggregate(cases, results)
+
     def test_family_equal_weighting_and_both_directions_visible(self):
         cases = case_bank("validation")
         results = []

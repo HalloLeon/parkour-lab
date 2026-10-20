@@ -10,6 +10,7 @@ from _terrain_checks.contacts import check_contact
 from _terrain_checks.curriculum import check_boundary, check_curriculum
 from _terrain_checks.geometry import assignments, check_geometry
 
+from parkour_lab.environments.terrains.specification import LEVEL_COUNT
 from parkour_lab.provenance import (
     dependency_identity,
     package_source_identity,
@@ -60,12 +61,23 @@ def _run(task, app, args, output, report):
     report["terrain_definition"] = native.cfg.benchmark_terrain
     report["initial_assignments"] = assignments(native)
     if args.resume:
-        assert curriculum_state(native) == record["curriculum"]
-    elif task.training:
+        current = curriculum_state(native)
+        saved = record["curriculum"]
+        for field in ("version", "definition", "types", "families"):
+            assert current[field] == saved[field]
+        # Fresh physical episodes take current targets, including rows that were
+        # still running at an earlier family target when the save was taken.
         assert all(
-            row["row"] == 0 if row["family"] == "Flat" else 0 <= row["row"] <= 1
+            current["levels"][row["env_id"]]
+            == (
+                0
+                if row["family"] == "Flat"
+                else current["families"][row["family"]]["target_level"]
+            )
             for row in report["initial_assignments"]
         )
+    elif task.training:
+        assert all(row["row"] == 0 for row in report["initial_assignments"])
     else:
         assert "training_information" not in task.metadata
         assert all(row["row"] == 0 for row in report["initial_assignments"])
@@ -85,7 +97,7 @@ def _run(task, app, args, output, report):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--role", choices=("train", "eval"), required=True)
-    parser.add_argument("--level", type=int, choices=(0, 3, 7))
+    parser.add_argument("--level", type=int, choices=range(LEVEL_COUNT))
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--seed", type=int, default=1077)
     parser.add_argument("--device", default="cuda:0")

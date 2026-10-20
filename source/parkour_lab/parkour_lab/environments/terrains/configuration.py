@@ -95,8 +95,8 @@ def tile_boundary(env):
     """Censor the first root-center sample beyond its assigned tile's XY extent.
 
     The outgoing transition remains observable; feet may already straddle the
-    edge. The strict crossing also permits the native half-length promotion
-    heuristic to see that sample before reset. This is not obstacle completion.
+    edge. Progression can inspect the outgoing sample before reset. This is not
+    obstacle completion.
     """
     offset = (
         env.scene["robot"].data.root_pos_w[:, :2] - env.scene.terrain.env_origins[:, :2]

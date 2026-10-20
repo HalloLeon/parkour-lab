@@ -203,3 +203,14 @@ class LoadedPolicyPlaybackTests(unittest.TestCase):
                     runner.evaluate(None, [self.case, self.case], folder)
                 run.assert_not_called()
             self.assertFalse(folder.exists())
+
+    def test_legacy_prescription_is_offline_only_before_output_or_policy_read(self):
+        from dataclasses import replace
+
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp) / "capture"
+            with patch.object(runner, "_run_case") as run:
+                with self.assertRaisesRegex(ValueError, "offline-only"):
+                    runner.evaluate(None, [replace(self.case, version="v1")], folder)
+                run.assert_not_called()
+            self.assertFalse(folder.exists())

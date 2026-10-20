@@ -101,6 +101,9 @@ class EpisodeCommandTests(unittest.TestCase):
         with episode_command(env) as command:
             command._resample(torch.arange(8))
             original = command.vel_command_b.clone()
+            # The command clock advances only after a physical step; newly
+            # initialized curriculum fixtures now start at episode length zero.
+            env.episode_length_buf.fill_(1)
             for _ in range(999):
                 command.compute(0.02)
             torch.testing.assert_close(command.vel_command_b, original, rtol=0, atol=0)

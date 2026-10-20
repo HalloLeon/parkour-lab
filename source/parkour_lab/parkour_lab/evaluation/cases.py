@@ -7,8 +7,12 @@ from dataclasses import asdict, dataclass, fields
 from types import MappingProxyType
 
 from parkour_lab.environments.faults import JOINT_NAMES, FaultConfig
+from parkour_lab.environments.terrains.specification import EVALUATION_LEVELS
 
-VERSION = "go2_fixed_cases_development_v1"
+VERSION = "go2_fixed_cases_development_v2"
+VERSIONS = MappingProxyType(
+    {name: f"go2_fixed_cases_development_{name}" for name in ("v1", "v2")}
+)
 PERIOD_S = 0.02
 DURATION_S = 20.0
 STEPS = 1000
@@ -54,8 +58,11 @@ class EvaluationCase:
     attempt: int = 0
     condition: str = "id"
     fault: FaultConfig | None = None
+    version: str = "v2"
 
     def __post_init__(self):
+        if type(self.version) is not str or self.version not in VERSIONS:
+            raise ValueError("Unsupported fixed case version")
         if any(
             type(value) is not str
             for value in (self.partition, self.family, self.subtype, self.profile)
@@ -70,10 +77,12 @@ class EvaluationCase:
         valid_level = (
             self.physical_level is None
             if self.family == "Flat"
-            else type(self.physical_level) is int and self.physical_level in (0, 3, 7)
+            else type(self.physical_level) is int
+            and self.physical_level
+            in ((0, 3, 7) if self.version == "v1" else EVALUATION_LEVELS)
         )
         if not valid_level:
-            raise ValueError("Flat has no ladder; other families use levels 0, 3 or 7")
+            raise ValueError("Flat has no ladder; other families use versioned anchors")
         if self.profile not in PROFILES:
             raise ValueError("Unknown fixed command profile")
         if type(self.attempt) is not int or self.attempt < 0:
@@ -95,7 +104,10 @@ class EvaluationCase:
                 not isinstance(self.fault, FaultConfig)
                 or self.fault.joint_name not in JOINT_NAMES
                 or self.family not in ("Flat", "Uneven")
-                or (self.family == "Uneven" and self.physical_level != 3)
+                or (
+                    self.family == "Uneven"
+                    and self.physical_level != (3 if self.version == "v1" else 8)
+                )
                 or self.profile != "forward-035"
                 or not 6 <= self.fault.onset_s <= 8
                 or not math.isclose(
@@ -114,6 +126,8 @@ class EvaluationCase:
     def as_dict(self):
         """Constructor fields only; identities are recomputed, never trusted input."""
         value = asdict(self)
+        if self.version == "v1":
+            value.pop("version")
         if self.fault is None:
             value.pop("fault")
         if self.condition == "id":
@@ -124,7 +138,7 @@ class EvaluationCase:
     def case_id(self):
         level = "flat" if self.physical_level is None else f"level{self.physical_level}"
         base = (
-            f"{VERSION}_{self.partition}_{self.family}_{level}_{self.subtype}"
+            f"{VERSIONS[self.version]}_{self.partition}_{self.family}_{level}_{self.subtype}"
             f"_{self.profile}_attempt{self.attempt}"
         )
         if self.condition == "id":
@@ -140,7 +154,10 @@ class EvaluationCase:
         identity.pop("profile")
         identity.pop("condition", None)
         identity.pop("fault", None)
-        text = json.dumps(dict(version=VERSION, **identity), sort_keys=True)
+        identity.pop("version", None)
+        text = json.dumps(
+            dict(version=VERSIONS[self.version], **identity), sort_keys=True
+        )
         return int.from_bytes(hashlib.sha256(text.encode()).digest()[:4], "big")
 
     def command_at(self, time_s):
@@ -153,14 +170,16 @@ class EvaluationCase:
 
 def case_from_dict(value):
     """Read exactly the prescribed case fields, without accepting identity aliases."""
-    required = {field.name for field in fields(EvaluationCase)} - {"condition", "fault"}
+    optional = {"condition", "fault", "version"}
+    required = {field.name for field in fields(EvaluationCase)} - optional
     if (
         type(value) is not dict
         or not required <= set(value)
-        or set(value) - required - {"condition", "fault"}
+        or set(value) - required - optional
     ):
         raise ValueError("Invalid fixed case fields")
     values = dict(value)
+    values.setdefault("version", "v1")
     if "fault" in values:
         fault = values["fault"]
         if type(fault) is not dict or set(fault) != {"joint_name", "factor", "onset_s"}:
@@ -169,14 +188,19 @@ def case_from_dict(value):
     return EvaluationCase(**values)
 
 
-def case_bank(partition, *, attempts=1):
-    """Nineteen geometry cells times six equally weighted profiles per attempt."""
+def case_bank(partition, *, attempts=1, version="v2"):
+    """Versioned geometry anchors times six equally weighted command profiles."""
     if type(attempts) is not int or attempts <= 0:
         raise ValueError("Require a positive prescribed attempt count")
+    if type(version) is not str or version not in VERSIONS:
+        raise ValueError("Unsupported fixed case version")
+    levels = (0, 3, 7) if version == "v1" else EVALUATION_LEVELS
     return tuple(
-        EvaluationCase(partition, family, level, subtype, profile, attempt)
+        EvaluationCase(
+            partition, family, level, subtype, profile, attempt, version=version
+        )
         for family, subtypes in SUBTYPES.items()
-        for level in ((None,) if family == "Flat" else (0, 3, 7))
+        for level in ((None,) if family == "Flat" else levels)
         for subtype in subtypes
         for profile in PROFILES
         for attempt in range(attempts)

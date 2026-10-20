@@ -33,11 +33,12 @@ def surfaces():
             foot_support_w_m=np.zeros((2, 4, 3)),
         )
     definitions = dict(
+        composition=dict(fixed_level=8),
         terrain_ood=dict(
-            fixed_level=3,
+            fixed_level=8,
             columns=[dict(family="Slopes")],
-            levels={3: dict(slope_rise_run=0.4)},
-        )
+            levels={8: dict(slope_rise_run=0.4)},
+        ),
     )
     return samples, definitions
 
@@ -258,9 +259,37 @@ runpy.run_module('scripts.check_robustness', run_name='__main__')
         with self.assertRaises(AssertionError):
             geometry.compare_surfaces(sample, definition)
         sample, definition = surfaces()
-        definition["terrain_ood"]["levels"][3]["slope_rise_run"] = 0.3
+        definition["terrain_ood"]["levels"][8]["slope_rise_run"] = 0.3
         with self.assertRaises(AssertionError):
             geometry.compare_surfaces(sample, definition)
+
+    def test_flat_entry_composition_is_noop_but_ood_still_requires_exclusion(self):
+        sample, definition = surfaces()
+        definition["composition"]["fixed_level"] = 0
+        sample["composition"]["height_w_m"][:] = 0
+        result = geometry.compare_surfaces(sample, definition)
+        self.assertTrue(result["flat_entry_composition"])
+        self.assertEqual(result["composed_outside_changed_fraction"], [0, 0])
+        self.assertTrue(result["ood_excluded_support"])
+        sample["composition"]["height_w_m"][:, 0, 0] = 0.01
+        with self.assertRaises(AssertionError):
+            geometry.compare_surfaces(sample, definition)
+
+    def test_flat_entry_geometry_does_not_waive_ood_surface_measurements(self):
+        from parkour_lab.environments.terrains.specification import physical_level
+        from scripts._terrain_checks.geometry import _surface_metrics
+
+        axis = np.linspace(-5.4, 5.4, 73)
+        plane = np.zeros((73, 73))
+        assignment = dict(family="Slopes", subtype="pyramid")
+        definition = dict(levels=[physical_level(0)])
+        result = _surface_metrics(assignment, plane, axis, definition, 0)
+        self.assertTrue(result["flat_entry"])
+        definition.update(
+            condition="terrain_ood", levels=[physical_level(0, condition="terrain_ood")]
+        )
+        with self.assertRaises(AssertionError):
+            _surface_metrics(assignment, plane, axis, definition, 0)
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ from parkour_lab.environments.faults import JOINT_NAMES, FaultConfig
 
 from .cases import case_bank
 
-VERSION = "go2_robustness_development_v1"
+VERSION = "go2_robustness_development_v2"
 JOINTS = JOINT_NAMES
 FACTORS = (1.0, 0.5, 0.0)
 
@@ -16,8 +16,8 @@ def fault_onset(case):
     return (300 + case.seed % 101) * 0.02
 
 
-def robustness_bank(partition, *, attempts=1):
-    """Core controls plus 90 compositions, 108 extrapolations and 72 joint cases.
+def robustness_bank(partition, *, attempts=1, version="v2"):
+    """Core controls, compositions, excluded severities and 72 joint cases.
 
     The same initial draws, nominal geometry and observation noise are paired
     across conditions. These explicit development severities are not calibrated
@@ -25,7 +25,7 @@ def robustness_bank(partition, *, attempts=1):
     """
     if partition not in ("validation", "test"):
         raise ValueError("Robustness banks are excluded from training")
-    core = case_bank(partition, attempts=attempts)
+    core = case_bank(partition, attempts=attempts, version=version)
     composed = tuple(
         replace(case, condition="composition")
         for case in core
@@ -44,7 +44,10 @@ def robustness_bank(partition, *, attempts=1):
         if case.profile == "forward-035"
         and (
             case.family == "Flat"
-            or (case.family == "Uneven" and case.physical_level == 3)
+            or (
+                case.family == "Uneven"
+                and case.physical_level == (3 if version == "v1" else 8)
+            )
         )
         for joint in JOINTS
         for factor in FACTORS
