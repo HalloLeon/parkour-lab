@@ -43,8 +43,8 @@ def episode(
     robot = env.scene["robot"].data
     ids = torch.tensor([row])
     env.episode_length_buf.zero_()
-    env.reset_terminated.zero_()
-    env.reset_time_outs.zero_()
+    env.termination_manager.terminated.zero_()
+    env.termination_manager.time_outs.zero_()
     for name in env.termination_manager.active_terms:
         env.termination_manager.get_term(name).zero_()
     robot.root_pos_w[row] = env.scene.terrain.env_origins[row]
@@ -60,6 +60,9 @@ def episode(
     with patch.object(teacher, "_contact_samples", side_effect=contact_samples):
         for _ in range(steps):
             env.episode_length_buf += 1
+            # Like the SDK, install step aliases only after physics begins.
+            env.reset_terminated = env.termination_manager.terminated
+            env.reset_time_outs = env.termination_manager.time_outs
             robot.root_pos_w[row, 0] += (
                 velocity if progress_velocity is None else progress_velocity
             ) * env.step_dt
@@ -87,6 +90,38 @@ def at_level(env, family, level):
 
 
 class CurriculumTests(unittest.TestCase):
+    def test_first_reset_without_step_aliases_assigns_targets_then_records_first_end(
+        self,
+    ):
+        env = curriculum_environment()
+        del env.reset_terminated, env.reset_time_outs
+        before = teacher.curriculum_state(env)
+        env._benchmark_teacher["episodes"]["eligible"].zero_()
+        teacher.terrain_levels(env, torch.arange(env.num_envs))
+        self.assertEqual(teacher.curriculum_state(env), before)
+        self.assertFalse(hasattr(env, "reset_terminated"))
+        self.assertFalse(hasattr(env, "reset_time_outs"))
+        episode(env)
+        self.assertEqual(env._benchmark_teacher["families"]["Uneven"]["block"], [True])
+
+    def test_observed_episode_requires_real_manager_ending_masks(self):
+        env = curriculum_environment()
+        env._benchmark_teacher["episodes"]["steps"][1] = 1
+        env.episode_length_buf[1] = 1
+        del env.termination_manager.terminated
+        with self.assertRaises(AttributeError):
+            teacher.terrain_levels(env, torch.tensor([1]))
+
+    def test_physical_failure_uses_manager_not_a_stale_step_alias(self):
+        env = curriculum_environment()
+        episode(env)
+        state = env._benchmark_teacher["families"]["Uneven"]
+        state["block"].clear()
+        env.termination_manager.terminated[1] = True
+        env.reset_terminated = torch.zeros_like(env.termination_manager.terminated)
+        teacher.terrain_levels(env, torch.tensor([1]))
+        self.assertEqual(state["block"], [False])
+
     def test_all_start_zero_without_global_or_private_rng_draws(self):
         env = curriculum_environment()
         before = deepcopy(env.parkour_randomization.state_dict())
@@ -264,6 +299,8 @@ class CurriculumTests(unittest.TestCase):
         source._benchmark_teacher["episodes"]["steps"][2] = 30
         record = json.loads(json.dumps(checkpoint(source)))
         target = curriculum_environment()
+        # A fresh SDK process has manager buffers but no step-created aliases.
+        del target.reset_terminated, target.reset_time_outs
         restore(target, record)
         self.assertEqual(teacher.curriculum_state(target), record["curriculum"])
         self.assertFalse(target._benchmark_teacher["episodes"]["steps"].any())

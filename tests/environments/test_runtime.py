@@ -187,6 +187,30 @@ class NativeTransitionTests(unittest.TestCase):
         self.assertEqual(self.reads, [False, True, True])
         self.assertEqual(env.interactions.session, 8)
 
+    def test_native_initial_reset_precedes_step_aliases_and_first_end_keeps_flags(self):
+        env = self.environment()
+        events = []
+
+        def curriculum(env_ids):
+            events.append((env.common_step_counter, hasattr(env, "reset_terminated")))
+            if env.common_step_counter == 0:
+                self.assertFalse(hasattr(env, "reset_time_outs"))
+                self.assertFalse(env.episode_length_buf.any())
+            else:
+                self.assertIs(env.reset_terminated, env.termination_manager.terminated)
+                self.assertIs(env.reset_time_outs, env.termination_manager.time_outs)
+                self.assertEqual(
+                    env.reset_terminated[env_ids].tolist(), [True, False, True]
+                )
+
+        env.curriculum_manager.compute = curriculum
+        env._reset_idx(torch.arange(4))
+        self.assertEqual(env.interactions.session, 0)
+        _, _, terminated, truncated, _ = env.step(torch.ones(4, 1))
+        self.assertEqual(events, [(0, False), (1, True)])
+        self.assertEqual(terminated.tolist(), [True, False, True, False])
+        self.assertEqual(truncated.tolist(), [False, True, True, False])
+
     def test_terminal_sample_does_not_advance_reset_or_regular_observation_rng(self):
         action = torch.ones(4, 1)
         torch.manual_seed(974)

@@ -99,6 +99,10 @@ def curriculum_environment():
         parkour_randomization=sampler,
         interactions=InteractionCounter(8),
     )
+    # The native manager owns these buffers from construction; env.reset_*
+    # aliases are only installed later by the SDK's first physical step.
+    env.termination_manager.terminated = env.reset_terminated
+    env.termination_manager.time_outs = env.reset_time_outs
     initialize_levels(env)
     begin_episodes(env, torch.arange(8))
     return env

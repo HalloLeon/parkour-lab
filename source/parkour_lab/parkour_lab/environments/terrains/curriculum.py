@@ -210,7 +210,7 @@ def _success(env, row, episode):
         and steps >= round(env.max_episode_length_s / env.step_dt) - 1
     )
     boundary = terms.get("terrain_boundary", False) and steps * env.step_dt >= 8.0
-    complete = (horizon or boundary) and not bool(env.reset_terminated[row])
+    complete = (horizon or boundary) and not bool(manager.terminated[row])
     if not complete or tracked == 0 or steps != int(env.episode_length_buf[row]):
         return False
     planar = (episode["planar_squared"][row] / tracked).sqrt()
@@ -244,17 +244,22 @@ def terrain_levels(env, env_ids):
         if family == "Flat":
             continue
         state = teacher["families"][family]
-        ended = bool(env.reset_terminated[row] or env.reset_time_outs[row])
         current = (
             episode["level"][row] == state["target_level"]
             and episode["revision"][row] == state["revision"]
         )
         if (
-            ended
-            and episode["eligible"][row]
+            episode["eligible"][row]
             and episode["steps"][row] > 0
             and env.episode_length_buf[row] > 0
             and current
+            # The SDK creates env.reset_* aliases only in its first step.
+            # Initial/manual zero-step resets have no outcome to read. For
+            # measured episodes, use the manager's authoritative current masks.
+            and (
+                env.termination_manager.terminated[row]
+                or env.termination_manager.time_outs[row]
+            )
         ):
             state["block"].append(_success(env, row, episode))
             if len(state["block"]) == BLOCK_SIZE:
