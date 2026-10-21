@@ -4,6 +4,13 @@ from copy import deepcopy
 
 import torch
 
+from .diagnostics import (
+    new_diagnostics,
+    record_outcome,
+    snapshot,
+    validate_diagnostics,
+)
+
 VERSION = "go2_family_block_curriculum_v2"
 BLOCK_SIZE = 20
 PROMOTE_SUCCESSES = 16
@@ -48,7 +55,14 @@ def _families(env):
 
 
 def _new_family():
-    return dict(target_level=0, revision=0, block=[], completed_blocks=0, history=[])
+    return dict(
+        target_level=0,
+        revision=0,
+        block=[],
+        completed_blocks=0,
+        history=[],
+        diagnostics=new_diagnostics(),
+    )
 
 
 def _new_episodes(env):
@@ -201,7 +215,7 @@ def observe_step(env):
         ).long()
 
 
-def _success(env, row, episode):
+def _outcome(env, row, episode):
     steps, tracked = int(episode["steps"][row]), int(episode["tracked"][row])
     manager = env.termination_manager
     terms = {name: bool(manager.get_term(name)[row]) for name in manager.active_terms}
@@ -210,24 +224,52 @@ def _success(env, row, episode):
         and steps >= round(env.max_episode_length_s / env.step_dt) - 1
     )
     boundary = terms.get("terrain_boundary", False) and steps * env.step_dt >= 8.0
-    complete = (horizon or boundary) and not bool(manager.terminated[row])
-    if not complete or tracked == 0 or steps != int(env.episode_length_buf[row]):
-        return False
-    planar = (episode["planar_squared"][row] / tracked).sqrt()
-    yaw = (episode["yaw_squared"][row] / tracked).sqrt()
-    progress = (
-        (env.scene["robot"].data.root_pos_w[row, :2] - episode["anchor"][row])
-        * episode["direction"][row]
-    ).sum()
-    requested = episode["speed"][row] * steps * env.step_dt
-    exposed = (
-        episode["level"][row] == 0 or episode["contact_steps"][row] * env.step_dt >= 1.0
+    planar = (
+        float((episode["planar_squared"][row] / tracked).sqrt()) if tracked else None
     )
-    return bool(
-        planar <= 0.3 * episode["speed"][row]
-        and yaw <= 0.15
-        and progress >= 0.7 * requested
-        and exposed
+    yaw = float((episode["yaw_squared"][row] / tracked).sqrt()) if tracked else None
+    progress = (
+        (
+            (env.scene["robot"].data.root_pos_w[row, :2] - episode["anchor"][row])
+            * episode["direction"][row]
+        )
+        .sum()
+        .item()
+    )
+    speed = float(episode["speed"][row])
+    requested = speed * steps * env.step_dt
+    contact = int(episode["contact_steps"][row]) * env.step_dt
+    gates = dict(
+        physical_clear=not bool(manager.terminated[row]),
+        completion=bool(horizon or boundary),
+        sample_alignment=steps == int(env.episode_length_buf[row]),
+        tracking_available=tracked > 0,
+        planar_tracking=planar is not None and planar <= 0.3 * speed,
+        yaw_tracking=yaw is not None and yaw <= 0.15,
+        directional_progress=progress >= 0.7 * requested,
+        nonflat_contact=bool(episode["level"][row] == 0 or contact >= 1.0),
+    )
+    return dict(
+        level=int(episode["level"][row]),
+        revision=int(episode["revision"][row]),
+        steps=steps,
+        episode_length_steps=int(env.episode_length_buf[row]),
+        tracked_steps=tracked,
+        duration_s=steps * env.step_dt,
+        contact_seconds=contact,
+        command_speed_m_s=speed,
+        planar_rmse_m_s=planar,
+        planar_limit_m_s=0.3 * speed,
+        yaw_rmse_rad_s=yaw,
+        yaw_limit_rad_s=0.15,
+        directional_progress_m=progress,
+        requested_travel_m=requested,
+        minimum_progress_m=0.7 * requested,
+        physical_termination=not gates["physical_clear"],
+        horizon=bool(horizon),
+        boundary=bool(boundary),
+        gates=gates,
+        success=all(gates.values()),
     )
 
 
@@ -261,7 +303,9 @@ def terrain_levels(env, env_ids):
                 or env.termination_manager.time_outs[row]
             )
         ):
-            state["block"].append(_success(env, row, episode))
+            outcome = _outcome(env, row, episode)
+            state["block"].append(outcome["success"])
+            record_outcome(state, outcome)
             if len(state["block"]) == BLOCK_SIZE:
                 successes, old = sum(state["block"]), state["target_level"]
                 delta = (
@@ -307,6 +351,11 @@ def curriculum_state(env):
         types=terrain.terrain_types.tolist(),
         families=None if teacher is None else deepcopy(teacher["families"]),
     )
+
+
+def curriculum_diagnostics(env):
+    """Return detached, bounded gate evidence without reading live simulator data."""
+    return snapshot(getattr(env, "_benchmark_teacher", None))
 
 
 def validate_curriculum_state(env, state):
@@ -401,6 +450,7 @@ def validate_curriculum_state(env, state):
             level = following
         if level != target or changes != revision:
             raise ValueError("Curriculum history and current target differ")
+        validate_diagnostics(record, BLOCK_SIZE)
     return dict(
         levels=torch.tensor(levels, device=env.device, dtype=torch.long),
         families=deepcopy(families),

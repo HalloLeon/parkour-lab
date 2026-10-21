@@ -6,9 +6,12 @@ from pathlib import Path
 from stable_baselines3 import PPO, SAC
 from stable_baselines3.common.logger import configure
 
+from parkour_lab.runtime.console import is_enabled
+
 from .checkpoint import load_checkpoint
 from .environment import Go2VecEnv
 from .policy import SB3FramePolicy
+from .progress import TrainingProgress
 from .snapshots import SnapshotIndex, next_snapshot, validate_schedule
 from .state import validate_model
 
@@ -111,8 +114,11 @@ def _learn_and_save(
 ):
     before = SB3FramePolicy(model).state_sha256()
     updates_before = model._n_updates
-    model.set_logger(configure(str(output / "metrics"), ["json"]))
+    formats = ["stdout", "json"] if is_enabled() else ["json"]
+    model.set_logger(configure(str(output / "metrics"), formats))
+    progress = TrainingProgress(task, algorithm=algorithm, target=target)
     try:
+        progress.emit("training_started", model)
         while model.num_timesteps < target:
             point, reasons = next_snapshot(
                 model,
@@ -122,7 +128,9 @@ def _learn_and_save(
                 target=target,
             )
             model.learn(
-                total_timesteps=point - model.num_timesteps, reset_num_timesteps=False
+                total_timesteps=point - model.num_timesteps,
+                reset_num_timesteps=False,
+                callback=progress,
             )
             counts = task.interactions
             if (
@@ -140,6 +148,7 @@ def _learn_and_save(
             losses = _losses(model)
             model.logger.dump(step=model.num_timesteps)
             receipt = snapshots.save(model, task, reasons)
+        progress.emit("training_completed", model)
         return {
             "training_interactions": counts,
             "learner_timesteps": model.num_timesteps,

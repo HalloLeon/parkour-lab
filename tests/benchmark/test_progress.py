@@ -12,12 +12,19 @@ from parkour_lab.environments.randomization import TaskRandomization
 from parkour_lab.runtime.accounting import InteractionCounter
 
 
-def environment(seed=42):
+def environment(seed=42, lesson="full"):
     sampler = TaskRandomization(dict(num_envs=2, seed=seed, dynamics="randomized"))
     sampler.dynamics()
     command = NS(
         sampling_report=dict(
-            version="flat_uniform_twist_v1", period_steps=200, samples=2, stops=1
+            version="go2_episode_twist_v1",
+            command_lesson=lesson,
+            period_steps=1000,
+            samples=2,
+            translations=1,
+            stops=1,
+            pivots=0,
+            arcs=0,
         )
     )
     return NS(
@@ -26,6 +33,7 @@ def environment(seed=42):
             benchmark_task_id="Go2-Flat-v1",
             benchmark_training=True,
             seed=seed,
+            benchmark_command_lesson=lesson,
         ),
         num_envs=2,
         scene=NS(terrain=NS()),
@@ -56,6 +64,39 @@ def restore(env, record, **kwargs):
 
 
 class ProgressTests(unittest.TestCase):
+    def test_lesson_is_checkpoint_identity_and_cross_lesson_restore_is_atomic(self):
+        source = environment(lesson="forward-stand")
+        record = json.loads(json.dumps(checkpoint(source)))
+        self.assertEqual(record["command_lesson"], "forward-stand")
+        self.assertEqual(record["sampling_report"]["command_lesson"], "forward-stand")
+        restored = environment(lesson="forward-stand")
+        restore(restored, record)
+        full = environment()
+        sampler = full.parkour_randomization.state_dict()
+        with self.assertRaisesRegex(ValueError, "command_lesson differs"):
+            restore(full, record)
+        self.assertEqual(full.parkour_randomization.state_dict(), sampler)
+        self.assertFalse(hasattr(full, "_benchmark_progress"))
+        self.assertEqual(full.interactions.cumulative, 0)
+
+    def test_forward_stand_rejects_turn_counts_even_when_category_totals_match(self):
+        source = environment(lesson="forward-stand")
+        record = checkpoint(source)
+        for name in ("pivots", "arcs"):
+            bad = deepcopy(record)
+            bad["sampling_report"][name] = 1
+            bad["sampling_report"]["translations"] = 0
+            target = environment(lesson="forward-stand")
+            sampler = target.parkour_randomization.state_dict()
+            with (
+                self.subTest(category=name),
+                self.assertRaisesRegex(ValueError, "cannot contain"),
+            ):
+                restore(target, bad)
+            self.assertEqual(target.parkour_randomization.state_dict(), sampler)
+            self.assertEqual(target.interactions.cumulative, 0)
+            self.assertFalse(hasattr(target, "_benchmark_progress"))
+
     def test_json_recreation_continues_next_stream_draws_and_keeps_milestones(self):
         source = environment()
         source.interactions.sync(6, 24)

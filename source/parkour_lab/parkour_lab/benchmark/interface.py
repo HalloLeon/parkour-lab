@@ -127,6 +127,7 @@ def validate_task_config(cfg):
             num_envs=cfg.scene.num_envs,
             seed=cfg.seed,
             device=cfg.sim.device,
+            command_lesson=cfg.benchmark_command_lesson,
             terrain=TerrainConfig(**cfg.benchmark_terrain_options),
             fault=(
                 FaultConfig(**cfg.benchmark_fault)

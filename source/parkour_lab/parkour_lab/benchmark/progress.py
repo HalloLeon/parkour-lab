@@ -25,11 +25,15 @@ def _json_copy(value):
 def _identity(env):
     if getattr(env.cfg, "benchmark_training", None) is not True:
         raise ValueError("Continuation requires a benchmark training environment")
+    lesson = getattr(env.cfg, "benchmark_command_lesson", "full")
+    if type(lesson) is not str or lesson not in ("full", "forward-stand"):
+        raise ValueError("Invalid command lesson identity")
     return dict(
         protocol=_text(env.cfg.benchmark_version, "protocol"),
         task_id=_text(env.cfg.benchmark_task_id, "task ID"),
         seed=nonnegative_integer(env.cfg.seed, "seed"),
         num_envs=env.num_envs,
+        command_lesson=lesson,
     )
 
 
@@ -93,6 +97,7 @@ def _validate_record(env, record, checkpoint_id, configuration_id):
         "task_id",
         "seed",
         "num_envs",
+        "command_lesson",
         "run_id",
         "checkpoint_id",
         "configuration_id",
@@ -176,6 +181,10 @@ def _validate_sampling_report(saved, current):
         and sum(saved[name] for name in categories) != saved["samples"]
     ):
         raise ValueError("Exclusive command categories must sum to total samples")
+    if saved.get("command_lesson") == "forward-stand" and any(
+        saved.get(name) != 0 for name in ("pivots", "arcs")
+    ):
+        raise ValueError("Forward/stand sampling cannot contain pivots or arcs")
 
 
 def restore_progress(

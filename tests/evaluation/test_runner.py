@@ -94,6 +94,46 @@ class LoadedPolicyPlaybackTests(unittest.TestCase):
     def setUp(self):
         self.case = EvaluationCase("validation", "Flat", None, "plane", "stand")
 
+    def test_progress_events_follow_complete_case_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with (
+                _native_fixture() as (_, task, _, policy),
+                patch.object(runner, "log_event") as log,
+            ):
+                report = runner.evaluate(policy, [self.case], Path(temp) / "capture")
+                self.assertEqual(
+                    [call.args[0] for call in log.call_args_list],
+                    [
+                        "evaluation_start",
+                        "evaluation_case_start",
+                        "evaluation_case_finish",
+                        "evaluation_finish",
+                    ],
+                )
+                fields = log.call_args_list[1].kwargs
+                self.assertEqual((fields["index"], fields["total"]), (1, 1))
+                self.assertEqual(fields["case_id"], self.case.case_id)
+                self.assertTrue(log.call_args.kwargs["capture_valid"])
+                self.assertEqual(report["cases"][0]["core_return"], 3.0)
+                task.close.assert_called_once()
+
+    def test_progress_error_keeps_failure_and_final_publication(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with (
+                _native_fixture(fail="inference") as (_, task, _, policy),
+                patch.object(runner, "log_event") as log,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "inference failed"):
+                    runner.evaluate(policy, [self.case], Path(temp) / "capture")
+                self.assertEqual(log.call_args_list[-2].args, ("evaluation_error",))
+                self.assertEqual(
+                    log.call_args_list[-2].kwargs["error"], "inference failed"
+                )
+                self.assertEqual(log.call_args.args, ("evaluation_finish",))
+                self.assertEqual(log.call_args.kwargs["status"], "ERROR")
+                self.assertFalse(log.call_args.kwargs["capture_valid"])
+                task.close.assert_called_once()
+
     def test_original_attempt_keeps_terminal_reward_and_owned_outgoing_state(self):
         for ending in ("terminated", "truncated", "both"):
             with self.subTest(ending=ending), tempfile.TemporaryDirectory() as temp:

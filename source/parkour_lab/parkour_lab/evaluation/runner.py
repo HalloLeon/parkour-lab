@@ -1,5 +1,6 @@
 """Fixed-case playback of an already-loaded policy; no learner or model loader."""
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,7 @@ from parkour_lab.provenance import (
     write_json,
     write_run_provenance,
 )
+from parkour_lab.runtime.console import log_event
 from parkour_lab.runtime.native import motion_state, sensor_noise_report
 from parkour_lab.runtime.session import finish_session
 
@@ -117,20 +119,37 @@ def evaluate(
         from .robustness import VERSION as robustness_version
 
         manifest["robustness_version"] = robustness_version
+    started = time.perf_counter()
+    log_event("evaluation_start", cases=len(cases), output=folder)
     try:
         manifest["native_dependencies"] = _native_dependencies()
         if repository_path is not None:
             write_run_provenance(folder, repository_path)
         publish_capture(folder, manifest)
-        for case in cases:
+        for index, case in enumerate(cases, start=1):
             if app is not None and not app.is_running():
                 manifest["status"] = "INTERRUPTED"
                 break
+            log_event(
+                "evaluation_case_start",
+                index=index,
+                total=len(cases),
+                case_id=case.case_id,
+                family=case.family,
+                profile=case.profile,
+            )
             interrupted = _run_case(
                 policy, case, folder / case.case_id, device, manifest, app
             )
             if _identity(policy) != before:
                 raise RuntimeError("Policy parameters or preprocessing changed")
+            log_event(
+                "evaluation_case_finish",
+                index=index,
+                total=len(cases),
+                case_id=case.case_id,
+                status="INTERRUPTED" if interrupted else "CAPTURED",
+            )
             if interrupted:
                 manifest["status"] = "INTERRUPTED"
                 break
@@ -138,6 +157,7 @@ def evaluate(
             manifest["status"] = "COMPLETE"
     except BaseException as error:
         manifest.update(status="ERROR", error=str(error))
+        log_event("evaluation_error", error=str(error))
         raise
     finally:
         manifest.setdefault("core_reward_recipe_sha256", None)
@@ -149,6 +169,12 @@ def evaluate(
         if manifest["final_policy_state_sha256"] != before:
             manifest["status"] = "ERROR"
         report = publish_capture(folder, manifest)
+        log_event(
+            "evaluation_finish",
+            status=manifest["status"],
+            elapsed_s=time.perf_counter() - started,
+            capture_valid=report["capture_valid"],
+        )
     return report
 
 

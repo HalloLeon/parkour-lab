@@ -4,6 +4,7 @@ import importlib.util
 import sys
 import unittest
 from contextlib import contextmanager
+from copy import deepcopy
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
@@ -87,6 +88,7 @@ class EpisodeCommandTests(unittest.TestCase):
                 command.sampling_report,
                 dict(
                     version="go2_episode_twist_v1",
+                    command_lesson="full",
                     period_steps=1000,
                     samples=8,
                     translations=2,
@@ -95,6 +97,65 @@ class EpisodeCommandTests(unittest.TestCase):
                     arcs=2,
                 ),
             )
+
+    def test_forward_stand_boundary_values_and_eligibility(self):
+        env = curriculum_environment()
+        env.cfg.benchmark_command_lesson = "forward-stand"
+        with episode_command(env) as command:
+            packet = np.array(
+                [
+                    [p, 0.123, 0.456, 0.789]
+                    for p in (0, 0.5, 0.89, 0.899, 0.9, 0.95, 0.999, 0.3)
+                ]
+            )
+            command.randomization = NS(uniform=lambda ids, width, stream: packet[ids])
+            command._resample(torch.arange(8))
+            self.assertEqual(command.category.tolist(), [0, 0, 0, 0, 1, 1, 1, 0])
+            torch.testing.assert_close(
+                command.vel_command_b,
+                torch.tensor([[0.35, 0, 0]] * 4 + [[0, 0, 0]] * 3 + [[0.35, 0, 0]]),
+                rtol=0,
+                atol=0,
+            )
+            self.assertEqual(command.sampling_report["command_lesson"], "forward-stand")
+            self.assertEqual(command.sampling_report["translations"], 5)
+            self.assertEqual(command.sampling_report["stops"], 3)
+            self.assertEqual(command.sampling_report["pivots"], 0)
+            self.assertEqual(command.sampling_report["arcs"], 0)
+            self.assertEqual(
+                command.curriculum_eligible.tolist(), [True] * 4 + [False] * 3 + [True]
+            )
+
+    def test_lesson_consumes_the_same_four_private_draws_and_no_global_rng(self):
+        first, second = curriculum_environment(), curriculum_environment()
+        second.cfg.benchmark_command_lesson = "forward-stand"
+        teacher_state = deepcopy(second._benchmark_teacher["families"])
+        with episode_command(first) as full, episode_command(second) as lesson:
+            rng = torch.get_rng_state().clone()
+            for ids in (torch.arange(8), torch.tensor([3, 0]), torch.tensor([7])):
+                full._resample(ids)
+                lesson._resample(ids)
+                self.assertEqual(
+                    full.randomization.state_dict(), lesson.randomization.state_dict()
+                )
+            self.assertTrue(torch.equal(torch.get_rng_state(), rng))
+            self.assertEqual(second._benchmark_teacher["families"], teacher_state)
+
+    def test_unknown_and_evaluation_lesson_are_rejected(self):
+        for lesson, training in (
+            ("unknown", True),
+            ([], True),
+            ("forward-stand", False),
+        ):
+            env = curriculum_environment()
+            env.cfg.benchmark_command_lesson = lesson
+            env.cfg.benchmark_training = training
+            with (
+                self.subTest(lesson=lesson, training=training),
+                self.assertRaises(ValueError),
+            ):
+                with episode_command(env):
+                    pass
 
     def test_packet_is_held_for_whole_horizon_and_partial_reset_owns_only_its_row(self):
         env = curriculum_environment()

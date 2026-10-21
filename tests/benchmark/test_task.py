@@ -219,6 +219,20 @@ class TaskTests(unittest.TestCase):
 
 
 class ConfigIdentityTests(unittest.TestCase):
+    def test_lesson_is_native_configuration_and_public_metadata_identity(self):
+        fixture = PublicTaskFixture()
+        options = Go2Config(num_envs=4, device="cpu", command_lesson="forward-stand")
+        with fixture.task(options=options) as task:
+            self.assertEqual(task.metadata["command_lesson"], "forward-stand")
+            self.assertEqual(task._env.cfg.benchmark_command_lesson, "forward-stand")
+        with public_configs():
+            full = build_config(Go2Config(device="cpu"))
+            lesson = build_config(
+                Go2Config(device="cpu", command_lesson="forward-stand")
+            )
+            self.assertNotEqual(configuration_id(full), configuration_id(lesson))
+            validate_task_config(lesson)
+
     def test_only_rewards_may_customize_the_fixed_preset_and_identity(self):
         with public_configs():
             cfg = build_config(Go2Config(device="cpu"))

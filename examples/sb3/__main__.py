@@ -14,6 +14,7 @@ from parkour_lab.provenance import (
     write_json,
     write_run_provenance,
 )
+from parkour_lab.runtime.console import log_event, restore_console, setup_console
 from parkour_lab.runtime.session import exit_native_process, finish_session
 
 
@@ -31,6 +32,9 @@ def _parser():
     train.add_argument("--seed", type=int, default=1077)
     train.add_argument("--run-id")
     train.add_argument(
+        "--command-lesson", choices=("full", "forward-stand"), default="full"
+    )
+    train.add_argument(
         "--save-every-updates",
         type=int,
         default=5000,
@@ -46,7 +50,9 @@ def _parser():
     evaluate = commands.add_parser("evaluate", help="Evaluate an already-saved policy")
     evaluate.add_argument("--checkpoint", type=Path, required=True)
     evaluate.add_argument("--full-bank", action="store_true")
-    evaluate.add_argument("--suite", choices=("core", "robustness"), default="core")
+    evaluate.add_argument(
+        "--suite", choices=("core", "robustness", "flat-entry"), default="core"
+    )
     for command in (train, evaluate):
         command.add_argument("--output", type=Path, required=True)
         command.add_argument("--device", default="cuda:0")
@@ -68,6 +74,8 @@ def _validate(parser, args):
             )
         checkpoint = args.resume
     else:
+        if args.suite == "flat-entry" and args.full_bank:
+            parser.error("--suite flat-entry is diagnostic only; omit --full-bank")
         checkpoint = args.checkpoint
     if checkpoint is not None and not checkpoint.is_dir():
         parser.error("Checkpoint must be an existing folder")
@@ -105,6 +113,12 @@ def _cases(full_bank, suite="core"):
         from parkour_lab.evaluation import robustness_bank
 
         return robustness_bank("validation")
+    if suite == "flat-entry":
+        return tuple(
+            case
+            for case in case_bank("validation")
+            if case.family == "Flat" and case.profile in ("stand", "forward-035")
+        )
     if full_bank:
         return case_bank("validation")
     return tuple(
@@ -149,6 +163,7 @@ def _evaluate(args, app, output, report):
 
     policy, checkpoint = load_policy(args.checkpoint, device=args.learner_device)
     cases = _cases(args.full_bank, args.suite)
+    log_event("ready", component="policy", cases=len(cases), suite=args.suite)
     result = evaluate(
         policy,
         cases,
@@ -174,6 +189,22 @@ def _evaluate(args, app, output, report):
         evaluation=result,
         recomputed_score_parity=True,
     )
+    if args.suite == "flat-entry":
+        from parkour_lab.evaluation import summarize_flat_entry
+
+        summary = summarize_flat_entry(output / "capture")
+        report.update(diagnostic_only=True, diagnostic_summary=summary)
+        for profile, row in summary["cases"].items():
+            log_event(
+                "flat_entry_case_summary",
+                profile=profile,
+                core_return=row["core_return"],
+                physical_failure=row["physical_failure"],
+                forward_travel_m=row["actual_onset_forward_travel_m"],
+                root_height_m=row["settled_mean_root_height_above_plane_m"],
+                foot_contact_fraction=row["settled_foot_contact_fraction"],
+            )
+        log_event("flat_entry_summary", **summary["command_contrast"])
 
 
 def main(argv=None):
@@ -206,7 +237,9 @@ def main(argv=None):
 
     app = task = None
     code = 2
+    previous_console = setup_console()
     try:
+        log_event("start", command=args.command, output=output)
         write_run_provenance(output, __file__)
         publish()
         from isaaclab.app import AppLauncher
@@ -234,6 +267,7 @@ def main(argv=None):
                     num_envs=args.num_envs,
                     seed=args.seed,
                     device=args.device,
+                    command_lesson=args.command_lesson,
                 ),
                 training=True,
             )
@@ -242,6 +276,7 @@ def main(argv=None):
             )
             task = make(cfg)
             report["metadata"] = task.metadata
+            log_event("ready", component="environment", task=args.task)
             _train(args, app, output, report, task)
         else:
             _evaluate(args, app, output, report)
@@ -250,10 +285,14 @@ def main(argv=None):
         report.update(
             status="ERROR", error=str(error), traceback=traceback.format_exc()
         )
+        log_event("error", command=args.command, error=str(error))
+        traceback.print_exc(file=sys.stderr)
     finally:
         if task is not None:
             report["interactions"] = task.interactions
         code = finish_session(task, app, report, publish, code)
+        log_event("finish", status=report["status"], returncode=code)
+        restore_console(previous_console)
         if app is not None:
             exit_native_process(code)
     return code

@@ -293,9 +293,8 @@ class CurriculumTests(unittest.TestCase):
     ):
         source = curriculum_environment()
         source.interactions.sync(6, 24)
-        state = source._benchmark_teacher["families"]["Uneven"]
-        state["block"] = [True] * 19
-        episode(source)
+        for _ in range(20):
+            episode(source)
         source._benchmark_teacher["episodes"]["steps"][2] = 30
         record = json.loads(json.dumps(checkpoint(source)))
         target = curriculum_environment()
@@ -317,6 +316,79 @@ class CurriculumTests(unittest.TestCase):
         self.assertEqual(
             teacher.curriculum_state(target)["families"], env_state["families"]
         )
+
+    def test_diagnostics_identify_multiple_failed_gates_without_changing_verdicts(self):
+        env = curriculum_environment()
+        episode(env, velocity=0)
+        diagnostic = teacher.curriculum_diagnostics(env)["families"]["Uneven"]
+        last = diagnostic["last_outcome"]
+        self.assertEqual(diagnostic["admitted_outcomes"], 1)
+        self.assertEqual(diagnostic["successful_outcomes"], 0)
+        self.assertFalse(last["success"])
+        self.assertAlmostEqual(last["planar_rmse_m_s"], 0.4)
+        self.assertAlmostEqual(last["planar_limit_m_s"], 0.12)
+        self.assertEqual(last["directional_progress_m"], 0)
+        self.assertEqual(
+            last["minimum_progress_m"], 0.7 * (float(torch.tensor(0.4)) * 1000 * 0.02)
+        )
+        self.assertFalse(last["gates"]["planar_tracking"])
+        self.assertFalse(last["gates"]["directional_progress"])
+        self.assertTrue(last["gates"]["nonflat_contact"])
+        self.assertEqual(diagnostic["gate_failures"]["planar_tracking"], 1)
+        self.assertEqual(diagnostic["gate_failures"]["directional_progress"], 1)
+        teacher.validate_curriculum_state(env, teacher.curriculum_state(env))
+
+    def test_short_physical_failure_keeps_unavailable_tracking_and_readback_is_pure(
+        self,
+    ):
+        env = curriculum_environment()
+        episode(env, ending="base_contact", steps=10)
+        before = checkpoint(env)
+        readback = teacher.curriculum_diagnostics(env)
+        last = readback["families"]["Uneven"]["last_outcome"]
+        self.assertIsNone(last["planar_rmse_m_s"])
+        self.assertIsNone(last["yaw_rmse_rad_s"])
+        self.assertEqual(last["duration_s"], 0.2)
+        self.assertFalse(last["gates"]["physical_clear"])
+        self.assertFalse(last["gates"]["tracking_available"])
+        self.assertEqual(checkpoint(env), before)
+        last["steps"] = 999
+        self.assertEqual(
+            teacher.curriculum_diagnostics(env)["families"]["Uneven"]["last_outcome"][
+                "steps"
+            ],
+            10,
+        )
+        teacher.validate_curriculum_state(env, teacher.curriculum_state(env))
+
+    def test_diagnostics_corruptions_are_rejected_before_sampler_or_teacher_mutation(
+        self,
+    ):
+        env = curriculum_environment()
+        episode(env, velocity=0)
+        record = checkpoint(env)
+        for mutate in (
+            lambda d: d.update(admitted_outcomes=True),
+            lambda d: d.update(successful_outcomes=1),
+            lambda d: d["gate_failures"].update(planar_tracking=2),
+            lambda d: d["gate_failures"].update(planar_tracking=0),
+            lambda d: d["last_outcome"].update(planar_rmse_m_s=float("nan")),
+            lambda d: d["last_outcome"].update(success=True),
+            lambda d: d["last_outcome"]["gates"].update(planar_tracking=True),
+            lambda d: d["last_outcome"].update(minimum_progress_m=0),
+        ):
+            bad = deepcopy(record)
+            mutate(bad["curriculum"]["families"]["Uneven"]["diagnostics"])
+            target = curriculum_environment()
+            before, sampler = (
+                teacher.curriculum_state(target),
+                target.parkour_randomization.state_dict(),
+            )
+            with self.subTest(record=bad), self.assertRaises(ValueError):
+                restore(target, bad)
+            self.assertEqual(teacher.curriculum_state(target), before)
+            self.assertEqual(target.parkour_randomization.state_dict(), sampler)
+            self.assertEqual(target.interactions.cumulative, 0)
 
     def test_old_schema_and_late_corruptions_reject_without_partial_restore(self):
         source = curriculum_environment()

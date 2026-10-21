@@ -128,9 +128,18 @@ requested amplitude. Slopes and Stairs retain 2 m central platforms; stairs have
 ideal peak-to-peak height is approximately twice that parameter. No added
 roughness appears on ID Slopes, Stairs or Hills. Receipts keep unrounded values.
 
-The shared command sampler is unchanged: one held 20 s episode packet selects
+The default `full` command sampler uses one held 20 s episode packet to select
 translation with probability 0.5, or stand, left/right pivot and left/right arc
-with probability 0.1 each. The `go2_family_block_curriculum_v2` teacher maintains
+with probability 0.1 each. An explicit training-only `forward-stand` lesson instead
+selects forward `(0.35, 0, 0)` with probability 0.9 or stand with probability 0.1.
+Select it through `Go2Config(command_lesson="forward-stand")`, or the optional
+SB3 CLI's `train --command-lesson forward-stand`. It holds that distribution for
+the entire run; it does not automatically introduce turns later. Both lessons
+use the same private RNG draw count and episode duration. The selected lesson
+is part of task/checkpoint identity, so continuation cannot switch lessons.
+Evaluation retains its prescribed command packets.
+
+The `go2_family_block_curriculum_v2` teacher maintains
 one target per nonflat family and assesses non-overlapping blocks of 20 unchanged
 translation episodes at that target, pooled across the family's replicas.
 
@@ -157,6 +166,9 @@ Task progress preserves family targets, assessment blocks/history and physical
 assignments. A fresh-process restart retains completed teacher state while
 clearing partial physical episodes; periodic saves do not reset episodes.
 Teacher-only simulator measurements do not enter actor or method GT observations.
+Cached per-family diagnostics retain cumulative failed-gate counts and the latest
+eligible measured outcome, including tracking, projected travel, physical ending
+and supported contact. They explain failed assessments without changing gates.
 
 Evaluation disables progression and generates one row at an explicit physical
 anchor: 0 (flat entry), 4, 8, 12 or 15. The default fixed level is 8; its native
@@ -719,6 +731,67 @@ task. It does not launch Isaac Sim:
 
 ```bash
 python -m unittest discover -s examples/sb3/tests -t . -v
+```
+
+### Forward-entry development diagnostic
+
+Use this finite experiment to test whether a simpler command distribution helps
+establish forward locomotion. It keeps the published reward, observations,
+dynamics, terrain teacher and learner settings. Only the training command lesson
+changes to 90% forward at 0.35 m/s and 10% stand. Mixed-family replicas still start
+on the exact plane at level 0 and advance independently under the same teacher.
+Start fresh runs: checkpoints from the full lesson cannot continue this recipe.
+
+From the repository root, with the configured native interpreter:
+
+```bash
+PLAB_PY=python bash examples/sb3/run_forward_entry.sh
+```
+
+The runner declares its complete grid before collection, then trains PPO and SAC
+with seeds 1078 and 2078 for **3,200,000 real interactions each**: four fresh runs,
+12,800,000 training interactions in total. It saves complete checkpoints at
+800k, 1.6M and 3.2M, in addition to the existing periodic saves.
+
+At 1.6M and 3.2M, each policy receives only the existing v2 validation **Flat
+stand and forward-035** cases, with their unchanged 20 s command schedules.
+Eight evaluations collect 16 cases, at most 16,000 evaluation transitions.
+They measure entry behavior, not turning, nonflat traversal or robustness. Later
+full-bank evaluations can reuse these checkpoints without repeating training.
+The ordinary `--full-bank` path and three-seed calibration pilot remain available.
+
+At the recorded native throughput, the four training processes are estimated to
+take **about four hours**: roughly 56 minutes per PPO run and 64 minutes per SAC
+run. The eight evaluations should add about 12–18 minutes. These estimates
+extrapolate the preceding 1.024M pilot on the same machine; throughput, physical
+behavior and checkpoint I/O can change. The runner finishes its fixed interaction
+budget and never stops on a wall-clock deadline. Both methods receive equal
+interaction budgets, even though their training times differ.
+
+Every stage preserves its log, process exit and original report under the printed
+`logs/parkour_lab/forward_entry_*` folder. Enabled CLI logs include UTC start,
+checkpoint, per-case, cleanup and error events. During training, roughly every
+10 wall seconds they include interaction/update counts, throughput, recent
+episode return/length, available learner metrics and cached curriculum failures.
+Inspect the printed stage log with `tail -f` while it runs. Durable metrics stay
+in `train/metrics/progress.json`; checkpoint locations are in
+`train/checkpoint_index.json`.
+
+The final `diagnostic_report.json` retains every planned endpoint, including
+failed or absent stages, and verifies source/checkpoint/capture links before
+summarizing recorded behavior. Read forward travel and forward-minus-stand
+velocity alongside tracking, stopping, falls, root height/uprightness and foot
+support. Low posture or passive drift must not be mistaken for commanded walking.
+`complete=true` means collection and linkage checks passed; it is not a locomotion
+success gate. The report always records `diagnostic_only=true`, `full_bank=false`,
+`valid_for_comparison=false` and `calibration_established=false`. Two seeds cannot
+establish the minimum-three-seed calibration requirement.
+
+To regenerate that report offline, without loading learner objects or Isaac Sim:
+
+```bash
+PYTHONPATH="$PWD/source/parkour_lab${PYTHONPATH:+:$PYTHONPATH}" \
+    python -m examples.sb3.entry_report report /absolute/path/to/forward_entry_XXXXXX
 ```
 
 ### Bounded development pilot

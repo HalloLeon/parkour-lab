@@ -128,11 +128,30 @@ for name in TASK_IDS:
             {"terrain": {}},
             {"task_id": "Go2-Mixed-v1", "num_envs": 9},
             {"terrain": TerrainConfig(fixed_level=1)},
+            {"command_lesson": "unknown"},
+            {"command_lesson": []},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 Go2Config(**kwargs)
         with self.assertRaises(ValueError):
             build_config(options, training=1)
+
+    def test_forward_stand_is_explicit_and_training_only_without_physical_changes(self):
+        from tests.support.public_task import config_dict
+
+        with native_config_modules(rough=rough_recipe()):
+            full = build_config(Go2Config(device="cpu"))
+            lesson = build_config(
+                Go2Config(device="cpu", command_lesson="forward-stand")
+            )
+            with self.assertRaisesRegex(ValueError, "training-only"):
+                build_config(Go2Config(command_lesson="forward-stand"), training=False)
+        self.assertEqual(full.benchmark_command_lesson, "full")
+        self.assertEqual(lesson.benchmark_command_lesson, "forward-stand")
+        first, second = config_dict(full), config_dict(lesson)
+        first.pop("benchmark_command_lesson")
+        second.pop("benchmark_command_lesson")
+        self.assertEqual(first, second)
 
     def test_every_family_reuses_the_common_native_reward_and_sensor_recipe(self):
         rough = rough_recipe()

@@ -17,6 +17,7 @@ from parkour_lab.provenance import (
     write_json,
     write_run_provenance,
 )
+from parkour_lab.runtime.console import log_event, restore_console, setup_console
 from parkour_lab.runtime.session import exit_native_process, finish_session
 
 
@@ -56,6 +57,12 @@ def _run(task, app, args, output, report):
         )
         report["restored_interactions"] = restored["interactions"]
     observation, _ = task.reset(seed=args.seed)
+    log_event(
+        "terrain_ready",
+        role=args.role,
+        fixed_level=args.level,
+        interactions=task.interactions,
+    )
     assert set(observation) == ({"actor", "training"} if task.training else {"actor"})
     assert set(native.observation_manager.active_terms) == {"proprio"}
     report["terrain_definition"] = native.cfg.benchmark_terrain
@@ -82,10 +89,14 @@ def _run(task, app, args, output, report):
         assert "training_information" not in task.metadata
         assert all(row["row"] == 0 for row in report["initial_assignments"])
     report["geometry"] = check_geometry(task, output)
+    log_event("terrain_geometry_verified", role=args.role, fixed_level=args.level)
     report["contact"] = check_contact(task, app, output)
+    log_event("terrain_contact_verified", **report["contact"])
     report["boundary"] = check_boundary(task)
+    log_event("terrain_boundary_verified", **report["boundary"])
     if task.training:
         report["curriculum_cases"] = check_curriculum(task)
+        log_event("curriculum_fixtures_verified", **report["curriculum_cases"])
         record = task.progress(
             run_id="terrain-contract", checkpoint_id="terrain-contract-fixture"
         )
@@ -111,6 +122,8 @@ def main():
         parser.error("Require a uint32 seed")
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
+    previous_console = setup_console()
+    log_event("terrain_check_started", role=args.role, output=str(output))
     report = dict(
         status="RUNNING",
         role=args.role,
@@ -150,8 +163,16 @@ def main():
         report.update(
             status="ERROR", error=str(error), traceback=traceback.format_exc()
         )
+        log_event("terrain_check_failed", error=str(error))
+        traceback.print_exc(file=sys.stderr)
     finally:
         code = finish_session(task, app, report, publish, code)
+        log_event(
+            "terrain_check_finished",
+            status=report["status"],
+            report=str(output / "report.json"),
+        )
+        restore_console(previous_console)
         if app is not None:
             exit_native_process(code)
     return code

@@ -23,6 +23,86 @@ def module(name, **values):
 
 
 class CliTests(unittest.TestCase):
+    def test_flat_entry_uses_exact_existing_controls_and_is_diagnostic_only(self):
+        from parkour_lab.evaluation import case_bank
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            summary = {
+                "command_contrast": {"forward_minus_stand_travel_m": 0.0},
+                "cases": {},
+            }
+            with (
+                self.native(root) as native,
+                patch(
+                    "parkour_lab.evaluation.summarize_flat_entry", return_value=summary
+                ) as summarize,
+            ):
+                self.assertEqual(
+                    cli.main(
+                        [
+                            "evaluate",
+                            "--suite",
+                            "flat-entry",
+                            "--checkpoint",
+                            str(checkpoint),
+                            "--output",
+                            str(root / "flat"),
+                        ]
+                    ),
+                    0,
+                )
+                selected = native.evaluate.call_args.args[1]
+                self.assertEqual(
+                    selected,
+                    tuple(
+                        case
+                        for case in case_bank("validation")
+                        if case.family == "Flat"
+                        and case.profile in ("stand", "forward-035")
+                    ),
+                )
+                self.assertEqual(len(selected), 2)
+                self.assertEqual(selected[0].seed, selected[1].seed)
+                summarize.assert_called_once_with((root / "flat" / "capture").resolve())
+                native.make.assert_not_called()
+                native.train.assert_not_called()
+            report = json.loads((root / "flat" / "report.json").read_text())
+            self.assertFalse(report["full_bank"])
+            self.assertFalse(report["evaluation"]["valid_for_comparison"])
+            self.assertTrue(report["diagnostic_only"])
+            self.assertFalse(report["calibration_validated"])
+            self.assertEqual(report["diagnostic_summary"], summary)
+
+    def test_flat_entry_full_bank_conflict_fails_before_output_or_native(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root / "checkpoint"
+            checkpoint.mkdir()
+            with (
+                self.native(root) as native,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+                self.assertRaises(SystemExit) as error,
+            ):
+                cli.main(
+                    [
+                        "evaluate",
+                        "--suite",
+                        "flat-entry",
+                        "--full-bank",
+                        "--checkpoint",
+                        str(checkpoint),
+                        "--output",
+                        str(root / "invalid"),
+                    ]
+                )
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn("diagnostic only", stderr.getvalue())
+            self.assertFalse((root / "invalid").exists())
+            native.launcher.assert_not_called()
+
     def test_robustness_suite_collects_full_bank_from_one_frozen_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -127,6 +207,8 @@ class CliTests(unittest.TestCase):
                         str(checkpoint),
                         "--run-id",
                         "run-1077",
+                        "--command-lesson",
+                        "forward-stand",
                         "--save-every-updates",
                         "10",
                         "--milestones",
@@ -147,6 +229,9 @@ class CliTests(unittest.TestCase):
                 self.assertEqual(arguments["milestones"], [1280, 2560])
                 self.assertIs(arguments["app"], native.app)
                 self.assertEqual(native.build.call_args.kwargs, {"training": True})
+                self.assertEqual(
+                    native.build.call_args.args[0].command_lesson, "forward-stand"
+                )
                 native.exit_process.assert_called_once_with(0)
             report = json.loads((output / "report.json").read_text())
             self.assertEqual(report["status"], "LEARNER_CHECK_PASSED")
@@ -160,15 +245,25 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "failed"
-            with self.native(
-                root, training_error=RuntimeError("checkpoint write failed")
-            ) as native:
+            with (
+                self.native(
+                    root, training_error=RuntimeError("checkpoint write failed")
+                ) as native,
+                contextlib.redirect_stdout(io.StringIO()) as stdout,
+                contextlib.redirect_stderr(io.StringIO()) as stderr,
+            ):
                 self.assertEqual(
                     cli.main(["train", "--algorithm", "ppo", "--output", str(output)]),
                     2,
                 )
                 self.assertEqual(native.closed, ["environment", "application"])
                 native.exit_process.assert_called_once_with(2)
+                self.assertIn("[parkour_lab] start", stdout.getvalue())
+                self.assertIn("[parkour_lab] ready", stdout.getvalue())
+                self.assertIn("[parkour_lab] error", stdout.getvalue())
+                self.assertIn("[parkour_lab] finish", stdout.getvalue())
+                self.assertIn("Traceback (most recent call last)", stderr.getvalue())
+                self.assertIn("checkpoint write failed", stderr.getvalue())
             report = json.loads((output / "report.json").read_text())
             self.assertEqual(report["status"], "ERROR")
             self.assertEqual(report["error"], "checkpoint write failed")

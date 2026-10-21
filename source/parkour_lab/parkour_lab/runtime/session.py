@@ -3,6 +3,8 @@
 import os
 import sys
 
+from .console import log_event
+
 
 def exit_native_process(code):
     """Exit a standalone native run after explicit cleanup, not Python finalizers.
@@ -29,6 +31,7 @@ def finish_session(env, app, report, publish, code):
         name: "pending" if resource is not None else "not_created"
         for name, resource in resources
     }
+    log_event("cleanup_started", status=report["session_status"])
 
     def save():
         nonlocal code
@@ -37,6 +40,7 @@ def finish_session(env, app, report, publish, code):
         except Exception as error:
             code = 2
             report.update(status="ERROR", report_write_error=str(error))
+            log_event("report_write_failed", error=str(error))
             try:
                 print(f"Could not publish run report: {error}", flush=True)
             except OSError:
@@ -52,7 +56,15 @@ def finish_session(env, app, report, publish, code):
         except Exception as error:
             report["cleanup"][name] = f"ERROR: {error}"
             code = 2
+        log_event("resource_closed", resource=name, status=report["cleanup"][name])
         save()
     report["status"] = report["session_status"] if code == 0 else "ERROR"
     save()
+    log_event(
+        "session_finished",
+        status=report["status"],
+        returncode=code,
+        cleanup=report["cleanup"],
+        interactions=report.get("interactions", report.get("collected_interactions")),
+    )
     return code

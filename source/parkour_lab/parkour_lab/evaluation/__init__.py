@@ -10,6 +10,7 @@ __all__ = [
     "evaluate",
     "score_capture",
     "report_campaign",
+    "summarize_flat_entry",
 ]
 
 
@@ -32,3 +33,10 @@ def report_campaign(path):
     from .campaign import report_campaign as report
 
     return report(path)
+
+
+def summarize_flat_entry(folder):
+    """Describe saved stand/forward Flat diagnostics without benchmark pass gates."""
+    from .diagnostics import summarize_flat_entry as summarize
+
+    return summarize(folder)

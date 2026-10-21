@@ -6,6 +6,7 @@ from pathlib import Path
 from time import perf_counter
 
 from parkour_lab.provenance import write_json
+from parkour_lab.runtime.console import log_event
 
 from .checkpoint import save_checkpoint
 
@@ -159,4 +160,13 @@ class SnapshotIndex:
         temporary = self.output / "checkpoint_index.json.tmp"
         write_json(temporary, self.record)
         temporary.replace(self.output / "checkpoint_index.json")
+        log_event(
+            "checkpoint_saved",
+            algorithm=self.record["algorithm"],
+            training_seed=self.record["training_seed"],
+            interactions=dict(task.interactions),
+            completed_updates=int(model._n_updates),
+            checkpoint_path=str(self.output / relative),
+            reasons=list(reasons),
+        )
         return receipt

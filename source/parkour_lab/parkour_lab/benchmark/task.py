@@ -62,6 +62,7 @@ class Go2Task:
                 "configuration_id": identity,
                 "seed": cfg.seed,
                 "training": self.training,
+                "command_lesson": cfg.benchmark_command_lesson,
                 "autoreset": "same_step",
                 "joint_names": list(self._env.scene["robot"].joint_names),
                 "reward_recipe": reward_recipe(self._env),

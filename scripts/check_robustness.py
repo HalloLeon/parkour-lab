@@ -13,6 +13,7 @@ from parkour_lab.provenance import (
     write_json,
     write_run_provenance,
 )
+from parkour_lab.runtime.console import log_event, restore_console, setup_console
 from parkour_lab.runtime.session import exit_native_process, finish_session
 
 
@@ -64,6 +65,12 @@ def _geometry(args, output, report, publish, app):
         folder.mkdir()
         receipt = dict(status="RUNNING", condition=condition)
         report["contexts"][condition] = receipt
+        log_event(
+            "geometry_started",
+            family=args.family,
+            level=args.level,
+            condition=condition,
+        )
 
         def save():
             write_json(folder / "report.json", receipt)
@@ -85,6 +92,9 @@ def _geometry(args, output, report, publish, app):
                     interpretation="Level-zero composition is an intentional plane, without added roughness",
                 )
             receipt.update(status="SURFACE_CAPTURED", interactions=task.interactions)
+            log_event(
+                "surface_captured", condition=condition, interactions=task.interactions
+            )
             code = 0
         except BaseException as error:
             receipt.update(
@@ -98,6 +108,9 @@ def _geometry(args, output, report, publish, app):
         if code:
             raise RuntimeError(f"Could not close {condition} environment cleanly")
     report["geometry"] = compare_surfaces(samples, definitions)
+    log_event(
+        "geometry_verified", family=args.family, level=args.level, **report["geometry"]
+    )
     report["collected_interactions"] = sum(
         context["interactions"]["session"] for context in report["contexts"].values()
     )
@@ -116,12 +129,19 @@ def _motor(args, output, report, publish, app):
         direct = direct_motor_checks(task)
         write_json(output / "direct_motor.json", direct)
         receipt["direct_motor"] = dict(passed=True, witness="direct_motor.json")
+        log_event("direct_motor_verified", factor=args.factor, joint=args.joint)
         publish()
         physical = check_physics(task, app)
         write_json(output / "physics.json", physical)
         receipt.update(
             status="MOTOR_CHECK_PASSED",
             physics=dict(passed=True, witness="physics.json"),
+        )
+        log_event(
+            "motor_physics_verified",
+            factor=args.factor,
+            joint=args.joint,
+            interactions=task.interactions,
         )
         code = 0
     except BaseException as error:
@@ -164,6 +184,8 @@ def main(argv=None):
     args = _arguments(argv)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
+    previous_console = setup_console()
+    log_event("robustness_check_started", check=args.check, output=str(output))
     scripts = Path(__file__).parent
     sources = [
         Path(__file__),
@@ -222,8 +244,16 @@ def main(argv=None):
         report.update(
             status="ERROR", error=str(error), traceback=traceback.format_exc()
         )
+        log_event("robustness_check_failed", error=str(error))
+        traceback.print_exc(file=sys.stderr)
     finally:
         code = finish_session(None, app, report, publish, code)
+        log_event(
+            "robustness_check_finished",
+            status=report["status"],
+            report=str(output / "report.json"),
+        )
+        restore_console(previous_console)
         if app is not None:
             exit_native_process(code)
     return code

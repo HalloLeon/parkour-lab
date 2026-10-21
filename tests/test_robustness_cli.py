@@ -236,7 +236,13 @@ runpy.run_module('scripts.check_robustness', run_name='__main__')
             output = Path(tmp)
             report = dict(contexts={})
             with self.assertRaisesRegex(RuntimeError, "ray miss"):
-                check._geometry(None, output, report, lambda: None, None)
+                check._geometry(
+                    SimpleNamespace(family="Hills", level=0),
+                    output,
+                    report,
+                    lambda: None,
+                    None,
+                )
             self.assertEqual(count, 2)
             self.assertEqual(order, ["id", "composition"])
             receipt = json.loads((output / "composition" / "report.json").read_text())
